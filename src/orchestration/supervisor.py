@@ -35,6 +35,22 @@ DATA_PIPELINE_AGENTS = ("A02_data_cleaner", "A03_data_validator", "A04_data_stor
 # 产出可被A17综合的全部分析类Agent
 ALL_INSIGHT_AGENTS = ANALYSIS_AGENTS + INDUSTRY_AGENTS
 
+# 行业专业指标目录（ind:前缀由模拟产业连接器提供，付费接口接入后保持id不变）
+INDUSTRY_INDICATORS: dict[str, tuple[str, ...]] = {
+    "A13_tech": (
+        "ind:半导体销售额同比", "ind:芯片出货量同比", "ind:科技行业PE(TTM)",
+    ),
+    "A14_consumer": (
+        "ind:社会消费品零售总额同比", "ind:白酒批价(元/瓶)", "ind:消费行业PE(TTM)",
+    ),
+    "A15_cyclical": (
+        "ind:动力煤价格(元/吨)", "ind:重点电厂煤炭库存(万吨)", "ind:周期行业PE(TTM)",
+    ),
+    "A16_pharma": (
+        "ind:创新药IND申报数量(个)", "ind:医保集采药品均价同比", "ind:医药行业PE(TTM)",
+    ),
+}
+
 # analysis_type → (采集指标, 参与分析Agent)
 _PLANNING: dict[str, tuple[list[str], list[str]]] = {
     "macro": (["CPI", "PPI"], ["A08_macro"]),
@@ -61,10 +77,15 @@ def plan_run(analysis_type: str, target: str, info_items: list | None = None) ->
     analysis_type = analysis_type if analysis_type in _PLANNING else "full"
     indicators, agents = _PLANNING[analysis_type]
     agents = list(agents)  # 拷贝：_PLANNING为模块级共享配置，禁止原地修改
+    indicators = list(indicators)
     resolved = [f"stock_close:{target}" if ind == "stock_close" else ind for ind in indicators]
     if analysis_type == "industry":
         # 通用产业链分析(A09) + 命中的专业行业Agent(A13-A16)，无匹配则仅A09
-        agents += [a for a in route_industry(target) if a not in agents]
+        routed = [a for a in route_industry(target) if a not in agents]
+        agents += routed
+        # 按命中行业下发专业产业指标（模拟连接器/未来付费接口）
+        for aid in routed:
+            resolved += [i for i in INDUSTRY_INDICATORS.get(aid, ()) if i not in resolved]
     if analysis_type in ("stock", "full") and target:
         agents = list(dict.fromkeys(agents))  # 保序去重
     if info_items:

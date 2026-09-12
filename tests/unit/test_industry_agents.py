@@ -51,8 +51,10 @@ def test_trend_signal_up():
     pts = [_dp("半导体出货量同比", 10.0, "2026-06"),
            _dp("半导体出货量同比", 15.0, "2026-07")]
     sig = IndustryAgentBase._trend_signal(pts)
-    assert "上行" in sig["trend"] and "50.0%" in sig["trend"]
+    assert "上行" in sig["trend"]
+    assert "50.0%" in sig["detail"]
     assert "2026-06" in sig["detail"] and "2026-07" in sig["detail"]
+    assert sig["per_indicator"]["半导体出货量同比"].startswith("环比上行")
 
 
 def test_trend_signal_flat_and_down():
@@ -60,6 +62,18 @@ def test_trend_signal_flat_and_down():
     assert "持平" in IndustryAgentBase._trend_signal(pts)["trend"]
     pts2 = [_dp("PPI同比", 5.0, "2026-07"), _dp("PPI同比", 4.0, "2026-08")]
     assert "下行" in IndustryAgentBase._trend_signal(pts2)["trend"]
+
+
+def test_trend_signal_groups_per_indicator_no_cross_compare():
+    """两个指标同期数据：禁止跨指标误比，各自成组后投票分化。"""
+    pts = [
+        _dp("动力煤价格", 700.0, "2026-07"), _dp("动力煤价格", 720.0, "2026-08"),
+        _dp("煤炭库存", 2600.0, "2026-07"), _dp("煤炭库存", 2400.0, "2026-08"),
+    ]
+    sig = IndustryAgentBase._trend_signal(pts)
+    assert "分化" in sig["trend"]
+    assert "动力煤价格" in sig["detail"] and "煤炭库存" in sig["detail"]
+    assert len(sig["per_indicator"]) == 2
 
 
 def test_trend_signal_insufficient_data():
@@ -200,12 +214,17 @@ def test_plan_industry_routes_specialist():
     assert "A09_meso" in plan["agents"]
     assert "A13_tech" in plan["agents"]
     assert "A14_consumer" not in plan["agents"]
+    # 命中行业后下发专业产业指标（模拟连接器占位，付费接口替换同id）
+    assert "ind:半导体销售额同比" in plan["indicators"]
+    assert "ind:科技行业PE(TTM)" in plan["indicators"]
+    assert "CPI" in plan["indicators"]  # 通用宏观背景仍保留给A09
 
 
 def test_plan_industry_no_match_only_meso():
     plan = plan_run("industry", "未知板块XYZ")
     assert "A09_meso" in plan["agents"]
     assert not (set(INDUSTRY_AGENTS) & set(plan["agents"]))
+    assert not [i for i in plan["indicators"] if i.startswith("ind:")]
 
 
 def test_plan_full_does_not_force_industry_agents():

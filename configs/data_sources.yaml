@@ -56,3 +56,12 @@ data_sources:
     priority: "P1"
     update_frequency: "日频"
     indicators: ["A股历史行情", "财务数据"]
+
+  mock_industry:
+    name: "模拟产业数据(Demo)"
+    base_url: "mock://industry-demo"
+    type: "simulated"
+    priority: "P3"
+    update_frequency: "静态生成（24个月度点）"
+    indicators: ["半导体销售额/出货量", "社零/白酒批价", "煤价/煤炭库存", "IND申报/集采均价", "行业PE"]
+    note: "付费产业接口（Wind/iFinD/Choice/Tushare Pro）接入前的占位数据，非真实行情；见 DEVELOPMENT_ROADMAP.md B01"

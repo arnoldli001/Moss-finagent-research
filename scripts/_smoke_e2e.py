@@ -117,6 +117,40 @@ async def main() -> None:
         print("[E2E-INDUSTRY] 本地景气信号:",
               json.dumps(a15["result"].get("industry_signal_calc"), ensure_ascii=False))
 
+    # ---- 科技行业段（模拟产业数据打通：半导体→A09+A13，ind:模拟指标+真实CPI/PPI）----
+    tech_state = {
+        "task_id": f"task_smoke_tech_{int(time.time())}",
+        "tenant_id": "tenant_001",
+        "user_query": "半导体行业当前景气度如何？渗透率处于什么阶段？",
+        "analysis_type": "industry",
+        "target": "半导体",
+        "plan": [], "raw_points": [], "cleaned_points": [], "validated_points": [],
+        "validation_report": {}, "storage_stats": {},
+        "info_items": [], "verified_items": {}, "extracted_events": {},
+        "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
+        "final_report": None,
+    }
+    tech_started = time.perf_counter()
+    tech_final = await runtime.graph.ainvoke(tech_state)
+    tech_elapsed = time.perf_counter() - tech_started
+    print("=" * 60)
+    print(f"[E2E-TECH] 耗时 {tech_elapsed:.1f}s | 错误 {tech_final['errors'] or '无'}")
+    print("[E2E-TECH] 采集指标:",
+          sorted({p["indicator"] for p in tech_final["raw_points"]}))
+    for o in tech_final["agent_outputs"]:
+        if o["agent_id"].startswith(("A13", "A17")):
+            print(f"  - {o['agent_id']} ({o['confidence']}): {o['conclusion'][:100]}")
+    a13 = next((o for o in tech_final["agent_outputs"]
+                if o["agent_id"] == "A13_tech"), None)
+    tech_ok = (
+        a13 is not None
+        and not (a13["result"] or {}).get("skipped")
+        and (a13["result"]["industry_signal_calc"].get("watched_indicator_count") or 0) >= 48
+    )
+    if a13 is not None:
+        print("[E2E-TECH] 本地景气信号:",
+              json.dumps(a13["result"].get("industry_signal_calc"), ensure_ascii=False))
+
     ok = (
         len(final["raw_points"]) > 0
         and final["final_report"]
@@ -124,6 +158,7 @@ async def main() -> None:
         and any(o["agent_id"] == "A08_macro" for o in final["agent_outputs"])
         and info_ok
         and industry_ok
+        and tech_ok
     )
     Path("data").mkdir(exist_ok=True)
     Path("data/_smoke_e2e_result.json").write_text(json.dumps({
@@ -132,6 +167,8 @@ async def main() -> None:
         "info_elapsed": info_elapsed, "info_errors": info_final["errors"],
         "industry_elapsed": ind_elapsed, "industry_errors": ind_final["errors"],
         "industry_signal": (a15["result"].get("industry_signal_calc") if a15 else None),
+        "tech_elapsed": tech_elapsed, "tech_errors": tech_final["errors"],
+        "tech_signal": (a13["result"].get("industry_signal_calc") if a13 else None),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print("SMOKE:", "PASS" if ok else "FAIL")
 

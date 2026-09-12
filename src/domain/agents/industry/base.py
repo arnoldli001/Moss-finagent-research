@@ -102,31 +102,64 @@ class IndustryAgentBase(AnalysisAgentBase):
         ]
 
     @staticmethod
-    def _trend_signal(points: list[dict[str, Any]]) -> dict[str, Any]:
-        """取同指标最近两期（按period_date）比较方向。"""
-        valued = [p for p in points if isinstance(p.get("value"), (int, float))]
-        if len(valued) < 2:
-            return {"trend": "数据不足", "detail": "关注指标少于两期，无法判断方向"}
-        ordered = sorted(valued, key=lambda p: str(p.get("period_date", "")))
-        prev, curr = ordered[-2], ordered[-1]
-        pv, cv = float(prev["value"]), float(curr["value"])
+    def _pair_direction(pv: float, cv: float) -> tuple[str, str]:
+        """返回(细标签含幅度, 粗方向)；粗方向用于多指标投票汇总。"""
         if pv == 0:
-            direction = "基数为零无法比较"
-            delta = cv
+            return f"基数为零，最新值{cv:g}", "持平"
+        delta = (cv - pv) / abs(pv) * 100
+        if abs(delta) < 1.0:
+            return "基本持平", "持平"
+        if delta > 0:
+            return f"环比上行{delta:.1f}%", "上行"
+        return f"环比下行{abs(delta):.1f}%", "下行"
+
+    @staticmethod
+    def _trend_signal(points: list[dict[str, Any]]) -> dict[str, Any]:
+        """按指标分组，各取最近两期比较方向；多指标时投票汇总。
+
+        不跨指标比较：多个指标同属最新一期时，旧实现会把A指标与B指标当成
+        前后两期，产生无意义的方向信号。
+        """
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for p in points:
+            if isinstance(p.get("value"), (int, float)):
+                groups.setdefault(str(p.get("indicator", "?")), []).append(p)
+
+        details: list[str] = []
+        votes: dict[str, int] = {"上行": 0, "下行": 0, "持平": 0}
+        per_indicator: dict[str, str] = {}
+        for indicator, series in groups.items():
+            ordered = sorted(series, key=lambda p: str(p.get("period_date", "")))
+            if len(ordered) < 2:
+                continue
+            prev, curr = ordered[-2], ordered[-1]
+            pv, cv = float(prev["value"]), float(curr["value"])
+            label, coarse = IndustryAgentBase._pair_direction(pv, cv)
+            votes[coarse] += 1
+            per_indicator[indicator] = label
+            details.append(
+                f"{indicator}：{prev.get('period_date', '?')}期{pv:g} → "
+                f"{curr.get('period_date', '?')}期{cv:g}（{label}）"
+            )
+
+        if not details:
+            return {"trend": "数据不足", "detail": "关注指标少于两期，无法判断方向",
+                    "per_indicator": {}}
+
+        decided = {k: v for k, v in votes.items() if v > 0}
+        if len(decided) == 1:
+            coarse = next(iter(decided))
+            trend = {"上行": "关注指标普遍环比上行",
+                     "下行": "关注指标普遍环比下行",
+                     "持平": "关注指标环比基本持平"}[coarse]
         else:
-            delta = (cv - pv) / abs(pv) * 100
-            if abs(delta) < 1.0:
-                direction = "基本持平"
-            elif delta > 0:
-                direction = f"环比上行{delta:.1f}%"
-            else:
-                direction = f"环比下行{abs(delta):.1f}%"
+            trend = (
+                f"信号分化（上行{votes['上行']}/持平{votes['持平']}/下行{votes['下行']}）"
+            )
         return {
-            "trend": direction,
-            "detail": (
-                f"{curr.get('indicator', '?')}：{prev.get('period_date', '?')}期"
-                f"{pv:g} → {curr.get('period_date', '?')}期{cv:g}"
-            ),
+            "trend": trend,
+            "detail": "；".join(details),
+            "per_indicator": per_indicator,
         }
 
     def _valuation_flag(self, payload: AnalysisPayload) -> str:

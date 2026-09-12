@@ -27,6 +27,8 @@ from src.domain.agents.info.extractor import ExtractorAgent
 from src.domain.agents.info.sentiment import SentimentAgent
 from src.domain.agents.info.verifier import VerifierAgent
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
+from src.infrastructure.connectors.mock_industry_connector import MockIndustryConnector
+from src.infrastructure.connectors.router import ConnectorRouter
 from src.infrastructure.llm import LLMGateway
 from src.infrastructure.repositories.base import DataPointRepository
 from src.infrastructure.repositories.repository_factory import build_repository
@@ -48,8 +50,15 @@ def build_runtime() -> Runtime:
     settings = get_settings()
     gateway = LLMGateway(settings=settings)
     repo = build_repository(settings)
+    # 采集后端：AkShare(CPI/PPI/A股行情) + 模拟产业数据(ind:前缀，付费接口接入前占位)
+    akshare = AkshareConnector()
+    mock_industry = MockIndustryConnector()
+    backend = ConnectorRouter([
+        (mock_industry, MockIndustryConnector.supports),
+        (akshare, lambda i: i in ("CPI", "PPI") or i.startswith("stock_close:")),
+    ])
     agents: dict[str, Any] = {
-        "A01_data_collector": DataCollectorAgent(AkshareConnector()),
+        "A01_data_collector": DataCollectorAgent(backend),
         "A02_data_cleaner": DataCleanerAgent(),
         "A03_data_validator": DataValidatorAgent(),
         "A04_data_storage": DataStorageAgent(repo),
