@@ -128,7 +128,9 @@ class LLMCache:
             score = cosine_similarity(query_vec, _ngram_vector(entry.get("vector_text", "")))
             if score >= best_score:
                 best_key, best_score = key, score
-        return self._mark(entry, "semantic") if (best_key and (entry := self._load(best_key))) else None
+        if best_key and (entry := self._load(best_key)):
+            return self._mark(entry, "semantic")
+        return None
 
     @staticmethod
     def _mark(entry: dict[str, Any], kind: str) -> LLMResponse:

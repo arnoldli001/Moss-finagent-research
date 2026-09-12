@@ -94,7 +94,9 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     A08-A11缺失时对应分支自动跳过）。
     """
 
-    async def _run_agent(agent: Any, state: ResearchState, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _run_agent(
+        agent: Any, state: ResearchState, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         output = await agent.execute(AgentInput(
             task_id=state["task_id"], tenant_id=state["tenant_id"], payload=payload,
         ))
@@ -203,10 +205,14 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     g = StateGraph(ResearchState)
     g.add_node("supervisor", supervisor_node)
     g.add_node("collect", collect_node)
-    g.add_node("clean", _node("A02_data_cleaner", lambda s: {"data_points": s.get("raw_points", [])}))
-    g.add_node("validate", _node("A03_data_validator", lambda s: {"data_points": s.get("cleaned_points", [])}))
-    g.add_node("store", _node("A04_data_storage", lambda s: {"data_points": s.get("validated_points", [])}))
-    g.add_node("verify_info", _node("A05_verifier", lambda s: {"info_items": s.get("info_items", [])}))
+    g.add_node("clean", _node(
+        "A02_data_cleaner", lambda s: {"data_points": s.get("raw_points", [])}))
+    g.add_node("validate", _node(
+        "A03_data_validator", lambda s: {"data_points": s.get("cleaned_points", [])}))
+    g.add_node("store", _node(
+        "A04_data_storage", lambda s: {"data_points": s.get("validated_points", [])}))
+    g.add_node("verify_info", _node(
+        "A05_verifier", lambda s: {"info_items": s.get("info_items", [])}))
     g.add_node("extract_events", _node("A06_extractor", lambda s: {
         "info_items": [i for i in (s.get("verified_items") or {}).get("items", [])
                        if i.get("verified")],

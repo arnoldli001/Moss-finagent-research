@@ -12,20 +12,20 @@ from src.domain.agents.analysis.meso.agent import MesoAnalysisAgent
 from src.domain.agents.analysis.micro.agent import MicroAnalysisAgent
 from src.domain.agents.analysis.risk.agent import RiskAnalysisAgent
 from src.domain.agents.audit.verifier.agent import AuditAgent
-from src.domain.agents.data.collector.agent import DataCollectorAgent
 from src.domain.agents.data.cleaner.agent import DataCleanerAgent
+from src.domain.agents.data.collector.agent import DataCollectorAgent
 from src.domain.agents.data.storage.agent import DataStorageAgent
 from src.domain.agents.data.validator.agent import DataValidatorAgent
 from src.domain.agents.decision.recommend.agent import RecommendationAgent
-from src.domain.agents.info.extractor import ExtractorAgent
-from src.domain.agents.info.sentiment import SentimentAgent
-from src.domain.agents.info.verifier import VerifierAgent
 from src.domain.agents.industry import (
     ConsumerIndustryAgent,
     CyclicalIndustryAgent,
     PharmaIndustryAgent,
     TechIndustryAgent,
 )
+from src.domain.agents.info.extractor import ExtractorAgent
+from src.domain.agents.info.sentiment import SentimentAgent
+from src.domain.agents.info.verifier import VerifierAgent
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
 from src.infrastructure.llm import LLMGateway
 from src.infrastructure.repositories.base import DataPointRepository

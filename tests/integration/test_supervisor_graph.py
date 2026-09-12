@@ -2,8 +2,6 @@
 
 import json
 
-import pytest
-
 from src.core.models import AgentInput, AgentOutput
 from src.core.schemas import Confidence
 from src.domain.agents.analysis.macro.agent import MacroAnalysisAgent
@@ -41,7 +39,8 @@ class FakeCollector:
 
 def _dp(indicator: str, value: float | None, period: str) -> dict:
     return {"indicator": indicator, "value": value, "period_date": period,
-            "source_name": "AkShare", "source_url": "https://x", "data_id": f"d_{indicator}_{period}"}
+            "source_name": "AkShare", "source_url": "https://x",
+            "data_id": f"d_{indicator}_{period}"}
 
 
 POINTS = {

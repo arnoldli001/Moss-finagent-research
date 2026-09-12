@@ -77,10 +77,14 @@ class AuditAgent(BaseAgent):
         issues = self._check_completeness(payload.agent_outputs)
         llm_calls = self._count_llm_calls(payload.llm_audit_path, payload.trace_id)
 
+        chain_note = (
+            "完整" if chain_result["valid"]
+            else f"于seq={chain_result['broken_at']}断链"
+        )
         verdict = "通过" if chain_result["valid"] and not issues else "不通过"
         conclusion = (
             f"审计{verdict}：哈希链{chain_result['count']}条记录"
-            f"{'完整' if chain_result['valid'] else f'于seq={chain_result["broken_at"]}断链'}，"
+            f"{chain_note}，"
             f"产出完整性问题{len(issues)}项，LLM调用{llm_calls}次。"
         )
 
@@ -105,7 +109,10 @@ class AuditAgent(BaseAgent):
             trace_id=input.task_id,
             reasoning_steps=[
                 TraceStep(step=1, step_type="cross_validation",
-                          description=f"哈希链校验 {chain_result['count']} 条, 断链位={chain_result['broken_at']}"),
+                          description=(
+                              f"哈希链校验 {chain_result['count']} 条, "
+                              f"断链位={chain_result['broken_at']}"
+                          )),
                 TraceStep(step=2, step_type="final_conclusion",
                           description=f"封存seq={sealed['seq']} head={sealed['record_hash'][:16]}"
                                       if sealed else "未封存（seal_report=False）"),

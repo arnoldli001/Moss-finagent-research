@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from src.domain.agents.analysis.base import AnalysisAgentBase, AnalysisPayload
 
 

@@ -118,7 +118,7 @@ class LLMGateway:
             started = time.perf_counter()
             try:
                 provider = self._providers[spec.provider]
-            except KeyError as exc:
+            except KeyError:
                 last_error = LLMGatewayError(f"提供商未注册: {spec.provider}")
                 continue
             try:

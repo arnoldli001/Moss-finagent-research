@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.core.exceptions import AgentExecutionError
 from src.core.models import AgentInput, AgentOutput
 from src.core.schemas import Confidence, TraceStep
 from src.domain.agents.analysis.base import parse_llm_json
@@ -67,8 +66,10 @@ class ExtractorAgent:
             "\n\n## 任务要求\n"
             "从上述条目中提取全部可确认的事件（每条信息可提取0-3个事件）。输出JSON对象：\n"
             '- "events": [{"item_id": "来源条目ID", "event_type": "earnings|merger|policy|'
-            'product|management|litigation|financing|other", "subject": "事件主体（公司/行业/宏观）", '
-            '"direction": "positive|negative|neutral", "magnitude": "影响程度简述（20字内，无量化则留空）", '
+            'product|management|litigation|financing|other", '
+            '"subject": "事件主体（公司/行业/宏观）", '
+            '"direction": "positive|negative|neutral", '
+            '"magnitude": "影响程度简述（20字内，无量化则留空）", '
             '"event_date": "事件发生日期YYYY-MM-DD（未知留空）", '
             '"evidence_quote": "支撑该事件的原文片段（必须逐字来自输入，30字内）", '
             '"confidence": 0到1之间的数值}]\n'
@@ -117,8 +118,11 @@ class ExtractorAgent:
                             else Confidence.MEDIUM if stats["total"] > 0 else Confidence.LOW)
         return AgentOutput(
             task_id=input.task_id, agent_id=self.agent_id,
-            conclusion=f"从 {len(raw_items)} 条可信信息中提取 {stats['total']} 个事件"
-                       f"（利好 {stats['positive']} / 利空 {stats['negative']} / 中性 {stats['neutral']}）",
+            conclusion=(
+                f"从 {len(raw_items)} 条可信信息中提取 {stats['total']} 个事件"
+                f"（利好 {stats['positive']} / 利空 {stats['negative']} "
+                f"/ 中性 {stats['neutral']}）"
+            ),
             confidence=confidence_level,
             data_refs=sorted(valid_ids - {""}),
             trace_id=input.task_id,

@@ -7,8 +7,6 @@ import pytest
 
 from src.api.main import app
 from src.api.tasks import TaskStore
-from src.core.models import AgentInput, AgentOutput
-from src.core.schemas import Confidence
 from src.infrastructure.repositories.macro_repo import MacroRepository
 
 

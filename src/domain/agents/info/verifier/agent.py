@@ -81,7 +81,7 @@ class VerifierAgent:
             for s in scored
         ]
         prompt = (
-            f"## 待核验信息（含本地规则分）\n" + "\n".join(lines) +
+            "## 待核验信息（含本地规则分）\n" + "\n".join(lines) +
             "\n\n## 任务要求\n"
             "请逐条复核信息可信度（规则分仅作参考）。输出JSON对象：\n"
             '- "reviews": [{"item_id": "...", "verdict": "可信"|"存疑"|"不可信", '

@@ -108,9 +108,15 @@ class RecommendationAgent(BaseAgent):
             trace_id=input.task_id,
             reasoning_steps=[
                 TraceStep(step=1, step_type="llm_inference",
-                          description=f"综合{len(payload.analyses)}维分析 model={response.model_used}"),
+                          description=(
+                              f"综合{len(payload.analyses)}维分析 "
+                              f"model={response.model_used}"
+                          )),
             ],
             result={**data, "stance": data.get("stance", "中性"),
                     "model_used": response.model_used,
-                    "disclaimer": "以上信息仅供研究参考，不构成投资建议。投资有风险，入市需谨慎，盈亏自负。"},
+                    "disclaimer": (
+                        "以上信息仅供研究参考，不构成投资建议。"
+                        "投资有风险，入市需谨慎，盈亏自负。"
+                    )},
         )

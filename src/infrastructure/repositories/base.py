@@ -37,3 +37,4 @@ class DataPointRepository(ABC):
 
     async def close(self) -> None:
         """释放连接资源（默认无操作，连接池后端覆盖）。"""
+        return None

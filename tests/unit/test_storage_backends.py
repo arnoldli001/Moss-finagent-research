@@ -75,6 +75,7 @@ class FakePGConn:
              "fetch_method", "raw_content_hash", "processed_by", "process_time",
              "confidence", "verified", "task_id", "created_at"),
             args,
+            strict=False,
         ))
         key = (row["indicator"], row["period_date"], row["raw_content_hash"])
         if key in self._table:

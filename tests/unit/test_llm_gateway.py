@@ -5,7 +5,6 @@ import pytest
 from src.core.config import Settings
 from src.core.exceptions import ConfigError, LLMGatewayError
 from src.infrastructure.llm.audit import LLMAuditLog
-from src.infrastructure.llm.cache import LLMCache
 from src.infrastructure.llm.gateway import LLMGateway
 from src.infrastructure.llm.models import LLMResponse
 

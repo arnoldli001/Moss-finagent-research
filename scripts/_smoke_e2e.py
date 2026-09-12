@@ -43,7 +43,8 @@ async def main() -> None:
     for o in final["agent_outputs"]:
         print(f"  - {o['agent_id']} ({o['confidence']}): {o['conclusion'][:80]}")
     chain = ChainVerifier("data/audit/audit_chain.jsonl").verify()
-    print(f"[E2E] 审计链 valid={chain['valid']} records={chain['count']} head={str(chain['head'])[:16]}")
+    print(f"[E2E] 审计链 valid={chain['valid']} records={chain['count']} "
+          f"head={str(chain['head'])[:16]}")
     print("[E2E] LLM审计条目数:",
           len([e for e in runtime.gateway.audit_log.read_all()
                if e.get("trace_id") == state["task_id"]]))

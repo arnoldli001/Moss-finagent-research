@@ -4,10 +4,10 @@ import pytest
 
 from src.infrastructure.llm.cache import (
     LLMCache,
+    _ngram_vector,
     cache_key,
     cosine_similarity,
     normalize_text,
-    _ngram_vector,
 )
 from src.infrastructure.llm.models import LLMResponse
 

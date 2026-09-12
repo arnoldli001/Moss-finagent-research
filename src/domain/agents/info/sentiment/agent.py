@@ -6,8 +6,6 @@ LLM（reasoning层）只负责解读指标并做周期定位，禁止自造数�
 
 from __future__ import annotations
 
-from typing import Any
-
 from src.core.models import AgentInput, AgentOutput
 from src.core.schemas import Confidence, TraceStep
 from src.domain.agents.analysis.base import parse_llm_json

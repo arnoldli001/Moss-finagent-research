@@ -10,8 +10,8 @@ DataPointRepository端口的SQLite实现，新代码请按抽象类型依赖。
 
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import json
 import os
 import sqlite3

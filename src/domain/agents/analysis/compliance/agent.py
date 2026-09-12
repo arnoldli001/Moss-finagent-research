@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from src.domain.agents.analysis.base import AnalysisAgentBase, AnalysisPayload
 from src.domain.agents.analysis.compliance.logic import evaluate_compliance
 
@@ -55,7 +57,8 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
             '- "conclusion": 合规风险与爆雷可能性评估（120字内，必须引用具体旗标/事件）\n'
             '- "confidence": "high"|"medium"|"low"（有明确监管事件或严重旗标为high）\n'
             '- "compliance_level": "高"|"中"|"无"（必须与本地规则等级一致）\n'
-            '- "burst_risk": 爆雷路径简述（如质押平仓/商誉减值/立案处罚，无风险则填"未见明确爆雷路径"）\n'
+            '- "burst_risk": 爆雷路径简述（如质押平仓/商誉减值/立案处罚，'
+            '无风险则填"未见明确爆雷路径"）\n'
             '- "red_flags": 风险明细数组（与本地旗标呼应）\n'
             '- "key_points": 2-4条要点'
         )
