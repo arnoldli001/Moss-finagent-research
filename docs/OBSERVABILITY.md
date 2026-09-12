@@ -58,6 +58,13 @@
 - P95延迟超过5秒时触发告警。
 - 慢查询日志：超过3秒的查询记录完整推理路径和耗时分解。
 
+**实现状态**：`src/infrastructure/observability/metrics.py` 从
+`data/audit/llm_audit.jsonl` 聚合（nearest-rank分位）：窗口调用数、
+P50/P95/P99/平均/最大延迟、≥3秒慢调用数、缓存命中率、降级率、错误率、
+Token累计、按提供方与按Agent分解。经 `GET /api/v1/metrics?limit=1000`
+暴露，前端"运行指标"视图15秒自动刷新。阈值告警（P95>5s主动推送）尚未实现，
+当前为可查询面板。
+
 ## 四、审计日志存储
 
 | 数据类型 | 存储方案 | 保留期限 |

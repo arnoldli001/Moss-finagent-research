@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, TaskDetail, TraceDetail } from "./api";
 import AgentTimeline from "./components/AgentTimeline";
+import MetricsPanel from "./components/MetricsPanel";
 import ReportView from "./components/ReportView";
 import SchedulerPanel from "./components/SchedulerPanel";
 import TracePanel from "./components/TracePanel";
@@ -20,7 +21,7 @@ export default function App() {
   const [trace, setTrace] = useState<TraceDetail | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<"research" | "scheduler">("research");
+  const [view, setView] = useState<"research" | "scheduler" | "metrics">("research");
   const timer = useRef<number | null>(null);
 
   const stopPolling = () => {
@@ -89,11 +90,19 @@ export default function App() {
           >
             调度管理
           </button>
+          <button
+            className={view === "metrics" ? "tab active" : "tab"}
+            onClick={() => setView("metrics")}
+          >
+            运行指标
+          </button>
         </nav>
       </header>
 
       {view === "scheduler" ? (
         <SchedulerPanel />
+      ) : view === "metrics" ? (
+        <MetricsPanel />
       ) : (
       <>
       <section className="submit-bar">

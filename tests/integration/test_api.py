@@ -199,3 +199,16 @@ async def test_scheduler_jobs_list_and_manual_trigger(client):
         assert summary.json()["success"] >= 1
 
         assert (await http.post("/api/v1/scheduler/jobs/nope/run")).status_code == 404
+
+
+async def test_metrics_endpoint_shape(client):
+    _, http = client
+    async with http:
+        resp = await http.get("/api/v1/metrics?limit=100")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["limit"] == 100
+        m = body["metrics"]
+        assert {"window_calls", "cache_hit_rate", "fallback_rate",
+                "latency_ms", "by_provider", "by_agent"} <= set(m)
+        assert {"p50", "p95", "p99", "avg", "max"} == set(m["latency_ms"])

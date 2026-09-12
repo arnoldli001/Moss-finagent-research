@@ -100,6 +100,23 @@ export type DailySummary = {
   failure_reasons: Record<string, number>;
 };
 
+export type LlmMetrics = {
+  window_calls: number;
+  errors: number;
+  error_rate: number | null;
+  cache_hit_rate: number | null;
+  fallback_rate: number | null;
+  latency_ms: { p50: number | null; p95: number | null; p99: number | null;
+                 avg: number | null; max: number | null };
+  slow_calls_over_3s: number;
+  tokens: { in: number; out: number; total: number };
+  by_provider: {
+    provider: string; calls: number; error_rate: number | null;
+    cache_hit_rate: number | null; p95_latency_ms: number | null;
+  }[];
+  by_agent: { agent_id: string; calls: number }[];
+};
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -144,4 +161,7 @@ export const api = {
     ),
   schedulerSummary: () =>
     request<DailySummary>("/api/v1/scheduler/runs/summary"),
+  llmMetrics: (limit = 1000) =>
+    request<{ limit: number; slow_call_threshold_ms: number;
+              metrics: LlmMetrics }>(`/api/v1/metrics?limit=${limit}`),
 };
