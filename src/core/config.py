@@ -31,6 +31,13 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = ""  # 仅经环境变量注入
+    model_config_path: str = "configs/models.yaml"
+    llm_timeout_seconds: float = 120.0
+    llm_cache_enabled: bool = True
+    llm_cache_dir: str = "data/llm_cache"
+    llm_cache_ttl_hours: float = 24.0
+    llm_semantic_threshold: float = 0.85  # n-gram余弦≥该值判语义命中
+    llm_audit_dir: str = "data/audit"
 
     # 数据层
     postgres_dsn: str = "postgresql+asyncpg://finagent:finagent@localhost:5432/finagent"

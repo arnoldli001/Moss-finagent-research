@@ -1,5 +1,17 @@
 # 模型路由配置
 
+# 任务层级 → 主备模型（主模型失败自动降级到fallback）
+routing:
+  light:              # 数据清洗、格式化等基础任务
+    primary: local_light
+    fallback: deepseek-v4-flash
+  reasoning:          # 宏观/中观/微观/财务风险等核心分析
+    primary: deepseek-v4-flash
+    fallback: local_medium
+  decision:           # 投研建议综合（A17）
+    primary: deepseek-v4-pro
+    fallback: deepseek-v4-flash
+
 models:
   local_light:
     provider: "ollama"
