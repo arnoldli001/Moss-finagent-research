@@ -33,3 +33,6 @@ class AgentOutput(BaseModel):
     data_refs: list[str] = Field(default_factory=list)
     trace_id: str = Field(default_factory=lambda: f"trace_{uuid4().hex}")
     reasoning_steps: list[TraceStep] = Field(default_factory=list)
+    result: dict[str, Any] = Field(default_factory=dict)
+    """结构化结果载体（Demo扩展字段）：如A01采集的DataPoint列表、A02清洗后的数据集，
+    供orchestration放入ResearchState与消息payload在Agent间传递。"""

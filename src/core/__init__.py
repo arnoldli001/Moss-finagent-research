@@ -8,7 +8,15 @@ from src.core.config import Settings, get_settings
 from src.core.exceptions import FinAgentError
 from src.core.message import Message, MessageMetadata, StandardMessageType, build_message
 from src.core.models import AgentInput, AgentOutput
-from src.core.schemas import Confidence, DataSourceRef, TraceStep
+from src.core.schemas import (
+    Confidence,
+    DataPoint,
+    DataSourceRef,
+    DataSourceType,
+    FetchMethod,
+    TraceStep,
+    hash_content,
+)
 from src.core.state import ResearchState
 
 __all__ = [
@@ -16,7 +24,10 @@ __all__ = [
     "AgentOutput",
     "BaseAgent",
     "Confidence",
+    "DataPoint",
     "DataSourceRef",
+    "DataSourceType",
+    "FetchMethod",
     "FinAgentError",
     "Message",
     "MessageMetadata",
@@ -26,4 +37,5 @@ __all__ = [
     "TraceStep",
     "build_message",
     "get_settings",
+    "hash_content",
 ]
