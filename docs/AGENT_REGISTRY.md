@@ -31,7 +31,11 @@ LLM仅做定性复核（verdict/red_flags）；A06事件必须携带item_id溯�
 | A09 | 中观分析Agent | P0 | DeepSeek-V4-Flash | 产业链数据 | 产业链报告 | ✅ |
 | A10 | 微观分析Agent | P0 | DeepSeek-V4-Flash | 财务/行情数据 | 个股研究报告 | ✅ |
 | A11 | 财务风险Agent | P1 | DeepSeek-V4-Flash | 财务报表 | 财务风险报告 | ✅ |
-| A12 | 合规爆雷Agent | P2 | DeepSeek-V4-Flash | 公告/新闻 | 合规风险报告 | ⬜ |
+| A12 | 合规爆雷Agent | P2 | DeepSeek-V4-Flash | 公告/新闻 | 合规风险报告 | ✅ |
+
+A12实现要点：合规旗标与爆雷等级由本地规则计算（关联交易/商誉/质押/担保比率阈值、
+存贷双高、信息层A06诉讼监管事件三源信号；含"立案/调查/冻结/处罚"事件升级为严重），
+LLM只做定性综合且输出等级必须与本地规则自洽；stock/full管线参与，消费A06事件表。
 
 ## 行业层
 

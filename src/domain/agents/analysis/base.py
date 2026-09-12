@@ -27,6 +27,8 @@ class AnalysisPayload(BaseModel):
     """分析焦点：行业名 / 股票代码 / 宏观主题"""
     hint: dict[str, Any] = Field(default_factory=dict)
     """本地计算参考值（如估值对比、风险比率），LLM只解读不计算"""
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    """信息层A06提取的事件表（诉讼/监管/管理层等），合规与风险Agent用作信号"""
 
 
 def parse_llm_json(agent_id: str, content: str) -> dict[str, Any]:
@@ -111,9 +113,15 @@ class AnalysisAgentBase(BaseAgent):
             )
 
         hint = json.dumps(payload.hint, ensure_ascii=False) if payload.hint else "无"
+        event_lines = "\n".join(
+            f"- [{e.get('direction', 'neutral')}] {e.get('event_type', 'other')} "
+            f"{e.get('subject', '')}: {e.get('evidence_quote', '')}"
+            for e in payload.events[:30]
+        ) or "无"
         prompt = (
             f"## 分析焦点\n{payload.focus or '综合分析'}\n\n"
             f"## 输入数据（含溯源）\n{self._build_context(payload)}\n\n"
+            f"## 信息层事件（A06提取，含溯源）\n{event_lines}\n\n"
             f"## 本地计算参考\n{hint}\n\n"
             f"## 任务要求\n{self._requirements(payload)}\n\n"
             "注意：本分析仅供研究参考，不构成投资建议。"

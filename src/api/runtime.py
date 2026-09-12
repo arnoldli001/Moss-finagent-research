@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.core.config import get_settings
+from src.domain.agents.analysis.compliance import ComplianceAnalysisAgent
 from src.domain.agents.analysis.macro.agent import MacroAnalysisAgent
 from src.domain.agents.analysis.meso.agent import MesoAnalysisAgent
 from src.domain.agents.analysis.micro.agent import MicroAnalysisAgent
@@ -52,6 +53,7 @@ def build_runtime() -> Runtime:
         "A09_meso": MesoAnalysisAgent(gateway),
         "A10_micro": MicroAnalysisAgent(gateway),
         "A11_fin_risk": RiskAnalysisAgent(gateway),
+        "A12_compliance": ComplianceAnalysisAgent(gateway),
         "A17_recommend": RecommendationAgent(gateway),
         "A18_audit": AuditAgent(),
     }

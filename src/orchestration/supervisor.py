@@ -17,7 +17,7 @@ from src.core.exceptions import AgentExecutionError
 from src.core.models import AgentInput, AgentOutput
 from src.core.state import ResearchState
 
-ANALYSIS_AGENTS = ("A08_macro", "A09_meso", "A10_micro", "A11_fin_risk")
+ANALYSIS_AGENTS = ("A08_macro", "A09_meso", "A10_micro", "A11_fin_risk", "A12_compliance")
 INFO_AGENTS = ("A05_verifier", "A06_extractor", "A07_sentiment")
 DATA_PIPELINE_AGENTS = ("A02_data_cleaner", "A03_data_validator", "A04_data_storage")
 
@@ -25,7 +25,7 @@ DATA_PIPELINE_AGENTS = ("A02_data_cleaner", "A03_data_validator", "A04_data_stor
 _PLANNING: dict[str, tuple[list[str], list[str]]] = {
     "macro": (["CPI", "PPI"], ["A08_macro"]),
     "industry": (["CPI", "PPI"], ["A09_meso"]),
-    "stock": (["stock_close"], ["A10_micro", "A11_fin_risk"]),
+    "stock": (["stock_close"], ["A10_micro", "A11_fin_risk", "A12_compliance"]),
     "news": ([], list(INFO_AGENTS)),
     "full": (["CPI", "PPI"], list(ANALYSIS_AGENTS)),
 }
@@ -197,6 +197,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 "focus": s["target"],
                 "data_points": s.get("validated_points", []),
                 "hint": s.get("analysis_hint", {}),
+                "events": (s.get("extracted_events") or {}).get("events", []),
             },
         ))
     g.add_node("recommend", recommend_node)
