@@ -36,6 +36,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 app.include_router(api_router)
 
+
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    """入口HTML禁缓存（发布新构建后刷新即生效）；hash资源仍走浏览器缓存。"""
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 # 前端构建产物（web/dist）存在时由同一服务托管，单服务演示
 _dist = Path(__file__).resolve().parents[2] / "web" / "dist"
 if _dist.is_dir():

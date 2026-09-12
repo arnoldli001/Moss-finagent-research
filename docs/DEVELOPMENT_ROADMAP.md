@@ -81,4 +81,4 @@
 |------|------|------|---------------|
 | B01 | 付费产业数据接口接入（Wind / 同花顺iFinD / Choice / Tushare Pro产业库等，覆盖半导体出货量、社零、煤价库存、IND申报、集采均价等行业指标） | 由 `MockIndustryConnector`（ind:前缀，24个月确定性合成序列，三重模拟标记）占位，A13-A16行业层链路已端到端打通 | 申请到付费API Key后，新建同 `BaseConnector` 契约的真实连接器，**保持 indicator id 不变**（见 supervisor.INDUSTRY_INDICATORS），在 `build_runtime()` 的 ConnectorRouter 中把 ind: 路由从模拟连接器换为真实连接器（可加 settings 开关与真实缺失时回退模拟）；替换后用 `scripts/_smoke_e2e.py` 科技/周期段回归 |
 | B02 | GitHub 远程仓库与 CI 启用 | `.github/workflows/ci.yml` 已就绪，本地仓库未配置 remote（用户决定暂缓创建） | 用户在 GitHub 建库后：`git remote add origin <url> && git push -u origin master`，观察首次 Actions（后端3.11/3.13 ruff+pytest，前端构建） |
-| B03 | 行业报告中的模拟数据披露 | 模拟点 source_name/extra 已标记，LLM上下文可见 | 接入真实数据（B01）后自然消除；在此之前演示口播需说明行业段为模拟数据 |
+| B03 | 行业报告中的模拟数据披露 | 模拟点 source_name/extra 已标记，LLM上下文可见；**前端"运行指标→数据源与依赖健康"已常驻"模拟数据"橙色徽标** | 接入真实数据（B01）后自然消除；演示时仍建议口播补充说明行业段为模拟数据 |

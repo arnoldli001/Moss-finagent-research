@@ -1,17 +1,94 @@
 import { useCallback, useEffect, useState } from "react";
-import { api, LlmMetrics } from "../api";
+import { api, Health, LlmMetrics } from "../api";
 
 const pct = (v: number | null) => (v === null ? "—" : `${(v * 100).toFixed(1)}%`);
 const ms = (v: number | null) => (v === null ? "—" : `${v}ms`);
 
+function HealthStrip({ health }: { health: Health }) {
+  const chainOk = health.audit_chain.valid;
+  return (
+    <section className="panel">
+      <h2>数据源与依赖健康</h2>
+      <table className="audit-table sched-table">
+        <thead>
+          <tr><th>组件</th><th>状态</th><th>说明</th></tr>
+        </thead>
+        <tbody>
+          {health.data_sources.connectors.map((c) => (
+            <tr key={c.name}>
+              <td className="agent-id">{c.name}</td>
+              <td>
+                {c.simulated
+                  ? <span className="badge run-skipped">模拟数据</span>
+                  : <span className="badge run-success">{c.status}</span>}
+              </td>
+              <td>{c.indicators.join("、")}</td>
+            </tr>
+          ))}
+          <tr>
+            <td className="agent-id">存储({health.data_sources.storage.backend})</td>
+            <td>
+              <span className={`badge ${health.data_sources.storage.status === "ok" ? "run-success" : "run-failed"}`}>
+                {health.data_sources.storage.status}
+              </span>
+            </td>
+            <td>
+              {health.data_sources.storage.indicators !== undefined &&
+                `${health.data_sources.storage.indicators} 个指标 · ${health.data_sources.storage.points} 个数据点`}
+            </td>
+          </tr>
+          <tr>
+            <td className="agent-id">Redis缓存</td>
+            <td>
+              <span className={`badge ${health.data_sources.redis_cache === "ok" ? "run-success" : "run-skipped"}`}>
+                {health.data_sources.redis_cache}
+              </span>
+            </td>
+            <td>未启用时直连存储，不影响功能</td>
+          </tr>
+          <tr>
+            <td className="agent-id">Ollama</td>
+            <td>
+              <span className={`badge ${health.model_gateway.ollama === "connected" ? "run-success" : "run-failed"}`}>
+                {health.model_gateway.ollama}
+              </span>
+            </td>
+            <td>本地模型网关</td>
+          </tr>
+          <tr>
+            <td className="agent-id">DeepSeek</td>
+            <td>
+              <span className={`badge ${health.model_gateway.deepseek === "configured" ? "run-success" : "run-skipped"}`}>
+                {health.model_gateway.deepseek}
+              </span>
+            </td>
+            <td>云端降级链路</td>
+          </tr>
+          <tr>
+            <td className="agent-id">审计哈希链</td>
+            <td>
+              <span className={`badge ${chainOk ? "run-success" : "run-failed"}`}>
+                {chainOk ? "valid" : "broken"}
+              </span>
+            </td>
+            <td>{health.audit_chain.records} 条Trace记录</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
 export default function MetricsPanel() {
   const [metrics, setMetrics] = useState<LlmMetrics | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const resp = await api.llmMetrics(1000);
-      setMetrics(resp.metrics);
+      const [m, h] = await Promise.all([api.llmMetrics(1000), api.health()]);
+      setMetrics(m.metrics);
+      setHealth(h);
       setError(null);
     } catch (e) {
       setError(`加载运行指标失败：${String(e)}`);
@@ -31,6 +108,7 @@ export default function MetricsPanel() {
 
   return (
     <div>
+      {health && <HealthStrip health={health} />}
       <div className="sched-head">
         <div className="warn-box" style={{ margin: 0 }}>
           最近 {metrics.window_calls} 次LLM调用窗口（审计JSONL实时聚合，15秒自动刷新；慢调用阈值3秒）。
