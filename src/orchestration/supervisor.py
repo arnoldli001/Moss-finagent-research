@@ -18,8 +18,22 @@ from src.core.models import AgentInput, AgentOutput
 from src.core.state import ResearchState
 
 ANALYSIS_AGENTS = ("A08_macro", "A09_meso", "A10_micro", "A11_fin_risk", "A12_compliance")
+INDUSTRY_AGENTS = ("A13_tech", "A14_consumer", "A15_cyclical", "A16_pharma")
+# 行业路由表：target命中关键词 → 对应行业Agent（industry类型任务用）
+INDUSTRY_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "A13_tech": ("科技", "半导体", "芯片", "电子", "软件", "ai", "人工智能", "计算机",
+                 "通信", "算力", "消费电子"),
+    "A14_consumer": ("消费", "白酒", "食品", "饮料", "家电", "零售", "纺织", "服装",
+                     "美妆", "农业", "旅游", "免税"),
+    "A15_cyclical": ("周期", "煤炭", "有色", "钢铁", "化工", "建材", "石油", "原油",
+                     "航运", "铜", "铝", "锂"),
+    "A16_pharma": ("医药", "医疗", "创新药", "生物", "器械", "中药", "药店", "疫苗",
+                   "cxo"),
+}
 INFO_AGENTS = ("A05_verifier", "A06_extractor", "A07_sentiment")
 DATA_PIPELINE_AGENTS = ("A02_data_cleaner", "A03_data_validator", "A04_data_storage")
+# 产出可被A17综合的全部分析类Agent
+ALL_INSIGHT_AGENTS = ANALYSIS_AGENTS + INDUSTRY_AGENTS
 
 # analysis_type → (采集指标, 参与分析Agent)
 _PLANNING: dict[str, tuple[list[str], list[str]]] = {
@@ -29,6 +43,13 @@ _PLANNING: dict[str, tuple[list[str], list[str]]] = {
     "news": ([], list(INFO_AGENTS)),
     "full": (["CPI", "PPI"], list(ANALYSIS_AGENTS)),
 }
+
+
+def route_industry(target: str) -> list[str]:
+    """按行业名关键词把target路由到对应行业Agent（无匹配返回空列表）。"""
+    lowered = (target or "").lower()
+    return [aid for aid, kws in INDUSTRY_KEYWORDS.items()
+            if any(k.lower() in lowered for k in kws)]
 
 
 def plan_run(analysis_type: str, target: str, info_items: list | None = None) -> dict[str, Any]:
@@ -41,6 +62,9 @@ def plan_run(analysis_type: str, target: str, info_items: list | None = None) ->
     indicators, agents = _PLANNING[analysis_type]
     agents = list(agents)  # 拷贝：_PLANNING为模块级共享配置，禁止原地修改
     resolved = [f"stock_close:{target}" if ind == "stock_close" else ind for ind in indicators]
+    if analysis_type == "industry":
+        # 通用产业链分析(A09) + 命中的专业行业Agent(A13-A16)，无匹配则仅A09
+        agents += [a for a in route_industry(target) if a not in agents]
     if analysis_type in ("stock", "full") and target:
         agents = list(dict.fromkeys(agents))  # 保序去重
     if info_items:
@@ -87,7 +111,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
         async def node(state: ResearchState) -> dict[str, Any]:
             if agent is None:
                 return {}  # 未注册的Agent直接跳过（可选分支）
-            if agent_id in ANALYSIS_AGENTS and agent_id not in state["plan"]:
+            if agent_id in ALL_INSIGHT_AGENTS and agent_id not in state["plan"]:
                 return {}
             if agent_id in INFO_AGENTS and (
                 agent_id not in state["plan"] or not state.get("info_items")
@@ -150,7 +174,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
         return updates
 
     async def recommend_node(state: ResearchState) -> dict[str, Any]:
-        analyses = [o for o in state["agent_outputs"] if o["agent_id"] in ANALYSIS_AGENTS]
+        analyses = [o for o in state["agent_outputs"] if o["agent_id"] in ALL_INSIGHT_AGENTS]
         if not analyses:  # 纯信息层管线（news）时以信息层结论综合
             analyses = [o for o in state["agent_outputs"] if o["agent_id"] in INFO_AGENTS]
         try:
@@ -190,7 +214,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     g.add_node("sentiment", _node("A07_sentiment", lambda s: {
         "events": (s.get("extracted_events") or {}).get("events", []),
     }))
-    for aid in ANALYSIS_AGENTS:
+    for aid in ALL_INSIGHT_AGENTS:
         g.add_node(f"analyze_{aid}", _node(
             aid,
             lambda s, _a=aid: {
@@ -212,7 +236,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     g.add_edge("store", "verify_info")
     g.add_edge("verify_info", "extract_events")
     g.add_edge("extract_events", "sentiment")
-    for aid in ANALYSIS_AGENTS:
+    for aid in ALL_INSIGHT_AGENTS:
         g.add_edge("sentiment", f"analyze_{aid}")
         g.add_edge(f"analyze_{aid}", "recommend")
     g.add_edge("recommend", "audit")
@@ -231,7 +255,7 @@ def _render_report(state: ResearchState, audit_output: AgentOutput) -> str:
             lines.append(f"- **{o['agent_id']}**（{o['confidence']}）：{o['conclusion']}")
         lines.append("")
     for o in state["agent_outputs"]:
-        if o["agent_id"] in ANALYSIS_AGENTS or o["agent_id"] == "A17_recommend":
+        if o["agent_id"] in ALL_INSIGHT_AGENTS or o["agent_id"] == "A17_recommend":
             lines += [f"## {o['agent_id']}（置信度 {o['confidence']}）", o["conclusion"], ""]
     stats = state.get("storage_stats") or {}
     if stats:

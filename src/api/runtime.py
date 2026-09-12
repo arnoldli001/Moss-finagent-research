@@ -20,6 +20,12 @@ from src.domain.agents.decision.recommend.agent import RecommendationAgent
 from src.domain.agents.info.extractor import ExtractorAgent
 from src.domain.agents.info.sentiment import SentimentAgent
 from src.domain.agents.info.verifier import VerifierAgent
+from src.domain.agents.industry import (
+    ConsumerIndustryAgent,
+    CyclicalIndustryAgent,
+    PharmaIndustryAgent,
+    TechIndustryAgent,
+)
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
 from src.infrastructure.llm import LLMGateway
 from src.infrastructure.repositories.base import DataPointRepository
@@ -55,6 +61,10 @@ def build_runtime() -> Runtime:
         "A10_micro": MicroAnalysisAgent(gateway),
         "A11_fin_risk": RiskAnalysisAgent(gateway),
         "A12_compliance": ComplianceAnalysisAgent(gateway),
+        "A13_tech": TechIndustryAgent(gateway),
+        "A14_consumer": ConsumerIndustryAgent(gateway),
+        "A15_cyclical": CyclicalIndustryAgent(gateway),
+        "A16_pharma": PharmaIndustryAgent(gateway),
         "A17_recommend": RecommendationAgent(gateway),
         "A18_audit": AuditAgent(),
     }
