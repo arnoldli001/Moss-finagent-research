@@ -18,6 +18,16 @@ class ResearchState(TypedDict):
     analysis_type: str
     target: str
 
+    # Supervisor计划（本run要执行的agent_id列表）
+    plan: list[str]
+
+    # 数据管线流转（collector→cleaner→validator→storage各写一次，add聚合）
+    raw_points: Annotated[list[dict[str, Any]], operator.add]
+    cleaned_points: Annotated[list[dict[str, Any]], operator.add]
+    validated_points: Annotated[list[dict[str, Any]], operator.add]
+    validation_report: dict[str, Any]
+    storage_stats: dict[str, Any]
+
     # 并行Agent输出聚合
     agent_outputs: Annotated[list[dict[str, Any]], operator.add]
     data_refs: Annotated[list[str], operator.add]
