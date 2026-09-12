@@ -163,15 +163,22 @@ class IndustryAgentBase(AnalysisAgentBase):
         }
 
     def _valuation_flag(self, payload: AnalysisPayload) -> str:
-        for p in payload.data_points:
-            ind = str(p.get("indicator", ""))
-            if "PE" in ind.upper() and isinstance(p.get("value"), (int, float)):
-                pe = float(p["value"])
-                if pe > self.pe_high_watermark:
-                    return f"{ind}{pe:g}高于{self.industry_name}行业警戒线" \
-                           f"{self.pe_high_watermark:g}，估值偏高"
-                return f"{ind}{pe:g}处于{self.industry_name}行业常规区间"
-        return "未提供PE数据，估值维度不评价"
+        pe_points = [
+            p for p in payload.data_points
+            if "PE" in str(p.get("indicator", "")).upper()
+            and isinstance(p.get("value"), (int, float))
+        ]
+        if not pe_points:
+            return "未提供PE数据，估值维度不评价"
+        # PE是时序点：必须取最新期，旧实现取序列首个点（24个月前）导致估值旗标失真
+        latest = max(pe_points, key=lambda p: str(p.get("period_date", "")))
+        ind, pe = str(latest.get("indicator", "")), float(latest["value"])
+        period = latest.get("period_date", "")
+        when = f"{period}期" if period else ""
+        if pe > self.pe_high_watermark:
+            return (f"{ind}{when}{pe:g}高于{self.industry_name}行业警戒线"
+                    f"{self.pe_high_watermark:g}，估值偏高")
+        return f"{ind}{when}{pe:g}处于{self.industry_name}行业常规区间"
 
     def _prepare(self, payload: AnalysisPayload) -> None:
         watched = self._watched_points(payload)

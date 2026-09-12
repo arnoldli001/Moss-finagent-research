@@ -180,6 +180,20 @@ async def test_industry_context_only_kept_six_latest_periods():
     assert "CPI" not in prompt  # 非关注指标不入上下文
 
 
+async def test_valuation_flag_uses_latest_pe_period_not_first():
+    """PE时序点必须取最新期：旧值48超线但最新39在区间内，应报常规区间。"""
+    gw = FakeGateway(REPLY)
+    out = await TechIndustryAgent(gw).execute(_input(TechIndustryAgent, [
+        _dp("半导体出货量同比", 10.0, "2026-07"),
+        _dp("半导体出货量同比", 12.0, "2026-08"),
+        _dp("科技行业PE(TTM)", 48.0, "2025-09"),   # 早期高点
+        _dp("科技行业PE(TTM)", 39.0, "2026-09"),   # 最新期
+    ], focus="半导体"))
+    val = out.result["industry_signal_calc"]["valuation"]
+    assert "39" in val and "常规区间" in val
+    assert "48" not in val
+
+
 def test_agent_ids_and_capabilities():
     cases = [
         (TechIndustryAgent, "A13_tech", "penetration_rate_tracking"),
