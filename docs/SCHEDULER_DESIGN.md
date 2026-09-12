@@ -43,3 +43,37 @@
 | calc_valuation | 每日收盘后 | 内部计算 | fetch_market_data |
 | update_cache | 每小时 | 内部 | 所有fetch任务 |
 | audit_cleanup | 每月1日 | 内部 | 无 |
+
+## 六、实现状态（src/scheduler/）
+
+已落地（Demo版，2026-09）：
+
+- **注册表（单一事实源）** `registry.py`：作业名/crontab/类型/参数集中声明，
+  Beat计划与管理API均从该表生成，禁止散落硬编码cron。
+  当前注册作业：`snapshot_macro`（每日18:30 CPI/PPI快照）、
+  `snapshot_industry_watchlist`（工作日17:00 半导体/煤炭/创新药/白酒）、
+  `run_log_cleanup`（每月1日03:00 清理过期运行记录）。
+- **幂等执行** `jobs.py`：作业复用研究StateGraph，A04存储按
+  (指标,期别,内容哈希)去重，重复执行零新增；同作业进程内asyncio锁防重叠。
+- **运行记录** `run_log.py`：`data/scheduler/runs.jsonl`，含
+  run_id/trigger/起止时间/耗时/状态/处理行数/错误信息；连续失败3次自动暂停
+  （仅跳过schedule触发，手动触发可用于人工介入恢复）；日报统计成功率/平均耗时/
+  失败原因分布；保留期90天（settings.scheduler_run_log_ttl_days）。
+- **Celery Beat** `celery_app.py`：broker为 `settings.celery_broker_url`
+  （Redis db1）；失败按1分钟→5分钟→15分钟退避重试，最多3次；软超时900s。
+
+启动worker+beat（Windows需solo池）：
+
+```
+uv run celery -A src.scheduler.celery_app.celery_app worker -B --pool=solo -l info
+```
+
+- **管理API（无需Redis即可用，进程内直接执行）**：
+  - `GET  /api/v1/scheduler/jobs`：作业清单/cron/暂停态/最近一次执行
+  - `POST /api/v1/scheduler/jobs/{name}/run`：手动触发（202，返回运行记录）
+  - `GET  /api/v1/scheduler/runs?job=&limit=`：执行历史
+  - `GET  /api/v1/scheduler/runs/summary?date=YYYY-MM-DD`：日报
+
+待办：设计文档五中的fetch_market_data/fetch_financial_data/fetch_noaa_data/
+calc_valuation等作业待对应连接器接入后按同一注册表模式追加；
+分布式重叠执行锁（多worker场景）待接入Redis分布式锁。

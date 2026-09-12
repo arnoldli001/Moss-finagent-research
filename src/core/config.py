@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     redis_cache_enabled: bool = False  # 开启后query_points走Redis缓存（Redis不可达自动降级）
     data_cache_ttl_seconds: int = 300
     celery_broker_url: str = "redis://localhost:6379/1"
+    scheduler_dir: str = "data/scheduler"  # 定时作业运行记录（runs.jsonl）
+    scheduler_run_log_ttl_days: int = 90  # 运行记录保留天数（audit_cleanup作业清理）
 
     # 数据源Token
     tushare_token: str = ""

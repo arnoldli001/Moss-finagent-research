@@ -14,6 +14,7 @@ from src.api.routes import api_router
 from src.api.runtime import build_runtime
 from src.api.tasks import TaskStore
 from src.core.config import get_settings
+from src.scheduler.run_log import RunLog
 
 settings = get_settings()
 
@@ -22,6 +23,7 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     app.state.runtime = build_runtime()
     app.state.store = TaskStore()
+    app.state.run_log = RunLog(f"{settings.scheduler_dir}/runs.jsonl")
     yield
     cancelled = await app.state.store.cancel_all()
     if cancelled:

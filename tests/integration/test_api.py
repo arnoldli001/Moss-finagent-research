@@ -8,6 +8,7 @@ import pytest
 from src.api.main import app
 from src.api.tasks import TaskStore
 from src.infrastructure.repositories.macro_repo import MacroRepository
+from src.scheduler.run_log import RunLog
 
 
 class FakeAuditLog:
@@ -50,6 +51,7 @@ class FakeGraph:
 
 def _install_app_state(tmp_dir):
     app.state.store = TaskStore()
+    app.state.run_log = RunLog(f"{tmp_dir}/scheduler/runs.jsonl")
     app.state.runtime = type("R", (), {})()
     app.state.runtime.gateway = FakeGateway()
     app.state.runtime.repo = MacroRepository(db_path=f"{tmp_dir}/api.db")
@@ -159,3 +161,29 @@ async def test_health_aggregation(client):
         assert resp.status_code == 200
         assert body["agents"]["A08_macro"] == "healthy"
         assert "model_gateway" in body and "audit_chain" in body
+
+
+async def test_scheduler_jobs_list_and_manual_trigger(client):
+    state, http = client
+    async with http:
+        resp = await http.get("/api/v1/scheduler/jobs")
+        jobs = resp.json()["jobs"]
+        names = {j["name"] for j in jobs}
+        assert {"snapshot_macro", "snapshot_industry_watchlist",
+                "run_log_cleanup"} <= names
+        macro = next(j for j in jobs if j["name"] == "snapshot_macro")
+        assert len(macro["cron"].split()) == 5 and macro["paused"] is False
+
+        run = await http.post("/api/v1/scheduler/jobs/snapshot_macro/run")
+        assert run.status_code == 202
+        record = run.json()["run"]
+        assert record["status"] == "success"
+        assert record["trigger"] == "manual"
+
+        runs = await http.get("/api/v1/scheduler/runs")
+        assert any(r["run_id"] == record["run_id"] for r in runs.json()["runs"])
+
+        summary = await http.get("/api/v1/scheduler/runs/summary")
+        assert summary.json()["success"] >= 1
+
+        assert (await http.post("/api/v1/scheduler/jobs/nope/run")).status_code == 404
