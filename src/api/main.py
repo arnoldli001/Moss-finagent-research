@@ -1,24 +1,33 @@
-"""FastAPI应用入口（启动：uvicorn src.api.main:app）。"""
+"""FastAPI应用入口（启动：uvicorn src.api.main:app）。
+
+lifespan：启动时组装Runtime（Agent注册表+StateGraph），关停时取消在飞任务。
+"""
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
+from src.api.routes import api_router
+from src.api.runtime import build_runtime
+from src.api.tasks import TaskStore
 from src.core.config import get_settings
 
 settings = get_settings()
 
-app = FastAPI(title=settings.app_name, version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.runtime = build_runtime()
+    app.state.store = TaskStore()
+    yield
+    cancelled = await app.state.store.cancel_all()
+    if cancelled:
+        import logging
+
+        logging.getLogger(__name__).warning("lifespan关停取消在飞任务 %d 个", cancelled)
 
 
-@app.get("/api/v1/health")
-async def health() -> dict:
-    """健康检查（API_REFERENCE.md 五）。
-
-    agents/data_sources 状态在后续阶段接入各Agent health_check聚合。
-    """
-    return {
-        "status": "healthy",
-        "agents": {},
-        "data_sources": {},
-    }
+app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+app.include_router(api_router)
