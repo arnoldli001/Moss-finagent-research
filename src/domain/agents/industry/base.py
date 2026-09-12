@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from src.core.models import AgentInput, AgentOutput
+from src.core.schemas import Confidence, TraceStep
 from src.domain.agents.analysis.base import AnalysisAgentBase, AnalysisPayload
+
+# 每个关注指标注入LLM上下文的最近期数（全量历史数百点会冲淡焦点且浪费token）
+_CONTEXT_PERIODS = 6
 
 
 class IndustryAgentBase(AnalysisAgentBase):
@@ -26,16 +31,67 @@ class IndustryAgentBase(AnalysisAgentBase):
     capabilities_names: ClassVar[tuple[str, ...]] = ()
 
     def _requirements(self, payload: AnalysisPayload) -> str:
+        focus = payload.focus or f"{self.industry_name}行业"
         return (
-            f"你正在按「{self.framework}」框架分析{self.industry_name}行业。\n"
+            f"你正在按「{self.framework}」框架分析{focus}所在的{self.industry_name}行业。\n"
             "请输出JSON对象，字段：\n"
-            '- "conclusion": 行业景气研判（150字内，必须引用本地信号中的具体数值）\n'
+            f'- "conclusion": {focus}行业景气研判（150字内，必须点名"{focus}"，'
+            "必须引用本地信号中的具体数值，禁止复述与本行业无关的宏观数据）\n"
             '- "confidence": "high"|"medium"|"low"\n'
             '- "outlook": "向好"|"平稳"|"走弱"|"不明确"\n'
-            '- "cycle_position": 当前行业周期位置（30字内，须符合上述框架术语）\n'
-            '- "drivers": 核心驱动因素2-4条\n'
+            '- "cycle_position": 当前行业周期位置（30字内，须用上述框架术语，'
+            "并解释本地信号对应哪个阶段）\n"
+            '- "drivers": 核心驱动因素2-4条（须落到本行业，如库存/价格/政策/需求）\n'
             '- "risks": 行业主要风险1-3条'
         )
+
+    def _build_context(self, payload: AnalysisPayload) -> str:
+        """只注入关注指标（含PE估值点）的最近若干期，避免无关指标冲淡行业焦点。"""
+        watched = self._watched_points(payload)
+        pe_points = [
+            p for p in payload.data_points
+            if "PE" in str(p.get("indicator", "")).upper() and p not in watched
+        ]
+        lines: list[str] = []
+        for points in (watched, pe_points):
+            by_indicator: dict[str, list[dict[str, Any]]] = {}
+            for p in points:
+                by_indicator.setdefault(str(p.get("indicator", "?")), []).append(p)
+            for indicator, series in by_indicator.items():
+                series = sorted(series, key=lambda p: str(p.get("period_date", "")),
+                                reverse=True)[:_CONTEXT_PERIODS]
+                for p in sorted(series, key=lambda p: str(p.get("period_date", ""))):
+                    lines.append(
+                        f"- {indicator} | 期间 {p.get('period_date', '?')} "
+                        f"| 值 {p.get('value', '缺失')} | 来源 {p.get('source_name', '?')}"
+                    )
+        return "\n".join(lines) if lines else "（无行业关注指标数据点）"
+
+    def _skip_reason(self, payload: AnalysisPayload) -> str | None:
+        """关注指标零命中时跳过LLM：通用CPI/PPI不足以支撑专业行业研判，防硬聊。"""
+        signal = payload.hint.get("industry_signal") or {}
+        if signal.get("watched_indicator_count", 0) == 0:
+            return (
+                f"采集数据中无{self.industry_name}行业关注指标"
+                f"（关注：{'/'.join(self.watch_keywords[:6])}…），跳过LLM定性"
+            )
+        return None
+
+    async def execute(self, input: AgentInput) -> AgentOutput:  # type: ignore[override]
+        payload = self._parse_payload(input.payload)
+        self._prepare(payload)
+        reason = self._skip_reason(payload)
+        if reason:
+            return AgentOutput(
+                task_id=input.task_id, agent_id=self.agent_id,
+                conclusion=reason, confidence=Confidence.LOW, trace_id=input.task_id,
+                result={"industry_signal_calc": payload.hint.get("industry_signal"),
+                        "skipped": True},
+                reasoning_steps=[TraceStep(
+                    step=1, step_type="data_retrieval",
+                    description="关注指标零命中，跳过LLM调用")],
+            )
+        return await super().execute(input)
 
     def _watched_points(self, payload: AnalysisPayload) -> list[dict[str, Any]]:
         if not self.watch_keywords:

@@ -85,11 +85,15 @@ async def test_tech_agent_watches_only_semiconductor_indicators():
 
 
 async def test_tech_pe_watermark_50():
+    """仅PE点、无科技关注指标：跳过LLM，但本地估值旗标仍入calc。"""
     gw = FakeGateway(REPLY)
     out = await TechIndustryAgent(gw).execute(_input(TechIndustryAgent, [
         _dp("行业PE", 48.0, "2026-08"),
     ]))
+    assert out.confidence.value == "low"
+    assert out.result["skipped"] is True
     assert "常规区间" in out.result["industry_signal_calc"]["valuation"]
+    assert gw.calls == []
 
 
 async def test_cyclical_pe_watermark_20():
@@ -135,6 +139,31 @@ async def test_industry_agent_empty_data_skips_llm():
     )
     assert out.confidence.value == "low"
     assert gw.calls == []
+
+
+async def test_industry_agent_skips_when_no_watched_indicator():
+    """有关注外数据但零命中（如科技任务只采到CPI/PPI）→ 不硬聊，跳过LLM。"""
+    gw = FakeGateway(REPLY)
+    out = await TechIndustryAgent(gw).execute(_input(TechIndustryAgent, [
+        _dp("CPI", 0.4, "2026-07"), _dp("CPI", 0.5, "2026-08"),
+    ], focus="软件"))
+    assert out.confidence.value == "low"
+    assert out.result["skipped"] is True
+    assert out.result["industry_signal_calc"]["watched_indicator_count"] == 0
+    assert gw.calls == []
+
+
+async def test_industry_context_only_kept_six_latest_periods():
+    """LLM上下文只含关注指标最近6期，更早期间不注入（省token且聚焦）。"""
+    gw = FakeGateway(REPLY)
+    points = [_dp("PPI同比", float(-i), f"2025-{m:02d}")
+              for i, m in enumerate(range(1, 11), start=1)]
+    await CyclicalIndustryAgent(gw).execute(_input(
+        CyclicalIndustryAgent, points, focus="煤炭"))
+    prompt = gw.calls[0]["prompt"]
+    assert "2025-10" in prompt and "2025-05" in prompt  # 最近6期
+    assert "2025-04" not in prompt and "2025-01" not in prompt  # 早期被截断
+    assert "CPI" not in prompt  # 非关注指标不入上下文
 
 
 def test_agent_ids_and_capabilities():
