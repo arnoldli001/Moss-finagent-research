@@ -47,10 +47,10 @@ async def test_routes_light_to_ollama_primary(gateway_env):
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
 
     resp = await gw.complete("light", "系统提示", "清洗这批数据")
-    assert resp.model_used == "qwen3.5:4b"
+    assert resp.model_used == "qwen2.5:1.5b-instruct-q4_K_M"
     assert resp.provider_chain == ["local_light"]
     assert not resp.fallback_used
-    assert resp.content == "answer::qwen3.5:4b"
+    assert resp.content == "answer::qwen2.5:1.5b-instruct-q4_K_M"
     assert resp.tokens_out == 20
 
 
@@ -121,4 +121,4 @@ async def test_failure_is_audited(gateway_env):
 
     entries = LLMAuditLog(tmp).read_all()
     assert [e["error"] for e in entries] == ["boom", "boom2"]
-    assert entries[0]["model"] == "qwen3.5:4b"
+    assert entries[0]["model"] == "qwen2.5:1.5b-instruct-q4_K_M"

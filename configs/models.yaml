@@ -15,14 +15,14 @@ routing:
 models:
   local_light:
     provider: "ollama"
-    model_name: "qwen3.5:4b"
+    model_name: "qwen2.5:1.5b-instruct-q4_K_M"
     base_url: "http://localhost:11434"
     max_tokens: 2048
     temperature: 0.1
 
   local_medium:
     provider: "ollama"
-    model_name: "gemma4:e4b"
+    model_name: "qwen3:8b-q4_K_M"
     base_url: "http://localhost:11434"
     max_tokens: 4096
     temperature: 0.1

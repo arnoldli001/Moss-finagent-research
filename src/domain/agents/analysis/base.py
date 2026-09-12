@@ -30,13 +30,24 @@ class AnalysisPayload(BaseModel):
 
 
 def parse_llm_json(agent_id: str, content: str) -> dict[str, Any]:
-    """解析LLM输出JSON（容忍```json围栏），失败抛AgentExecutionError。"""
+    """解析LLM输出JSON（容忍```json围栏、<think>块与尾随文本）。
+
+    依次尝试：围栏提取 → 整体loads → raw_decode取首个JSON对象。
+    """
     text = content.strip()
     fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
     if fenced:
         text = fenced.group(1).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     try:
         data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+        raise AgentExecutionError(f"{agent_id} LLM输出JSON非对象: {type(data)}")
+    except json.JSONDecodeError:
+        pass
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError as exc:
         raise AgentExecutionError(f"{agent_id} LLM输出非合法JSON: {exc}") from exc
     if not isinstance(data, dict):

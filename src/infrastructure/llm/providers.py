@@ -32,7 +32,13 @@ class BaseProvider(Protocol):
 
 
 def _wrap_response(
-    spec: ModelSpec, content: str, tokens_in: int, tokens_out: int, started: float
+    spec: ModelSpec,
+    system: str,
+    prompt: str,
+    content: str,
+    tokens_in: int,
+    tokens_out: int,
+    started: float,
 ) -> LLMResponse:
     return LLMResponse(
         content=content,
@@ -79,6 +85,8 @@ class OllamaProvider:
             raise LLMGatewayError(f"Ollama调用失败({spec.model_name}): {exc}") from exc
         return _wrap_response(
             spec,
+            system,
+            prompt,
             data["message"]["content"],
             int(data.get("prompt_eval_count") or 0),
             int(data.get("eval_count") or 0),
@@ -127,6 +135,8 @@ class DeepSeekProvider:
         usage = data.get("usage") or {}
         return _wrap_response(
             spec,
+            system,
+            prompt,
             data["choices"][0]["message"]["content"],
             int(usage.get("prompt_tokens") or 0),
             int(usage.get("completion_tokens") or 0),
