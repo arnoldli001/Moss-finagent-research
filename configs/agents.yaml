@@ -1,0 +1,72 @@
+# Agent配置
+
+agents:
+  A01_data_collector:
+    name: "数据采集Agent"
+    layer: "data"
+    priority: "P0"
+    model: "none"  # 无需LLM
+    capabilities: ["fetch_api", "web_crawl", "file_download"]
+
+  A02_data_cleaner:
+    name: "数据清洗Agent"
+    layer: "data"
+    priority: "P0"
+    model: "local_light"
+    capabilities: ["normalize", "deduplicate", "format_convert"]
+
+  A03_data_validator:
+    name: "数据校验Agent"
+    layer: "data"
+    priority: "P1"
+    model: "local_light"
+    capabilities: ["range_check", "logic_check", "anomaly_detect"]
+
+  A04_data_storage:
+    name: "数据存储Agent"
+    layer: "data"
+    priority: "P1"
+    model: "local_light"
+    capabilities: ["db_insert", "version_manage", "lineage_track"]
+
+  A08_macro:
+    name: "宏观分析Agent"
+    layer: "analysis"
+    priority: "P0"
+    model: "deepseek-v4-flash"
+    capabilities: ["cycle_position", "liquidity_analysis", "cpi_ppi_analysis"]
+
+  A09_meso:
+    name: "中观分析Agent"
+    layer: "analysis"
+    priority: "P0"
+    model: "deepseek-v4-flash"
+    capabilities: ["industry_chain", "bottleneck_identify", "valuation_elasticity"]
+
+  A10_micro:
+    name: "微观分析Agent"
+    layer: "analysis"
+    priority: "P0"
+    model: "deepseek-v4-flash"
+    capabilities: ["stock_research", "valuation", "catalyst_track"]
+
+  A11_financial_risk:
+    name: "财务风险Agent"
+    layer: "analysis"
+    priority: "P1"
+    model: "deepseek-v4-flash"
+    capabilities: ["z_score", "m_score", "cashflow_analysis"]
+
+  A17_advisory:
+    name: "投研建议Agent"
+    layer: "decision"
+    priority: "P0"
+    model: "deepseek-v4-pro"
+    capabilities: ["signal_aggregate", "conflict_resolve", "recommendation"]
+
+  A18_audit:
+    name: "逻辑审计Agent"
+    layer: "audit"
+    priority: "P1"
+    model: "local_light"
+    capabilities: ["trace_record", "backtest", "quality_check"]

@@ -1,0 +1,58 @@
+# 数据源配置
+
+data_sources:
+  stats_gov:
+    name: "国家统计局"
+    base_url: "https://data.stats.gov.cn"
+    type: "official"
+    priority: "P0"
+    update_frequency: "随官方发布"
+    indicators: ["GDP", "CPI", "PPI", "PMI", "工业增加值"]
+
+  pbc:
+    name: "中国人民银行"
+    base_url: "http://www.pbc.gov.cn"
+    type: "official"
+    priority: "P0"
+    update_frequency: "月度/季度"
+    indicators: ["社融", "M2", "货币当局资产负债表"]
+
+  fred:
+    name: "FRED"
+    base_url: "https://fred.stlouisfed.org"
+    type: "api"
+    priority: "P1"
+    update_frequency: "实时"
+    indicators: ["美联储资产负债表", "联邦基金利率", "10年期国债收益率"]
+
+  noaa:
+    name: "NOAA"
+    base_url: "https://psl.noaa.gov"
+    type: "file"
+    priority: "P1"
+    update_frequency: "月度/周度"
+    indicators: ["ONI", "Niño3.4", "MEI"]
+
+  akshare:
+    name: "AkShare"
+    base_url: "https://akshare.akfamily.xyz"
+    type: "api"
+    priority: "P0"
+    update_frequency: "实时/日频"
+    indicators: ["A股行情", "财务数据", "基金数据"]
+
+  tushare:
+    name: "Tushare Pro"
+    base_url: "https://tushare.pro"
+    type: "api"
+    priority: "P0"
+    update_frequency: "实时/日频"
+    indicators: ["A股行情", "财务数据", "指数数据"]
+
+  baostock:
+    name: "BaoStock"
+    base_url: "http://baostock.com"
+    type: "api"
+    priority: "P1"
+    update_frequency: "日频"
+    indicators: ["A股历史行情", "财务数据"]

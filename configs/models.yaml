@@ -1,0 +1,48 @@
+# 模型路由配置
+
+models:
+  local_light:
+    provider: "ollama"
+    model_name: "qwen3.5:4b"
+    base_url: "http://localhost:11434"
+    max_tokens: 2048
+    temperature: 0.1
+
+  local_medium:
+    provider: "ollama"
+    model_name: "gemma4:e4b"
+    base_url: "http://localhost:11434"
+    max_tokens: 4096
+    temperature: 0.1
+
+  deepseek-v4-flash:
+    provider: "deepseek"
+    model_name: "deepseek-v4-flash"
+    base_url: "https://api.deepseek.com"
+    max_tokens: 4096
+    temperature: 0.1
+    cost:
+      input_cache_hit: 0.02  # 元/百万token
+      input_cache_miss: 1.0
+      output: 4.0
+
+  deepseek-v4-pro:
+    provider: "deepseek"
+    model_name: "deepseek-v4-pro"
+    base_url: "https://api.deepseek.com"
+    max_tokens: 8192
+    temperature: 0.1
+    cost:
+      input_cache_hit: 0.5
+      input_cache_miss: 4.5
+      output: 13.5
+
+  claude-opus-5:
+    provider: "anthropic"
+    model_name: "claude-opus-5"
+    base_url: "https://api.anthropic.com"
+    max_tokens: 8192
+    temperature: 0.1
+    cost:
+      input: 35.0  # 元/百万token
+      output: 175.0

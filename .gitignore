@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 环境与密钥（禁止提交真实值）
+.env
+
+# 测试与工具缓存
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# 运行时数据与日志
+data/
+logs/
+output/
+
+# 前端（后续阶段）
+node_modules/
