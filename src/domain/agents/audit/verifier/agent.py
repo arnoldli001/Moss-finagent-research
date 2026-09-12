@@ -114,7 +114,7 @@ class AuditAgent(BaseAgent):
                 "verdict": verdict,
                 "chain_valid": chain_result["valid"],
                 "chain_count": chain_result["count"],
-                "chain_head": chain_result["head"],
+                "chain_head": sealed["record_hash"] if sealed else chain_result["head"],
                 "completeness_issues": issues,
                 "llm_calls": llm_calls,
                 "sealed_seq": sealed["seq"] if sealed else None,
