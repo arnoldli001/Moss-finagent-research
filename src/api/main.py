@@ -28,6 +28,7 @@ async def lifespan(app: FastAPI):
         import logging
 
         logging.getLogger(__name__).warning("lifespan关停取消在飞任务 %d 个", cancelled)
+    await app.state.runtime.repo.close()
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)

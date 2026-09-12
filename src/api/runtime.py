@@ -22,7 +22,8 @@ from src.domain.agents.info.sentiment import SentimentAgent
 from src.domain.agents.info.verifier import VerifierAgent
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
 from src.infrastructure.llm import LLMGateway
-from src.infrastructure.repositories.macro_repo import MacroRepository
+from src.infrastructure.repositories.base import DataPointRepository
+from src.infrastructure.repositories.repository_factory import build_repository
 from src.orchestration.supervisor import build_research_graph
 
 
@@ -31,7 +32,7 @@ class Runtime:
     """应用运行时句柄（挂在app.state上）。"""
 
     gateway: LLMGateway
-    repo: MacroRepository
+    repo: DataPointRepository
     agents: dict[str, Any]
     graph: Any
 
@@ -40,7 +41,7 @@ def build_runtime() -> Runtime:
     """按生产默认配置组装全部Agent与StateGraph。"""
     settings = get_settings()
     gateway = LLMGateway(settings=settings)
-    repo = MacroRepository(db_path="data/finagent.db")
+    repo = build_repository(settings)
     agents: dict[str, Any] = {
         "A01_data_collector": DataCollectorAgent(AkshareConnector()),
         "A02_data_cleaner": DataCleanerAgent(),

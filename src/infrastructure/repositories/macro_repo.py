@@ -3,6 +3,9 @@
 版本管理：UNIQUE(indicator, period_date, raw_content_hash)约束，
 同键重复写入自动跳过，不同哈希同期数据共存形成版本序列；
 血缘追踪：行级task_id/processed_by记录数据来源链路。
+
+类名MacroRepository为历史命名（业务最初只存宏观指标），现已是通用
+DataPointRepository端口的SQLite实现，新代码请按抽象类型依赖。
 """
 
 from __future__ import annotations
@@ -15,8 +18,9 @@ import sqlite3
 from datetime import datetime
 from typing import Any
 
-from src.core.exceptions import DataValidationError
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
+from src.infrastructure.repositories._mapping import COLUMNS, point_to_row
+from src.infrastructure.repositories.base import DataPointRepository
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fact_data_points (
@@ -45,6 +49,11 @@ CREATE INDEX IF NOT EXISTS idx_points_indicator_period
     ON fact_data_points(indicator, period_date);
 """
 
+_INSERT_SQL = (
+    "INSERT OR IGNORE INTO fact_data_points (" + ", ".join(COLUMNS) + ") VALUES ("
+    + ", ".join("?" for _ in COLUMNS) + ")"
+)
+
 
 def _parse_dt(raw: str | None) -> datetime | None:
     if not raw:
@@ -55,7 +64,7 @@ def _parse_dt(raw: str | None) -> datetime | None:
         return None
 
 
-class MacroRepository:
+class MacroRepository(DataPointRepository):
     """统一数据点仓储（SQLite，线程池化阻塞IO）。"""
 
     def __init__(self, db_path: str = "data/finagent.db") -> None:
@@ -78,25 +87,8 @@ class MacroRepository:
         inserted = 0
         with self._connect() as conn:
             for p in points:
-                cursor = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO fact_data_points (
-                        data_id, indicator, value, unit, period_date, extra_json,
-                        source_name, source_url, source_type, publish_time, fetch_time,
-                        fetch_method, raw_content_hash, processed_by, process_time,
-                        confidence, verified, task_id, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        p.data_id, p.indicator, p.value, p.unit, p.period_date,
-                        json.dumps(p.extra, ensure_ascii=False, default=str), p.source_name, p.source_url, p.source_type.value,
-                        p.publish_time.isoformat() if p.publish_time else None,
-                        p.fetch_time.isoformat(), p.fetch_method.value,
-                        p.raw_content_hash, p.processed_by, p.process_time.isoformat(),
-                        p.confidence, int(p.verified), task_id,
-                        datetime.now().isoformat(),
-                    ),
-                )
+                row = point_to_row(p, task_id)
+                cursor = conn.execute(_INSERT_SQL, tuple(row[c] for c in COLUMNS))
                 inserted += cursor.rowcount
         return {"inserted": inserted, "skipped": len(points) - inserted, "total": len(points)}
 

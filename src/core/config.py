@@ -40,9 +40,13 @@ class Settings(BaseSettings):
     llm_audit_dir: str = "data/audit"
 
     # 数据层
+    data_backend: str = "sqlite"  # sqlite | postgres（经DATA_BACKEND环境变量切换）
+    sqlite_path: str = "data/finagent.db"
     postgres_dsn: str = "postgresql+asyncpg://finagent:finagent@localhost:5432/finagent"
     sqlite_dsn: str = "sqlite:///data/finagent.db"
     redis_url: str = "redis://localhost:6379/0"
+    redis_cache_enabled: bool = False  # 开启后query_points走Redis缓存（Redis不可达自动降级）
+    data_cache_ttl_seconds: int = 300
     celery_broker_url: str = "redis://localhost:6379/1"
 
     # 数据源Token
