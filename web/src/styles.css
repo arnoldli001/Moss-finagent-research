@@ -101,3 +101,39 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .markdown h2 { font-size: 16px; margin-top: 20px; }
 .markdown table { border-collapse: collapse; }
 .markdown th, .markdown td { border: 1px solid var(--border); padding: 6px 10px; }
+
+/* 顶部视图切换 */
+.tabs { display: flex; gap: 6px; margin-left: auto; }
+.tab {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); min-width: auto;
+  padding: 6px 14px; font-size: 13px; border-radius: 16px;
+}
+.tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* 次要按钮 */
+.btn-ghost {
+  background: transparent; color: var(--accent);
+  border: 1px solid var(--accent); min-width: auto;
+  padding: 6px 14px; font-size: 13px;
+}
+
+/* 调度面板 */
+.sched-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.sched-head .warn-box { flex: 1; }
+.summary-row { display: flex; gap: 12px; margin-bottom: 16px; }
+.stat-card {
+  flex: 1; background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.stat-label { font-size: 12px; color: var(--muted); }
+.stat-value { font-size: 22px; font-weight: 600; }
+.sched-table { font-size: 13px; }
+.sched-table td, .sched-table th { vertical-align: middle; }
+.run-success { background: var(--high); }
+.run-failed { background: var(--low); }
+.run-running { background: var(--accent); }
+.run-skipped { background: var(--medium); color: #222; }
+.run-error { color: var(--low); font-size: 12px; max-width: 260px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

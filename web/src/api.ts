@@ -47,9 +47,57 @@ export type TraceDetail = {
 export type Health = {
   status: string;
   agents: Record<string, string>;
-  data_sources: Record<string, string>;
+  data_sources: {
+    connectors: {
+      name: string;
+      status: string;
+      simulated: boolean;
+      indicators: string[];
+    }[];
+    storage: { backend: string; status: string; indicators?: number; points?: number };
+    redis_cache: string;
+  };
   model_gateway: Record<string, string>;
   audit_chain: { valid: boolean; records: number };
+};
+
+export type SchedulerJob = {
+  name: string;
+  cron: string;
+  kind: string;
+  description: string;
+  params: Record<string, unknown>;
+  paused: boolean;
+  last_run: {
+    status: string;
+    start_time: string;
+    duration_ms: number;
+    records_processed: number;
+    error_message: string | null;
+  } | null;
+};
+
+export type RunRecord = {
+  run_id: string;
+  job_name: string;
+  trigger: string;
+  start_time: string;
+  end_time: string | null;
+  duration_ms: number | null;
+  status: "running" | "success" | "failed" | "skipped";
+  records_processed: number;
+  error_message: string | null;
+  retries: number;
+};
+
+export type DailySummary = {
+  date: string;
+  total: number;
+  success: number;
+  failed: number;
+  success_rate: number | null;
+  avg_duration_ms: number | null;
+  failure_reasons: Record<string, number>;
 };
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -83,4 +131,17 @@ export const api = {
       { method: "POST", body: JSON.stringify({ task_id: taskId }) }
     ),
   health: () => request<Health>("/api/v1/health"),
+  schedulerJobs: () =>
+    request<{ jobs: SchedulerJob[] }>("/api/v1/scheduler/jobs"),
+  schedulerTrigger: (name: string) =>
+    request<{ run: RunRecord }>(
+      `/api/v1/scheduler/jobs/${encodeURIComponent(name)}/run`,
+      { method: "POST" }
+    ),
+  schedulerRuns: (limit = 50) =>
+    request<{ runs: RunRecord[] }>(
+      `/api/v1/scheduler/runs?limit=${limit}`
+    ),
+  schedulerSummary: () =>
+    request<DailySummary>("/api/v1/scheduler/runs/summary"),
 };

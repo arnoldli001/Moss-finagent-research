@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api, TaskDetail, TraceDetail } from "./api";
 import AgentTimeline from "./components/AgentTimeline";
 import ReportView from "./components/ReportView";
+import SchedulerPanel from "./components/SchedulerPanel";
 import TracePanel from "./components/TracePanel";
 
 const ANALYSIS_TYPES = [
@@ -19,6 +20,7 @@ export default function App() {
   const [trace, setTrace] = useState<TraceDetail | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<"research" | "scheduler">("research");
   const timer = useRef<number | null>(null);
 
   const stopPolling = () => {
@@ -74,8 +76,26 @@ export default function App() {
       <header className="header">
         <h1>FinAgent-Research</h1>
         <span className="subtitle">多Agent投研工作台 · 全链路可溯源</span>
+        <nav className="tabs">
+          <button
+            className={view === "research" ? "tab active" : "tab"}
+            onClick={() => setView("research")}
+          >
+            投研分析
+          </button>
+          <button
+            className={view === "scheduler" ? "tab active" : "tab"}
+            onClick={() => setView("scheduler")}
+          >
+            调度管理
+          </button>
+        </nav>
       </header>
 
+      {view === "scheduler" ? (
+        <SchedulerPanel />
+      ) : (
+      <>
       <section className="submit-bar">
         <input
           className="query-input"
@@ -126,6 +146,8 @@ export default function App() {
       )}
 
       {task?.report && <ReportView markdown={task.report} />}
+      </>
+      )}
     </div>
   );
 }
