@@ -6,6 +6,7 @@ lifespan：启动时组装Runtime（Agent注册表+StateGraph），关停时取�
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 
@@ -31,3 +32,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 app.include_router(api_router)
+
+# 前端构建产物（web/dist）存在时由同一服务托管，单服务演示
+_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+if _dist.is_dir():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=_dist, html=True), name="web")

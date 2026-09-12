@@ -11,6 +11,7 @@ export type LlmAuditEntry = {
   model: string;
   provider: string;
   prompt_hash: string;
+  response_hash: string;
   tokens_in: number;
   tokens_out: number;
   latency_ms: number;
