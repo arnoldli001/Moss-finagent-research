@@ -29,6 +29,21 @@ class AnalysisPayload(BaseModel):
     """本地计算参考值（如估值对比、风险比率），LLM只解读不计算"""
 
 
+def parse_llm_json(agent_id: str, content: str) -> dict[str, Any]:
+    """解析LLM输出JSON（容忍```json围栏），失败抛AgentExecutionError。"""
+    text = content.strip()
+    fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AgentExecutionError(f"{agent_id} LLM输出非合法JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise AgentExecutionError(f"{agent_id} LLM输出JSON非对象: {type(data)}")
+    return data
+
+
 class AnalysisAgentBase(BaseAgent):
     """分析层四Agent（A08/A09/A10/A11）的公共骨架。"""
 
@@ -62,17 +77,7 @@ class AnalysisAgentBase(BaseAgent):
         return "\n".join(lines) if lines else "（无数据点）"
 
     def _parse_llm_json(self, content: str) -> dict[str, Any]:
-        text = content.strip()
-        fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
-        if fenced:
-            text = fenced.group(1).strip()
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise AgentExecutionError(f"{self.agent_id} LLM输出非合法JSON: {exc}") from exc
-        if not isinstance(data, dict):
-            raise AgentExecutionError(f"{self.agent_id} LLM输出JSON非对象: {type(data)}")
-        return data
+        return parse_llm_json(self.agent_id, content)
 
     def _enrich_result(self, payload: AnalysisPayload, data: dict[str, Any]) -> dict[str, Any]:
         """子类可覆盖：向result追加本地计算字段。"""
