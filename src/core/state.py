@@ -28,6 +28,11 @@ class ResearchState(TypedDict):
     validation_report: dict[str, Any]
     storage_stats: dict[str, Any]
 
+    # 信息层管线（A05→A06→A07串行链；info_items为任务创建时直接注入）
+    info_items: list[dict[str, Any]]
+    verified_items: dict[str, Any]
+    extracted_events: dict[str, Any]
+
     # 并行Agent输出聚合
     agent_outputs: Annotated[list[dict[str, Any]], operator.add]
     data_refs: Annotated[list[str], operator.add]

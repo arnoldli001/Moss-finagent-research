@@ -5,6 +5,9 @@ routing:
   light:              # 数据清洗、格式化等基础任务
     primary: local_light
     fallback: deepseek-v4-flash
+  medium:             # 信息层处理（A05去伪/A06提取）：本地模型为主，云端兜底
+    primary: local_medium
+    fallback: deepseek-v4-flash
   reasoning:          # 宏观/中观/微观/财务风险等核心分析
     primary: deepseek-v4-flash
     fallback: local_medium

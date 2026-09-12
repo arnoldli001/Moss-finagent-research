@@ -28,6 +28,7 @@ async def main() -> None:
         "target": "",
         "plan": [], "raw_points": [], "cleaned_points": [], "validated_points": [],
         "validation_report": {}, "storage_stats": {},
+        "info_items": [], "verified_items": {}, "extracted_events": {},
         "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
         "final_report": None,
     }
@@ -49,16 +50,52 @@ async def main() -> None:
     print("=" * 60)
     print(final["final_report"])
 
+    # ---- 信息层冒烟（A05→A06→A07，纯本地文本，不采集数据）----
+    info_state = {
+        "task_id": f"task_smoke_info_{int(time.time())}",
+        "tenant_id": "tenant_001",
+        "user_query": "市场上最近有哪些值得关注的事件？情绪如何？",
+        "analysis_type": "news",
+        "target": "",
+        "plan": [], "raw_points": [], "cleaned_points": [], "validated_points": [],
+        "validation_report": {}, "storage_stats": {},
+        "info_items": [
+            {"title": "国家统计局发布通胀数据", "source_name": "国家统计局",
+             "publish_time": "2026-09-09T09:30:00+08:00",
+             "text": "2026年8月CPI同比上涨0.4%，PPI同比下降3.6%，"
+                     "工业品出厂价格延续负增长区间。"},
+            {"title": "惊天利好！这只股票必涨", "source_name": "股吧",
+             "publish_time": "2026-09-11T20:00:00+08:00",
+             "text": "内幕消息，某科技公司即将获得百亿订单，股价必将翻倍，"
+                     "满仓干就完了！"},
+        ],
+        "verified_items": {}, "extracted_events": {},
+        "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
+        "final_report": None,
+    }
+    info_started = time.perf_counter()
+    info_final = await runtime.graph.ainvoke(info_state)
+    info_elapsed = time.perf_counter() - info_started
+    print("=" * 60)
+    print(f"[E2E-INFO] 耗时 {info_elapsed:.1f}s | 错误 {info_final['errors'] or '无'}")
+    for o in info_final["agent_outputs"]:
+        print(f"  - {o['agent_id']} ({o['confidence']}): {o['conclusion'][:80]}")
+    print(info_final["final_report"])
+    info_ok = any(o["agent_id"] == "A05_verifier" for o in info_final["agent_outputs"]) and \
+        any(o["agent_id"] == "A07_sentiment" for o in info_final["agent_outputs"])
+
     ok = (
         len(final["raw_points"]) > 0
         and final["final_report"]
         and chain["valid"]
         and any(o["agent_id"] == "A08_macro" for o in final["agent_outputs"])
+        and info_ok
     )
     Path("data").mkdir(exist_ok=True)
     Path("data/_smoke_e2e_result.json").write_text(json.dumps({
         "ok": bool(ok), "elapsed": elapsed, "errors": final["errors"],
         "storage": final["storage_stats"],
+        "info_elapsed": info_elapsed, "info_errors": info_final["errors"],
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print("SMOKE:", "PASS" if ok else "FAIL")
 

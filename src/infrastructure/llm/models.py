@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-TaskTier = Literal["light", "reasoning", "decision"]
+TaskTier = Literal["light", "medium", "reasoning", "decision"]
 
 
 class ModelSpec(BaseModel):

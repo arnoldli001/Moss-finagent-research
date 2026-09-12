@@ -22,6 +22,9 @@ class AnalyzeRequest(BaseModel):
     analysis_type: str = "full"
     target: str = ""
     tenant_id: str = "tenant_001"
+    info_items: list[dict] = Field(default_factory=list)
+    """信息层输入（新闻/公告/研报）：[{text, source_name, publish_time, title?}]；
+    非空时自动追加A05→A06→A07信息层管线。"""
     options: dict = Field(default_factory=dict)
 
 
@@ -39,7 +42,7 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
     runtime = _runtime(request)
     store = _store(request)
     task_id = new_task_id()
-    plan = plan_run(body.analysis_type, body.target)
+    plan = plan_run(body.analysis_type, body.target, body.info_items)
 
     store.create(
         task_id,
@@ -54,6 +57,7 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
         "user_query": body.query, "analysis_type": plan["analysis_type"],
         "target": body.target, "plan": [], "raw_points": [], "cleaned_points": [],
         "validated_points": [], "validation_report": {}, "storage_stats": {},
+        "info_items": body.info_items, "verified_items": {}, "extracted_events": {},
         "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
         "final_report": None,
     }

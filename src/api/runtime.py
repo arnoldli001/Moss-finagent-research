@@ -16,6 +16,9 @@ from src.domain.agents.data.cleaner.agent import DataCleanerAgent
 from src.domain.agents.data.storage.agent import DataStorageAgent
 from src.domain.agents.data.validator.agent import DataValidatorAgent
 from src.domain.agents.decision.recommend.agent import RecommendationAgent
+from src.domain.agents.info.extractor import ExtractorAgent
+from src.domain.agents.info.sentiment import SentimentAgent
+from src.domain.agents.info.verifier import VerifierAgent
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
 from src.infrastructure.llm import LLMGateway
 from src.infrastructure.repositories.macro_repo import MacroRepository
@@ -42,6 +45,9 @@ def build_runtime() -> Runtime:
         "A02_data_cleaner": DataCleanerAgent(),
         "A03_data_validator": DataValidatorAgent(),
         "A04_data_storage": DataStorageAgent(repo),
+        "A05_verifier": VerifierAgent(gateway),
+        "A06_extractor": ExtractorAgent(gateway),
+        "A07_sentiment": SentimentAgent(gateway),
         "A08_macro": MacroAnalysisAgent(gateway),
         "A09_meso": MesoAnalysisAgent(gateway),
         "A10_micro": MicroAnalysisAgent(gateway),

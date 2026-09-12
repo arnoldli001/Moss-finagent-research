@@ -13,6 +13,9 @@ from src.domain.agents.data.cleaner.agent import DataCleanerAgent
 from src.domain.agents.data.storage.agent import DataStorageAgent
 from src.domain.agents.data.validator.agent import DataValidatorAgent
 from src.domain.agents.decision.recommend.agent import RecommendationAgent
+from src.domain.agents.info.extractor import ExtractorAgent
+from src.domain.agents.info.sentiment import SentimentAgent
+from src.domain.agents.info.verifier import VerifierAgent
 from src.infrastructure.repositories.audit_chain import ChainVerifier
 from src.infrastructure.repositories.macro_repo import MacroRepository
 from src.orchestration.supervisor import build_research_graph, plan_run
@@ -62,6 +65,14 @@ REPLY17 = {
     "key_logic": ["[宏观] 复苏", "[微观] 低估"], "catalysts": [], "risks": [],
     "monitoring_points": ["PMI"], "conflicts_resolved": [],
 }
+INFO_REPLY5 = {"reviews": [{"item_id": "info_1", "verdict": "可信",
+                            "red_flags": [], "reasoning": "官方数据"}]}
+INFO_REPLY6 = {"events": [{"item_id": "info_1", "event_type": "policy",
+                           "subject": "中国宏观", "direction": "positive",
+                           "magnitude": "通胀温和", "event_date": "2026-09-09",
+                           "evidence_quote": "CPI同比上涨0.4%", "confidence": 0.9}]}
+INFO_REPLY7 = {"conclusion": "情绪偏暖", "confidence": "medium",
+               "sentiment_phase": "乐观", "narrative": "官方数据提振"}
 
 
 class FakeGateway:
@@ -116,6 +127,7 @@ def _state(**over):
         "target": "600519",
         "plan": [], "raw_points": [], "cleaned_points": [], "validated_points": [],
         "validation_report": {}, "storage_stats": {},
+        "info_items": [], "verified_items": {}, "extracted_events": {},
         "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
         "final_report": None,
     }
@@ -185,3 +197,48 @@ async def test_collector_error_is_contained(tmp_dir):
     # 宏观分析走空数据短路；仅A17对"无数据"摘要做了一次综合
     assert "宏观分析师" not in gw.calls
     assert "投研委员会主席" in gw.calls
+
+
+async def test_news_graph_info_pipeline(tmp_dir):
+    """news管线：信息层串行链全跑，数据管线因无raw_points跳过，审计无完整性问题。"""
+    gw = FakeGateway()
+    gw.set("信息核查员", INFO_REPLY5)
+    gw.set("财经信息结构化专家", INFO_REPLY6)
+    gw.set("市场舆情分析师", INFO_REPLY7)
+    gw.set("投研委员会主席", REPLY17)
+    agents = {
+        "A01_data_collector": FakeCollector(POINTS),
+        "A02_data_cleaner": DataCleanerAgent(),
+        "A03_data_validator": DataValidatorAgent(),
+        "A04_data_storage": DataStorageAgent(MacroRepository(f"{tmp_dir}/news.db")),
+        "A05_verifier": VerifierAgent(gw),
+        "A06_extractor": ExtractorAgent(gw),
+        "A07_sentiment": SentimentAgent(gw),
+        "A17_recommend": RecommendationAgent(gw),
+        "A18_audit": AuditAgent(),
+    }
+    graph = build_research_graph(agents, chain_path=f"{tmp_dir}/nc.jsonl",
+                                 llm_audit_path=f"{tmp_dir}/nl.jsonl")
+    final = await graph.ainvoke(_state(
+        analysis_type="news", target="",
+        info_items=[{"source_name": "国家统计局",
+                     "publish_time": "2026-09-10T09:00:00+08:00",
+                     "text": "8月CPI同比上涨0.4%"}],
+    ))
+
+    aids = {o["agent_id"] for o in final["agent_outputs"]}
+    assert {"A05_verifier", "A06_extractor", "A07_sentiment",
+            "A17_recommend", "A18_audit"} <= aids
+    # 数据管线与A01在news管线下整体跳过
+    assert not ({"A01_data_collector", "A02_data_cleaner", "A03_data_validator",
+                 "A04_data_storage"} & aids)
+    assert final["verified_items"]["stats"]["verified"] == 1
+    assert final["extracted_events"]["stats"]["total"] == 1
+    # 报告含信息层区块与免责声明
+    assert "信息核验与舆情" in final["final_report"]
+    assert "不构成投资建议" in final["final_report"]
+    # A18无completeness问题 → 审计通过
+    audit = next(o for o in final["agent_outputs"] if o["agent_id"] == "A18_audit")
+    assert "审计通过" in audit["conclusion"]
+    assert not final["errors"]
+    assert ChainVerifier(f"{tmp_dir}/nc.jsonl").verify()["valid"]
