@@ -25,3 +25,6 @@ output/
 
 # 前端（后续阶段）
 node_modules/
+
+# TS构建缓存
+*.tsbuildinfo
