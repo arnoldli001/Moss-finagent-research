@@ -85,18 +85,53 @@ async def main() -> None:
     info_ok = any(o["agent_id"] == "A05_verifier" for o in info_final["agent_outputs"]) and \
         any(o["agent_id"] == "A07_sentiment" for o in info_final["agent_outputs"])
 
+    # ---- 行业层冒烟（industry类型 + 关键词路由：煤炭→A09中观+A15周期，真实PPI数据）----
+    ind_state = {
+        "task_id": f"task_smoke_ind_{int(time.time())}",
+        "tenant_id": "tenant_001",
+        "user_query": "煤炭行业当前景气度如何？处于库存周期什么位置？",
+        "analysis_type": "industry",
+        "target": "煤炭",
+        "plan": [], "raw_points": [], "cleaned_points": [], "validated_points": [],
+        "validation_report": {}, "storage_stats": {},
+        "info_items": [], "verified_items": {}, "extracted_events": {},
+        "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
+        "final_report": None,
+    }
+    ind_started = time.perf_counter()
+    ind_final = await runtime.graph.ainvoke(ind_state)
+    ind_elapsed = time.perf_counter() - ind_started
+    print("=" * 60)
+    print(f"[E2E-INDUSTRY] 耗时 {ind_elapsed:.1f}s | 错误 {ind_final['errors'] or '无'}")
+    for o in ind_final["agent_outputs"]:
+        print(f"  - {o['agent_id']} ({o['confidence']}): {o['conclusion'][:80]}")
+    print(ind_final["final_report"])
+    a15 = next((o for o in ind_final["agent_outputs"]
+                if o["agent_id"] == "A15_cyclical"), None)
+    industry_ok = (
+        a15 is not None
+        and (a15["result"] or {}).get("industry_signal_calc") is not None
+        and (a15["result"]["industry_signal_calc"].get("watched_indicator_count") or 0) > 0
+    )
+    if a15 is not None:
+        print("[E2E-INDUSTRY] 本地景气信号:",
+              json.dumps(a15["result"].get("industry_signal_calc"), ensure_ascii=False))
+
     ok = (
         len(final["raw_points"]) > 0
         and final["final_report"]
         and chain["valid"]
         and any(o["agent_id"] == "A08_macro" for o in final["agent_outputs"])
         and info_ok
+        and industry_ok
     )
     Path("data").mkdir(exist_ok=True)
     Path("data/_smoke_e2e_result.json").write_text(json.dumps({
         "ok": bool(ok), "elapsed": elapsed, "errors": final["errors"],
         "storage": final["storage_stats"],
         "info_elapsed": info_elapsed, "info_errors": info_final["errors"],
+        "industry_elapsed": ind_elapsed, "industry_errors": ind_final["errors"],
+        "industry_signal": (a15["result"].get("industry_signal_calc") if a15 else None),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print("SMOKE:", "PASS" if ok else "FAIL")
 
