@@ -51,6 +51,10 @@ class CachedRepository(DataPointRepository):
         """被包装的底层仓储（测试/运维直接访问用）。"""
         return self._inner
 
+    async def probe(self) -> str:
+        """缓存可用性探测：ok=可连接，degraded=不可达（fail-open直连）。"""
+        return "ok" if await self._get_client() is not None else "degraded"
+
     async def _get_client(self) -> Any | None:
         if self._degraded:
             return None

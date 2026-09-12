@@ -43,6 +43,7 @@ class Runtime:
     repo: DataPointRepository
     agents: dict[str, Any]
     graph: Any
+    backend: Any
 
 
 def build_runtime() -> Runtime:
@@ -82,7 +83,9 @@ def build_runtime() -> Runtime:
         chain_path=f"{settings.llm_audit_dir}/audit_chain.jsonl",
         llm_audit_path=f"{settings.llm_audit_dir}/llm_audit.jsonl",
     )
-    return Runtime(gateway=gateway, repo=repo, agents=agents, graph=graph)
+    return Runtime(
+        gateway=gateway, repo=repo, agents=agents, graph=graph, backend=backend
+    )
 
 
 def agent_health(agents: dict[str, Any]) -> dict[str, str]:

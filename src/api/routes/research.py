@@ -142,10 +142,54 @@ async def health(request: Request) -> dict:
         ollama_status = "unreachable"
 
     chain = ChainVerifier(f"{settings.llm_audit_dir}/audit_chain.jsonl").verify()
+
+    # 数据源真实状态：连接器能力来自注册表（非网络谎报），存储做功能探测
+    import importlib.util
+
+    from src.infrastructure.repositories.cached_repo import CachedRepository
+
+    connectors = []
+    capabilities = runtime.backend.get_capabilities()
+    for cap in capabilities.get("routes", []):
+        name = cap.get("name", "unknown")
+        if cap.get("simulated"):
+            status = "simulated"
+        elif name.lower().startswith("akshare"):
+            status = "ready" if importlib.util.find_spec("akshare") else "not_installed"
+        else:
+            status = "configured"
+        connectors.append({
+            "name": name,
+            "status": status,
+            "simulated": bool(cap.get("simulated", False)),
+            "indicators": cap.get("indicators", []),
+        })
+
+    try:
+        counts = await runtime.repo.count_by_indicator()
+        storage = {
+            "backend": settings.data_backend,
+            "status": "ok",
+            "indicators": len(counts),
+            "points": sum(counts.values()),
+        }
+    except Exception as exc:  # noqa: BLE001 健康检查需要把异常变成状态而非500
+        storage = {"backend": settings.data_backend, "status": "error",
+                   "error": str(exc)}
+
+    if isinstance(runtime.repo, CachedRepository):
+        redis_cache = await runtime.repo.probe()
+    else:
+        redis_cache = "disabled"
+
     return {
         "status": "healthy" if all(v == "healthy" for v in agents.values()) else "degraded",
         "agents": agents,
-        "data_sources": {"akshare": "connected", "sqlite": "connected"},
+        "data_sources": {
+            "connectors": connectors,
+            "storage": storage,
+            "redis_cache": redis_cache,
+        },
         "model_gateway": {
             "ollama": ollama_status,
             "deepseek": "configured" if settings.deepseek_api_key else "not_configured",

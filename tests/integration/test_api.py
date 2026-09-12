@@ -57,6 +57,13 @@ def _install_app_state(tmp_dir):
     app.state.runtime.repo = MacroRepository(db_path=f"{tmp_dir}/api.db")
     app.state.runtime.agents = {"A08_macro": HealthyAgent("A08_macro")}
     app.state.runtime.graph = FakeGraph()
+    app.state.runtime.backend = type(
+        "B", (), {"get_capabilities": lambda self: {"routes": [
+            {"name": "模拟产业数据(Demo)", "simulated": True,
+             "indicators": ["ind:科技行业PE(TTM)"]},
+            {"name": "AkShare", "simulated": False, "indicators": ["CPI", "PPI"]},
+        ]}}
+    )()
     return app.state
 
 
@@ -161,6 +168,11 @@ async def test_health_aggregation(client):
         assert resp.status_code == 200
         assert body["agents"]["A08_macro"] == "healthy"
         assert "model_gateway" in body and "audit_chain" in body
+        sources = body["data_sources"]
+        statuses = {c["name"]: c["status"] for c in sources["connectors"]}
+        assert statuses["模拟产业数据(Demo)"] == "simulated"
+        assert sources["storage"]["status"] == "ok"
+        assert sources["redis_cache"] == "disabled"
 
 
 async def test_scheduler_jobs_list_and_manual_trigger(client):
