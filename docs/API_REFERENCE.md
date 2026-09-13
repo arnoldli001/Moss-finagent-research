@@ -129,3 +129,51 @@
   }
 }
 ```
+
+## 六、定时调度接口
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/v1/scheduler/jobs` | 作业注册表（cron/kind/暂停态/最近一次运行） |
+| POST | `/api/v1/scheduler/jobs/{name}/run` | 手动触发作业（202，进程内执行并落运行记录） |
+| GET | `/api/v1/scheduler/runs?job=&limit=` | 运行记录（JSONL持久化） |
+| GET | `/api/v1/scheduler/runs/summary?date=` | 当日汇总（成功/失败/跳过/平均耗时） |
+
+## 七、LLM运行指标接口
+
+### GET /api/v1/metrics?limit=1000
+
+**响应体要点**：`metrics.window_calls`、`cache_hit_rate`、`fallback_rate`、
+`latency_ms.{p50,p95,p99,avg,max}`（nearest-rank百分位）、
+`by_provider[]`（各模型供应商的错误率/缓存命中率/P95）、`by_agent[]`。
+
+## 八、策略回测接口
+
+### POST /api/v1/backtest/run
+
+纯本地规则回测（**全程无LLM、无未来函数**）：实时拉取宏观指标与个股全历史行情，
+按指标**发布月**与月末收盘价内连接对齐，逐月用仅含截至当月历史的扩展窗口生成信号，
+计算方向命中率与多头策略净值。全历史行情拉取可能耗时数十秒。
+
+**请求体**：
+
+```json
+{ "indicator": "PPI", "code": "601088", "eps_pct": 1.0, "pe_watermark": null }
+```
+
+- `indicator`：当前支持 `CPI` / `PPI`
+- `code`：6位A股代码
+- `eps_pct`：指标同比序列环比变动阈值（百分点），超过且PE不超水位线→次月持有
+
+**响应体要点**：`range`/`periods`、`signals.{long,neutral,avoid}`、
+`directional`（1m/3m/6m看多/回避命中率与全程持有基准）、
+`strategy`（累计/年化CAGR/年化波动/最大回撤/夏普/持仓月数，内嵌
+`buy_and_hold` 与 `excess_cumulative_return`）、`equity_curve[]`、
+`disclaimer`（固定风险声明，前端必须原样展示）。
+
+**错误码**：400 参数非法；502 数据源获取失败；422 对齐月份不足（<8个月）。
+API层不静默回退合成数据。
+
+> 实测（601088，2007-10~2025-08共213月）：朴素PPI动量规则累计-46.09%，
+> 买入持有+20.38%，超额-66.47%——框架验证成立，但该规则本身无超额收益。
+> ⚠️ 历史回测不代表未来收益，不构成投资建议。
