@@ -52,6 +52,9 @@ class FakeGraph:
 class FakeBackend:
     """回测API用：返回12个月确定性PPI发布点与月末收盘价。"""
 
+    def __init__(self):
+        self.calls: dict[str, int] = {}
+
     def get_capabilities(self):
         return {"routes": [
             {"name": "模拟产业数据(Demo)", "simulated": True,
@@ -62,6 +65,7 @@ class FakeBackend:
     async def fetch(self, indicator):
         from src.core.schemas import DataPoint
 
+        self.calls[indicator] = self.calls.get(indicator, 0) + 1
         if indicator == "PPI":
             values = [100 + i * 2 for i in range(12)]  # 持续环比上行→信号1
             return [
@@ -239,6 +243,9 @@ async def test_metrics_endpoint_shape(client):
 
 
 async def test_backtest_run_endpoint(client):
+    from src.api.routes.backtest import clear_fetch_cache
+
+    clear_fetch_cache()
     _, http = client
     async with http:
         resp = await http.post("/api/v1/backtest/run",
@@ -252,6 +259,17 @@ async def test_backtest_run_endpoint(client):
         assert "cumulative_return" in body["strategy"]
         assert len(body["equity_curve"]) == 12
         assert "不构成投资建议" in body["disclaimer"]
+        assert body["cache"]["price_hit"] is False
+        assert body["cache"]["ttl_seconds"] == 600
+
+        # 第二次请求命中TTL缓存：后端不再重复拉取行情
+        backend = app.state.runtime.backend
+        resp2 = await http.post("/api/v1/backtest/run",
+                                json={"indicator": "PPI", "code": "601088"})
+        body2 = resp2.json()
+        assert body2["cache"]["price_hit"] is True
+        assert backend.calls["stock_close:601088"] == 1
+        assert body2["equity_curve"] == body["equity_curve"]
 
 
 async def test_backtest_validation(client):

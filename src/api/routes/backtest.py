@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import time
+
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from src.backtest.data import align_monthly
 from src.backtest.engine import result_to_dict, run_backtest
 from src.backtest.signals import TrendPEConfig
+from src.core.schemas import DataPoint
 
 router = APIRouter(prefix="/api/v1/backtest", tags=["backtest"])
 
@@ -15,6 +18,25 @@ _DISCLAIMER = (
     "⚠️ 历史回测不代表未来收益，结果仅供框架验证，不构成投资建议。"
     "投资有风险，入市需谨慎，盈亏自负。"
 )
+
+# 全历史行情拉取约10-30秒；月末月度数据短期不变，进程内TTL缓存避免演示重复等待。
+_CACHE_TTL_SECONDS = 600.0
+_fetch_cache: dict[str, tuple[float, list[DataPoint]]] = {}
+
+
+def clear_fetch_cache() -> None:
+    """测试用：清空回测取数缓存。"""
+    _fetch_cache.clear()
+
+
+async def _cached_fetch(backend, indicator: str) -> tuple[list[DataPoint], bool]:
+    now = time.monotonic()
+    hit = _fetch_cache.get(indicator)
+    if hit is not None and now - hit[0] < _CACHE_TTL_SECONDS:
+        return hit[1], True
+    points = await backend.fetch(indicator)
+    _fetch_cache[indicator] = (now, points)
+    return points, False
 
 
 class BacktestRequest(BaseModel):
@@ -36,8 +58,10 @@ async def run(body: BacktestRequest, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="A股代码应为6位数字")
 
     try:
-        indicator_points = await runtime.backend.fetch(indicator)
-        price_points = await runtime.backend.fetch(f"stock_close:{code}")
+        indicator_points, ind_cached = await _cached_fetch(runtime.backend, indicator)
+        price_points, price_cached = await _cached_fetch(
+            runtime.backend, f"stock_close:{code}"
+        )
     except Exception as exc:  # noqa: BLE001 数据源失败转4xx而非500
         raise HTTPException(
             status_code=502, detail=f"数据获取失败：{exc}"
@@ -59,6 +83,11 @@ async def run(body: BacktestRequest, request: Request) -> dict:
         "indicator": indicator,
         "simulated": False,
         "range": {"start": bars[0].period, "end": bars[-1].period},
+        "cache": {
+            "indicator_hit": ind_cached,
+            "price_hit": price_cached,
+            "ttl_seconds": int(_CACHE_TTL_SECONDS),
+        },
         **result_to_dict(result),
         "disclaimer": _DISCLAIMER,
     }

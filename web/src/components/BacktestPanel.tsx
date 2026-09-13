@@ -104,6 +104,11 @@ export default function BacktestPanel() {
             <div className="stat-card">
               <span className="stat-label">
                 {result.asset} · {result.range.start}~{result.range.end}（{result.periods}月）
+                {result.cache.price_hit && (
+                  <span className="cache-badge">
+                    行情缓存命中（{Math.round(result.cache.ttl_seconds / 60)}分钟TTL）
+                  </span>
+                )}
               </span>
               <span className="stat-value">
                 多{result.signals.long} / 中{result.signals.neutral} / 空{result.signals.avoid}

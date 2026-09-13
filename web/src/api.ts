@@ -122,6 +122,7 @@ export type BacktestResponse = {
   indicator: string;
   simulated: boolean;
   range: { start: string; end: string };
+  cache: { indicator_hit: boolean; price_hit: boolean; ttl_seconds: number };
   periods: number;
   signals: { long: number; neutral: number; avoid: number };
   directional: Record<string, {

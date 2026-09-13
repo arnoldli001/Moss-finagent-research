@@ -142,3 +142,6 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .eps-label { display: flex; align-items: center; font-size: 13px;
   color: var(--muted); white-space: nowrap; }
 .equity-svg { width: 100%; height: auto; display: block; }
+.cache-badge { margin-left: 8px; padding: 1px 8px; border-radius: 10px;
+  font-size: 11px; color: var(--accent);
+  border: 1px solid var(--accent); white-space: nowrap; }

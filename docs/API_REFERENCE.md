@@ -165,7 +165,9 @@
 - `code`：6位A股代码
 - `eps_pct`：指标同比序列环比变动阈值（百分点），超过且PE不超水位线→次月持有
 
-**响应体要点**：`range`/`periods`、`signals.{long,neutral,avoid}`、
+**响应体要点**：`range`/`periods`、`cache.{indicator_hit,price_hit,ttl_seconds}`
+（全历史行情进程内TTL缓存10分钟，命中时秒回，月末月度数据短期不变）、
+`signals.{long,neutral,avoid}`、
 `directional`（1m/3m/6m看多/回避命中率与全程持有基准）、
 `strategy`（累计/年化CAGR/年化波动/最大回撤/夏普/持仓月数，内嵌
 `buy_and_hold` 与 `excess_cumulative_return`）、`equity_curve[]`、
