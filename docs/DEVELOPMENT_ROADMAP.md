@@ -56,7 +56,9 @@
 ## 五、第四阶段详细任务
 
 ### 第7周
-- [ ] 演示脚本编写
+- [x] 演示脚本编写：`scripts/demo_tour.py` 七步导览（健康/审计链→DAG规划→异步分析任务→
+  Agent输出+Trace LLM审计→调度器→LLM指标→可选回测），纯stdlib HTTP、逐项PASS/FAIL、
+  末尾固定风险声明；实跑9/9 PASS（`_smoke_e2e.py` 为四管线工程冒烟，二者互补）
 - [ ] 演示数据准备
 - [ ] 项目文档整理
 - [x] 回测验证引擎：`src/backtest/` 纯本地规则回测（趋势+PE闸门，无LLM/无未来函数），
