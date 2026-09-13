@@ -66,7 +66,7 @@ export default function App() {
       });
       poll(resp.task_id);
     } catch (e) {
-      setError(`提交失败：${String(e)}。请确认后端已启动（uvicorn src.api.main:app --port 8000）`);
+      setError(`提交失败：${String(e)}。请确认后端已启动（uvicorn src.api.main:app --port 8100）`);
     } finally {
       setSubmitting(false);
     }

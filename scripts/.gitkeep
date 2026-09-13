@@ -1,1 +1,5 @@
-# 运维脚本占位（setup_dev.py / seed_data.py，数据库初始化阶段补充）
+# 运维与演示脚本目录
+# - _smoke_e2e.py    四管线端到端工程冒烟（真实采集+Ollama降级链）
+# - seed_demo_data.py 演示数据预热（CPI/PPI 幂等入库）
+# - demo_tour.py     面试演示七步导览（HTTP，逐项PASS/FAIL）
+# - backtest_demo.py 回测引擎独立演示（真实AkShare优先，合成数据回退）

@@ -51,21 +51,18 @@ uv sync
 ### 3.5 初始化数据库
 
 ```bash
-python scripts/setup_dev.py
-python scripts/seed_data.py
+# 预热CPI/PPI演示数据（幂等；SQLite为默认库，无需额外建库脚本）
+python scripts/seed_demo_data.py
 ```
 
 ## 四、启动服务
 
 ```bash
-# 启动API服务
-uvicorn src.api.main:app --reload --port 8000
+# 启动API服务（本机8000端口常被占用，统一使用8100）
+PYTHONPATH=. uvicorn src.api.main:app --port 8100
 
-# 启动Worker
-celery -A src.worker worker --loglevel=info
-
-# 启动调度器
-celery -A src.worker beat --loglevel=info
+# 启动Worker与Beat（Windows演示用solo池；无Redis时可跳过，API支持进程内手动触发）
+celery -A src.scheduler.celery_app.celery_app worker -B --pool=solo -l info
 ```
 
 ## 五、成本控制
