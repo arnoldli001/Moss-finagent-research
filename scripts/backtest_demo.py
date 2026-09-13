@@ -19,7 +19,6 @@ import argparse
 import asyncio
 import json
 import math
-import re
 import sys
 import zlib
 from datetime import datetime
@@ -27,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from src.backtest.data import align_monthly  # noqa: E402
 from src.backtest.engine import result_to_dict, run_backtest  # noqa: E402
 from src.backtest.signals import Bar, TrendPEConfig  # noqa: E402
 
@@ -34,19 +34,6 @@ DISCLAIMER = (
     "⚠️ 历史回测不代表未来收益，以上结果仅供框架验证，不构成投资建议。"
     "投资有风险，入市需谨慎，盈亏自负。"
 )
-_MONTH_RE = re.compile(r"(\d{4})\D{0,2}(\d{1,2})")
-
-
-def _month_key(text: str | None) -> str | None:
-    if not text:
-        return None
-    m = _MONTH_RE.search(str(text))
-    if not m:
-        return None
-    year, month = int(m.group(1)), int(m.group(2))
-    if not 1 <= month <= 12:
-        return None
-    return f"{year:04d}-{month:02d}"
 
 
 async def _fetch_with_retry(conn, indicator: str, retries: int = 1):
@@ -71,31 +58,10 @@ async def _load_real_bars(code: str) -> list[Bar]:
     await asyncio.sleep(1)
     price_points = await _fetch_with_retry(conn, f"stock_close:{code}")
 
-    indicator_by_month: dict[str, float] = {}
-    for p in ppi_points:
-        # period_date是发布日（如2025-07-09发布6月PPI）：按发布月对齐，
-        # 信号在发布月才可知，天然保证回测无未来函数。
-        key = _month_key(p.period_date)
-        if key and isinstance(p.value, (int, float)):
-            indicator_by_month[key] = float(p.value)
-
-    # 日频收盘→月末收盘（同月取日期最大者）
-    last_by_month: dict[str, tuple[str, float]] = {}
-    for p in price_points:
-        key = _month_key(p.period_date)
-        if key and isinstance(p.value, (int, float)):
-            day = str(p.period_date)
-            if key not in last_by_month or day > last_by_month[key][0]:
-                last_by_month[key] = (day, float(p.value))
-
-    months = sorted(set(indicator_by_month) & set(last_by_month))
-    if len(months) < 8:
-        raise RuntimeError(f"真实数据对齐月份不足（{len(months)}），无法回测")
-    return [
-        Bar(period=m, price=last_by_month[m][1],
-            indicators={"PPI": indicator_by_month[m]})
-        for m in months
-    ]
+    bars = align_monthly(ppi_points, price_points, "PPI")
+    if len(bars) < 8:
+        raise RuntimeError(f"真实数据对齐月份不足（{len(bars)}），无法回测")
+    return bars
 
 
 def _synthetic_bars(months: int = 120) -> list[Bar]:

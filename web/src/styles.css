@@ -137,3 +137,8 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .run-skipped { background: var(--medium); color: #222; }
 .run-error { color: var(--low); font-size: 12px; max-width: 260px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 回测面板 */
+.eps-label { display: flex; align-items: center; font-size: 13px;
+  color: var(--muted); white-space: nowrap; }
+.equity-svg { width: 100%; height: auto; display: block; }

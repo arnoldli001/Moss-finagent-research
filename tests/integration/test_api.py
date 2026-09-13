@@ -49,6 +49,36 @@ class FakeGraph:
         }
 
 
+class FakeBackend:
+    """回测API用：返回12个月确定性PPI发布点与月末收盘价。"""
+
+    def get_capabilities(self):
+        return {"routes": [
+            {"name": "模拟产业数据(Demo)", "simulated": True,
+             "indicators": ["ind:科技行业PE(TTM)"]},
+            {"name": "AkShare", "simulated": False, "indicators": ["CPI", "PPI"]},
+        ]}
+
+    async def fetch(self, indicator):
+        from src.core.schemas import DataPoint
+
+        if indicator == "PPI":
+            values = [100 + i * 2 for i in range(12)]  # 持续环比上行→信号1
+            return [
+                DataPoint(indicator="PPI", value=float(values[i]),
+                          period_date=f"2024-{i + 1:02d}-09")
+                for i in range(12)
+            ]
+        if indicator.startswith("stock_close:"):
+            prices = [10 * 1.01 ** i for i in range(12)]
+            return [
+                DataPoint(indicator=indicator, value=round(prices[i], 3),
+                          period_date=f"2024-{i + 1:02d}-28")
+                for i in range(12)
+            ]
+        raise ValueError(f"unsupported {indicator}")
+
+
 def _install_app_state(tmp_dir):
     app.state.store = TaskStore()
     app.state.run_log = RunLog(f"{tmp_dir}/scheduler/runs.jsonl")
@@ -57,13 +87,7 @@ def _install_app_state(tmp_dir):
     app.state.runtime.repo = MacroRepository(db_path=f"{tmp_dir}/api.db")
     app.state.runtime.agents = {"A08_macro": HealthyAgent("A08_macro")}
     app.state.runtime.graph = FakeGraph()
-    app.state.runtime.backend = type(
-        "B", (), {"get_capabilities": lambda self: {"routes": [
-            {"name": "模拟产业数据(Demo)", "simulated": True,
-             "indicators": ["ind:科技行业PE(TTM)"]},
-            {"name": "AkShare", "simulated": False, "indicators": ["CPI", "PPI"]},
-        ]}}
-    )()
+    app.state.runtime.backend = FakeBackend()
     return app.state
 
 
@@ -212,3 +236,30 @@ async def test_metrics_endpoint_shape(client):
         assert {"window_calls", "cache_hit_rate", "fallback_rate",
                 "latency_ms", "by_provider", "by_agent"} <= set(m)
         assert {"p50", "p95", "p99", "avg", "max"} == set(m["latency_ms"])
+
+
+async def test_backtest_run_endpoint(client):
+    _, http = client
+    async with http:
+        resp = await http.post("/api/v1/backtest/run",
+                               json={"indicator": "PPI", "code": "601088"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["periods"] == 12
+        assert body["range"] == {"start": "2024-01", "end": "2024-12"}
+        assert body["rule"]["kind"] == "trend+PE_gate_long_only"
+        assert body["signals"]["long"] >= 1
+        assert "cumulative_return" in body["strategy"]
+        assert len(body["equity_curve"]) == 12
+        assert "不构成投资建议" in body["disclaimer"]
+
+
+async def test_backtest_validation(client):
+    _, http = client
+    async with http:
+        bad_code = await http.post("/api/v1/backtest/run",
+                                   json={"indicator": "PPI", "code": "ABC"})
+        assert bad_code.status_code == 400
+        bad_ind = await http.post("/api/v1/backtest/run",
+                                  json={"indicator": "GDP", "code": "601088"})
+        assert bad_ind.status_code == 400

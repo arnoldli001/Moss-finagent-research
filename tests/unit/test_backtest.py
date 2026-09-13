@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.backtest.data import align_monthly, month_key
 from src.backtest.engine import (
     forward_return,
     result_to_dict,
@@ -13,6 +14,7 @@ from src.backtest.signals import (
     generate_signals,
     trend_pe_signal,
 )
+from src.core.schemas import DataPoint
 
 
 def _bars(prices: list[float], ind: list[float],
@@ -137,3 +139,29 @@ def test_result_to_dict_serializable():
     d = result_to_dict(result)
     assert d["rule"]["kind"] == "trend+PE_gate_long_only"
     assert len(d["equity_curve"]) == 2
+
+
+def test_month_key_variants():
+    assert month_key("2025-07-09") == "2025-07"
+    assert month_key("2025年7月份") == "2025-07"
+    assert month_key(None) is None
+    assert month_key("garbage") is None
+    assert month_key("2025-13-01") is None
+
+
+def test_align_monthly_inner_join_and_month_end_price():
+    ind = [
+        DataPoint(indicator="PPI", value=1.0, period_date="2024-01-09"),
+        DataPoint(indicator="PPI", value=2.0, period_date="2024-02-09"),
+        DataPoint(indicator="PPI", value=None, period_date="2024-03-09"),
+    ]
+    prices = [
+        DataPoint(indicator="stock_close:x", value=10.0, period_date="2024-02-01"),
+        DataPoint(indicator="stock_close:x", value=11.0, period_date="2024-02-28"),
+        DataPoint(indicator="stock_close:x", value=12.0, period_date="2024-03-29"),
+    ]
+    bars = align_monthly(ind, prices, "PPI")
+    # 1月无价格、3月指标None → 仅2月对齐；2月取月末11.0
+    assert [b.period for b in bars] == ["2024-02"]
+    assert bars[0].price == 11.0
+    assert bars[0].indicators == {"PPI": 2.0}

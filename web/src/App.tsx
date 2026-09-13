@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, TaskDetail, TraceDetail } from "./api";
 import AgentTimeline from "./components/AgentTimeline";
+import BacktestPanel from "./components/BacktestPanel";
 import MetricsPanel from "./components/MetricsPanel";
 import ReportView from "./components/ReportView";
 import SchedulerPanel from "./components/SchedulerPanel";
@@ -21,7 +22,8 @@ export default function App() {
   const [trace, setTrace] = useState<TraceDetail | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [view, setView] = useState<"research" | "scheduler" | "metrics">("research");
+  const [view, setView] =
+    useState<"research" | "scheduler" | "metrics" | "backtest">("research");
   const timer = useRef<number | null>(null);
 
   const stopPolling = () => {
@@ -96,6 +98,12 @@ export default function App() {
           >
             运行指标
           </button>
+          <button
+            className={view === "backtest" ? "tab active" : "tab"}
+            onClick={() => setView("backtest")}
+          >
+            策略回测
+          </button>
         </nav>
       </header>
 
@@ -103,6 +111,8 @@ export default function App() {
         <SchedulerPanel />
       ) : view === "metrics" ? (
         <MetricsPanel />
+      ) : view === "backtest" ? (
+        <BacktestPanel />
       ) : (
       <>
       <section className="submit-bar">

@@ -117,6 +117,39 @@ export type LlmMetrics = {
   by_agent: { agent_id: string; calls: number }[];
 };
 
+export type BacktestResponse = {
+  asset: string;
+  indicator: string;
+  simulated: boolean;
+  range: { start: string; end: string };
+  periods: number;
+  signals: { long: number; neutral: number; avoid: number };
+  directional: Record<string, {
+    long: { n: number; hit_rate: number | null; avg_forward_return: number | null };
+    avoid: { n: number; hit_rate: number | null; avg_forward_return: number | null };
+    always_long_baseline: number | null;
+    baseline_n: number;
+  }>;
+  strategy: {
+    cumulative_return: number;
+    cagr: number | null;
+    annualized_volatility: number;
+    max_drawdown: number;
+    sharpe_rf0: number | null;
+    invested_months: number;
+    total_months: number;
+    buy_and_hold: {
+      cumulative_return: number; cagr: number | null;
+      annualized_volatility: number; max_drawdown: number;
+      sharpe_rf0: number | null;
+    };
+    excess_cumulative_return: number;
+  };
+  equity_curve: { period: string; strategy: number;
+                   buy_and_hold: number; signal: number }[];
+  disclaimer: string;
+};
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const resp = await fetch(url, {
     headers: { "Content-Type": "application/json" },
@@ -164,4 +197,8 @@ export const api = {
   llmMetrics: (limit = 1000) =>
     request<{ limit: number; slow_call_threshold_ms: number;
               metrics: LlmMetrics }>(`/api/v1/metrics?limit=${limit}`),
+  backtestRun: (body: { indicator: string; code: string; eps_pct: number }) =>
+    request<BacktestResponse>("/api/v1/backtest/run", {
+      method: "POST", body: JSON.stringify(body),
+    }),
 };
