@@ -84,4 +84,4 @@
 | B01 | 付费产业数据接口接入（Wind / 同花顺iFinD / Choice / Tushare Pro产业库等，覆盖半导体出货量、社零、煤价库存、IND申报、集采均价等行业指标） | 由 `MockIndustryConnector`（ind:前缀，24个月确定性合成序列，三重模拟标记）占位，A13-A16行业层链路已端到端打通 | 申请到付费API Key后，新建同 `BaseConnector` 契约的真实连接器，**保持 indicator id 不变**（见 supervisor.INDUSTRY_INDICATORS），在 `build_runtime()` 的 ConnectorRouter 中把 ind: 路由从模拟连接器换为真实连接器（可加 settings 开关与真实缺失时回退模拟）；替换后用 `scripts/_smoke_e2e.py` 科技/周期段回归 |
 | B02 | GitHub 远程仓库与 CI 启用 | `.github/workflows/ci.yml` 已就绪，本地仓库未配置 remote（用户决定暂缓创建） | 用户在 GitHub 建库后：`git remote add origin <url> && git push -u origin master`，观察首次 Actions（后端3.11/3.13 ruff+pytest，前端构建） |
 | B03 | 行业报告中的模拟数据披露 | 模拟点 source_name/extra 已标记，LLM上下文可见；**前端"运行指标→数据源与依赖健康"已常驻"模拟数据"橙色徽标** | 接入真实数据（B01）后自然消除；演示时仍建议口播补充说明行业段为模拟数据 |
-| B04 | 回测真实行情实跑 | `scripts/backtest_demo.py` 真实分支已就绪（PPI发布月对齐月末收盘+顺序请求重试），本机环境东财行情接口连接被拒，当前仅合成数据验证过引擎 | 网络恢复后执行 `uv run python -u scripts/backtest_demo.py`（可 `--code` 换标的），确认 data/backtest JSON 中 simulated=false；结果须带风险声明，不构成投资建议 |
+| B04 | ~~回测真实行情实跑~~（已完成） | 东财主源断连，已给AkshareConnector加新浪前复权源故障回退；真实数据回测已跑通（601088，2007-10~2025-08共213月，朴素PPI动量规则跑输买入持有66%——框架验证结论：规则本身无超额收益，不构成投资建议） | 后续可扩展多规则/多标的对比；新增行情源时保持stock_close契约 |

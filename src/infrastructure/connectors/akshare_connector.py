@@ -5,18 +5,22 @@ indicator约定（configs/data_sources.yaml akshare节）：
 - "PPI"                  → 工业生产者出厂价格指数（月度同比）
 - "stock_close:{code}"   → A股日频收盘价（如 stock_close:000001）
 
-akshare为阻塞库，fetch内部经asyncio.to_thread线程池化，避免阻塞事件循环。
+个股行情主源东财（stock_zh_a_hist），连接失败自动回退新浪（stock_zh_a_daily，
+前复权）——实测东财接口偶发断连。akshare为阻塞库，fetch经asyncio.to_thread线程池化。
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from typing import Any
 
 from src.core.exceptions import DataFetchError
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
 from src.infrastructure.connectors.base import BaseConnector
+
+logger = logging.getLogger(__name__)
 
 _DATE_COLUMN_HINTS = ("日期", "月份", "报告日", "时间")
 _VALUE_COLUMN_PRIORITY = ("同比", "收盘", "今值")
@@ -124,13 +128,36 @@ class AkshareConnector(BaseConnector):
             return ak.macro_china_ppi_yearly()
         if indicator.startswith("stock_close:"):
             code = indicator.split(":", 1)[1].strip()
+            return self._stock_dataframe(ak, code, start_date, end_date)
+        raise DataFetchError(f"AkShare连接器不支持的指标: {indicator}")
+
+    @staticmethod
+    def _sina_symbol(code: str) -> str:
+        """A股代码→新浪带市场前缀符号：6/9开头沪市，其余按深市。"""
+        return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
+
+    def _stock_dataframe(
+        self, ak: Any, code: str, start_date: str | None, end_date: str | None
+    ) -> Any:
+        """东财主源失败时回退新浪前复权；返回列名统一为中文（日期/收盘…）。"""
+        try:
             return ak.stock_zh_a_hist(
                 symbol=code,
                 period="daily",
                 start_date=start_date or "",
                 end_date=end_date or "",
             )
-        raise DataFetchError(f"AkShare连接器不支持的指标: {indicator}")
+        except Exception as exc:  # noqa: BLE001 源故障回退（实测东财偶发RemoteDisconnected）
+            logger.warning("东财行情接口失败（%s），回退新浪源: %s", code, exc)
+            df = ak.stock_zh_a_daily(symbol=self._sina_symbol(code), adjust="qfq")
+            df = df.rename(columns={"date": "日期", "close": "收盘"})
+            if start_date or end_date:
+                dates = df["日期"].astype(str).str.replace("-", "")
+                if start_date:
+                    df = df[dates >= start_date]
+                if end_date:
+                    df = df[df["日期"].astype(str).str.replace("-", "") <= end_date]
+            return df
 
     async def fetch(
         self,

@@ -156,7 +156,7 @@ async def main(force_synthetic: bool, code: str) -> int:
 
     out_dir = Path("data/backtest")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "ppi_csi300_backtest.json"
+    out_path = out_dir / "ppi_stock_backtest.json"
     out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     s = result.strategy
