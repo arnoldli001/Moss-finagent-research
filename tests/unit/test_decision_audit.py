@@ -105,11 +105,13 @@ async def test_chain_roundtrip_and_verify(tmp_dir):
 async def test_chain_detects_tampering(tmp_dir):
     path, _ = _chain(tmp_dir)
     # 篡改中间记录的entry
-    lines = open(path, encoding="utf-8").read().splitlines()
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
     rec = json.loads(lines[1])
     rec["entry"]["n"] = 999
     lines[1] = json.dumps(rec, ensure_ascii=False)
-    open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
     verdict = ChainVerifier(path).verify()
     assert not verdict["valid"] and verdict["broken_at"] == 2
@@ -117,9 +119,11 @@ async def test_chain_detects_tampering(tmp_dir):
 
 async def test_chain_detects_deletion(tmp_dir):
     path, _ = _chain(tmp_dir)
-    lines = open(path, encoding="utf-8").read().splitlines()
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
     del lines[0]  # 删首条 → 后续prev_hash断裂
-    open(path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
     assert not ChainVerifier(path).verify()["valid"]
 
 
@@ -160,11 +164,13 @@ async def test_audit_agent_flags_incomplete_outputs(tmp_dir):
 
 async def test_audit_agent_detects_broken_chain(tmp_dir):
     chain_path, _ = _chain(tmp_dir)
-    lines = open(chain_path, encoding="utf-8").read().splitlines()
+    with open(chain_path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
     rec = json.loads(lines[0])
     rec["entry"]["n"] = -1
     lines[0] = json.dumps(rec, ensure_ascii=False)
-    open(chain_path, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    with open(chain_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
 
     out = await AuditAgent().execute(_ainput({
         "agent_outputs": ANALYSES, "chain_path": chain_path, "seal_report": False,

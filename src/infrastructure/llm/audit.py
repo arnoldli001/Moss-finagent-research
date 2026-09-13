@@ -55,9 +55,8 @@ class LLMAuditLog:
             "error": error,
         }
         line = json.dumps(entry, ensure_ascii=False)
-        with self._lock:
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
+        with self._lock, self.path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
         return entry
 
     def read_all(self, limit: int | None = None) -> list[dict]:
