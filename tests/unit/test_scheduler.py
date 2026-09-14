@@ -47,7 +47,7 @@ def test_registry_crons_are_valid_five_fields():
 def test_beat_schedule_built_from_registry():
     for name in JOB_REGISTRY:
         entry = celery_app.conf.beat_schedule[name]
-        assert entry["task"] == "finagent.scheduler.dispatch"
+        assert entry["task"] == "moss_finagent.scheduler.dispatch"
         assert entry["args"] == (name,)
 
 

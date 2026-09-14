@@ -16,7 +16,7 @@ import pytest
 @pytest.fixture
 def tmp_dir() -> Generator[str, None, None]:
     """快速临时目录（str路径），测试结束自动清理。"""
-    d = tempfile.mkdtemp(prefix="finagent_test_")
+    d = tempfile.mkdtemp(prefix="moss_finagent_test_")
     yield d
     shutil.rmtree(d, ignore_errors=True)
 

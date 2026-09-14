@@ -20,7 +20,7 @@ from src.infrastructure.repositories.base import DataPointRepository
 
 logger = logging.getLogger(__name__)
 
-_KEY_PREFIX = "finagent:dp"
+_KEY_PREFIX = "moss_finagent:dp"
 _SCAN_BATCH = 200
 
 

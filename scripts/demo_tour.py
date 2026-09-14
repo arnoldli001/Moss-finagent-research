@@ -43,7 +43,7 @@ def _banner(step: str, title: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="FinAgent-Research 演示导览")
+    parser = argparse.ArgumentParser(description="Moss-FinAgent-Research 演示导览")
     parser.add_argument("--base", default="http://127.0.0.1:8100")
     parser.add_argument("--poll-timeout", type=int, default=300)
     parser.add_argument("--with-backtest", action="store_true")

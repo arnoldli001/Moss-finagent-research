@@ -6,7 +6,7 @@ from src.core.schemas import Confidence, TraceStep
 
 def test_settings_defaults():
     settings = get_settings()
-    assert settings.app_name == "FinAgent-Research"
+    assert settings.app_name == "Moss-FinAgent-Research"
     assert settings.api_port == 8000
     assert settings.ollama_base_url == "http://localhost:11434"
 

@@ -1,5 +1,5 @@
 [project]
-name = "finagent-research"
+name = "Moss-finagent-research"
 version = "0.1.0"
 description = "基于多Agent协作的AI辅助投研分析系统（Demo版）"
 readme = "README.md"

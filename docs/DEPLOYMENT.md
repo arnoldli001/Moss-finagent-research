@@ -34,7 +34,7 @@ OLLAMA_HOST=0.0.0.0 ollama serve
 ### 3.2 安装数据库
 
 ```bash
-docker run -d --name postgres -e POSTGRES_PASSWORD=finagent -p 5432:5432 postgres:14
+docker run -d --name postgres -e POSTGRES_PASSWORD=moss_finagent -p 5432:5432 postgres:14
 docker run -d --name redis -p 6379:6379 redis:7
 ```
 

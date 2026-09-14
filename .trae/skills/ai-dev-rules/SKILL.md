@@ -5,7 +5,7 @@ license: MIT
 compatibility: "Python 3.10+, FastAPI, LangGraph, PostgreSQL, Neo4j"
 metadata:
   version: "1.0.0"
-  project: "FinAgent-Research"
+  project: "Moss-FinAgent-Research"
 ---
 
 # AI投研系统开发规则

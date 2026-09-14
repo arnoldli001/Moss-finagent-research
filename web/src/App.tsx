@@ -77,7 +77,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <h1>FinAgent-Research</h1>
+        <h1>Moss-FinAgent-Research</h1>
         <span className="subtitle">多Agent投研工作台 · 全链路可溯源</span>
         <nav className="tabs">
           <button

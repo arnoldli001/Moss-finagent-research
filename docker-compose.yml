@@ -3,11 +3,11 @@
 services:
   postgres:
     image: postgres:14
-    container_name: finagent-postgres
+    container_name: moss-finagent-postgres
     environment:
-      POSTGRES_USER: finagent
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-finagent}
-      POSTGRES_DB: finagent
+      POSTGRES_USER: moss_finagent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-moss_finagent}
+      POSTGRES_DB: moss_finagent
     ports:
       - "5432:5432"
     volumes:
@@ -15,7 +15,7 @@ services:
 
   redis:
     image: redis:7
-    container_name: finagent-redis
+    container_name: moss-finagent-redis
     ports:
       - "6379:6379"
 

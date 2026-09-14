@@ -67,7 +67,7 @@ def _parse_dt(raw: str | None) -> datetime | None:
 class MacroRepository(DataPointRepository):
     """统一数据点仓储（SQLite，线程池化阻塞IO）。"""
 
-    def __init__(self, db_path: str = "data/finagent.db") -> None:
+    def __init__(self, db_path: str = "data/moss_finagent.db") -> None:
         self._db_path = db_path
 
     def _connect(self) -> sqlite3.Connection:

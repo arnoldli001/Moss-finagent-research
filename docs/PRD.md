@@ -1,11 +1,11 @@
-# FinAgent-Research 需求开发设计文档
+# Moss-FinAgent-Research 需求开发设计文档
 
-> 项目代号：FinAgent-Research
+> 项目代号：Moss-FinAgent-Research
 > 原始需求文档存档（用户提供，2026-09-12）
 
 ## 一、项目概述
 
-FinAgent-Research 是一个基于多Agent协作的AI辅助投研分析系统，面向二级市场投资决策场景，覆盖产业政策研究、产业链研究、个股研究三大核心模块，支持宏观、中观、微观三层分析，具备数据溯源、推理路径可回溯、多租户隔离、自迭代学习等能力。
+Moss-FinAgent-Research 是一个基于多Agent协作的AI辅助投研分析系统，面向二级市场投资决策场景，覆盖产业政策研究、产业链研究、个股研究三大核心模块，支持宏观、中观、微观三层分析，具备数据溯源、推理路径可回溯、多租户隔离、自迭代学习等能力。
 
 系统采用 Supervisor分层调度 + 专业Agent协同 架构，参考 TradingAgents 的虚拟投研团队范式，将复杂投研决策拆解为可编排、可追踪、可复盘的Agent协作流程。整体架构采用 LangGraph StateGraph 搭建 Supervisor 多智能体协同架构，Supervisor 作为总调度，通过 LLM 动态决策任务执行顺序，Agent 间通过共享状态自动传递上下文。
 
@@ -214,7 +214,7 @@ Demo阶段优先实现P0级Agent，P1/P2逐步扩展：
 ### 6.1 顶层目录结构
 
 ```
-finagent-research/
+Moss-finagent-research/
 ├── pyproject.toml
 ├── README.md
 ├── AGENTS.md
@@ -330,7 +330,7 @@ OLLAMA_HOST=0.0.0.0 ollama serve
 ### 10.1 AGENTS.md配置
 
 ```markdown
-# FinAgent-Research 项目规则
+# Moss-FinAgent-Research 项目规则
 
 ## 项目定位
 基于多Agent协作的AI辅助投研分析系统（Demo版）。

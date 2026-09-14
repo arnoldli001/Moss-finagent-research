@@ -1,6 +1,6 @@
 """端到端冒烟：真实akshare采集 + 真实LLM网关（Ollama降级链）跑通全图。
 
-运行：cd d:/code/finagent-research; $env:PYTHONPATH="."; uv run python scripts/_smoke_e2e.py
+运行：cd d:/code/Moss-finagent-research; $env:PYTHONPATH="."; uv run python scripts/_smoke_e2e.py
 说明：无DEEPSEEK_API_KEY时DeepSeek主模型快速失败自动降级Ollama本地模型。
 """
 

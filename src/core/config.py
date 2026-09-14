@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     )
 
     # 应用
-    app_name: str = "FinAgent-Research"
+    app_name: str = "Moss-FinAgent-Research"
     debug: bool = False
     log_level: str = "INFO"
 
@@ -41,9 +41,9 @@ class Settings(BaseSettings):
 
     # 数据层
     data_backend: str = "sqlite"  # sqlite | postgres（经DATA_BACKEND环境变量切换）
-    sqlite_path: str = "data/finagent.db"
-    postgres_dsn: str = "postgresql+asyncpg://finagent:finagent@localhost:5432/finagent"
-    sqlite_dsn: str = "sqlite:///data/finagent.db"
+    sqlite_path: str = "data/moss_finagent.db"
+    postgres_dsn: str = "postgresql+asyncpg://moss_finagent:moss_finagent@localhost:5432/moss_finagent"
+    sqlite_dsn: str = "sqlite:///data/moss_finagent.db"
     redis_url: str = "redis://localhost:6379/0"
     redis_cache_enabled: bool = False  # 开启后query_points走Redis缓存（Redis不可达自动降级）
     data_cache_ttl_seconds: int = 300

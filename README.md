@@ -1,4 +1,4 @@
-# FinAgent-Research
+# Moss-FinAgent-Research
 
 基于多Agent协作的AI辅助投研分析系统（Demo版）。面向二级市场投资决策，覆盖产业政策研究、产业链研究、个股研究三大模块，支持宏观、中观、微观三层分析，具备数据溯源与推理路径可回溯能力。
 

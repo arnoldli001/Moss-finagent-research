@@ -1,4 +1,4 @@
-# FinAgent-Research 项目规则
+# Moss-FinAgent-Research 项目规则
 
 ## 项目定位
 基于多Agent协作的AI辅助投研分析系统（Demo版），面向二级市场投资决策。

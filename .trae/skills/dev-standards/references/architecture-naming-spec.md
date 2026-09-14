@@ -5,7 +5,7 @@
 采用Python src layout + 分层架构，参考uv monorepo的apps/libs分离模式。
 
 ```
-finagent-research/
+Moss-finagent-research/
 ├── pyproject.toml
 ├── uv.lock
 ├── README.md

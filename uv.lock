@@ -706,7 +706,7 @@ wheels = [
 ]
 
 [[package]]
-name = "finagent-research"
+name = "Moss-finagent-research"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

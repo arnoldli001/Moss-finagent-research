@@ -28,7 +28,7 @@ from src.scheduler.run_log import RunLog
 settings = get_settings()
 
 celery_app = Celery(
-    "finagent_scheduler",
+    "moss_finagent_scheduler",
     broker=settings.celery_broker_url,
     backend=settings.celery_broker_url,
 )
@@ -54,7 +54,7 @@ def _parse_cron(expr: str) -> crontab:
 
 celery_app.conf.beat_schedule = {
     name: {
-        "task": "finagent.scheduler.dispatch",
+        "task": "moss_finagent.scheduler.dispatch",
         "schedule": _parse_cron(spec.cron),
         "args": (name,),
     }
@@ -70,7 +70,7 @@ def _get_runtime():
     return build_runtime()
 
 
-@celery_app.task(name="finagent.scheduler.dispatch", bind=True)
+@celery_app.task(name="moss_finagent.scheduler.dispatch", bind=True)
 def dispatch_job(self, job_name: str, trigger: str = "schedule") -> dict:
     log = RunLog(f"{settings.scheduler_dir}/runs.jsonl")
     runtime = _get_runtime()
