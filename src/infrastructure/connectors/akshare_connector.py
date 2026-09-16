@@ -1,9 +1,20 @@
 """AkShare数据源连接器。
 
 indicator约定（configs/data_sources.yaml akshare节）：
-- "CPI"                  → 全国居民消费价格指数（月度同比）
-- "PPI"                  → 工业生产者出厂价格指数（月度同比）
+- "CPI"                  → 全国居民消费价格指数（月度同比，国家统计局NBS源，发布月对齐）
+- "PPI"                  → 工业生产者出厂价格指数（月度同比，国家统计局NBS源）
 - "stock_close:{code}"   → A股日频收盘价（如 stock_close:000001）
+- "index_close:{code}"   → 指数日频收盘价（新浪源，如 index_close:000300）
+- "etf_close:{code}"     → ETF日频前复权收盘价（东财主/新浪备，如 etf_close:510300）
+- "M2"/"社融"             → 货币供应M2同比 / 社融规模增量（月度）
+- "PE(TTM):{code}"/"PB:{code}" → 百度估值日线序列（喂饱A10微观估值）；
+  ETF代码（51/58/15/16开头）百度不支持，改走关联指数代理估值：行业主题
+  （半导体/芯片→中证全指半导体H30184，中证官网PE-TTM近20期）优先，其次
+  宽基（沪深300/中证500/创业板50/科创50等，乐咕PE+PB全序列，PE可降级中证
+  官网）；代理关系与口径强制写入每个DataPoint.extra（proxy/proxy_index/…）
+- "资产负债率:{code}"/"流动比率:{code}" → 季度财务比率（喂饱A11财务排雷；ETF无此数据）
+- "ind:社会消费品零售总额同比" → 真实社零月度同比（替换同名模拟指标）
+- "ind:动力煤价格(元/吨)" → 郑煤期货主力收盘价（现货价代理，extra披露口径）
 
 个股行情主源东财（stock_zh_a_hist），连接失败自动回退新浪（stock_zh_a_daily，
 前复权）——实测东财接口偶发断连。akshare为阻塞库，fetch经asyncio.to_thread线程池化。
@@ -14,15 +25,26 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import re
+import time
+from datetime import date as _date
+from datetime import datetime
 from typing import Any
+
+import requests
 
 from src.core.exceptions import DataFetchError
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
 from src.infrastructure.connectors.base import BaseConnector
+from src.infrastructure.connectors.real_industry_connector import (
+    _latest_snapshot,
+    parse_csindex_pe,
+)
+from src.infrastructure.connectors.xtquant_connector import QUOTE_PREFIXES
 
 logger = logging.getLogger(__name__)
 
-_DATE_COLUMN_HINTS = ("日期", "月份", "报告日", "时间")
+_DATE_COLUMN_HINTS = ("日期", "月份", "报告日", "时间", "date")
 _VALUE_COLUMN_PRIORITY = ("同比", "收盘", "今值")
 
 
@@ -99,19 +121,302 @@ def df_to_data_points(
     return points
 
 
+_MONTH_CN_RE = re.compile(r"(\d{4})\D{0,2}(\d{1,2})")
+
+
+def period_to_iso(raw: Any) -> str | None:
+    """把'2026年07月份'/'202607'/'2026-07-01'/date对象 统一为 YYYY-MM 或 YYYY-MM-DD。"""
+    if raw is None:
+        return None
+    if isinstance(raw, (datetime, _date)):
+        return raw.isoformat()[:10]
+    text = str(raw).strip()
+    digits = text.replace("-", "").replace("/", "")
+    if digits.isdigit():
+        if len(digits) == 6:
+            return f"{digits[:4]}-{digits[4:]}"
+        if len(digits) == 8:
+            return f"{digits[:4]}-{digits[4:6]}-{digits[6:]}"
+    m = _MONTH_CN_RE.search(text)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}"
+    return text[:10] or None
+
+
+def _find_col(columns: list[str], *keywords: str) -> str | None:
+    """按关键词包含匹配列名（akshare列名随版本可能微调，容错选取）。"""
+    for kw in keywords:
+        for col in columns:
+            if kw in col:
+                return col
+    return None
+
+
+def _in_range(period: str | None, start: str | None, end: str | None) -> bool:
+    """ISO期间(YYYY-MM或YYYY-MM-DD)与可选起止比较；月粒度边界按整月包含处理。"""
+    if not period:
+        return False
+    key = period.replace("-", "")
+    if len(key) == 6:
+        key_lo, key_hi = key + "01", key + "31"
+    else:
+        key_lo = key_hi = key
+    s = (start or "").replace("-", "")
+    e = (end or "").replace("-", "")
+    s = (s + "01")[:8] if s else ""
+    e = (e + "31")[:8] if len(e) == 6 else e
+    return (not s or key_hi >= s) and (not e or key_lo <= e)
+
+
+def series_to_points(
+    df: Any,
+    indicator: str,
+    *,
+    date_keywords: tuple[str, ...],
+    value_keywords: tuple[str, ...],
+    start_date: str | None,
+    end_date: str | None,
+    extra: dict[str, Any] | None = None,
+    confidence: float = 0.8,
+    exact_date_col: str | None = None,
+    exact_value_col: str | None = None,
+) -> list[DataPoint]:
+    """通用单列时间序列 → DataPoint（日期列/数值列按关键词容错选取）。
+
+    传入 exact_*_col 时要求列名精确相等，避免子串误中
+    （如乐咕"等权滚动市盈率"包含"滚动市盈率"）。
+    """
+    if df is None or len(df) == 0:
+        return []
+    columns = [str(c) for c in df.columns]
+    if exact_date_col is not None or exact_value_col is not None:
+        if exact_date_col not in columns or exact_value_col not in columns:
+            raise DataFetchError(
+                f"AkShare返回结构异常({indicator})：缺{exact_date_col}/"
+                f"{exact_value_col}列，实际列={columns}"
+            )
+        date_col, value_col = exact_date_col, exact_value_col
+    else:
+        date_col = _find_col(columns, *date_keywords)
+        value_col = _find_col(columns, *value_keywords)
+    if date_col is None or value_col is None:
+        raise DataFetchError(
+            f"AkShare返回结构异常({indicator})：缺日期/数值列，实际列={columns}"
+        )
+    points: list[DataPoint] = []
+    for _, row in df.iterrows():
+        period = period_to_iso(row[date_col])
+        value = _to_float(row[value_col])
+        if value is None or not _in_range(period, start_date, end_date):
+            continue
+        points.append(
+            DataPoint(
+                indicator=indicator, value=value, period_date=period,
+                extra=dict(extra or {}),
+                source_name=AkshareConnector.source_name,
+                source_url=AkshareConnector.source_url,
+                source_type=DataSourceType.API,
+                fetch_method=FetchMethod.API_CALL,
+                confidence=confidence, verified=False,
+            )
+        )
+    return points
+
+
+# ==================== ETF 代理估值 ====================
+# 百度个股估值接口(stock_zh_valuation_baidu)对ETF与行业指数均不可用（实测 KeyError
+# 'chartInfo'；对000688/000001等指数代码返回的是同名深市个股估值，绝非指数口径，
+# 严禁误用）。ETF 的 PE(TTM)/PB 改按「最相关的行业/宽基指数估值」代理，代理关系在
+# 每个 DataPoint.extra 中强制披露（数据溯源规范）：
+#   - 行业主题：中证官网 indicator.xls（市盈率2=TTM滚动，仅近20期、无PB，日频积累）；
+#   - 宽基：乐咕指数估值（PE+PB全序列），PE 在乐咕反爬/不支持时降级中证官网序列。
+_ETF_PREFIXES = ("51", "56", "58", "15", "16")
+# 名称关键词（首个命中为准）→ (中证指数代码, 指数名)；行业主题优先于宽基匹配
+_ETF_PROXY_CSINDEX: tuple[tuple[tuple[str, ...], str, str], ...] = (
+    (("半导体", "芯片", "集成电路"), "H30184", "中证全指半导体产品与设备"),
+)
+# 名称关键词 → 乐咕指数名（PE/PB历史序列）
+_ETF_PROXY_LEGU: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("沪深300",), "沪深300"),
+    (("中证500",), "中证500"),
+    (("中证1000",), "中证1000"),
+    (("上证50",), "上证50"),
+    (("创业板50",), "创业板50"),
+    # 创业板指乐咕/中证官网均不支持，以流动性最高的创业板50近似（extra强制披露）
+    (("创业板",), "创业板50"),
+    (("科创50",), "科创50"),
+    (("科创板", "科创"), "科创50"),
+)
+# 乐咕指数名 → 中证官网指数代码（乐咕不可用时PE兜底；创业板50为国指无此文件）
+_LEGU_CSINDEX_CODE = {
+    "沪深300": "000300", "中证500": "000905", "中证1000": "000852",
+    "上证50": "000016", "科创50": "000688",
+}
+_ETF_NAME_TTL_SEC = 24 * 3600.0
+_CSINDEX_OSS_URL = (
+    "https://oss-ch.csindex.com.cn/static/html/csindex/public/"
+    "uploads/file/autofile/indicator/{code}indicator.xls"
+)
+_CSINDEX_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 Chrome/124.0 Safari/537.36"),
+    "Referer": "https://www.csindex.com.cn/",
+}
+_TENCENT_QUOTE_URL = "https://qt.gtimg.cn/q={symbol}"
+
+
+def _is_etf_code(code: str) -> bool:
+    """6位代码是否为场内ETF（沪 51/58，深 15/16）。"""
+    return len(code) == 6 and code.isdigit() and code.startswith(_ETF_PREFIXES)
+
+
 class AkshareConnector(BaseConnector):
-    """AkShare连接器：覆盖宏观CPI/PPI与A股日频行情。"""
+    """AkShare连接器：宏观(CPI/PPI/M2/社融)、A股行情、估值、财务比率、部分行业真实指标。"""
 
     source_name = "AkShare"
     source_url = "https://akshare.akfamily.xyz"
+
+    # ETF简称进程内缓存：code → (缓存时间戳, 简称)，避免PE/PB两次取数重复请求腾讯
+    _etf_name_cache: dict[str, tuple[float, str]] = {}
+
+    # 无代码参数的月度真实序列：指标 → (ak接口, 日期列关键词, 数值列关键词, 附加extra, confidence)
+    _MACRO_SERIES: dict[str, tuple[str, tuple, tuple, dict, float]] = {
+        "M2": ("macro_china_money_supply", ("月份",), ("货币和准货币(M2)-同比增长",),
+               {"unit": "同比%"}, 0.8),
+        "社融": ("macro_china_shrzgm", ("月份",), ("社会融资规模增量",),
+                {"unit": "亿元"}, 0.8),
+        "ind:社会消费品零售总额同比": (
+            "macro_china_consumer_goods_retail", ("月份",), ("同比增长",),
+            {"unit": "同比%", "real_industry_data": True}, 0.85),
+    }
+    # 美国宏观指标：指标 → (ak接口, 日期列关键词, 数值列关键词, 附加extra, confidence)
+    _US_MACRO_SERIES: dict[str, tuple[str, tuple, tuple, dict, float]] = {
+        "us_cpi_yoy": ("macro_usa_cpi_yoy", ("时间",), ("现值",),
+                       {"unit": "同比%", "country": "US"}, 0.85),
+        "us_core_cpi": ("macro_usa_core_cpi_monthly", ("日期",), ("今值",),
+                        {"unit": "同比%", "country": "US"}, 0.85),
+        "us_nonfarm": ("macro_usa_non_farm", ("日期",), ("今值",),
+                       {"unit": "万人", "country": "US",
+                        "note": "非农就业新增"}, 0.8),
+        "us_unemployment": ("macro_usa_unemployment_rate", ("日期",), ("今值",),
+                            {"unit": "%", "country": "US"}, 0.8),
+        "us_fed_rate": ("macro_bank_usa_interest_rate", ("日期",), ("今值",),
+                        {"unit": "%", "country": "US",
+                         "note": "美联储利率决议"}, 0.85),
+        "us_pce": ("macro_usa_core_pce_price", ("日期",), ("今值",),
+                   {"unit": "同比%", "country": "US",
+                    "note": "核心PCE"}, 0.8),
+    }
+    _CODE_PREFIXES = ("PE(TTM):", "PB:", "资产负债率:", "流动比率:")
+
+    # CPI/PPI 走国家统计局NBS（旧英为财情macro_china_*源2025-09后停更）。
+    # NBS目录按年代分段，列"(上年同月=100)指数"→同比%=指数-100。
+    _NBS_PRICE_SERIES: dict[str, dict[str, Any]] = {
+        "CPI": {
+            "row_prefix": "居民消费价格指数(",
+            "nodes": [
+                ("价格指数 > 居民消费价格分类指数 (上年同月=100) "
+                 "> 全国居民消费价格分类指数 (上年同月=100) (2026-)", "2026-2026"),
+                ("价格指数 > 居民消费价格分类指数 (上年同月=100) "
+                 "> 全国居民消费价格分类指数 (上年同月=100) (2021-2025)", "2021-2025"),
+                ("价格指数 > 居民消费价格分类指数 (上年同月=100) "
+                 "> 全国居民消费价格分类指数 (上年同月=100) (2016-2020)", "2016-2020"),
+            ],
+        },
+        "PPI": {
+            "row_prefix": "工业生产者出厂价格指数(",
+            "nodes": [
+                ("价格指数 > 工业生产者出厂价格分类指数 "
+                 "> 工业生产者出厂价格指数 (上年同月=100)", "2016-2026"),
+            ],
+        },
+    }
+
+    def _nbs_price_yoy_points(
+        self, ak: Any, indicator: str,
+        start_date: str | None, end_date: str | None,
+    ) -> list[DataPoint] | None:
+        """NBS月度价格指数同比；全部年代段失败返回None（由旧源兜底）。"""
+        cfg = self._NBS_PRICE_SERIES[indicator]
+        merged: dict[str, float] = {}
+        for path, period in cfg["nodes"]:
+            df = None
+            for attempt in range(3):  # NBS新站偶发WAF挑战
+                try:
+                    df = ak.macro_china_nbs_nation(
+                        kind="月度数据", path=path, period=period)
+                    break
+                except Exception:  # noqa: BLE001
+                    if attempt == 2:
+                        df = None
+                    time.sleep(2.0 * (attempt + 1))
+            if df is None or len(df) == 0:
+                continue
+            row = df[df.index.astype(str).str.startswith(cfg["row_prefix"])]
+            if row.empty:
+                continue
+            for col in df.columns:
+                m = re.fullmatch(r"(\d{4})年(\d{1,2})月", str(col).strip())
+                if not m:
+                    continue
+                try:
+                    index_value = float(row.iloc[0][col])
+                except (TypeError, ValueError):
+                    continue
+                if index_value != index_value:  # NaN
+                    continue
+                year, month = int(m.group(1)), int(m.group(2))
+                # 数据月→次月发布月对齐（CPI/PPI次月9-15日发布），防止月末信号偷看
+                month += 1
+                if month == 13:
+                    year, month = year + 1, 1
+                period_date = f"{year:04d}-{month:02d}-01"
+                if start_date and period_date < start_date:
+                    continue
+                if end_date and period_date > end_date:
+                    continue
+                merged[period_date] = round(index_value - 100.0, 1)
+        if not merged:
+            return None
+        return [
+            DataPoint(
+                indicator=indicator, value=yoy, period_date=period_date,
+                extra={"unit": "同比%", "frequency": "monthly",
+                       "nbs_basis": "上年同月=100指数减100",
+                       "release_month_aligned": True},
+                source_name="国家统计局(AkShare封装)",
+                source_url="https://data.stats.gov.cn",
+                source_type=DataSourceType.API,
+                fetch_method=FetchMethod.API_CALL,
+                confidence=0.85, verified=True,
+            )
+            for period_date, yoy in sorted(merged.items())
+        ]
 
     def get_capabilities(self) -> dict[str, Any]:
         return {
             "name": self.source_name,
             "source_type": DataSourceType.API.value,
-            "indicators": ["CPI", "PPI", "stock_close:{code}"],
+            "indicators": [
+                "CPI", "PPI", "M2", "社融",
+                "stock_close:{code}", "index_close:{code}", "etf_close:{code}",
+                "PE(TTM):{code}", "PB:{code}",
+                "资产负债率:{code}", "流动比率:{code}",
+                "ind:社会消费品零售总额同比", "ind:动力煤价格(元/吨)",
+                *self._US_MACRO_SERIES.keys(),
+            ],
             "notes": " akshare未安装时fetch将抛出DataFetchError，需 uv sync --extra data",
         }
+
+    @staticmethod
+    def supports(indicator: str) -> bool:
+        return (
+            indicator in AkshareConnector._MACRO_SERIES
+            or indicator in AkshareConnector._US_MACRO_SERIES
+            or indicator in ("CPI", "PPI", "ind:动力煤价格(元/吨)")
+            or indicator.startswith(
+                QUOTE_PREFIXES + AkshareConnector._CODE_PREFIXES)
+        )
 
     def _load_dataframe(
         self, indicator: str, start_date: str | None, end_date: str | None
@@ -122,14 +427,318 @@ class AkshareConnector(BaseConnector):
         except ImportError as exc:
             raise DataFetchError("akshare未安装，请执行: uv sync --extra data") from exc
 
+        # CPI/PPI旧英为财情源（2025-09后停更，仅作NBS全失败时的历史兜底）
         if indicator == "CPI":
             return ak.macro_china_cpi_monthly()
         if indicator == "PPI":
             return ak.macro_china_ppi_yearly()
-        if indicator.startswith("stock_close:"):
-            code = indicator.split(":", 1)[1].strip()
-            return self._stock_dataframe(ak, code, start_date, end_date)
+        if indicator.startswith(QUOTE_PREFIXES):
+            kind, code = indicator.split(":", 1)
+            code = code.strip()
+            if kind == "stock_close":
+                return self._stock_dataframe(ak, code, start_date, end_date)
+            if kind == "index_close":
+                return self._index_dataframe(ak, code, start_date, end_date)
+            if kind == "etf_close":
+                return self._etf_dataframe(ak, code, start_date, end_date)
         raise DataFetchError(f"AkShare连接器不支持的指标: {indicator}")
+
+    @staticmethod
+    def _filter_frame_dates(
+        df: Any, start_date: str | None, end_date: str | None
+    ) -> Any:
+        """对自带全历史的新浪帧按YYYYMMDD字符串过滤。"""
+        dates = df["日期"].astype(str).str.replace("-", "")
+        if start_date:
+            df = df[dates >= start_date.replace("-", "")]
+        if end_date:
+            df = df[df["日期"].astype(str).str.replace("-", "")
+                    <= end_date.replace("-", "")]
+        return df
+
+    def _index_dataframe(
+        self, ak: Any, code: str,
+        start_date: str | None, end_date: str | None,
+    ) -> Any:
+        """指数日线（新浪源，指数不除权）：000/880沪，399深。"""
+        if code.startswith(("000", "880")):
+            symbol = f"sh{code}"
+        elif code.startswith("399"):
+            symbol = f"sz{code}"
+        else:
+            raise DataFetchError(f"暂支持000xxx(沪)/399xxx(深)指数: {code}")
+        df = ak.stock_zh_index_daily(symbol=symbol)
+        df = df.rename(columns={"date": "日期", "close": "收盘"})
+        return self._filter_frame_dates(df, start_date, end_date)
+
+    def _etf_dataframe(
+        self, ak: Any, code: str,
+        start_date: str | None, end_date: str | None,
+    ) -> Any:
+        """ETF日线：东财主源(前复权)，失败回退新浪(不除权，ETF分红少)。"""
+        try:
+            return ak.fund_etf_hist_em(
+                symbol=code, period="daily",
+                start_date=start_date or "20100101",
+                end_date=end_date or "20991231", adjust="qfq")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("东财ETF接口失败（%s），回退新浪源: %s", code, exc)
+            symbol = ("sh" if code.startswith(("51", "58")) else "sz") + code
+            df = ak.fund_etf_hist_sina(symbol=symbol)
+            df = df.rename(columns={"date": "日期", "close": "收盘"})
+            return self._filter_frame_dates(df, start_date, end_date)
+
+    def _load_extra_points(
+        self, ak: Any, indicator: str,
+        start_date: str | None, end_date: str | None,
+    ) -> list[DataPoint] | None:
+        """扩展指标（宏观/行业真实序列/估值/财务）；非扩展指标返回None走DataFrame路径。"""
+        if indicator in ("CPI", "PPI"):
+            points = self._nbs_price_yoy_points(
+                ak, indicator, start_date, end_date)
+            if points is not None:
+                return points
+            logger.warning(
+                "NBS价格指数(%s)取数失败，回退英为财情历史序列（数据可能滞后）",
+                indicator)
+
+        if indicator in self._MACRO_SERIES:
+            fn_name, dkw, vkw, extra, conf = self._MACRO_SERIES[indicator]
+            df = getattr(ak, fn_name)()
+            return series_to_points(
+                df, indicator, date_keywords=dkw, value_keywords=vkw,
+                start_date=start_date, end_date=end_date, extra=extra, confidence=conf)
+
+        if indicator in self._US_MACRO_SERIES:
+            fn_name, dkw, vkw, extra, conf = self._US_MACRO_SERIES[indicator]
+            df = getattr(ak, fn_name)()
+            return series_to_points(
+                df, indicator, date_keywords=dkw, value_keywords=vkw,
+                start_date=start_date, end_date=end_date, extra=extra, confidence=conf)
+
+        if indicator == "ind:动力煤价格(元/吨)":
+            # 郑煤期货主力连续（ZC0）收盘价代理现货动力煤价，口径必须在extra披露
+            df = ak.futures_main_sina(symbol="ZC0", start_date="20150101")
+            return series_to_points(
+                df, indicator, date_keywords=("日期",), value_keywords=("收盘价",),
+                start_date=start_date, end_date=end_date,
+                extra={"unit": "元/吨", "real_industry_data": True,
+                       "proxy": "郑煤期货主力连续收盘价，非秦皇岛港现货价"},
+                confidence=0.65)
+
+        if indicator.startswith(self._CODE_PREFIXES):
+            return self._stock_fundamental(ak, indicator, start_date, end_date)
+        return None
+
+    def _stock_fundamental(
+        self, ak: Any, indicator: str,
+        start_date: str | None, end_date: str | None,
+    ) -> list[DataPoint]:
+        """个股估值（百度日线PE/PB）或季度财务比率；ETF走关联指数代理估值。"""
+        prefix, code = indicator.split(":", 1)
+        code = code.strip()
+        if prefix in ("PE(TTM)", "PB"):
+            if _is_etf_code(code):
+                return self._etf_proxy_fundamental(
+                    ak, indicator, code, prefix, start_date, end_date)
+            baidu_ind = "市盈率(TTM)" if prefix == "PE(TTM)" else "市净率"
+            df = ak.stock_zh_valuation_baidu(
+                symbol=code, indicator=baidu_ind, period="近三年")
+            return series_to_points(
+                df, indicator, date_keywords=("date", "日期"),
+                value_keywords=("value", baidu_ind),
+                start_date=start_date, end_date=end_date,
+                extra={"valuation": baidu_ind}, confidence=0.8)
+
+        # ETF无个股财务报表，禁止误打个股接口产生误导性数据
+        if prefix in ("资产负债率", "流动比率") and _is_etf_code(code):
+            raise DataFetchError(f"ETF({code})无个股{prefix}财务指标")
+
+        # 季度财务比率（资产负债率/流动比率），一次拉取整表后取列
+        start_year = int(start_date[:4]) if start_date else datetime.now().year - 3
+        df = ak.stock_financial_analysis_indicator(symbol=code, start_year=str(start_year))
+        col_keyword = "资产负债率" if prefix == "资产负债率" else "流动比率"
+        return series_to_points(
+            df, indicator, date_keywords=("日期",), value_keywords=(col_keyword,),
+            start_date=start_date, end_date=end_date,
+            extra={"frequency": "quarterly"}, confidence=0.8)
+
+    # ---------------- ETF 代理估值 ----------------
+
+    def _etf_display_name(self, code: str) -> str:
+        """腾讯快照取ETF简称（进程内TTL缓存24h）；失败返回空串。"""
+        now = time.time()
+        cached = self._etf_name_cache.get(code)
+        if cached and now - cached[0] < _ETF_NAME_TTL_SEC:
+            return cached[1]
+        market = "sh" if code.startswith(("5", "6", "9")) else "sz"
+        name = ""
+        try:
+            resp = requests.get(
+                _TENCENT_QUOTE_URL.format(symbol=f"{market}{code}"),
+                timeout=4, headers={"Referer": "https://gu.qq.com/"})
+            resp.encoding = "gbk"
+            if '"' in resp.text:
+                payload = resp.text.split('"')[1].split("~")
+                if len(payload) > 1:
+                    name = payload[1].strip()
+        except requests.RequestException as exc:
+            logger.warning("ETF简称解析失败(%s): %s", code, str(exc)[:80])
+        self._etf_name_cache[code] = (now, name)
+        return name
+
+    @staticmethod
+    def _proxy_extra(
+        *, valuation: str, etf_code: str, etf_name: str, kind: str,
+        index_name: str, index_code: str | None, source: str, note: str,
+    ) -> dict[str, Any]:
+        """代理估值 DataPoint 统一溯源字段（强制披露代理关系）。"""
+        return {
+            "valuation": valuation,
+            "proxy": True,
+            "proxy_kind": kind,  # industry_index / broad_index
+            "proxy_index": index_code or index_name,
+            "proxy_index_name": index_name,
+            "underlying_etf": etf_code,
+            "etf_name": etf_name,
+            "source": source,
+            "proxy_note": note,
+        }
+
+    def _etf_proxy_fundamental(
+        self, ak: Any, indicator: str, code: str, prefix: str,
+        start_date: str | None, end_date: str | None,
+    ) -> list[DataPoint]:
+        """ETF PE/PB → 最相关行业/宽基指数估值代理（extra强制披露代理关系）。"""
+        etf_name = self._etf_display_name(code)
+        if not etf_name:
+            raise DataFetchError(
+                f"ETF {code} 简称解析失败，无法匹配关联行业/宽基指数估值代理")
+        valuation = "市盈率(TTM)" if prefix == "PE(TTM)" else "市净率"
+
+        # 1) 行业主题优先：中证官网 indicator.xls，仅PE-TTM近20期，无PB
+        for keywords, idx_code, idx_name in _ETF_PROXY_CSINDEX:
+            if any(k in etf_name for k in keywords):
+                if prefix == "PB":
+                    raise DataFetchError(
+                        f"ETF无个股PB；{idx_name}({idx_code})"
+                        "仅披露PE-TTM，PB暂缺")
+                note = (f"ETF本身无个股估值，采用最相关行业指数"
+                        f"「{idx_name}」PE-TTM代理（非ETF自身估值）")
+                return self._etf_csindex_points(
+                    indicator, code, etf_name, idx_code, idx_name,
+                    "industry_index", note, start_date, end_date,
+                    snapshot_fallback=(idx_code == "H30184"))
+
+        # 2) 宽基指数：乐咕 PE/PB 全序列；PE 失败时可降级中证官网序列
+        for keywords, idx_name in _ETF_PROXY_LEGU:
+            if not any(k in etf_name for k in keywords):
+                continue
+            note = (f"ETF本身无个股估值，采用相关宽基指数「{idx_name}」"
+                    "估值代理（非ETF自身估值）")
+            if idx_name == "创业板50" and "创业板50" not in etf_name:
+                note = ("ETF本身无个股估值，创业板指无公开PE/PB序列，"
+                        "采用「创业板50」估值近似代理（非ETF自身估值）")
+            extra = self._proxy_extra(
+                valuation=valuation, etf_code=code, etf_name=etf_name,
+                kind="broad_index", index_name=idx_name, index_code=None,
+                source="AKShare乐咕乐股", note=note)
+            if prefix == "PE(TTM)":
+                try:
+                    df = ak.stock_index_pe_lg(symbol=idx_name)
+                    points = series_to_points(
+                        df, indicator, date_keywords=("日期",),
+                        value_keywords=("滚动市盈率",),
+                        start_date=start_date, end_date=end_date,
+                        extra=extra, confidence=0.7,
+                        exact_date_col="日期", exact_value_col="滚动市盈率")
+                except Exception as exc:  # noqa: BLE001 反爬/不支持→中证官网兜底
+                    oss_code = _LEGU_CSINDEX_CODE.get(idx_name)
+                    if not oss_code:
+                        raise DataFetchError(
+                            f"乐咕宽基PE({idx_name})不可用且无中证官网兜底: "
+                            f"{str(exc)[:80]}") from exc
+                    logger.info("乐咕PE(%s)失败，降级中证官网: %s",
+                                idx_name, str(exc)[:80])
+                    return self._etf_csindex_points(
+                        indicator, code, etf_name, oss_code, idx_name,
+                        "broad_index", note, start_date, end_date,
+                        snapshot_fallback=False,
+                        source_note="乐咕源不可用，中证官网仅近20期PE、无历史分位")
+                if not points:
+                    raise DataFetchError(f"乐咕宽基PE({idx_name})返回空序列")
+                return points
+            # PB：仅乐咕有源；失败（反爬/不支持）如实记缺口，禁止杜撰
+            try:
+                df = ak.stock_index_pb_lg(symbol=idx_name)
+                points = series_to_points(
+                    df, indicator, date_keywords=("日期",),
+                    value_keywords=("市净率",),
+                    start_date=start_date, end_date=end_date,
+                    extra=extra, confidence=0.7,
+                    exact_date_col="日期", exact_value_col="市净率")
+            except Exception as exc:  # noqa: BLE001
+                raise DataFetchError(
+                    f"ETF代理PB：乐咕{idx_name}市净率不可用"
+                    f"（中证官网仅提供PE）：{str(exc)[:80]}") from exc
+            if not points:
+                raise DataFetchError(f"乐咕宽基PB({idx_name})返回空序列")
+            return points
+
+        raise DataFetchError(
+            f"ETF({etf_name})暂无已验证的关联行业/宽基指数估值映射，"
+            "PE/PB代理取数留缺口")
+
+    def _etf_csindex_points(
+        self, indicator: str, code: str, etf_name: str, idx_code: str,
+        idx_name: str, kind: str, note: str,
+        start_date: str | None, end_date: str | None, *,
+        snapshot_fallback: bool, source_note: str = "",
+    ) -> list[DataPoint]:
+        """中证官网 indicator.xls PE-TTM（市盈率2滚动口径）→ 代理 DataPoint。"""
+        url = _CSINDEX_OSS_URL.format(code=idx_code)
+        records: list[dict[str, Any]] = []
+        storage_fallback = False
+        try:
+            resp = requests.get(url, timeout=12, headers=_CSINDEX_HEADERS)
+            resp.raise_for_status()
+            records = parse_csindex_pe(resp.content)
+        except requests.RequestException as exc:
+            if snapshot_fallback:
+                snap = _latest_snapshot("csindex")
+                if snap and snap.get("records"):
+                    records = list(snap["records"])
+                    storage_fallback = True
+                    logger.warning("中证官网PE(%s)失败，使用本地快照: %s",
+                                   idx_code, str(exc)[:80])
+            if not records:
+                raise DataFetchError(
+                    f"关联指数{idx_name}({idx_code})中证官网PE获取失败: "
+                    f"{str(exc)[:80]}") from exc
+        extra = self._proxy_extra(
+            valuation="市盈率(TTM)", etf_code=code, etf_name=etf_name,
+            kind=kind, index_name=idx_name, index_code=idx_code,
+            source="中证指数官网indicator.xls", note=note)
+        if source_note:
+            extra["source_note"] = source_note
+        if storage_fallback:
+            extra["storage_fallback"] = True
+        points: list[DataPoint] = []
+        for rec in records:
+            period = str(rec["period"])
+            if not _in_range(period, start_date, end_date):
+                continue
+            points.append(DataPoint(
+                indicator=indicator, value=float(rec["pe_ttm"]),
+                period_date=period, extra=dict(extra),
+                source_name="中证指数官网(ETF估值代理)", source_url=url,
+                source_type=DataSourceType.API,
+                fetch_method=FetchMethod.WEB_CRAWL,
+                confidence=0.7, verified=False))
+        if not points:
+            raise DataFetchError(
+                f"关联指数{idx_name}({idx_code})PE序列在请求区间内无数据")
+        return points
 
     @staticmethod
     def _sina_symbol(code: str) -> str:
@@ -159,11 +768,24 @@ class AkshareConnector(BaseConnector):
                     df = df[df["日期"].astype(str).str.replace("-", "") <= end_date]
             return df
 
+    def _fetch_sync(
+        self, indicator: str, start_date: str | None, end_date: str | None
+    ) -> list[DataPoint]:
+        """同步取数（线程池执行）：扩展指标直接出点，其余走DataFrame通用转换。"""
+        try:
+            import akshare as ak
+        except ImportError as exc:
+            raise DataFetchError("akshare未安装，请执行: uv sync --extra data") from exc
+        extra = self._load_extra_points(ak, indicator, start_date, end_date)
+        if extra is not None:
+            return extra
+        df = self._load_dataframe(indicator, start_date, end_date)
+        return df_to_data_points(df, indicator, self.source_name, self.source_url)
+
     async def fetch(
         self,
         indicator: str,
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> list[DataPoint]:
-        df = await asyncio.to_thread(self._load_dataframe, indicator, start_date, end_date)
-        return df_to_data_points(df, indicator, self.source_name, self.source_url)
+        return await asyncio.to_thread(self._fetch_sync, indicator, start_date, end_date)

@@ -146,6 +146,28 @@ class MacroRepository(DataPointRepository):
             verified=bool(row["verified"]),
         )
 
+    def _delete_sync(
+        self, indicator: str, start_date: str | None, end_date: str | None
+    ) -> int:
+        sql = "DELETE FROM fact_data_points WHERE indicator = ?"
+        params: list[Any] = [indicator]
+        if start_date:
+            sql += " AND period_date >= ?"
+            params.append(start_date)
+        if end_date:
+            sql += " AND period_date <= ?"
+            params.append(end_date)
+        with self._connect() as conn:
+            cursor = conn.execute(sql, params)
+            return cursor.rowcount
+
+    async def delete_points(
+        self, indicator: str, start_date: str | None = None, end_date: str | None = None
+    ) -> int:
+        """数据修正/坏点清理：按指标（可选区间）删除，返回删除行数。"""
+        return await asyncio.to_thread(
+            self._delete_sync, indicator, start_date, end_date)
+
     def _count_sync(self) -> dict[str, int]:
         with self._connect() as conn:
             rows = conn.execute(

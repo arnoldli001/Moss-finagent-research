@@ -1,0 +1,68 @@
+# 开源策略案例抓取源配置
+#
+# 用途：`python scripts/quant_cases.py fetch` 从这里读源清单。
+# 文件不存在时回退到代码内置清单（src/quant/strategy_cases.py: DEFAULT_SOURCES）。
+#
+# ## 只启用**实测能抓到内容**的源
+#
+# "HTTP 200 不等于能抓到东西"。2026-09-16 实测结论：
+#
+#   GitHub 搜索 API   200 / 161KB 结构化 JSON      ✅ 启用
+#   arXiv q-fin       200 /   8KB Atom XML         ✅ 启用
+#   CSDN 搜索         200 / 174KB 结构化 JSON      ✅ 启用
+#   聚宽社区           200 /   3KB（JS 壳，无正文）  ❌ 不启用
+#   雪球搜索           200，但返回 WAF 挑战页        ❌ 不启用
+#   新浪财经 RSS       404                          ❌ 不启用
+#
+# 抓取报告里会**列出被跳过的源及原因** —— 源悄悄消失会让人以为已覆盖全网。
+#
+# ## kind 可选值
+#   github / arxiv / csdn / xueqiu / rss
+#   rss 用于你自己加的 RSS/Atom 源：把 URL 写进 endpoint。
+
+sources:
+  - name: GitHub
+    kind: github
+    enabled: true
+    limit: 8
+    tags: [开源实现]
+    queries:
+      - "quant backtest strategy stars:>100"
+      - "量化 回测 策略 stars:>100"
+      - "factor investing backtest stars:>50"
+      - "A股 因子 选股 stars:>30"
+
+  - name: arXiv q-fin
+    kind: arxiv
+    enabled: true
+    limit: 8
+    tags: [学术]
+    queries:
+      - "cat:q-fin.PM AND abs:backtest"
+      - "cat:q-fin.ST AND abs:factor"
+      - "cat:q-fin.TR AND abs:momentum"
+
+  - name: CSDN
+    kind: csdn
+    enabled: true
+    limit: 8
+    tags: [技术博客]
+    queries:
+      - "量化回测策略"
+      - "多因子选股"
+      - "回测 未来函数"
+
+  # 需要 JS 过风控，抓取必然失败；保留条目是为了让"为什么没有雪球"有据可查
+  - name: 雪球
+    kind: xueqiu
+    enabled: false
+    limit: 8
+    tags: [社区分享]
+    queries: ["回测 策略", "因子 选股"]
+
+  # 自定义 RSS 源示例（取消注释并填 URL 即可）：
+  # - name: 我的RSS源
+  #   kind: rss
+  #   enabled: true
+  #   limit: 10
+  #   endpoint: "https://example.com/quant/feed.xml"

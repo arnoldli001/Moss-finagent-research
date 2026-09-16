@@ -7,9 +7,10 @@ LLM（reasoning层）只负责解读指标并做周期定位，禁止自造数�
 from __future__ import annotations
 
 from src.core.models import AgentInput, AgentOutput
-from src.core.schemas import Confidence, TraceStep
+from src.core.schemas import Confidence, TraceStep, coerce_confidence
 from src.domain.agents.analysis.base import parse_llm_json
 from src.domain.agents.info.sentiment.logic import compute_sentiment_metrics
+from src.domain.skills.library import SkillLibrary
 from src.infrastructure.llm import LLMGateway, TaskTier
 
 _PHASES = ("乐观", "分歧", "谨慎", "恐慌", "不明确")
@@ -20,9 +21,15 @@ class SentimentAgent:
 
     task_tier: TaskTier = "reasoning"
 
-    def __init__(self, gateway: LLMGateway, agent_id: str = "A07_sentiment") -> None:
+    def __init__(
+        self, gateway: LLMGateway, agent_id: str = "A07_sentiment",
+        skill_library: SkillLibrary | None = None,
+        default_skill: str = "sentiment-heat-tracking",
+    ) -> None:
         self.agent_id = agent_id
         self._gateway = gateway
+        self._skill_library = skill_library
+        self._default_skill = default_skill
 
     def get_capabilities(self) -> dict:
         return {
@@ -33,6 +40,15 @@ class SentimentAgent:
 
     def health_check(self) -> bool:
         return True
+
+    def _load_default_skill(self) -> str:
+        """加载固定技能正文；失败返回空（不阻断主流程）。"""
+        if self._skill_library is None or not self._default_skill:
+            return ""
+        try:
+            return self._skill_library.load_skill(self.agent_id, self._default_skill)
+        except Exception:  # noqa: BLE001 技能加载失败不阻断主流程
+            return ""
 
     async def execute(self, input: AgentInput) -> AgentOutput:
         events = input.payload.get("events", [])
@@ -53,12 +69,18 @@ class SentimentAgent:
             f"{e.get('evidence_quote', '')}"
             for e in events[:30]
         ]
+        skill_text = self._load_default_skill()
+        skill_block = (
+            f"\n\n## 专业技能指引（遵循其Phase步骤与输出要求）\n{skill_text[:4000]}\n"
+            if skill_text else ""
+        )
         prompt = (
             f"## 本地计算的情绪指标（权威数值，禁止修改）\n"
             f"加权情绪分 {metrics['weighted_sentiment']}（[-1,1]，越大越乐观）\n"
             f"事件分布 {metrics['distribution']}\n"
             f"热点主体 {metrics['top_subjects']}\n\n"
             f"## 事件明细\n" + "\n".join(event_lines) +
+            skill_block +
             "\n\n## 任务要求\n基于上述指标与事件做情绪解读与周期定位。输出JSON对象：\n"
             '- "conclusion": 舆情综合研判（120字内，必须引用情绪分与分布数值）\n'
             '- "confidence": "high"|"medium"|"low"\n'
@@ -86,7 +108,7 @@ class SentimentAgent:
         return AgentOutput(
             task_id=input.task_id, agent_id=self.agent_id,
             conclusion=conclusion or f"加权情绪分 {metrics['weighted_sentiment']}",
-            confidence=Confidence(data.get("confidence", "medium")),
+            confidence=coerce_confidence(data.get("confidence", "medium")),
             data_refs=sorted({e.get("item_id", "") for e in events} - {""}),
             trace_id=input.task_id,
             reasoning_steps=[

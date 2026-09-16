@@ -45,6 +45,9 @@ class AuditAgent(BaseAgent):
         except ValidationError as exc:
             raise AgentExecutionError(f"{self.agent_id}输入不合法: {exc}") from exc
 
+    # 信息层以上游文本为输入，合法产出可能为空（如0个事件），不强制数据溯源引用
+    _REF_EXEMPT_AGENTS = {"A05_verifier", "A06_extractor", "A07_sentiment"}
+
     def _check_completeness(self, outputs: list[dict[str, Any]]) -> list[str]:
         issues: list[str] = []
         for a in outputs:
@@ -53,7 +56,7 @@ class AuditAgent(BaseAgent):
                 issues.append(f"{aid}: 缺少conclusion")
             if not a.get("confidence"):
                 issues.append(f"{aid}: 缺少confidence")
-            if not a.get("data_refs"):
+            if aid not in self._REF_EXEMPT_AGENTS and not a.get("data_refs"):
                 issues.append(f"{aid}: 无数据溯源引用")
         return issues
 

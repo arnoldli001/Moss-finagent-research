@@ -46,7 +46,13 @@ class FakeGraph:
             ],
             "errors": [],
             "final_report": "# 报告\n⚠️ 不构成投资建议",
+            "agent_messages": [],
+            "progress": ["FakeGraph 已完成"],
         }
+
+    async def astream(self, state):
+        """模拟LangGraph的astream：以单chunk返回最终state，便于API层实时合并。"""
+        yield await self.ainvoke(state)
 
 
 class FakeBackend:
@@ -58,7 +64,7 @@ class FakeBackend:
     def get_capabilities(self):
         return {"routes": [
             {"name": "模拟产业数据(Demo)", "simulated": True,
-             "indicators": ["ind:科技行业PE(TTM)"]},
+             "indicators": ["ind:白酒批价(元/瓶)"]},
             {"name": "AkShare", "simulated": False, "indicators": ["CPI", "PPI"]},
         ]}
 
@@ -66,18 +72,24 @@ class FakeBackend:
         from src.core.schemas import DataPoint
 
         self.calls[indicator] = self.calls.get(indicator, 0) + 1
-        if indicator == "PPI":
+        if indicator in ("PPI", "M2"):
             values = [100 + i * 2 for i in range(12)]  # 持续环比上行→信号1
             return [
-                DataPoint(indicator="PPI", value=float(values[i]),
+                DataPoint(indicator=indicator, value=float(values[i]),
                           period_date=f"2024-{i + 1:02d}-09")
                 for i in range(12)
             ]
-        if indicator.startswith("stock_close:"):
+        if indicator.startswith(("stock_close:", "index_close:", "etf_close:")):
             prices = [10 * 1.01 ** i for i in range(12)]
             return [
                 DataPoint(indicator=indicator, value=round(prices[i], 3),
                           period_date=f"2024-{i + 1:02d}-28")
+                for i in range(12)
+            ]
+        if indicator.startswith("PE(TTM):"):
+            return [
+                DataPoint(indicator=indicator, value=15.0,
+                          period_date=f"2024-{i + 1:02d}-27")
                 for i in range(12)
             ]
         raise ValueError(f"unsupported {indicator}")
@@ -138,6 +150,58 @@ async def test_analyze_unknown_task_404(client):
     async with http:
         assert (await http.get("/api/v1/research/nope")).status_code == 404
         assert (await http.get("/api/v1/trace/nope")).status_code == 404
+
+
+async def test_stock_name_resolved_to_code(client, monkeypatch):
+    """target填中文简称时后端解析为6位代码采集，原始名称保留用于展示。"""
+    from src.api.routes import research
+
+    async def fake_resolve(text):
+        assert "中际旭创" in text
+        return "300308", "中际旭创"
+
+    monkeypatch.setattr(research, "resolve_stock", fake_resolve)
+
+    captured: dict = {}
+
+    class CapturingGraph(FakeGraph):
+        async def ainvoke(self, state):
+            captured["state"] = state
+            return await super().ainvoke(state)
+
+    state, http = client
+    state.runtime.graph = CapturingGraph()
+    async with http:
+        resp = await http.post("/api/v1/research/analyze", json={
+            "query": "中际旭创目前A股是否有价值洼地，值得持有3-6个月？",
+            "analysis_type": "stock", "target": "中际旭创",
+        })
+        task_id = resp.json()["task_id"]
+        await _wait_done(state.store, task_id)
+
+    assert captured["state"]["target"] == "300308"
+    assert captured["state"]["target_display"] == "中际旭创"
+    # 任务记录展示中文名而非代码
+    assert state.store.get(task_id).target == "中际旭创"
+
+
+async def test_stock_resolve_failure_keeps_original(client, monkeypatch):
+    """名称表不可用时保留原target，任务不失败（下游诚实输出数据不足）。"""
+    from src.api.routes import research
+
+    async def fake_resolve(text):
+        return None
+
+    monkeypatch.setattr(research, "resolve_stock", fake_resolve)
+    state, http = client
+    async with http:
+        resp = await http.post("/api/v1/research/analyze", json={
+            "query": "某不存在公司值得买吗",
+            "analysis_type": "stock", "target": "某不存在公司",
+        })
+        assert resp.status_code == 202
+        record = await _wait_done(state.store, resp.json()["task_id"])
+        assert record.status == "completed"
 
 
 async def test_data_macro_query(client, tmp_dir):
@@ -203,6 +267,26 @@ async def test_health_aggregation(client):
         assert sources["redis_cache"] == "disabled"
 
 
+async def test_agents_meta_endpoint(client):
+    """前端展示元数据：id→中文名 + 置信度中文映射。"""
+    _, http = client
+    async with http:
+        resp = await http.get("/api/v1/agents/meta")
+        body = resp.json()
+        assert resp.status_code == 200
+        assert body["agents"]["A17_recommend"]["name"] == "投研建议Agent"
+        assert body["agents"]["A09_meso"]["name"] == "中观分析Agent"
+        assert body["confidence_zh"] == {"high": "高", "medium": "中", "low": "低"}
+        # 全部运行时 Agent 均有中文名
+        for agent_id in (
+            "A05_verifier", "A06_extractor", "A07_sentiment",
+            "A11_fin_risk", "A12_compliance",
+            "A13_tech", "A14_consumer", "A15_cyclical", "A16_pharma",
+            "A17_recommend", "A18_audit",
+        ):
+            assert agent_id in body["agents"]
+
+
 async def test_scheduler_jobs_list_and_manual_trigger(client):
     state, http = client
     async with http:
@@ -242,16 +326,42 @@ async def test_metrics_endpoint_shape(client):
         assert {"p50", "p95", "p99", "avg", "max"} == set(m["latency_ms"])
 
 
+async def _run_backtest(http: httpx.AsyncClient, payload: dict) -> httpx.Response:
+    """回测异步任务辅助：提交任务后轮询至终态，返回终态响应。
+
+    POST /run 立即返回job_id（长请求会被浏览器/代理掐断，故为异步），
+    测试同事件循环轮询GET /jobs/{id}，FakeBackend瞬时完成。
+    """
+    started = await http.post("/api/v1/backtest/run", json=payload)
+    if started.status_code != 200:
+        return started
+    job_id = started.json()["job_id"]
+    for _ in range(200):
+        status = await http.get(f"/api/v1/backtest/jobs/{job_id}")
+        assert status.status_code == 200
+        body = status.json()
+        if body["status"] != "running":
+            return status
+        await asyncio.sleep(0)
+    raise AssertionError("回测任务轮询超时")
+
+
+def _backtest_result(job_response: httpx.Response) -> dict:
+    body = job_response.json()
+    if body["status"] == "error":
+        raise AssertionError(f"回测任务失败: {body.get('error')}")
+    return body["result"]
+
+
 async def test_backtest_run_endpoint(client):
     from src.api.routes.backtest import clear_fetch_cache
 
     clear_fetch_cache()
     _, http = client
     async with http:
-        resp = await http.post("/api/v1/backtest/run",
-                               json={"indicator": "PPI", "code": "601088"})
+        resp = await _run_backtest(http, {"indicator": "PPI", "code": "601088"})
         assert resp.status_code == 200
-        body = resp.json()
+        body = _backtest_result(resp)
         assert body["periods"] == 12
         assert body["range"] == {"start": "2024-01", "end": "2024-12"}
         assert body["rule"]["kind"] == "trend+PE_gate_long_only"
@@ -264,12 +374,27 @@ async def test_backtest_run_endpoint(client):
 
         # 第二次请求命中TTL缓存：后端不再重复拉取行情
         backend = app.state.runtime.backend
-        resp2 = await http.post("/api/v1/backtest/run",
-                                json={"indicator": "PPI", "code": "601088"})
-        body2 = resp2.json()
+        resp2 = await _run_backtest(http, {"indicator": "PPI", "code": "601088"})
+        body2 = _backtest_result(resp2)
         assert body2["cache"]["price_hit"] is True
         assert backend.calls["stock_close:601088"] == 1
         assert body2["equity_curve"] == body["equity_curve"]
+
+        # 提交响应必须是异步任务契约：立即返回job_id与预估等待
+        clear_fetch_cache()
+        started = await http.post("/api/v1/backtest/run",
+                                  json={"indicator": "PPI", "code": "601088"})
+        assert started.status_code == 200
+        sj = started.json()
+        assert sj["status"] == "running" and sj["job_id"]
+        assert sj["estimated_wait_seconds"] >= 10
+        assert "数据下载中" in sj["message"]
+        running = await http.get(f"/api/v1/backtest/jobs/{sj['job_id']}")
+        assert running.status_code == 200
+        assert running.json()["stage_label"]
+
+        unknown = await http.get("/api/v1/backtest/jobs/no_such_job")
+        assert unknown.status_code == 404
 
 
 async def test_backtest_validation(client):
@@ -281,3 +406,98 @@ async def test_backtest_validation(client):
         bad_ind = await http.post("/api/v1/backtest/run",
                                   json={"indicator": "GDP", "code": "601088"})
         assert bad_ind.status_code == 400
+        bad_type = await http.post("/api/v1/backtest/run",
+                                   json={"indicator": "PPI", "code": "601088",
+                                         "asset_type": "futures"})
+        assert bad_type.status_code == 400
+        pe_on_etf = await http.post("/api/v1/backtest/run",
+                                    json={"indicator": "PPI", "code": "510300",
+                                          "asset_type": "etf",
+                                          "pe_watermark": 20})
+        assert pe_on_etf.status_code == 400
+        bad_date = await http.post("/api/v1/backtest/run",
+                                   json={"indicator": "PPI", "code": "601088",
+                                         "start_date": "2024/03"})
+        assert bad_date.status_code == 400
+        reversed_range = await http.post("/api/v1/backtest/run",
+                                         json={"indicator": "PPI",
+                                               "code": "601088",
+                                               "start_date": "2024-10",
+                                               "end_date": "2024-03"})
+        assert reversed_range.status_code == 400
+
+
+async def test_backtest_date_range_filter(client):
+    from src.api.routes.backtest import clear_fetch_cache
+
+    clear_fetch_cache()
+    _, http = client
+    async with http:
+        resp = await _run_backtest(http, {
+            "indicator": "PPI", "code": "601088",
+            "start_date": "2024-03", "end_date": "2024-10",
+            # 零成本便于断言
+            "commission_rate": 0.0, "stamp_tax_rate": 0.0,
+            "slippage_rate": 0.0, "cash_annual_yield": 0.0,
+        })
+        assert resp.status_code == 200
+        body = _backtest_result(resp)
+        assert body["range"] == {"start": "2024-03", "end": "2024-10"}
+        assert body["periods"] == 8
+        assert len(body["equity_curve"]) == 8
+
+
+async def test_backtest_pe_gate_fetches_pe_and_index_routing(client):
+    from src.api.routes.backtest import clear_fetch_cache
+
+    clear_fetch_cache()
+    state, http = client
+    async with http:
+        # PE闸门开启：应额外拉取PE(TTM)，覆盖率100%
+        resp = await _run_backtest(http, {
+            "indicator": "PPI", "code": "601088", "pe_watermark": 20,
+            "commission_rate": 0.0, "stamp_tax_rate": 0.0,
+            "slippage_rate": 0.0, "cash_annual_yield": 0.0,
+        })
+        assert resp.status_code == 200
+        body = _backtest_result(resp)
+        assert body["pe_gate"]["enabled"] is True
+        assert body["pe_gate"]["watermark"] == 20
+        assert body["pe_gate"]["coverage"] == 1.0
+        assert body["cache"]["pe_hit"] is False
+
+        # 指数标的走 index_close 前缀；M2 指标可用；ETF默认无印花税
+        resp2 = await _run_backtest(http, {
+            "indicator": "M2", "code": "000300", "asset_type": "index",
+        })
+        assert resp2.status_code == 200
+        body2 = _backtest_result(resp2)
+        assert "指数" in body2["asset"]
+        assert body2["rule"]["cost"]["stamp_tax_rate"] == 0.0
+        backend = state.runtime.backend
+        assert backend.calls["PE(TTM):601088"] == 1
+        assert backend.calls["index_close:000300"] == 1
+        assert backend.calls["M2"] == 1
+
+
+async def test_backtest_cost_and_capital_in_response(client):
+    from src.api.routes.backtest import clear_fetch_cache
+
+    clear_fetch_cache()
+    _, http = client
+    async with http:
+        resp = await _run_backtest(http, {
+            "indicator": "PPI", "code": "601088",
+            "initial_capital": 500_000,
+            "commission_rate": 0.0003, "stamp_tax_rate": 0.0005,
+            "slippage_rate": 0.001, "cash_annual_yield": 0.02,
+        })
+        assert resp.status_code == 200
+        s = _backtest_result(resp)["strategy"]
+        assert s["initial_capital"] == 500_000
+        assert s["final_equity"] > 0
+        assert s["trades"] >= 1
+        assert s["total_transaction_cost"] > 0
+        rule = _backtest_result(resp)["rule"]
+        assert rule["cost"]["commission_rate"] == 0.0003
+        assert rule["cost"]["cash_annual_yield"] == 0.02

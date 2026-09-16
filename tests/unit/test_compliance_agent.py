@@ -186,7 +186,24 @@ def test_capabilities_surface():
 def test_stock_plan_includes_compliance():
     plan = plan_run("stock", "600001")
     assert "A12_compliance" in plan["agents"]
-    assert plan["indicators"] == ["stock_close:600001"]
+    # 个股契约：行情+估值(PE/PB)+财务排雷比率（A10/A11数据缺口补齐）+大盘流动性7指标
+    assert plan["indicators"] == [
+        "stock_close:600001",
+        "PE(TTM):600001",
+        "PB:600001",
+        "资产负债率:600001",
+        "流动比率:600001",
+        "mkt:turnover:total",
+        "mkt:turnover:hist",
+        "mkt:turnover_rate:all_a",
+        "mkt:margin_balance",
+        "mkt:margin_balance:hist",
+        "mkt:north_flow",
+        "idx_val:snapshot:all",
+        "mkt:cybkcb:turnover:all",
+        "mkt:cybkcb:val:all",
+        "mkt:cybkcb:spot_summary",
+    ]
 
 
 def test_full_plan_includes_compliance():

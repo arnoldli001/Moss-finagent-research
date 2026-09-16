@@ -1,19 +1,19 @@
-# 模型路由配置
+﻿# 模型路由配置
 
 # 任务层级 → 主备模型（主模型失败自动降级到fallback）
 routing:
   light:              # 数据清洗、格式化等基础任务
     primary: local_light
-    fallback: deepseek-v4-flash
+    fallback: deepseek-flash
   medium:             # 信息层处理（A05去伪/A06提取）：本地模型为主，云端兜底
     primary: local_medium
-    fallback: deepseek-v4-flash
+    fallback: deepseek-flash
   reasoning:          # 宏观/中观/微观/财务风险等核心分析
-    primary: deepseek-v4-flash
+    primary: deepseek-flash
     fallback: local_medium
   decision:           # 投研建议综合（A17）
     primary: deepseek-v4-pro
-    fallback: deepseek-v4-flash
+    fallback: deepseek-flash
 
 models:
   local_light:
@@ -30,11 +30,11 @@ models:
     max_tokens: 4096
     temperature: 0.1
 
-  deepseek-v4-flash:
+  deepseek-flash:
     provider: "deepseek"
-    model_name: "deepseek-v4-flash"
+    model_name: "deepseek-flash"
     base_url: "https://api.deepseek.com"
-    max_tokens: 4096
+    max_tokens: 4096  # 推理模型思维链+正文：3072推理+1024输出足够，过大会导致延迟与浪费
     temperature: 0.1
     cost:
       input_cache_hit: 0.02  # 元/百万token
@@ -45,19 +45,10 @@ models:
     provider: "deepseek"
     model_name: "deepseek-v4-pro"
     base_url: "https://api.deepseek.com"
-    max_tokens: 8192
+    max_tokens: 4096  # decision层输出更结构化但4096足够（含思维链）
     temperature: 0.1
     cost:
       input_cache_hit: 0.5
       input_cache_miss: 4.5
       output: 13.5
-
-  claude-opus-5:
-    provider: "anthropic"
-    model_name: "claude-opus-5"
-    base_url: "https://api.anthropic.com"
-    max_tokens: 8192
-    temperature: 0.1
-    cost:
-      input: 35.0  # 元/百万token
-      output: 175.0
+    # 注：providers.py当前仅注册 ollama/deepseek；pro不可用时decision层自动降级flash

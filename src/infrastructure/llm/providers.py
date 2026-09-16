@@ -53,13 +53,20 @@ def _wrap_response(
 
 
 class OllamaProvider:
-    """本地Ollama /api/chat（非流式）。"""
+    """本地Ollama /api/chat（非流式）。
+
+    关键优化：payload 传 keep_alive（默认24h）让 Ollama 把模型常驻内存，
+    避免每次调用都重新加载 4-5GB 的 GGUF 文件（冷启动 10-20s → 常驻 < 2s）。
+    """
 
     name = "ollama"
+    DEFAULT_KEEP_ALIVE_SEC = 24 * 3600  # 模型常驻内存
 
     def __init__(self, timeout: float | None = None) -> None:
         settings = get_settings()
         self._timeout = timeout or settings.llm_timeout_seconds
+        # HTTP 连接池复用：同 session 复用 TCP 连接，避免每次都握手
+        self._client = httpx.AsyncClient(timeout=self._timeout)
 
     async def chat(
         self, spec: ModelSpec, system: str, prompt: str, *, json_mode: bool = False
@@ -72,15 +79,16 @@ class OllamaProvider:
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
+            "keep_alive": self.DEFAULT_KEEP_ALIVE_SEC,
             "options": {"temperature": spec.temperature, "num_predict": spec.max_tokens},
         }
         if json_mode:
             payload["format"] = "json"
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                resp = await client.post(f"{spec.base_url}/api/chat", json=payload)
-                resp.raise_for_status()
-                data = resp.json()
+            resp = await self._client.post(
+                f"{spec.base_url}/api/chat", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             raise LLMGatewayError(f"Ollama调用失败({spec.model_name}): {exc}") from exc
         return _wrap_response(
@@ -92,6 +100,9 @@ class OllamaProvider:
             int(data.get("eval_count") or 0),
             started,
         )
+
+    async def close(self) -> None:
+        await self._client.aclose()
 
 
 class DeepSeekProvider:

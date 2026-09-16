@@ -58,7 +58,7 @@ python scripts/seed_demo_data.py
 ## 四、启动服务
 
 ```bash
-# 启动API服务（本机8000端口常被占用，统一使用8100）
+# 启动API服务（默认端口8100）
 PYTHONPATH=. uvicorn src.api.main:app --port 8100
 
 # 启动Worker与Beat（Windows演示用solo池；无Redis时可跳过，API支持进程内手动触发）

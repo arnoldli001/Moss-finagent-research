@@ -13,6 +13,25 @@ _TRADING_MONTHS = 12
 
 
 @dataclass(frozen=True)
+class CostConfig:
+    """交易成本与空仓收益（费率均为小数，如万2.5=0.00025）。
+
+    全部默认0 → 与旧版零成本回测完全一致。
+    - commission_rate：单边佣金，买/卖双边各收
+    - stamp_tax_rate：印花税，仅卖出收取（ETF/指数回测可置0）
+    - slippage_rate：单边滑点，买入价上浮/卖出价下压
+    - cash_annual_yield：空仓资金货币基金年化（如0.015），按月/12计息
+    - initial_capital：初始资金，仅用于期末资产金额展示
+    """
+
+    commission_rate: float = 0.0
+    stamp_tax_rate: float = 0.0
+    slippage_rate: float = 0.0
+    cash_annual_yield: float = 0.0
+    initial_capital: float = 1.0
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     rule: dict[str, Any]
     periods: int
@@ -116,12 +135,67 @@ def _curve_metrics(curve: list[float], monthly_returns: list[float]) -> dict[str
     }
 
 
+def _simulate_equity(
+    bars: list[Bar], signals: list[int], cost: CostConfig
+) -> tuple[list[float], dict[str, Any]]:
+    """全仓/空仓月度账户模拟，返回净值序列(长度=月数)与成本明细。
+
+    时点：t月末按signal[t]调仓（执行价含滑点，扣佣金/印花税），
+    持仓经历[t,t+1]股价变动；空仓经历货基月息。月末按收盘价盯市。
+    零成本时净值与旧版逐月月收益连乘完全一致。
+    """
+    cash = cost.initial_capital
+    shares = 0.0
+    prev_holding = False
+    total_fees = 0.0
+    trades = 0
+    equity_path = [cost.initial_capital]
+
+    for t in range(len(bars) - 1):
+        price_t = bars[t].price
+        holding = signals[t] == 1
+        if holding and not prev_holding and price_t > 0:
+            exec_px = price_t * (1 + cost.slippage_rate)
+            # 佣金从现金扣减：shares*px*(1+commission)=cash
+            shares = cash / (exec_px * (1 + cost.commission_rate))
+            total_fees += cash - shares * exec_px
+            cash = 0.0
+            trades += 1
+        elif not holding and prev_holding and price_t > 0:
+            exec_px = price_t * (1 - cost.slippage_rate)
+            gross = shares * exec_px
+            net = gross * (1 - cost.commission_rate - cost.stamp_tax_rate)
+            total_fees += gross - net
+            cash = net
+            shares = 0.0
+            trades += 1
+
+        if shares > 0:
+            equity_next = shares * bars[t + 1].price
+        else:
+            cash *= 1 + cost.cash_annual_yield / _TRADING_MONTHS
+            equity_next = cash
+        equity_path.append(equity_next)
+        prev_holding = holding
+
+    curve = [v / cost.initial_capital for v in equity_path]
+    cost_detail = {
+        "trades": trades,
+        "total_transaction_cost": round(total_fees, 2),
+        "initial_capital": cost.initial_capital,
+        "final_equity": round(equity_path[-1], 2),
+    }
+    return curve, cost_detail
+
+
 def run_backtest(
     bars: list[Bar],
     cfg: TrendPEConfig,
     horizons: tuple[int, ...] = _DEFAULT_HORIZONS,
+    cost: CostConfig | None = None,
 ) -> BacktestResult:
-    """执行完整回测：信号→方向统计→多头策略净值（空仓月收益0）。"""
+    """执行完整回测：信号→方向统计→多头策略净值（含成本/空仓利息）。"""
+    cost = cost or CostConfig()
     signals = generate_signals(bars, cfg)
 
     monthly_returns = [
@@ -129,10 +203,11 @@ def run_backtest(
         for t in range(len(bars) - 1)
         if bars[t].price != 0
     ]
-    # 信号t决定[t,t+1]持仓；多头策略仅在signal==1时持有
-    strategy_monthly: list[float] = []
-    for t, r in enumerate(monthly_returns):
-        strategy_monthly.append(r if signals[t] == 1 else 0.0)
+
+    strat_curve, cost_detail = _simulate_equity(bars, signals, cost)
+    strategy_monthly = [
+        strat_curve[i + 1] / strat_curve[i] - 1 for i in range(len(strat_curve) - 1)
+    ]
 
     def _equity(returns: list[float]) -> list[float]:
         curve = [1.0]
@@ -140,14 +215,16 @@ def run_backtest(
             curve.append(curve[-1] * (1 + r))
         return curve
 
-    strat_curve = _equity(strategy_monthly)
     hold_curve = _equity(monthly_returns)
     strategy_stats = _curve_metrics(strat_curve, strategy_monthly)
     hold_stats = _curve_metrics(hold_curve, monthly_returns)
+    # 实际持仓月数（信号决定，旧实现以非零月收益近似）
+    strategy_stats["invested_months"] = sum(1 for s in signals[:-1] if s == 1)
     strategy_stats["buy_and_hold"] = hold_stats
     strategy_stats["excess_cumulative_return"] = round(
         strategy_stats["cumulative_return"] - hold_stats["cumulative_return"], 6
     )
+    strategy_stats.update(cost_detail)
 
     signal_counts = {"long": signals.count(1), "neutral": signals.count(0),
                      "avoid": signals.count(-1)}
@@ -165,6 +242,12 @@ def run_backtest(
             "eps_pct": cfg.eps_pct,
             "pe_watermark": cfg.pe_watermark,
             "kind": "trend+PE_gate_long_only",
+            "cost": {
+                "commission_rate": cost.commission_rate,
+                "stamp_tax_rate": cost.stamp_tax_rate,
+                "slippage_rate": cost.slippage_rate,
+                "cash_annual_yield": cost.cash_annual_yield,
+            },
         },
         periods=len(bars),
         signals=signal_counts,

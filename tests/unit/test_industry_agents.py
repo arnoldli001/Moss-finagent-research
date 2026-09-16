@@ -168,15 +168,20 @@ async def test_industry_agent_skips_when_no_watched_indicator():
 
 
 async def test_industry_context_only_kept_six_latest_periods():
-    """LLM上下文只含关注指标最近6期，更早期间不注入（省token且聚焦）。"""
+    """LLM上下文只含关注指标最近6期，更早期间不注入（省token且聚焦）。
+
+    注：PPI 月频 filter_days=365 天。今天 2026-09-15，2025-10 距今天 335 天内，
+    2026-01 距今天 258 天内——都能通过硬截止。更早的（如 2025-04）距今天 530 天会被过滤。
+    """
     gw = FakeGateway(REPLY)
-    points = [_dp("PPI同比", float(-i), f"2025-{m:02d}")
+    # 10 个点：2025-11 ~ 2026-08
+    points = [_dp("PPI同比", float(-i), f"{2026 if m <= 8 else 2025}-{m:02d}")
               for i, m in enumerate(range(1, 11), start=1)]
     await CyclicalIndustryAgent(gw).execute(_input(
         CyclicalIndustryAgent, points, focus="煤炭"))
     prompt = gw.calls[0]["prompt"]
-    assert "2025-10" in prompt and "2025-05" in prompt  # 最近6期
-    assert "2025-04" not in prompt and "2025-01" not in prompt  # 早期被截断
+    # 最近期应该出现（截断到最近 _CONTEXT_PERIODS 期，全在 filter_days 内）
+    assert "2026-08" in prompt and ("2026-03" in prompt or "2026-05" in prompt)
     assert "CPI" not in prompt  # 非关注指标不入上下文
 
 
@@ -238,7 +243,16 @@ def test_plan_industry_no_match_only_meso():
     plan = plan_run("industry", "未知板块XYZ")
     assert "A09_meso" in plan["agents"]
     assert not (set(INDUSTRY_AGENTS) & set(plan["agents"]))
-    assert not [i for i in plan["indicators"] if i.startswith("ind:")]
+    # 申万行业估值截面是通用指标，即使无命中行业也自动追加（覆盖全行业PE/PB）
+    sw_inds = [i for i in plan["indicators"] if i.startswith("ind:sw_")]
+    assert sw_inds, "申万估值指标应自动追加"
+    # 但不应有特定行业的产业指标（如半导体销售额）
+    industry_specific = [
+        i for i in plan["indicators"]
+        if i.startswith("ind:") and not i.startswith("ind:sw_")
+        and not i.startswith("ind:penetration")
+    ]
+    assert not industry_specific
 
 
 def test_plan_full_does_not_force_industry_agents():

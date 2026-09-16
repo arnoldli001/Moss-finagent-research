@@ -28,8 +28,9 @@ class RiskAnalysisAgent(AnalysisAgentBase):
         "2. 输出仅为研究参考，不构成投资建议。"
     )
 
-    def __init__(self, gateway, agent_id: str = "A11_fin_risk") -> None:
-        super().__init__(agent_id, gateway)
+    def __init__(self, gateway, agent_id: str = "A11_fin_risk",
+                 skill_library=None) -> None:
+        super().__init__(agent_id, gateway, skill_library)
 
     def get_capabilities(self) -> dict:
         return {

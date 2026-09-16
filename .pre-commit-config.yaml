@@ -1,0 +1,32 @@
+# pre-commit hooks：commit 前自动跑 ruff + pytest
+# 第一次用：pip install pre-commit && pre-commit install
+# 手动跑全部：pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.0
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+        files: src/|tests/|scripts/
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (单元 + 集成)
+        entry: .venv/bin/python manage.py test tests -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [commit, push]
+        # 失败时阻断 commit（--no-verify 可跳过）
+
+      - id: type-check
+        name: 类型检查 (可选)
+        entry: .venv/bin/python -c "import mypy"
+        language: system
+        pass_filenames: false
+        always_run: false
+        stages: [push]
+        verbose: true

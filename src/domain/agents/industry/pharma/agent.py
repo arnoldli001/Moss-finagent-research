@@ -11,7 +11,7 @@ class PharmaIndustryAgent(IndustryAgentBase):
     industry_name = "医药"
     framework = "政策周期（集采/医保谈判）× 研发管线兑现节奏 双轮驱动"
     watch_keywords = ("集采", "医保", "研发费用", "管线", "医药", "医疗", "创新药",
-                      "器械", "临床")
+                      "器械", "临床", "ind:sw_", "ind:penetration")
     pe_high_watermark = 45.0
     capabilities_names = ("policy_cycle_analysis", "pipeline_valuation")
 

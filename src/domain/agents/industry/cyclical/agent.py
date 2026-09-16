@@ -11,7 +11,7 @@ class CyclicalIndustryAgent(IndustryAgentBase):
     industry_name = "周期"
     framework = "基钦库存周期（被动去库→主动补库→被动补库→主动去库）与供需缺口"
     watch_keywords = ("PPI", "库存", "产能", "价格", "煤炭", "有色", "钢铁", "化工",
-                      "原油", "水泥")
+                      "原油", "水泥", "ind:sw_", "ind:penetration")
     pe_high_watermark = 20.0
     capabilities_names = ("inventory_cycle_analysis", "supply_gap_pricing")
 

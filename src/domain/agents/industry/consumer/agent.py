@@ -10,7 +10,8 @@ class ConsumerIndustryAgent(IndustryAgentBase):
 
     industry_name = "消费"
     framework = "消费升级/降级分层 + 渠道库存周期 + 品牌溢价持续性"
-    watch_keywords = ("CPI", "社零", "零售", "客单价", "毛利", "白酒", "食品", "消费")
+    watch_keywords = ("CPI", "社零", "零售", "客单价", "毛利", "白酒", "食品",
+                      "消费", "ind:sw_", "ind:penetration")
     pe_high_watermark = 35.0
     capabilities_names = ("consumer_demand_analysis", "channel_inventory_tracking")
 

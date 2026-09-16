@@ -68,9 +68,12 @@ class RunLog:
         return records[-limit:]
 
     def is_paused(self, job_name: str) -> bool:
-        """最近N次执行全部失败 → 暂停（等人工介入）。"""
+        """最近N次执行全部失败 → 暂停（等人工介入）。
+
+        partial（部分指标成功）与success一样中断连续失败计数。
+        """
         history = [r for r in self.read_all(job_name, limit=10000)
-                   if r["status"] in ("success", "failed")]
+                   if r["status"] in ("success", "partial", "failed")]
         tail = history[-PAUSE_AFTER_CONSECUTIVE_FAILURES:]
         return (
             len(tail) == PAUSE_AFTER_CONSECUTIVE_FAILURES
@@ -87,19 +90,21 @@ class RunLog:
         rows = [
             r for r in self.read_all(limit=100000)
             if str(r.get("start_time", "")).startswith(day)
-            and r["status"] in ("success", "failed")
+            and r["status"] in ("success", "partial", "failed")
         ]
         total = len(rows)
         failed = [r for r in rows if r["status"] == "failed"]
+        partial = [r for r in rows if r["status"] == "partial"]
         durations = [r["duration_ms"] for r in rows if r["duration_ms"] is not None]
         reason_counts: dict[str, int] = {}
-        for r in failed:
+        for r in failed + partial:
             reason = (r.get("error_message") or "未知错误")[:80]
             reason_counts[reason] = reason_counts.get(reason, 0) + 1
         return {
             "date": day,
             "total": total,
-            "success": total - len(failed),
+            "success": total - len(failed) - len(partial),
+            "partial": len(partial),
             "failed": len(failed),
             "success_rate": round((total - len(failed)) / total, 4) if total else None,
             "avg_duration_ms": int(sum(durations) / len(durations)) if durations else None,

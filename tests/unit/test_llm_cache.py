@@ -1,4 +1,4 @@
-"""LLM语义缓存测试。"""
+﻿"""LLM语义缓存测试。"""
 
 import pytest
 
@@ -14,7 +14,7 @@ from src.infrastructure.llm.models import LLMResponse
 
 def _resp(content: str = "答案") -> LLMResponse:
     return LLMResponse(
-        content=content, model_used="deepseek-v4-flash", provider="deepseek",
+        content=content, model_used="deepseek-flash", provider="deepseek",
         prompt_hash="ph", response_hash="rh",
     )
 
@@ -40,11 +40,25 @@ def test_exact_hit_roundtrip(tmp_dir):
 
 def test_semantic_hit_above_threshold(tmp_dir):
     cache = LLMCache(cache_dir=tmp_dir, ttl_hours=1, semantic_threshold=0.6)
-    cache.put("系统", "请基于宏观流动性与行业景气度，分析贵州茅台的投资价值", _resp("结论A"))
+    cache.put("系统", "请基于宏观流动性与行业景气度，分析贵州茅台的投资价值",
+              _resp("结论A"), agent_id="A08_macro")
 
-    hit = cache.get("系统", "请基于宏观流动性与行业景气度，分析五粮液的投资价值")
+    hit = cache.get("系统", "请基于宏观流动性与行业景气度，分析五粮液的投资价值",
+                    agent_id="A08_macro")
     assert hit is not None
     assert hit.cache_kind == "semantic"
+
+
+def test_semantic_cross_agent_isolation(tmp_dir):
+    """同一Agent内语义复用允许；跨Agent（如A05核验→A06抽取）禁止语义命中。"""
+    cache = LLMCache(cache_dir=tmp_dir, ttl_hours=1, semantic_threshold=0.6)
+    cache.put("核验系统", "请基于宏观流动性与行业景气度，分析贵州茅台的投资价值",
+              _resp("结论A"), agent_id="A05_verifier")
+    # 高度相似的输入但来自不同Agent → 不得命中（防止结论串台）
+    assert cache.get("核验系统", "请基于宏观流动性与行业景气度，分析五粮液的投资价值",
+                     agent_id="A06_extractor") is None
+    # 调用方不带agent_id（旧用法）同样不做语义复用
+    assert cache.get("核验系统", "请基于宏观流动性与行业景气度，分析五粮液的投资价值") is None
 
 
 def test_miss_below_threshold(tmp_dir):

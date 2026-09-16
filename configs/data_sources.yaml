@@ -1,67 +1,104 @@
-# 数据源配置
+# 数据源配置（status: active=已接入连接器；planned=规划中，尚无连接器代码）
 
 data_sources:
-  stats_gov:
-    name: "国家统计局"
-    base_url: "https://data.stats.gov.cn"
-    type: "official"
-    priority: "P0"
-    update_frequency: "随官方发布"
-    indicators: ["GDP", "CPI", "PPI", "PMI", "工业增加值"]
-
-  pbc:
-    name: "中国人民银行"
-    base_url: "http://www.pbc.gov.cn"
-    type: "official"
-    priority: "P0"
-    update_frequency: "月度/季度"
-    indicators: ["社融", "M2", "货币当局资产负债表"]
-
-  fred:
-    name: "FRED"
-    base_url: "https://fred.stlouisfed.org"
+  xtquant:
+    name: "迅投QMT(xtquant)"
+    base_url: "qmt://127.0.0.1:58610"
     type: "api"
-    priority: "P1"
-    update_frequency: "实时"
-    indicators: ["美联储资产负债表", "联邦基金利率", "10年期国债收益率"]
+    status: "active"
+    priority: "P0"
+    update_frequency: "日频（全历史，需XtMiniQmt运行登录，scripts/download_qmt_data.py预下载）"
+    indicators: ["stock_close/index_close/etf_close:{code} 日线（个股/ETF前复权，指数不除权）"]
+    note: "本地终端数据，沪深A股+宽基指数+ETF；服务不可用时自动回退本地CSV/AkShare"
 
-  noaa:
-    name: "NOAA"
-    base_url: "https://psl.noaa.gov"
+  local_csv:
+    name: "本地行情CSV"
+    base_url: "file://${LOCAL_QUOTE_DIR}"
     type: "file"
-    priority: "P1"
-    update_frequency: "月度/周度"
-    indicators: ["ONI", "Niño3.4", "MEI"]
+    status: "active"
+    priority: "P0"
+    update_frequency: "依赖QMT导出（迅投price_{code}.csv，SH/SZ子目录）"
+    indicators: ["stock_close/index_close/etf_close:{code} 日线（复权口径未知）"]
+    note: "经环境变量LOCAL_QUOTE_DIR启用（如 D:/quantTrader/data）；QMT服务未启动时的本地兜底"
 
   akshare:
     name: "AkShare"
     base_url: "https://akshare.akfamily.xyz"
     type: "api"
+    status: "active"
     priority: "P0"
-    update_frequency: "实时/日频"
-    indicators: ["A股行情", "财务数据", "基金数据"]
-
-  tushare:
-    name: "Tushare Pro"
-    base_url: "https://tushare.pro"
-    type: "api"
-    priority: "P0"
-    update_frequency: "实时/日频"
-    indicators: ["A股行情", "财务数据", "指数数据"]
-
-  baostock:
-    name: "BaoStock"
-    base_url: "http://baostock.com"
-    type: "api"
-    priority: "P1"
-    update_frequency: "日频"
-    indicators: ["A股历史行情", "财务数据"]
+    update_frequency: "实时/日频/月频"
+    indicators:
+      - "CPI、PPI（NBS国家统计局上年同月=100指数转同比，次月发布月对齐）"
+      - "M2、社融（货币供应/社融规模）"
+      - "stock_close:{code} 前复权行情（东财主源，新浪回退）"
+      - "index_close:{code} 指数日线（新浪源），etf_close:{code} ETF日线（东财主，新浪备）"
+      - "PE(TTM):{code}、PB:{code}（百度估值，日频近三年）"
+      - "资产负债率:{code}、流动比率:{code}（季度财务比率）"
+      - "ind:社会消费品零售总额同比（官方月度真实数据）"
+      - "ind:动力煤价格(元/吨)（郑煤期货主力收盘价代理现货，extra披露口径）"
+      - "个股新闻 stock_news_em（经news_fetcher自动注入信息层）"
+    note: "需 uv sync --extra data；东财接口偶发断连，已实现源内回退"
 
   mock_industry:
     name: "模拟产业数据(Demo)"
     base_url: "mock://industry-demo"
     type: "simulated"
+    status: "active"
     priority: "P3"
     update_frequency: "静态生成（24个月度点）"
-    indicators: ["半导体销售额/出货量", "社零/白酒批价", "煤价/煤炭库存", "IND申报/集采均价", "行业PE"]
-    note: "付费产业接口（Wind/iFinD/Choice/Tushare Pro）接入前的占位数据，非真实行情；见 DEVELOPMENT_ROADMAP.md B01"
+    indicators:
+      - "半导体销售额同比、芯片出货量同比（无免费源）"
+      - "白酒批价(元/瓶)、重点电厂煤炭库存(万吨)（非标/付费数据）"
+      - "创新药IND申报数量、医保集采药品均价同比（CDE/医保局非结构化，需自建爬虫）"
+      - "科技/消费/周期/医药 4个行业PE(TTM)（巨潮快照接口不适合时间序列）"
+    note: "付费产业接口（Wind/iFinD/Choice）接入前的占位数据，非真实行情；报告自动披露；见 DEVELOPMENT_ROADMAP.md B01"
+
+  # ---- 以下为规划数据源：data_sources.yaml声明但尚无连接器实现，路由不会命中 ----
+  stats_gov:
+    name: "国家统计局"
+    base_url: "https://data.stats.gov.cn"
+    type: "official"
+    status: "planned"
+    priority: "P1"
+    indicators: ["GDP", "PMI", "工业增加值"]  # CPI/PPI实际已由AkShare提供
+
+  pbc:
+    name: "中国人民银行"
+    base_url: "http://www.pbc.gov.cn"
+    type: "official"
+    status: "planned"
+    priority: "P1"
+    indicators: ["货币当局资产负债表"]  # M2/社融实际已由AkShare提供
+
+  fred:
+    name: "FRED"
+    base_url: "https://fred.stlouisfed.org"
+    type: "api"
+    status: "planned"
+    priority: "P2"
+    indicators: ["美联储资产负债表", "联邦基金利率", "10年期美债收益率"]
+
+  noaa:
+    name: "NOAA"
+    base_url: "https://psl.noaa.gov"
+    type: "file"
+    status: "planned"
+    priority: "P2"
+    indicators: ["ONI", "Niño3.4", "MEI"]
+
+  tushare:
+    name: "Tushare Pro"
+    base_url: "https://tushare.pro"
+    type: "api"
+    status: "planned"
+    priority: "P1"
+    indicators: ["A股行情/财务（需TUSHARE_TOKEN，AkShare已覆盖主要需求）"]
+
+  baostock:
+    name: "BaoStock"
+    base_url: "http://baostock.com"
+    type: "api"
+    status: "planned"
+    priority: "P2"
+    indicators: ["A股历史行情/财务（备用在线源）"]

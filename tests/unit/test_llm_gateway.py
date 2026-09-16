@@ -1,4 +1,4 @@
-"""LLM网关测试（FakeProvider注入，不联网）。"""
+﻿"""LLM网关测试（FakeProvider注入，不联网）。"""
 
 import pytest
 
@@ -60,9 +60,9 @@ async def test_fallback_chain_on_primary_failure(gateway_env):
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
 
     resp = await gw.complete("light", "系统", "任务")
-    assert resp.model_used == "deepseek-v4-flash"  # light层fallback
+    assert resp.model_used == "deepseek-flash"  # light层fallback
     assert resp.fallback_used
-    assert resp.provider_chain == ["local_light", "deepseek-v4-flash"]
+    assert resp.provider_chain == ["local_light", "deepseek-flash"]
 
 
 async def test_cache_hit_skips_provider(gateway_env):

@@ -133,6 +133,41 @@ def _state(**over):
     return {**base, **over}
 
 
+async def test_collect_falls_back_to_stored_snapshot(tmp_dir):
+    """实时采集为空时，A01环节降级读取定时作业已入库的最近快照。"""
+    from src.core.schemas import DataPoint
+
+    repo = MacroRepository(db_path=f"{tmp_dir}/fallback.db")
+    await repo.save_points([DataPoint(
+        indicator="mkt:turnover:total", value=16000.0, unit="亿元",
+        period_date="2026-09-13", source_name="腾讯财经",
+        source_url="http://qt.gtimg.cn/q=sh000001,sz399001", confidence=0.9,
+    )], "task_seed")
+    agents = {
+        # A01实时采集对该指标返回空（模拟东财/腾讯同时不可用）
+        "A01_data_collector": FakeCollector({}),
+        "A02_data_cleaner": DataCleanerAgent(),
+        "A03_data_validator": DataValidatorAgent(),
+        "A04_data_storage": DataStorageAgent(repo),
+        "A18_audit": AuditAgent(),
+    }
+    graph = build_research_graph(
+        agents, chain_path=f"{tmp_dir}/chain_fb.jsonl",
+        llm_audit_path=f"{tmp_dir}/llm_fb.jsonl", repo=repo,
+    )
+    state = _state(analysis_type="stock", target="300308",
+                   plan=[], _planned_indicators=["mkt:turnover:total"])
+    final = await graph.ainvoke(state)
+
+    pts = final["raw_points"]
+    assert len(pts) == 1
+    assert pts[0]["indicator"] == "mkt:turnover:total"
+    assert pts[0]["period_date"] == "2026-09-13"
+    assert pts[0]["extra"]["storage_fallback"] == "live_empty_or_failed"
+    # 有快照兜底时A01不计硬错误
+    assert not [e for e in final["errors"] if "A01_data_collector" in e]
+
+
 async def test_full_graph_pipeline(tmp_dir):
     graph, gw, repo = _build(tmp_dir)
     final = await graph.ainvoke(_state())
@@ -159,8 +194,19 @@ async def test_full_graph_pipeline(tmp_dir):
 
 async def test_plan_routes_by_analysis_type():
     stock_plan = plan_run("stock", "600519")
-    assert stock_plan["indicators"] == ["stock_close:600519"]
+    assert stock_plan["indicators"] == [
+        "stock_close:600519", "PE(TTM):600519", "PB:600519",
+        "资产负债率:600519", "流动比率:600519",
+        # 个股任务确定性追加大盘流动性7指标+双创板块3指标（skill 1.1中观三市）
+        "mkt:turnover:total", "mkt:turnover:hist",
+        "mkt:turnover_rate:all_a", "mkt:margin_balance",
+        "mkt:margin_balance:hist", "mkt:north_flow",
+        "idx_val:snapshot:all",
+        "mkt:cybkcb:turnover:all", "mkt:cybkcb:val:all",
+        "mkt:cybkcb:spot_summary"]
     assert "A10_micro" in stock_plan["agents"] and "A08_macro" not in stock_plan["agents"]
+    # 个股任务默认纳入信息层（采集节点自动拉新闻，无新闻时节点空跳过）
+    assert "A05_verifier" in stock_plan["agents"]
 
     macro_plan = plan_run("macro", "")
     assert macro_plan["indicators"] == ["CPI", "PPI"]
@@ -241,3 +287,119 @@ async def test_news_graph_info_pipeline(tmp_dir):
     assert "审计通过" in audit["conclusion"]
     assert not final["errors"]
     assert ChainVerifier(f"{tmp_dir}/nc.jsonl").verify()["valid"]
+
+
+class _FakeNewsFetcher:
+    """个股新闻 + 主题新闻抓取替身：各返回一条预置新闻。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.topic_calls: list[list[str]] = []
+
+    async def fetch_news(self, code: str, limit: int = 10):
+        self.calls.append(code)
+        return [{"source_name": "界面新闻",
+                 "publish_time": "2026-08-29T10:26:54+08:00",
+                 "title": "贵州茅台中报点评",
+                 "text": "营收稳健增长，现金流充沛"}]
+
+    async def fetch_topic_news(self, keywords, limit: int = 15):
+        self.topic_calls.append(list(keywords))
+        if not keywords:
+            return []
+        return [{"source_name": "东方财富-全球财经",
+                 "publish_time": "2026-09-10T09:00:00+08:00",
+                 "title": f"{keywords[0]}相关快讯",
+                 "text": f"市场围绕{keywords[0]}预期重新定价，风险资产波动加大"}]
+
+
+async def test_stock_auto_news_injection(tmp_dir):
+    """个股任务未传info_items时，采集节点自动拉新闻并触发A05-A07信息层。"""
+    gw = FakeGateway()
+    gw.set("信息核查员", INFO_REPLY5)
+    gw.set("财经信息结构化专家", INFO_REPLY6)
+    gw.set("市场舆情分析师", INFO_REPLY7)
+    gw.set("投研委员会主席", REPLY17)
+    fetcher = _FakeNewsFetcher()
+    agents = {
+        "A01_data_collector": FakeCollector({}),  # 估值/财务点全空，专注验证新闻链路
+        "A02_data_cleaner": DataCleanerAgent(),
+        "A03_data_validator": DataValidatorAgent(),
+        "A04_data_storage": DataStorageAgent(MacroRepository(f"{tmp_dir}/an.db")),
+        "A05_verifier": VerifierAgent(gw),
+        "A06_extractor": ExtractorAgent(gw),
+        "A07_sentiment": SentimentAgent(gw),
+        "A10_micro": MicroAnalysisAgent(gw),  # 数据不足短路，不调LLM
+        "A17_recommend": RecommendationAgent(gw),
+        "A18_audit": AuditAgent(),
+    }
+    graph = build_research_graph(
+        agents, chain_path=f"{tmp_dir}/an_c.jsonl",
+        llm_audit_path=f"{tmp_dir}/an_l.jsonl", news_fetcher=fetcher)
+    final = await graph.ainvoke(_state(analysis_type="stock", target="600519"))
+
+    assert fetcher.calls == ["600519"]
+    assert len(final["info_items"]) == 1  # 自动注入
+    aids = {o["agent_id"] for o in final["agent_outputs"]}
+    assert {"A05_verifier", "A06_extractor", "A07_sentiment"} <= aids
+    assert "信息核验与舆情" in final["final_report"]
+
+
+async def test_stock_no_news_fetcher_info_layer_skipped(tmp_dir):
+    """未配置news_fetcher时信息层节点空跳过，不产生LLM调用。"""
+    gw = FakeGateway()
+    gw.set("投研委员会主席", REPLY17)
+    agents = {
+        "A01_data_collector": FakeCollector({}),
+        "A02_data_cleaner": DataCleanerAgent(),
+        "A03_data_validator": DataValidatorAgent(),
+        "A04_data_storage": DataStorageAgent(MacroRepository(f"{tmp_dir}/nn.db")),
+        "A05_verifier": VerifierAgent(gw),
+        "A10_micro": MicroAnalysisAgent(gw),
+        "A17_recommend": RecommendationAgent(gw),
+        "A18_audit": AuditAgent(),
+    }
+    graph = build_research_graph(
+        agents, chain_path=f"{tmp_dir}/nn_c.jsonl",
+        llm_audit_path=f"{tmp_dir}/nn_l.jsonl")  # news_fetcher=None
+    final = await graph.ainvoke(_state(analysis_type="stock", target="600519"))
+    assert "A05_verifier" not in {o["agent_id"] for o in final["agent_outputs"]}
+
+
+async def test_macro_topic_news_injection(tmp_dir):
+    """宏观问句（美股加息概率）：按主题关键词拉全球快讯，信息层与A08基于事实回答。"""
+    gw = FakeGateway()
+    gw.set("信息核查员", INFO_REPLY5)
+    gw.set("财经信息结构化专家", INFO_REPLY6)
+    gw.set("市场舆情分析师", INFO_REPLY7)
+    gw.set("宏观分析师", MACRO_REPLY)
+    gw.set("投研委员会主席", REPLY17)
+    fetcher = _FakeNewsFetcher()
+    agents = {
+        "A01_data_collector": FakeCollector({}),  # 仅有中国CPI/PPI且故意返回空
+        "A02_data_cleaner": DataCleanerAgent(),
+        "A03_data_validator": DataValidatorAgent(),
+        "A04_data_storage": DataStorageAgent(MacroRepository(f"{tmp_dir}/mt.db")),
+        "A05_verifier": VerifierAgent(gw),
+        "A06_extractor": ExtractorAgent(gw),
+        "A07_sentiment": SentimentAgent(gw),
+        "A08_macro": MacroAnalysisAgent(gw),
+        "A17_recommend": RecommendationAgent(gw),
+        "A18_audit": AuditAgent(),
+    }
+    graph = build_research_graph(
+        agents, chain_path=f"{tmp_dir}/mt_c.jsonl",
+        llm_audit_path=f"{tmp_dir}/mt_l.jsonl", news_fetcher=fetcher)
+    final = await graph.ainvoke(_state(
+        analysis_type="macro", target="",
+        user_query="美股未来9月和10月的加息概率分别有多大？"))
+
+    # 走主题新闻而非个股新闻
+    assert fetcher.calls == []
+    assert fetcher.topic_calls and "加息" in fetcher.topic_calls[0]
+    assert len(final["info_items"]) == 1
+    aids = {o["agent_id"] for o in final["agent_outputs"]}
+    assert {"A05_verifier", "A06_extractor", "A07_sentiment", "A08_macro"} <= aids
+    # A08因有可信事件不再空数据短路
+    assert "宏观分析师" in gw.calls
+    assert "信息核验与舆情" in final["final_report"]

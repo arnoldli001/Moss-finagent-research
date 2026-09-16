@@ -1,6 +1,8 @@
-# Agent配置
+﻿# Agent配置
+# name 字段为前端/报告展示用中文名，agent_id 为系统内部路由稳定标识，禁止混用。
 
 agents:
+  # ===== 数据层 A01-A04 =====
   A01_data_collector:
     name: "数据采集Agent"
     layer: "data"
@@ -29,41 +31,102 @@ agents:
     model: "local_light"
     capabilities: ["db_insert", "version_manage", "lineage_track"]
 
+  # ===== 信息层 A05-A07 =====
+  A05_verifier:
+    name: "信息核验Agent"
+    layer: "info"
+    priority: "P0"
+    model: "local_medium"
+    capabilities: ["source_scoring", "credibility_check", "cross_validation"]
+
+  A06_extractor:
+    name: "事件提取Agent"
+    layer: "info"
+    priority: "P0"
+    model: "local_medium"
+    capabilities: ["event_extract", "entity_recognition", "impact_typing"]
+
+  A07_sentiment:
+    name: "舆情分析Agent"
+    layer: "info"
+    priority: "P1"
+    model: "local_medium"
+    capabilities: ["sentiment_scoring", "hotspot_detect", "cycle_positioning"]
+
+  # ===== 分析层 A08-A12 =====
   A08_macro:
     name: "宏观分析Agent"
     layer: "analysis"
     priority: "P0"
-    model: "deepseek-v4-flash"
+    model: "deepseek-flash"
     capabilities: ["cycle_position", "liquidity_analysis", "cpi_ppi_analysis"]
 
   A09_meso:
     name: "中观分析Agent"
     layer: "analysis"
     priority: "P0"
-    model: "deepseek-v4-flash"
+    model: "deepseek-flash"
     capabilities: ["industry_chain", "bottleneck_identify", "valuation_elasticity"]
 
   A10_micro:
     name: "微观分析Agent"
     layer: "analysis"
     priority: "P0"
-    model: "deepseek-v4-flash"
+    model: "deepseek-flash"
     capabilities: ["stock_research", "valuation", "catalyst_track"]
 
-  A11_financial_risk:
+  A11_fin_risk:
     name: "财务风险Agent"
     layer: "analysis"
     priority: "P1"
-    model: "deepseek-v4-flash"
+    model: "deepseek-flash"
     capabilities: ["z_score", "m_score", "cashflow_analysis"]
 
-  A17_advisory:
+  A12_compliance:
+    name: "合规风险Agent"
+    layer: "analysis"
+    priority: "P1"
+    model: "deepseek-flash"
+    capabilities: ["regulatory_risk", "sanction_check", "governance"]
+
+  # ===== 行业层 A13-A16 =====
+  A13_tech:
+    name: "科技行业Agent"
+    layer: "industry"
+    priority: "P1"
+    model: "deepseek-flash"
+    capabilities: ["semiconductor", "ai_computing", "consumer_electronics"]
+
+  A14_consumer:
+    name: "消费行业Agent"
+    layer: "industry"
+    priority: "P1"
+    model: "deepseek-flash"
+    capabilities: ["liquor", "retail", "consumer_goods"]
+
+  A15_cyclical:
+    name: "周期行业Agent"
+    layer: "industry"
+    priority: "P1"
+    model: "deepseek-flash"
+    capabilities: ["coal", "metals", "chemicals", "shipping"]
+
+  A16_pharma:
+    name: "医药行业Agent"
+    layer: "industry"
+    priority: "P1"
+    model: "deepseek-flash"
+    capabilities: ["innovative_drug", "medical_devices", "procurement_policy"]
+
+  # ===== 决策层 A17 =====
+  A17_recommend:
     name: "投研建议Agent"
     layer: "decision"
     priority: "P0"
     model: "deepseek-v4-pro"
     capabilities: ["signal_aggregate", "conflict_resolve", "recommendation"]
 
+  # ===== 审计层 A18 =====
   A18_audit:
     name: "逻辑审计Agent"
     layer: "audit"

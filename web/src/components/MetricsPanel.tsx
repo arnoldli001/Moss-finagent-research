@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, Health, LlmMetrics } from "../api";
+import { agentLabel } from "../agentMeta";
+import DataSourceHealth from "./DataSourceHealth";
 
 const pct = (v: number | null) => (v === null ? "—" : `${(v * 100).toFixed(1)}%`);
 const ms = (v: number | null) => (v === null ? "—" : `${v}ms`);
@@ -83,32 +85,68 @@ export default function MetricsPanel() {
   const [metrics, setMetrics] = useState<LlmMetrics | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [healthError, setHealthError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  /** LLM 指标（JSONL 实时聚合）：15 秒一刷，单独加载，**不**等健康度。 */
+  const loadMetrics = useCallback(async () => {
     try {
-      const [m, h] = await Promise.all([api.llmMetrics(1000), api.health()]);
+      const m = await api.llmMetrics(1000);
       setMetrics(m.metrics);
-      setHealth(h);
       setError(null);
     } catch (e) {
       setError(`加载运行指标失败：${String(e)}`);
     }
   }, []);
 
+  /**
+   * 数据源健康度：分钟级信息，60 秒一刷，**与指标解耦**。
+   *
+   * 这里曾经是 `Promise.all([metrics, health])` —— 健康度要遍历 3.5 万个分区清单
+   * 并查仓库九表，一旦它慢（或在旧实现里慢到 300 秒超时），整页就永远停在
+   * 「加载指标中…」，而指标本身其实早就拿到了。分开加载后：指标先渲染，
+   * 健康度到了再补上，它失败也只影响自己那一块。
+   */
+  const loadHealth = useCallback(async () => {
+    try {
+      setHealth(await api.health());
+      setHealthError(null);
+    } catch (e) {
+      setHealthError(`数据源健康度获取失败（不影响上方指标）：${String(e)}`);
+    }
+  }, []);
+
   useEffect(() => {
-    refresh();
-    const t = window.setInterval(refresh, 15000);
-    return () => window.clearInterval(t);
-  }, [refresh]);
+    void loadMetrics();
+    void loadHealth();
+    const fast = window.setInterval(() => void loadMetrics(), 15000);
+    const slow = window.setInterval(() => void loadHealth(), 60000);
+    return () => {
+      window.clearInterval(fast);
+      window.clearInterval(slow);
+    };
+  }, [loadMetrics, loadHealth]);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([loadMetrics(), loadHealth()]);
+  }, [loadMetrics, loadHealth]);
 
   if (error) return <div className="error-box">{error}</div>;
-  if (!metrics) return <div className="progress-box"><span className="spinner" />加载指标中…</div>;
+  if (!metrics) {
+    return (
+      <>
+        <div className="progress-box"><span className="spinner" />加载指标中…</div>
+        {healthError && <div className="warn-box">{healthError}</div>}
+      </>
+    );
+  }
 
   const lat = metrics.latency_ms;
 
   return (
     <div>
-      {health && <HealthStrip health={health} />}
+      {health ? <HealthStrip health={health} /> : null}
+      {healthError && <div className="warn-box">{healthError}</div>}
+      <DataSourceHealth />
       <div className="sched-head">
         <div className="warn-box" style={{ margin: 0 }}>
           最近 {metrics.window_calls} 次LLM调用窗口（审计JSONL实时聚合，15秒自动刷新；慢调用阈值3秒）。
@@ -193,7 +231,9 @@ export default function MetricsPanel() {
             <tbody>
               {metrics.by_agent.map((a) => (
                 <tr key={a.agent_id}>
-                  <td className="agent-id">{a.agent_id}</td>
+                  <td className="agent-id" title={a.agent_id}>
+                    {agentLabel(a.agent_id)}
+                  </td>
                   <td>{a.calls}</td>
                 </tr>
               ))}

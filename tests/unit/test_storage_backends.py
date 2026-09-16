@@ -83,6 +83,21 @@ class FakePGConn:
         self._table[key] = row
         return "INSERT 0 1"
 
+    async def fetchval(self, sql: str, *params):
+        # DELETE ... RETURNING CTE：按indicator+区间从内存表移除并回计数
+        if sql.startswith("WITH deleted AS (DELETE"):
+            indicator = params[0]
+            doomed = [
+                k for k, r in self._table.items()
+                if r["indicator"] == indicator
+                and (len(params) < 2 or (r["period_date"] or "") >= params[1])
+                and (len(params) < 3 or (r["period_date"] or "") <= params[2])
+            ]
+            for k in doomed:
+                self._table.pop(k, None)
+            return len(doomed)
+        return None
+
     async def fetch(self, sql: str, *params):
         if "GROUP BY" in sql:
             counts: dict[str, int] = {}
@@ -235,6 +250,11 @@ class FakeInnerRepo:
     async def count_by_indicator(self):
         return {"CPI": len(self.points)}
 
+    async def delete_points(self, indicator, start_date=None, end_date=None):
+        n = len(self.points)
+        self.points = []
+        return n
+
     async def close(self):
         pass
 
@@ -300,3 +320,69 @@ def test_cache_key_distinguishes_ranges():
     assert _cache_key("CPI", "2026-01-01", "2026-06-01") != _cache_key(
         "CPI", "2026-01-01", "2026-07-01"
     )
+
+
+# ---------- delete_points（坏点清理/数据修正） ----------
+
+async def test_sqlite_delete_points_by_indicator_and_range(tmp_dir):
+    repo = MacroRepository(f"{tmp_dir}/del.db")
+    pts = [
+        _point("PE(TTM):510300", 31.78, "2026-09-15"),
+        _point("PE(TTM):510300", 31.20, "2026-09-12"),
+        _point("PB:510300", 1.40, "2026-09-15"),
+    ]
+    await repo.save_points(pts, "cleanup_test")
+
+    deleted = await repo.delete_points(
+        "PE(TTM):510300", end_date="2026-09-12")
+    assert deleted == 1
+    left = await repo.query_points("PE(TTM):510300")
+    assert [p.period_date for p in left] == ["2026-09-15"]
+    # 其他指标不受影响
+    assert len(await repo.query_points("PB:510300")) == 1
+
+    assert await repo.delete_points("PE(TTM):510300") == 1
+    assert await repo.query_points("PE(TTM):510300") == []
+    # 不存在的指标返回0，不报错
+    assert await repo.delete_points("NOPE") == 0
+
+
+def _patch_fake_pg_pool(monkeypatch) -> FakePool:
+    import sys
+    import types
+    fake_pool = FakePool()
+
+    async def fake_create_pool(dsn, **kw):
+        return fake_pool
+
+    asyncpg_stub = types.ModuleType("asyncpg")
+    asyncpg_stub.create_pool = fake_create_pool
+    monkeypatch.setitem(sys.modules, "asyncpg", asyncpg_stub)
+    return fake_pool
+
+
+async def test_postgres_delete_with_fake_pool(monkeypatch):
+    repo = PostgresRepository("postgresql://u:p@h/db")
+    _patch_fake_pg_pool(monkeypatch)
+    pts = [_point("CPI", 2.1, "2026-08-01"), _point("CPI", 2.0, "2026-07-01")]
+    await repo.save_points(pts, "t")
+
+    deleted = await repo.delete_points("CPI", start_date="2026-07-15")
+    assert deleted == 1
+    rows = await repo.query_points("CPI")
+    assert [r.period_date for r in rows] == ["2026-07-01"]
+
+
+async def test_cache_invalidated_on_delete():
+    """删除坏点后必须失效Redis查询缓存，否则下次读仍返回旧缓存。"""
+    inner = FakeInnerRepo()
+    fake_redis = FakeRedis()
+    cached = CachedRepository(inner, "redis://x")
+    cached._client = fake_redis
+
+    await cached.query_points("CPI")  # 回填缓存
+    await cached.delete_points("CPI")
+    # 缓存键被扫描删除
+    assert not any(k.startswith("moss_finagent:dp:CPI:") for k in fake_redis._store)
+    await cached.query_points("CPI")  # 穿透到底层（空列表不再回填）
+    assert inner.query_calls == 2

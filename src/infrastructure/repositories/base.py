@@ -35,6 +35,16 @@ class DataPointRepository(ABC):
     async def count_by_indicator(self) -> dict[str, int]:
         """各指标行数统计（健康检查/冒烟用）。"""
 
+    @abstractmethod
+    async def delete_points(
+        self, indicator: str, start_date: str | None = None, end_date: str | None = None
+    ) -> int:
+        """按指标（可选期间区间）删除数据点，返回删除行数。
+
+        仅用于数据修正/坏点清理（如源口径错误污染本地缓存）；
+        调用方必须通过统一数据层，禁止直接操作数据库。
+        """
+
     async def close(self) -> None:
         """释放连接资源（默认无操作，连接池后端覆盖）。"""
         return None

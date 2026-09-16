@@ -23,12 +23,16 @@ def month_key(text: str | None) -> str | None:
 
 
 def align_monthly(
-    indicator_points: list, price_points: list, indicator_name: str
+    indicator_points: list,
+    price_points: list,
+    indicator_name: str,
+    pe_points: list | None = None,
 ) -> list[Bar]:
     """月度指标 + 日频收盘价 → 内连接对齐的月末Bar序列。
 
     - 指标按period_date所在月归并（同月多条以后到者为准，视作修订）；
     - 价格同月取日期最大的一条（月末收盘）；
+    - PE(TTM)日频序列同月取最新一条，作为月末信号时点的已知估值；
     - 指标period_date语义为发布日时，按发布月对齐即保证信号不偷看。
     """
     indicator_by_month: dict[str, float] = {}
@@ -47,9 +51,20 @@ def align_monthly(
             if key not in last_by_month or day > last_by_month[key][0]:
                 last_by_month[key] = (day, float(value))
 
+    # PE同月取日期最大的一条（月末最新估值，信号时点已知）
+    pe_by_month: dict[str, tuple[str, float]] = {}
+    for p in pe_points or []:
+        key = month_key(getattr(p, "period_date", None))
+        value = getattr(p, "value", None)
+        if key and isinstance(value, (int, float)) and value == value:
+            day = str(getattr(p, "period_date", ""))
+            if key not in pe_by_month or day > pe_by_month[key][0]:
+                pe_by_month[key] = (day, float(value))
+
     months = sorted(set(indicator_by_month) & set(last_by_month))
     return [
         Bar(period=m, price=last_by_month[m][1],
-            indicators={indicator_name: indicator_by_month[m]})
+            indicators={indicator_name: indicator_by_month[m]},
+            pe=pe_by_month[m][1] if m in pe_by_month else None)
         for m in months
     ]

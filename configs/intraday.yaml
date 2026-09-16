@@ -1,0 +1,314 @@
+# 股票做T辅助模块配置（多因子合成打分 + 做T信号）
+#
+# 全部参数热可调：改本文件后重新请求 /api/v1/intraday/snapshot 即生效（按文件mtime自动重载）。
+# 权重约束：weights 各项之和必须恰好等于 100（加载时硬校验，防止总分刻度漂移）。
+
+version: 1
+
+# ============ 因子权重（合计=100，硬校验） ============
+# 贡献分 = 因子得分(-1..1) × 权重；总分 = Σ贡献分 ∈ [-100, 100]
+# 14个维度分三批接入：
+#   ① 原七因子（箱体30/VWAP20/布林15/…）
+#   ② 市场环境三因子（指数量能/板块排行/海外映射）
+#   ③ 交易技能库四因子（缠论结构/筹码量能/情绪周期/股性适配）—— 2026-09-16 接入
+# 本版把原十因子按 0.71 等比缩放（17/11/8/6/6/6/3/6/4/4 = 71），
+# 新增四项合计 29，保持「箱体仍是单项最高权重」与总分刻度 [-100,100] 不变。
+# 想完全回到旧口径：前端权重编辑器一键切 `legacy` 模板（四因子置0、其余恢复24/16/12/8/8/8/4/8/6/6）。
+weights:
+  box: 17             # 箱体/压力位：当前价在N日箱体中的位置（仍为最高权重）
+  vwap: 11            # VWAP偏离：分时均价偏离度z-score
+  boll: 8             # 布林带：%B位置 + 带宽收口/扩张修正
+  macd: 6             # MACD：5分钟与日线DIF/DEA/柱值多周期共振
+  kdj_rsi: 6          # KDJ/RSI：30分钟与日线超买超卖
+  sentiment: 6        # 市场情绪：板块内涨跌家数 + 个股相对板块强度
+  news: 3             # 消息面：NLP情绪打分（DeepSeek API + 偏多/偏空计数交叉校验）
+  index_volume: 6     # 指数量能：所属指数（上证/创业板/科创50/深证成指）量价配合
+  board_rank: 4       # 板块涨幅排行：关联板块涨跌幅 + 全A板块涨幅排名分位
+  overseas: 4         # 海外映射：美股隔夜涨跌 + 韩国SK海力士盘中同步
+  # ---- 交易技能库四因子 ----
+  chan: 12            # 缠论结构：笔中枢位置 + MACD背驰（分时结构 + 日线中枢）
+  chip: 8             # 筹码量能结构：今日量能进度 × 放量位置 × 换手活跃度
+  cycle: 6            # 市场情绪周期：涨停家数/炸板率/最高连板 → 做T环境温度（含退潮闸门）
+  character: 3        # 股性适配：偏离按该股自身日ATR归一化，按震荡/趋势缩放
+
+# ============ 日线做T（日K级别）因子权重（合计=100，硬校验） ============
+# 分时回答「今天在哪一档动手」，日线回答「这只票现在该不该做这一轮滚动」，
+# 两套因子集合完全不同，因此各自独立配平。
+daily_weights:
+  trend: 20           # 趋势结构：均线排列(5/10/60/120) + 年线位置 + 平台突破/破位
+  chan_daily: 18      # 缠论买卖点：日线笔中枢位置 + 背驰 + 三类买卖点接近度
+  volume: 16          # 量价结构：高量柱实顶/实底攻防 + 倍量/缩量/梯量 + 量价16形态
+  position: 14        # 位置与身位：近120日分位 + 距高低点 + 连板高度惩罚
+  signal_rule: 12     # 规则信号质量：B1-B15 / S1-S6 的触发条数与满足度
+  cycle: 10           # 市场情绪周期：周期阶段 → 该阶段的做T适用性
+  character: 10       # 股性适配：做T友好度（振幅×均值回归性×活跃度×涨停基因）
+
+
+# ============ 信号阈值 ============
+thresholds:
+  action: 30     # 动手线：|总分| ≥ 30 且价格触及关键档位 → 实心三角（正式信号）
+  hint: 20       # 提示线：20 ≤ |总分| < 30 且价格触及关键档位 → 空心三角（软提示，小仓位试仓）
+
+# ============ 个股微调（按代码覆盖全局口径） ============
+# 为什么需要：不同标的脾气差得远。实测 300308（中际旭创）日线 ATR=52.8（占价 5.8%），
+# 默认 stop_loss_pct=1% 的止损距离只有 9 元，任何噪声都能打穿；而 600036（招商银行）
+# ATR 只占 1.7%，1% 的止损是合适的。一套全局参数覆盖所有票，必然有一半是错的。
+#
+# 只写要覆盖的项，其余沿用全局；字段名写错会直接报配置错误（不会静默忽略）。
+# 生效时面板会显示「已应用个股微调（overrides.XXXXXX）：…」，避免两套口径混着看。
+#
+# overrides:
+#   "300308":
+#     weights: {boll: 8, vwap: 20}        # 高波动突破股：降低布林权重、提高VWAP偏离
+#     thresholds: {action: 35, hint: 25}  # 波动大 → 阈值抬高，减少噪声信号
+#     levels:
+#       stop_loss_pct: 2.0                # 止损距离下限 2%
+#       atr_stop_mult: 0.8                # 且不小于 0.8×ATR（高波动股的关键）
+#       min_band_pct: 2.0                 # 低吸~高抛最小档位差，否则被摩擦成本吃光
+#   "600036":
+#     levels: {stop_loss_pct: 0.8, atr_stop_mult: 0.5}   # 低波动银行股：止损收紧
+
+# ============ 因子参数 ============
+factors:
+  box:
+    # 箱体取近 N 个交易日的最高/最低（日线，动态支撑压力）
+    lookback_days: 20
+    # 位置→得分 的非线性指数：score = -sign(p-0.5) × |2(p-0.5)|^exponent
+    # exponent=2.5 时 p=0.7 → -0.10（贴近上沿偏空），p=0.2 → +0.28（贴近下沿偏多）
+    exponent: 2.5
+  vwap:
+    # score = clip(-z / z_scale)：z 为「现价相对VWAP偏离率」的当日标准化值
+    z_scale: 3.0
+  boll:
+    window: 20
+    num_std: 2.0
+    # 布林收口（带宽分位 < squeeze_percentile）时，均值回归信号可信度下降 → 打 squeeze_damp 折
+    squeeze_percentile: 0.2
+    squeeze_damp: 0.6
+  macd:
+    fast: 12
+    slow: 26
+    signal: 9
+    # DIF-DEA 相对价格的偏离达到该比例即给满分（0.008 = 0.8%）
+    gap_scale_pct: 0.008
+    cross_bonus: 0.15   # 刚发生金叉/死叉的额外加成
+    tf_weights: { intraday: 0.6, daily: 0.4 }
+  kdj_rsi:
+    kdj_n: 9
+    rsi_n: 14
+    rsi_scale: 40       # score = clip((50 - RSI)/rsi_scale)
+    tf_weights: { intraday: 0.5, daily: 0.5 }
+  sentiment:
+    breadth_weight: 0.5   # 板块内涨跌家数占比
+    rs_weight: 0.5        # 个股相对板块强度
+    rs_scale_pct: 2.0     # 相对板块跑赢/跑输 2% 即给满分
+  news:
+    llm_weight: 0.6       # 大模型返回情绪分权重
+    count_weight: 0.4     # 偏多/偏空计数比权重（LLM不可用时自动升为1.0）
+    count_saturation: 3.0 # count_score = clip(count_saturation × (pos-neg)/(pos+neg))
+    max_items: 10
+    # 消息面LLM层级：light=本地qwen2.5:1.5b（非推理，实测1.1s且稳定出合法JSON）
+    # medium=本地qwen3:8b（推理模型，实测72~85s，且偶发思维链耗尽token导致正文为空）
+    # 新闻情绪是短分类任务、权重仅5，默认 light；需要更深语义判断时再改 medium
+    news_task_tier: light
+    # 空返回/非JSON时的重试次数（重试会追加"直接输出JSON"的严格指令）
+    llm_retries: 1
+    # 单条新闻喂给模型的正文截断长度（越短思维链越短）
+    item_text_chars: 180
+    # 新闻内容未变时复用上次打分（**省 LLM 调用**）。
+    # 依据（data/audit/llm_audit.jsonl）：做T消息面 278 次调用只有 28 个不同 prompt
+    # （重复率 90%，最热的一个被推理 97 次），其中 161 次走本地 qwen3:8b、
+    # 中位 53.7 秒/次 —— 全是白烧算力。开启后 TTL 到期照常抓一次新闻（本来也要抓），
+    # 内容指纹没变就直接复用、不调 LLM。关掉可回到"每个 TTL 周期都重跑"。
+    reuse_when_unchanged: true
+
+  # ---- 新增：指数量能（个股所属指数的量价配合） ----
+  index_volume:
+    change_scale_pct: 1.0   # 指数涨跌幅 ±1% 给方向满分
+    volume_scale: 0.5       # 量能比 ±50% 给量能强度满分
+    # 打分口径：score = 方向 × (0.5 + 0.5×量能强度)
+    #   放量上涨 → +1（流动性支持做多）／缩量上涨 → 0（上涨无量=见顶）
+    #   放量下跌 → -1（放量杀跌）／缩量下跌 → 0（卖压不足）
+    # 即：量能只放大或衰减方向分，不单独给方向
+
+  # ---- 新增：板块涨幅排行 ----
+  board_rank:
+    rank_weight: 0.6        # 全A板块涨幅排名分位权重（主）
+    change_weight: 0.4      # 板块涨跌幅权重（次）
+    change_scale_pct: 2.0   # 板块涨跌幅满分刻度（%）
+
+  # ---- 新增：海外映射（隔夜美股 + 盘中韩股） ----
+  overseas:
+    scale_pct: 3.0          # 映射加权均涨跌 ±3% 给满分
+    overnight_weight: 0.75  # 美股隔夜（驱动跳空）
+    intraday_weight: 0.25   # 韩股盘中同步（与A股同时开市）
+    default_weight: 1.0
+    # 各海外标的权重：与A股映射标的的相关度越高给越高权重
+    weights:
+      usNVDA: 1.5   # 英伟达（AI算力链总龙头）
+      usTSM: 1.2    # 台积电（晶圆代工）
+      usMU: 1.0     # 美光科技（存储）
+      usASX: 1.0    # 日月光半导体（封测）
+      usGLW: 0.8    # 康宁（玻璃基板/光纤）
+      usGOOGL: 0.5  # 谷歌
+      usINTC: 0.5   # 英特尔
+      usORCL: 0.5   # 甲骨文
+      kr000660: 1.0 # 韩国SK海力士（存储，盘中同步）
+
+  # ---- 交易技能库四因子（2026-09-16 接入）----
+  # 缠论结构：分时/日线「包含处理→分型→笔→中枢→MACD背驰」
+  chan:
+    min_bars: 30          # 构建结构所需最少K线
+    min_gap: 4            # 笔的分型之间最少间隔原始K线数（4=新笔口径，5=老笔）
+    overshoot: 0.5        # 现价离开中枢超过 zd/zg 的该比例后位置分饱和
+    area_ratio_max: 0.85  # 创新极值但MACD面积不足前段该比例 → 背驰
+    divergence_weight: 0.5  # 背驰分在中枢位置分中的占比
+
+  # 筹码量能结构：今日量能进度 × 放量位置（高位放量=派发/低位放量=吸筹）
+  chip:
+    volume_ratio_scale: 1.0  # 量能比达到 1+该值 给满分
+    high_position: 0.65      # 现价在当日分时区间的位置高于此值 → 该处放量偏派发
+    low_position: 0.35       # 低于此值 → 该处放量偏吸筹
+
+  # 市场情绪周期：东财涨停池/炸板池/跌停池（akshare，实测单次 0.1~0.2 秒）
+  cycle:
+    enabled: true
+    ttl_seconds: 60          # 池子盘中实时变化，60秒缓存足够跟手
+    veto_signals: true       # 退潮期/冰点/一票否决时禁止正式做T信号（安全关键）
+    neutral_temperature: 50  # 温度≥该值给正分（环境适合动手）
+
+  # 股性适配：用该股自身日ATR归一化偏离，并按震荡/趋势缩放
+  character:
+    sample_days: 250         # 股性画像取样日线根数（约一年）
+    min_sample_days: 60      # 少于该根数记为不可用（不编造股性）
+    atr_scale: 0.35          # 偏离达到 该倍数×日ATR 给满分（0.35≈半日波动量级）
+    suggest_weights: true    # 是否提供「按股性推荐权重模板」
+
+# ============ 数据层 ============
+data:
+  intraday_period: "5m"     # 做T基准周期：5分钟K线
+  daily_context_bars: 120   # 日线上下文K线数（MACD/箱体/分位）
+  minute_cache_ttl: 45      # 分钟线缓存秒数（盘中可短，收盘后无需刷新）
+  # 自选池自动刷新：盘中把所有自选标的的分钟数据取到最新。**服务端**循环执行，
+  # 不依赖浏览器是否开着；只在 09:15~11:30 与 13:00~15:00 生效（节假日按市场时钟跳过）。
+  # 0 = 关闭自动刷新。前端自选列表每分钟取一次缓存，无需手动刷新。
+  watchlist_refresh_seconds: 60
+  # 自选概览缓存秒数：刷新循环写入后前端直接命中缓存，不会每个请求都重算 N 只票
+  # （非盘中自动放宽到 300 秒 —— 收盘后行情不变，重算没有意义）。
+  watchlist_cache_ttl: 60
+  # 报价快车道：现价/涨跌幅每 N 秒走一次**批量**快照（QMT 一次调用取全部，
+  # 9 只实测 0.54ms），与上面的整表重算解耦 —— 价格跟手不必把打分也拉起来。
+  # 实测 9 只一轮 <5ms，5 秒纯属保守值；0 = 关闭（价格随 60 秒那轮一起更新）。
+  quote_refresh_seconds: 5
+  # 日K做T快照缓存秒数 = 前端日K面板的自动刷新周期。日线bar在盘中由逐笔驱动、
+  # 按分钟更新（QMT 订阅后当天形成中bar 1 秒内到位），取「数据源周期的 3 倍」
+  # = 180 秒；服务端缓存同值，避免前端刚取完又重算。
+  daily_snapshot_ttl: 180
+  board_cache_ttl: 120      # 板块快照缓存秒数。冷取要 3~6 秒（子进程 + 同花顺接口），
+                          # 20 秒时几乎每次前端刷新都会过期、每轮重付一遍；
+                          # 且现在过期也会先返回旧值再后台刷新，所以放大到 120 秒
+                          # 不会让数据变旧，只会让后台刷新更少。
+  daily_cache_ttl: 1800     # 日线缓存秒数
+  valuation_cache_ttl: 3600 # 估值/同业缓存秒数（日频）
+  news_cache_ttl: 600       # 消息面缓存秒数
+  request_timeout: 12       # 单次外部请求超时（秒）
+  # 数据源优先级（逐个尝试，全部失败则报数据缺口，绝不使用模拟数据）
+  intraday_sources: [qmt, tencent, eastmoney, sina]
+
+# ============ 交易时段（北京时间） ============
+session:
+  call_auction: "09:25"
+  morning_open: "09:30"
+  morning_close: "11:30"
+  afternoon_open: "13:00"
+  afternoon_close: "15:00"
+
+# ============ 关键价位 ============
+levels:
+  # 止损位 = 低吸线 × (1 - stop_loss_pct/100)；跌破即强制卖出警告并禁止一切低吸信号
+  stop_loss_pct: 1.0
+  # 高抛线 = 箱体上沿（可由 buffer 微调，正数上移）
+  take_profit_buffer_pct: 0.0
+  # 价格触及关键档位的判定带宽（%）：|price - level|/level ≤ band 视为触及
+  touch_band_pct: 0.3
+  # 高抛线不高于布林上轨、低吸线不低于布林下轨时的融合开关
+  # （开启后低吸/高抛各取「箱体与布林带中更早被触及」的那条档位）
+  blend_boll_bands: true
+  # VWAP偏离极值 |z|：达标即视为「价格触及关键档位」（对应需求中的「VWAP极值」触发条件）
+  vwap_extreme_z: 1.5
+  # 低吸线~高抛线的最小档位差（占现价%）：做T一轮双边成本约0.2%
+  # （佣金0.05% + 印花税0.05% + 滑点0.1%），档位差过小会让信号被摩擦成本吃光
+  min_band_pct: 1.5
+  # 档位差上限：防止箱体过宽时低吸/高抛线离现价太远而永不触发
+  max_band_pct: 8.0
+
+# ============ 关联板块（同花顺概念板块名，real-time 快照含板块涨幅/涨跌家数/资金流） ============
+boards:
+  - name: PCB概念
+    kind: concept
+    aliases: ["PCB", "印制电路板", "覆铜板"]
+    # 板块默认海外映射：个股未单独配置时按板块取用（临时分析不在自选池的股票也有映射）
+    overseas: ["usNVDA", "usTSM", "usASX", "usMU", "kr000660"]
+  - name: PET铜箔
+    kind: concept
+    aliases: ["铜箔", "锂电铜箔", "电子铜箔"]
+    overseas: ["usGLW", "usTSM"]
+
+# >>> intraday-watchlist:begin（本段由前端「加/删自选」自动维护）
+# ============ 自选做T标的 ============
+# peers：自选同业股票池（用于逐只 PE/PB 对比，经腾讯批量快照一次取回）
+# industry：巨潮行业分类名（用于自动取"行业中位数PE"作权威对标）
+watchlist:
+  - code: "600150"
+    name: "中国船舶"
+    boards: ["PCB概念"]
+    peers: []
+  - code: "300308"
+    name: "中际旭创"
+    boards: ["CPO概念"]
+    peers: []
+    overseas: ["usNVDA"]
+  - code: "600176"
+    name: "中国巨石"
+    boards: ["PCB概念"]
+    peers: []
+  - code: "588170"
+    name: "科创半导体ETF华夏"
+    boards: []
+    peers: []
+  - code: "603083"
+    name: "剑桥科技"
+    boards: ["共封装光学（CPO）"]
+    peers: []
+  - code: "002463"
+    name: "沪电股份"
+    boards: ["PCB概念"]
+    peers: []
+  - code: "688825"
+    name: "长鑫科技"
+    boards: ["存储芯片"]
+    peers: []
+  - code: "600105"
+    name: "永鼎股份"
+    boards: ["光纤概念"]
+    peers: []
+  - code: "600036"
+    name: "招商银行"
+    boards: ["银行"]
+    peers: []
+# <<< intraday-watchlist:end
+# ============ 信号推送（实心三角才推送；空心三角仅站内） ============
+notify:
+  enabled: true
+  # 仅推送正式信号（实心三角）与止损警告，避免提示线噪音
+  push_solid_only: true
+  # 同标的同方向信号的推送冷却（分钟）
+  cooldown_minutes: 30
+  # 飞书/钉钉/企业微信 群机器人 Webhook（经环境变量注入，禁止硬编码）
+  feishu_webhook_env: "FEISHU_WEBHOOK_URL"
+  dingtalk_webhook_env: "DINGTALK_WEBHOOK_URL"
+  wecom_webhook_env: "WECOM_WEBHOOK_URL"
+  # 无Webhook时回落邮件通道（复用 ALERT_SMTP_* 配置）
+  email_fallback: true
+
+disclaimer: "本模块输出为多因子量化打分的机械结果，不构成投资建议；做T为高风险短线操作，请自行承担全部交易风险。"

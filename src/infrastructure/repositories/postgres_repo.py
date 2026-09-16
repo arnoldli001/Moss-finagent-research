@@ -121,6 +121,26 @@ class PostgresRepository(DataPointRepository):
             records = await conn.fetch(sql, *params)
         return [row_to_point(dict(r)) for r in records]
 
+    async def delete_points(
+        self, indicator: str, start_date: str | None = None, end_date: str | None = None
+    ) -> int:
+        """数据修正/坏点清理：按指标（可选区间）删除，返回删除行数。"""
+        sql = (
+            "WITH deleted AS ("
+            "DELETE FROM fact_data_points WHERE indicator = $1"
+        )
+        params: list[Any] = [indicator]
+        if start_date:
+            params.append(start_date)
+            sql += f" AND period_date >= ${len(params)}"
+        if end_date:
+            params.append(end_date)
+            sql += f" AND period_date <= ${len(params)}"
+        sql += " RETURNING 1) SELECT count(*) FROM deleted"
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            return int(await conn.fetchval(sql, *params))
+
     async def count_by_indicator(self) -> dict[str, int]:
         pool = await self._get_pool()
         async with pool.acquire() as conn:

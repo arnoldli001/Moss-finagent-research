@@ -1,4 +1,5 @@
 import { AgentOutputSummary } from "../api";
+import { agentLabel, confidenceLabel } from "../agentMeta";
 
 const CONFIDENCE_CLASS: Record<string, string> = {
   high: "conf-high",
@@ -45,9 +46,11 @@ export default function AgentTimeline({
         {outputs.map((o) => (
           <li key={o.agent_id} className="timeline-item">
             <div className="timeline-head">
-              <span className="agent-id">{o.agent_id}</span>
+              <span className="agent-id" title={o.agent_id}>
+                {o.agent_name ?? agentLabel(o.agent_id)}
+              </span>
               <span className={`badge ${CONFIDENCE_CLASS[o.confidence] ?? "conf-low"}`}>
-                置信度 {o.confidence}
+                置信度 {o.confidence_zh ?? confidenceLabel(o.confidence)}
               </span>
             </div>
             <p className="conclusion">{o.conclusion}</p>

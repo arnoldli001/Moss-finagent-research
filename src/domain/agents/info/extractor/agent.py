@@ -12,6 +12,7 @@ from src.core.models import AgentInput, AgentOutput
 from src.core.schemas import Confidence, TraceStep
 from src.domain.agents.analysis.base import parse_llm_json
 from src.domain.agents.info.models import normalize_direction, normalize_event_type
+from src.domain.skills.library import SkillLibrary
 from src.infrastructure.llm import LLMGateway, TaskTier
 
 _ITEM_TEXT_CHARS = 500
@@ -26,9 +27,15 @@ class ExtractorAgent:
 
     task_tier: TaskTier = "medium"
 
-    def __init__(self, gateway: LLMGateway, agent_id: str = "A06_extractor") -> None:
+    def __init__(
+        self, gateway: LLMGateway, agent_id: str = "A06_extractor",
+        skill_library: SkillLibrary | None = None,
+        default_skill: str = "news-entity-extraction",
+    ) -> None:
         self.agent_id = agent_id
         self._gateway = gateway
+        self._skill_library = skill_library
+        self._default_skill = default_skill
 
     def get_capabilities(self) -> dict:
         return {
@@ -39,6 +46,15 @@ class ExtractorAgent:
 
     def health_check(self) -> bool:
         return True
+
+    def _load_default_skill(self) -> str:
+        """加载固定技能正文（信息层任务单一，无需触发匹配）；失败返回空。"""
+        if self._skill_library is None or not self._default_skill:
+            return ""
+        try:
+            return self._skill_library.load_skill(self.agent_id, self._default_skill)
+        except Exception:  # noqa: BLE001 技能加载失败不阻断主流程
+            return ""
 
     async def execute(self, input: AgentInput) -> AgentOutput:
         raw_items = input.payload.get("info_items", [])
@@ -61,8 +77,14 @@ class ExtractorAgent:
                 f"- [{item.get('item_id', '?')}] {title} | {text}"
             )
 
+        skill_text = self._load_default_skill()
+        skill_block = (
+            f"\n\n## 专业技能指引（遵循其Phase步骤与输出要求）\n{skill_text[:4000]}\n"
+            if skill_text else ""
+        )
         prompt = (
             "## 待提取信息条目\n" + "\n".join(lines) +
+            skill_block +
             "\n\n## 任务要求\n"
             "从上述条目中提取全部可确认的事件（每条信息可提取0-3个事件）。输出JSON对象：\n"
             '- "events": [{"item_id": "来源条目ID", "event_type": "earnings|merger|policy|'

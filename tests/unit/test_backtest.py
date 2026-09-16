@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from src.backtest.data import align_monthly, month_key
 from src.backtest.engine import (
+    CostConfig,
     forward_return,
     result_to_dict,
     run_backtest,
@@ -165,3 +166,86 @@ def test_align_monthly_inner_join_and_month_end_price():
     assert [b.period for b in bars] == ["2024-02"]
     assert bars[0].price == 11.0
     assert bars[0].indicators == {"PPI": 2.0}
+
+
+def test_align_monthly_attaches_latest_pe_within_month():
+    ind = [DataPoint(indicator="PPI", value=1.0, period_date="2024-02-09")]
+    prices = [DataPoint(indicator="stock_close:x", value=11.0,
+                        period_date="2024-02-28")]
+    pe_points = [
+        DataPoint(indicator="PE(TTM):x", value=14.0, period_date="2024-02-01"),
+        DataPoint(indicator="PE(TTM):x", value=15.5, period_date="2024-02-27"),
+        DataPoint(indicator="PE(TTM):x", value=99.0, period_date="2024-03-01"),
+    ]
+    bars = align_monthly(ind, prices, "PPI", pe_points)
+    assert len(bars) == 1
+    assert bars[0].pe == 15.5  # 同月取最新，但不含次月数据
+
+
+def test_zero_cost_matches_legacy_equity():
+    """CostConfig全默认0时净值与旧版月收益连乘一致（回归保护）。"""
+    n = 20
+    ind = [100 * 1.05 ** i for i in range(n)]
+    prices = [10 * 1.01 ** i for i in range(n)]
+    result = run_backtest(_bars(prices, ind), TrendPEConfig("x"),
+                          cost=CostConfig())
+    # 全程看多（t0中性踏空首月）：t1买入持有到末尾，无成本=精确连乘
+    expected = prices[-1] / prices[1]
+    assert result.strategy["cumulative_return"] == round(expected - 1, 6)
+    assert result.strategy["trades"] == 1
+    assert result.strategy["total_transaction_cost"] == 0.0
+    assert result.strategy["initial_capital"] == 1.0
+    assert result.strategy["final_equity"] == round(expected, 2)
+
+
+def test_costs_reduce_returns_and_capital_scales():
+    n = 24
+    ind = [100 * 1.05 ** i for i in range(n)]
+    prices = [10 * 1.01 ** i for i in range(n)]
+    cfg = TrendPEConfig("x")
+    zero = run_backtest(_bars(prices, ind), cfg, cost=CostConfig()).strategy
+    costly = run_backtest(
+        _bars(prices, ind), cfg,
+        cost=CostConfig(commission_rate=0.00025, stamp_tax_rate=0.0005,
+                        slippage_rate=0.0005, initial_capital=1_000_000.0),
+    ).strategy
+    assert costly["cumulative_return"] < zero["cumulative_return"]
+    # 24个月信号：t1买入，末尾t23仍持有；本序列从不转空 → 仅1次买入
+    assert costly["trades"] == 1
+    assert costly["total_transaction_cost"] > 0
+    assert costly["initial_capital"] == 1_000_000.0
+    assert abs(costly["final_equity"]
+               - round(1_000_000.0 * (1 + costly["cumulative_return"]), 2)) <= 1.0
+
+
+def test_cash_yield_credited_during_flat_months():
+    # 全程看空 → 全程空仓，货基年化12% → 月息1%
+    n = 12
+    ind = [100 * 0.95 ** i for i in range(n)]
+    prices = [10 * 0.98 ** i for i in range(n)]
+    result = run_backtest(
+        _bars(prices, ind), TrendPEConfig("x"),
+        cost=CostConfig(cash_annual_yield=0.12, initial_capital=100.0),
+    )
+    assert result.strategy["trades"] == 0
+    # 11个空仓月，每月×1.01
+    assert result.strategy["cumulative_return"] == round(1.01 ** (n - 1) - 1, 6)
+    assert result.strategy["final_equity"] == round(100.0 * 1.01 ** (n - 1), 2)
+
+
+def test_buy_sell_round_trip_costs_charged_both_legs():
+    # t1看多买入，t2看空卖出（需第4根bar让t2信号可交易）
+    # → 买佣 + 卖佣 + 印花税，双边价格不变
+    ind = [100, 105, 100.0, 100.0]
+    prices = [10, 10, 10, 10]
+    result = run_backtest(
+        _bars(prices, ind), TrendPEConfig("x", eps_pct=1.0),
+        cost=CostConfig(commission_rate=0.001, stamp_tax_rate=0.001,
+                        slippage_rate=0.0, initial_capital=10_000.0),
+    )
+    # 买入：佣金0.1%；卖出：佣金0.1%+印花税0.1%；价格不变→成本≈0.3%
+    loss = -result.strategy["cumulative_return"]
+    assert 0.002 < loss < 0.005
+    assert result.strategy["trades"] == 2
+    assert result.strategy["total_transaction_cost"] > 0
+

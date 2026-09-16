@@ -17,6 +17,8 @@ dependencies = [
     "celery>=5.4",
     "langgraph>=0.2",
     "langchain>=0.3",
+    "pymysql>=1.2.0",
+    "pypinyin>=0.55.0",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +26,7 @@ data = [
     "akshare>=1.14",
     "tushare>=1.4",
     "baostock>=0.8",
+    "xtquant>=250807",  # 迅投QMT本地行情（需XtMiniQmt运行；未运行时自动回退）
 ]
 
 [dependency-groups]
@@ -49,3 +52,9 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# RLS 故意延迟 import sqlalchemy（避免无 SQLAlchemy 环境崩）
+"src/infrastructure/security/rls.py" = ["E402"]
+# scripts/ 下临时脚本质量要求低
+"scripts/*" = ["F", "E402", "I001", "F541"]

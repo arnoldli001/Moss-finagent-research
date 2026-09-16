@@ -65,19 +65,25 @@ class LLMCache:
         self._dir.mkdir(parents=True, exist_ok=True)
         return self._dir / f"{key}.json"
 
-    def get(self, system: str, prompt: str) -> LLMResponse | None:
-        """先精确后语义。返回的response已带cache_hit/cache_kind标记。"""
+    def get(self, system: str, prompt: str, agent_id: str = "") -> LLMResponse | None:
+        """先精确后语义。返回的response已带cache_hit/cache_kind标记。
+
+        语义命中仅限同一agent_id：不同Agent（如A05核验/A06抽取）输入文本
+        大量重叠时3-gram相似度可能越界，跨Agent复用会造成结论串台。
+        """
         key = cache_key(system, prompt)
         hit = self._get_exact(key)
         if hit is not None:
             return self._mark(hit, "exact")
-        return self._get_semantic(system, prompt, exclude=key)
+        return self._get_semantic(system, prompt, exclude=key, agent_id=agent_id)
 
-    def put(self, system: str, prompt: str, response: LLMResponse) -> None:
+    def put(self, system: str, prompt: str, response: LLMResponse,
+            agent_id: str = "") -> None:
         expires_at = time.time() + self._ttl_seconds
         entry = {
             **response.model_dump(mode="json"),
             "vector_text": normalize_text(system + prompt),
+            "agent_id": agent_id,
         }
         key = cache_key(system, prompt)
         self._memory[key] = (expires_at, entry)
@@ -111,9 +117,9 @@ class LLMCache:
         return self._load(key)
 
     def _get_semantic(
-        self, system: str, prompt: str, *, exclude: str
-    ) -> dict[str, Any] | None:
-        """扫描L2文件构建向量索引，取相似度最高且≥阈值的条目。"""
+        self, system: str, prompt: str, *, exclude: str, agent_id: str = ""
+    ) -> LLMResponse | None:
+        """扫描L2文件构建向量索引，取相似度最高且≥阈值的条目（同Agent内）。"""
         if not self._dir.exists():
             return None
         query_vec = _ngram_vector(normalize_text(system + prompt))
@@ -124,6 +130,9 @@ class LLMCache:
                 continue
             entry = self._load(key)
             if entry is None:
+                continue
+            # 无agent_id标记的历史缓存不参与语义复用，避免跨任务串台
+            if not agent_id or entry.get("agent_id") != agent_id:
                 continue
             score = cosine_similarity(query_vec, _ngram_vector(entry.get("vector_text", "")))
             if score >= best_score:

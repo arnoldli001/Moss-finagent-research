@@ -20,6 +20,18 @@ class Confidence(str, Enum):
     LOW = "low"
 
 
+def coerce_confidence(value: Any) -> Confidence:
+    """LLM偶发输出'medium-low'等非枚举值时容错映射，避免整任务失败。"""
+    text = str(value or "").strip().lower()
+    if text in ("high", "medium", "low"):
+        return Confidence(text)
+    if "high" in text:
+        return Confidence.HIGH
+    if "low" in text:
+        return Confidence.LOW
+    return Confidence.MEDIUM
+
+
 StepType = Literal[
     "data_retrieval",
     "indicator_calculation",
@@ -27,6 +39,7 @@ StepType = Literal[
     "llm_inference",
     "cross_validation",
     "final_conclusion",
+    "skill_injection",
 ]
 """推理步骤类型（OBSERVABILITY.md 二）。"""
 
@@ -55,6 +68,7 @@ class DataSourceType(str, Enum):
 
     OFFICIAL = "official"
     API = "api"
+    FILE = "file"
     REPORT = "report"
     NEWS = "news"
 
@@ -64,7 +78,10 @@ class FetchMethod(str, Enum):
 
     WEB_CRAWL = "web_crawl"
     API_CALL = "api_call"
+    FILE_READ = "file_read"
     MANUAL_INPUT = "manual_input"
+    # 降级/代理值：主源不可用时用独立故障域备源或常数代理
+    FALLBACK = "fallback"
 
 
 def hash_content(raw: Any) -> str:

@@ -32,11 +32,19 @@ class IndustryAgentBase(AnalysisAgentBase):
 
     def _requirements(self, payload: AnalysisPayload) -> str:
         focus = payload.focus or f"{self.industry_name}行业"
+        answer_rule = (
+            f'conclusion必须先直接回答用户提问「{payload.user_query[:80]}」，'
+            "再给行业景气研判；"
+            if payload.user_query else ""
+        )
         return (
             f"你正在按「{self.framework}」框架分析{focus}所在的{self.industry_name}行业。\n"
             "请输出JSON对象，字段：\n"
-            f'- "conclusion": {focus}行业景气研判（150字内，必须点名"{focus}"，'
-            "必须引用本地信号中的具体数值，禁止复述与本行业无关的宏观数据）\n"
+            f'- "conclusion": {answer_rule}（200字内，必须点名"{focus}"，'
+            "引用本地信号或信息层事件中的具体事实，禁止复述与本行业无关的数据。\n"
+            "若上下文包含申万行业估值截面，须引用具体行业PE/PB数值判断估值高低；"
+            "若包含渗透率数据，须判断生命周期阶段（预研/导入/成长/成熟/饱和）。\n"
+            "可输出'估值洼地'判断：PE分位低于20%的行业值得关注，高于80%属高估。）\n"
             '- "confidence": "high"|"medium"|"low"\n'
             '- "outlook": "向好"|"平稳"|"走弱"|"不明确"\n'
             '- "cycle_position": 当前行业周期位置（30字内，须用上述框架术语，'
@@ -46,34 +54,161 @@ class IndustryAgentBase(AnalysisAgentBase):
         )
 
     def _build_context(self, payload: AnalysisPayload) -> str:
-        """只注入关注指标（含PE估值点）的最近若干期，避免无关指标冲淡行业焦点。"""
+        """注入关注指标、PE估值点、申万行业估值截面、渗透率数据的最近若干期。
+
+        每行带 DataFreshnessEvaluator 评估的新鲜度图标/权重/标注；
+        expired (conf<0.1) 完全过滤；stale/lagging 展示但标注。
+        """
+        from datetime import date
+
+        from src.core.data_freshness import DataFreshnessEvaluator
+
+        evaluator = DataFreshnessEvaluator()
+        # self.industry_name 直接当行业 hint（行业 Agent 自己知道分析哪个行业）
+        industry_hint = self.industry_name or None
+        today = date.today()
+
         watched = self._watched_points(payload)
         pe_points = [
             p for p in payload.data_points
             if "PE" in str(p.get("indicator", "")).upper() and p not in watched
         ]
         lines: list[str] = []
+        expired_count = 0
+
+        def _format_with_fresh(p: dict[str, Any]) -> str | None:
+            """单行格式化，返回 None 表示 expired 被过滤。"""
+            nonlocal expired_count
+            indicator = str(p.get("indicator", "?"))
+            fe = evaluator.evaluate(
+                indicator, p.get("period_date"), industry_hint, today,
+            )
+            if not fe.should_display:
+                expired_count += 1
+                return None
+            raw_conf = p.get("confidence")
+            display_conf = (
+                min(float(raw_conf), fe.confidence)
+                if raw_conf is not None else fe.confidence
+            )
+            parts = [
+                f"- {indicator} {fe.status_icon}",
+                f"期间 {p.get('period_date', '?')}",
+                f"值 {p.get('value', '缺失')}",
+                f"来源 {p.get('source_name', '?')}",
+                f"置信度 {display_conf:.2f}",
+            ]
+            if fe.weight_multiplier < 1.0:
+                parts.append(f"权重×{fe.weight_multiplier}")
+            if fe.note and fe.status != "expired":
+                parts.append(f"[{fe.note}]")
+            return " | ".join(parts)
+
+        # 常规行业指标（关注指标+PE时序点）
         for points in (watched, pe_points):
             by_indicator: dict[str, list[dict[str, Any]]] = {}
             for p in points:
                 by_indicator.setdefault(str(p.get("indicator", "?")), []).append(p)
-            for indicator, series in by_indicator.items():
+            for _indicator, series in by_indicator.items():
                 series = sorted(series, key=lambda p: str(p.get("period_date", "")),
                                 reverse=True)[:_CONTEXT_PERIODS]
                 for p in sorted(series, key=lambda p: str(p.get("period_date", ""))):
-                    lines.append(
-                        f"- {indicator} | 期间 {p.get('period_date', '?')} "
-                        f"| 值 {p.get('value', '缺失')} | 来源 {p.get('source_name', '?')}"
-                    )
-        return "\n".join(lines) if lines else "（无行业关注指标数据点）"
+                    row = _format_with_fresh(p)
+                    if row:
+                        lines.append(row)
+        # 申万行业估值截面（PE/PB/股息率，按行业名分组展示）
+        sw_points = [
+            p for p in payload.data_points
+            if str(p.get("indicator", "")).startswith("ind:sw_")
+        ]
+        if sw_points:
+            lines.append("\n【申万行业估值截面】")
+            for p in sorted(sw_points, key=lambda x: float(x.get("value", 0))):
+                fe = evaluator.evaluate(
+                    str(p.get("indicator", "?")),
+                    p.get("period_date"), industry_hint, today,
+                )
+                if not fe.should_display:
+                    expired_count += 1
+                    continue
+                extra = p.get("extra") or {}
+                ind_name = extra.get("industry_name", "?")
+                ind_level = extra.get("industry_level", "?")
+                parent = extra.get("parent_industry", "")
+                metric = extra.get("metric", "?")
+                val = p.get("value", "?")
+                parent_str = f"（所属：{parent}）" if parent else ""
+                icon = fe.status_icon if fe.status != "fresh" else ""
+                weight_note = f" 权重×{fe.weight_multiplier}" if fe.weight_multiplier < 1.0 else ""
+                lines.append(
+                    f"- 申万{ind_level} {icon}| {ind_name}{parent_str} | "
+                    f"{metric}={val} | 成份{extra.get('constituent_count', '?')}个"
+                    f"{weight_note}"
+                )
+        # 渗透率数据
+        pen_points = [
+            p for p in payload.data_points
+            if str(p.get("indicator", "")).startswith("ind:penetration:")
+        ]
+        if pen_points:
+            lines.append("\n【渗透率数据（生命周期判断）】")
+            for p in pen_points:
+                fe = evaluator.evaluate(
+                    str(p.get("indicator", "?")),
+                    p.get("period_date"), industry_hint, today,
+                )
+                if not fe.should_display:
+                    expired_count += 1
+                    continue
+                extra = p.get("extra") or {}
+                track = extra.get("track", "?")
+                val = p.get("value", "?")
+                lifecycle = extra.get("lifecycle", "?")
+                source = extra.get("source", "?")
+                note = extra.get("note", "")
+                icon = fe.status_icon if fe.status != "fresh" else ""
+                line = (
+                    f"- {track}：渗透率{val}%（{lifecycle}）{icon}| 来源：{source}"
+                )
+                if note:
+                    line += f" | 备注：{note}"
+                lines.append(line)
+
+        # 头部时效概览
+        header = (
+            f"### 当前日期锚定：{today.isoformat()}\n"
+            f"### 行业：{self.industry_name}\n"
+        )
+        if expired_count:
+            header += f"### ℹ️ {expired_count} 个数据点因过期已过滤\n"
+
+        return header + "\n".join(lines) if lines else header + "（无行业关注指标数据点）"
 
     def _skip_reason(self, payload: AnalysisPayload) -> str | None:
-        """关注指标零命中时跳过LLM：通用CPI/PPI不足以支撑专业行业研判，防硬聊。"""
+        """关注指标零命中且无可信事件且无申万估值/渗透率时跳过LLM。
+
+        信息层提取到事件（如产业链新闻）时允许基于事件做定性研判，避免"有问题无回答"。
+        申万行业估值截面和渗透率数据本身也可支撑行业研判，不应跳过。
+        """
         signal = payload.hint.get("industry_signal") or {}
-        if signal.get("watched_indicator_count", 0) == 0:
+        has_sw_valuation = any(
+            str(p.get("indicator", "")).startswith("ind:sw_")
+            for p in payload.data_points
+        )
+        has_penetration = any(
+            str(p.get("indicator", "")).startswith("ind:penetration:")
+            for p in payload.data_points
+        )
+        if (
+            signal.get("watched_indicator_count", 0) == 0
+            and not payload.events
+            and not payload.verified_texts
+            and not has_sw_valuation
+            and not has_penetration
+        ):
             return (
                 f"采集数据中无{self.industry_name}行业关注指标"
-                f"（关注：{'/'.join(self.watch_keywords[:6])}…），跳过LLM定性"
+                f"（关注：{'/'.join(self.watch_keywords[:6])}…）且无相关可信事件，跳过LLM定性"
             )
         return None
 

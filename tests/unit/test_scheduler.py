@@ -169,3 +169,84 @@ async def test_unknown_job_raises(tmp_dir):
     log = RunLog(f"{tmp_dir}/sched/runs.jsonl")
     with pytest.raises(KeyError):
         await execute_job(None, "not_registered", log)
+
+
+# ---------- 事件告警扫描作业 ----------
+
+class _FakeEventService:
+    def __init__(self, result):
+        self.result = result
+        self.triggers: list[str] = []
+
+    async def run(self, trigger):
+        self.triggers.append(trigger)
+        return self.result
+
+
+class _EventRuntime:
+    def __init__(self, service):
+        self.event_service = service
+
+
+def test_event_alert_job_registered_weekday_1730():
+    spec = JOB_REGISTRY["event_alert_daily"]
+    assert spec.kind == "event_alert_scan"
+    assert spec.cron == "30 17 * * 1-5"
+
+
+async def test_execute_event_scan_success(tmp_dir):
+    from src.domain.alerts.models import ScanResult
+
+    log = RunLog(f"{tmp_dir}/sched/runs.jsonl")
+    service = _FakeEventService(ScanResult(
+        status="success", scanned=10, new_events=3, alerts_created=1,
+        by_level={"high": 1}))
+    rec = await execute_job(
+        _EventRuntime(service), "event_alert_daily", log, trigger="schedule")
+    assert rec["status"] == "success"
+    assert rec["records_processed"] == 1
+    assert service.triggers == ["schedule"]
+
+
+async def test_execute_event_scan_partial_and_failed(tmp_dir):
+    from src.domain.alerts.models import ScanResult
+
+    log = RunLog(f"{tmp_dir}/sched/runs2.jsonl")
+    partial = _FakeEventService(ScanResult(
+        status="partial", scanned=5, new_events=2, alerts_created=1,
+        errors=["备源cls超时"]))
+    rec = await execute_job(
+        _EventRuntime(partial), "event_alert_daily", log)
+    assert rec["status"] == "partial" and "备源cls超时" in rec["error_message"]
+
+    failed = _FakeEventService(ScanResult(
+        status="failed", scanned=0, errors=["全部快讯源无数据或全部被阻断"]))
+    rec2 = await execute_job(
+        _EventRuntime(failed), "event_alert_daily", log, trigger="manual")
+    assert rec2["status"] == "failed" and rec2["error_message"]
+
+
+async def test_execute_event_scan_without_service_marks_failed(tmp_dir):
+    log = RunLog(f"{tmp_dir}/sched/runs3.jsonl")
+
+    class _NoService:
+        event_service = None
+
+    rec = await execute_job(_NoService(), "event_alert_daily", log)
+    assert rec["status"] == "failed"
+    assert "event_service未装配" in rec["error_message"]
+
+
+async def test_execute_event_scan_in_progress_marks_skipped(tmp_dir):
+    """D6：扫描锁冲突时调度作业记skipped而非failed。"""
+    from src.domain.alerts.service import ScanInProgressError
+
+    class _BusyService:
+        async def run(self, trigger):
+            raise ScanInProgressError("扫描已在执行中")
+
+    log = RunLog(f"{tmp_dir}/sched/runs4.jsonl")
+    rec = await execute_job(
+        _EventRuntime(_BusyService()), "event_alert_daily", log)
+    assert rec["status"] == "skipped"
+    assert "跳过" in rec["error_message"]

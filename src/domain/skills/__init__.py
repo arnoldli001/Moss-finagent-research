@@ -1,1 +1,5 @@
-"""domain.skills：分析引擎技能（按{domain}-{action}目录命名，含SKILL.md/scripts/references/assets）。"""
+"""Domain skills：可复用的本地量化研判模块（纯计算，无网络/LLM依赖）。
+
+每个skill消费已采集数据点，产出结构化"本地计算参考"供分析层Agent解读，
+LLM只做解读不做计算（结论可解释、可测试、可追溯到数据点）。
+"""

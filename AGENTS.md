@@ -1,12 +1,13 @@
 # Moss-FinAgent-Research 项目规则
 
 ## 项目定位
-基于多Agent协作的AI辅助投研分析系统（Demo版），面向二级市场投资决策。
+基于多Agent协作的AI辅助投研分析系统。面向二级市场提供投资分析与决策。
 
 ## 环境配置
-- 本地运行Ollama（模型：qwen3.5:4b、gemma4:e4b）
-- 本地运行PostgreSQL + Redis + SQLite
-- 核心推理调用DeepSeek-V4-Flash API
+- 本地运行Ollama（模型以 configs/models.yaml 为准：qwen2.5:1.5b-instruct-q4_K_M、qwen3:8b-q4_K_M）
+- 存储默认SQLite零依赖；PostgreSQL/Redis为可选（DATA_BACKEND=postgres / REDIS_CACHE_ENABLED=true）
+- 本地行情：迅投QMT极简模式(XtMiniQmt)+xtquant（全量日线见 scripts/download_qmt_data.py），不可用时回退本地CSV/AkShare
+- 核心推理调用DeepSeek-V4-Flash API（DEEPSEEK_API_KEY 经环境变量注入）
 
 ## 架构规范
 - 采用LangGraph StateGraph搭建Supervisor调度架构

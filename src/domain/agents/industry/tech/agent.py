@@ -10,7 +10,8 @@ class TechIndustryAgent(IndustryAgentBase):
 
     industry_name = "科技"
     framework = "技术成熟度曲线与渗透率S曲线（导入期→成长期→成熟期→衰退期）"
-    watch_keywords = ("半导体", "芯片", "出货量", "研发", "渗透率", "算力", "AI", "电子")
+    watch_keywords = ("半导体", "芯片", "出货量", "研发", "渗透率", "算力",
+                       "AI", "电子", "ind:sw_", "ind:penetration")
     pe_high_watermark = 50.0  # 成长板块容忍更高估值
     capabilities_names = ("tech_cycle_analysis", "penetration_rate_tracking")
 

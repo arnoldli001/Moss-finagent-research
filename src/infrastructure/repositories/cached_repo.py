@@ -125,6 +125,14 @@ class CachedRepository(DataPointRepository):
     async def count_by_indicator(self) -> dict[str, int]:
         return await self._inner.count_by_indicator()
 
+    async def delete_points(
+        self, indicator: str, start_date: str | None = None, end_date: str | None = None
+    ) -> int:
+        deleted = await self._inner.delete_points(indicator, start_date, end_date)
+        if deleted:
+            await self._invalidate(indicator)
+        return deleted
+
     async def _invalidate(self, indicator: str) -> None:
         """删除某indicator下的全部查询缓存。"""
         client = await self._get_client()

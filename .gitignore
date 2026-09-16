@@ -28,3 +28,7 @@ node_modules/
 
 # TS构建缓存
 *.tsbuildinfo
+
+# 本地临时探针脚本与下载日志（根目录，勿提交）
+/_tmp_*.py
+/_*.log
