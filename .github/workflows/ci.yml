@@ -32,6 +32,8 @@ jobs:
         run: uv sync
 
       - name: Ruff lint
+        # 注意范围：`moss_selector/` 与 `src/auction_select/` 属仓库外的私有资产
+        # （见 .gitignore），公开 checkout 里不存在，加进来会让 CI 直接报路径不存在。
         run: uv run ruff check src tests scripts
 
       - name: Pytest
@@ -58,6 +60,16 @@ jobs:
         run: |
           uv run python -m pytest tests/unit/test_compliance_gate.py \
             tests/unit/test_tenancy.py -q
+
+      # 代码卫生门禁：把「同一口径多处各写一遍」这类漂移变成 CI 断言。
+      # 检查项与理由见 scripts/verify_cleanup.py 的 docstring。
+      - name: 代码卫生（魔鬼数字 / 截断分层 / 时段权威 / 同名不同值）
+        run: uv run python scripts/verify_cleanup.py
+
+      - name: 共享口径单一权威
+        run: |
+          uv run python -m pytest tests/unit/test_market_constants.py \
+            tests/unit/test_trading_session.py -q
 
       - name: 敏感信息扫描（.env.example 与仓库根）
         run: |

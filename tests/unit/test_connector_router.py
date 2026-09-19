@@ -4,6 +4,8 @@
 全部源都旧时回退本地 DB —— 见文件末尾的分节说明。
 """
 
+from datetime import date
+
 import pytest
 
 from src.core.exceptions import DataFetchError
@@ -248,13 +250,23 @@ async def test_db_query_failure_still_reaches_network():
 
 
 async def test_non_ranged_flow_unchanged_uses_fresh_db_without_network():
-    """非区间查询的老行为必须保持不变：DB 够新就直接返回，不打网络。"""
+    """非区间查询的老行为必须保持不变：DB 够新就直接返回，不打网络。
+
+    ⚠️ 这里的 DB 日期必须**相对今天**取，不能写死。
+
+    非区间查询走 `_is_db_fresh()`，它以 `date.today()` 为基准按指数衰减算
+    confidence，**< 0.4 就判定为 stale 并继续打网络**（`stock_close` 的
+    publish_cycle_days=1，隔 2 天就掉到 0.4 以下）。原先这里写死
+    `2026-09-16`，于是这条用例在写入当天通过、两天后自己变红 ——
+    看起来像"代码坏了"，其实是测试把日历钉死了。
+    """
+    today = date.today().isoformat()
     csv_c = _FakeConnector("本地行情CSV", points=[_point("2026-08-31")])
-    repo = _FakeRepo([_point("2026-09-16")])
+    repo = _FakeRepo([_point(today)])
     router = ConnectorRouter([(csv_c, lambda i: i.startswith("stock_close:"))],
                              repo=repo)
     out = await router.fetch("stock_close:300308")
-    assert [p.period_date for p in out] == ["2026-09-16"]
+    assert [p.period_date for p in out] == [today]
     assert csv_c.calls == 0
 
 

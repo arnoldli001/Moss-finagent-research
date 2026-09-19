@@ -322,6 +322,8 @@ def test_parse_time_of_day() -> None:
 
 
 def test_auction_scheduler_falls_back_to_call_auction() -> None:
+    # `src/auction_select/` 是 .gitignore 里的私有核心资产，公开 checkout 里不存在
+    pytest.importorskip("src.auction_select.scheduler")
     from src.auction_select.scheduler import _parse_hhmmss
 
     assert _parse_hhmmss("09:25:00") == (9, 25, 0)

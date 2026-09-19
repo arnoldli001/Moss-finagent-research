@@ -18,10 +18,10 @@ venv/
 .coverage
 htmlcov/
 
-# 运行时数据与日志
-data/
-logs/
-output/
+# 运行时数据与日志（仅根目录；避免误伤代码中名为 data/logs/output 的包）
+/data/
+/logs/
+/output/
 
 # moss_selector 的运行产物（模型/面板/备份体积大，不入库；config 与代码要入库）
 moss_selector/data/
@@ -40,7 +40,7 @@ node_modules/
 
 # 备份文件与下载缓存
 *.bak*
-downloads/
+/downloads/
 
 # ==================== 私有核心资产（本地保留，不进入公开仓库） ====================
 # 竞价选股：逻辑/参数/情绪周期/综合打分（含根目录配置与API路由）

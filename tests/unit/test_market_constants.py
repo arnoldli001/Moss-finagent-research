@@ -29,6 +29,8 @@ from src.core import market_constants
 
 #: 共享口径清单：常量名 → 必须与 `core.market_constants` 取值一致的模块。
 #: 新增共享常量时在这里登记，测试会保证没有任何模块私自另立一份。
+#: 只列**≥2 个来源**的名字 —— 单一来源没有"一致性"可言，
+#: 它的取值由下面的数值断言负责（如 `LIMIT_UP_GAP_PCT_GEM`）。
 SHARED: dict[str, tuple[str, ...]] = {
     "TRADING_DAYS_PER_YEAR": (
         "src.core.market_constants",
@@ -39,7 +41,6 @@ SHARED: dict[str, tuple[str, ...]] = {
         "src.core.market_constants",
         "src.auction_select.features",
     ),
-    "LIMIT_UP_GAP_PCT_GEM": ("src.core.market_constants",),
 }
 
 
@@ -47,10 +48,17 @@ SHARED: dict[str, tuple[str, ...]] = {
 def test_shared_constant_has_single_value(name: str, modules: tuple[str, ...]) -> None:
     values = {}
     for module_name in modules:
-        module = importlib.import_module(module_name)
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            # 公开 checkout 不含 .gitignore 里的私有资产（`src/auction_select/` 等），
+            # 缺模块时只校验剩下的模块，不把私有资产的存在当成公开仓库的前提。
+            continue
         if not hasattr(module, name):
-            pytest.skip(f"{module_name} 不再导出 {name}（视为已收敛，仅提示）")
+            continue
         values[module_name] = getattr(module, name)
+    if len(values) < 2:
+        pytest.skip(f"{name} 在本次 checkout 中只有 {len(values)} 个可见来源")
     distinct = {repr(value) for value in values.values()}
     assert len(distinct) == 1, (
         f"{name} 在不同模块取值不一致（同名不同值是维护陷阱）：\n"
@@ -86,6 +94,9 @@ def test_auction_cap_threshold_not_merged_with_stats_threshold() -> None:
     历史上这两者被混用过一次，`market_constants` 里专门写了「不要合并」。
     这里用一个显式断言把"它们本来就不同"变成可执行事实。
     """
+    # `src/auction_select/` 是 .gitignore 里的私有核心资产，公开 checkout 里不存在；
+    # 缺它就 skip 而不是失败（与 `test_auction_golden.py` 同一处置）。
+    pytest.importorskip("src.auction_select.config")
     from src.auction_select.config import load_config
 
     assert market_constants.STATS_LIMIT_UP_MIN_CIRC_MV == 25e8
