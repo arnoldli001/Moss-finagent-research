@@ -665,8 +665,24 @@ router prefix 也不统一（`auction_select` snake vs `code-engineer` kebab）�
 
 ## 5.5 回归
 
-`2588 passed / 1 failed` —— 唯一失败是 `test_connector_router.py` 的既有无关用例
-（路由层，与本次改动无交集）。
+**`2703 passed / 0 failed`**（175 s）。
+
+前几轮一直挂着的那条"既有无关失败"
+（`test_connector_router.py::test_non_ranged_flow_unchanged_uses_fresh_db_without_network`）
+**不是无关的**，它是一条**定时炸弹测试**，本次一并修掉：
+
+> 该用例给假仓储写死 `period_date="2026-09-16"`，然后断言"DB 够新就直接返回"。
+> 但非区间查询走 `_is_db_fresh()`，它以 **`date.today()`** 为基准按指数衰减算
+> confidence，**< 0.4 即判定 stale 并继续打网络**。`stock_close` 的
+> `publish_cycle_days=1`，落后 1 天 confidence=0.61（过）、落后 3 天 =0.22（挂）。
+> 于是这条用例在写入当天通过、两天后自己变红 —— 报错信息
+> （`assert ['2026-08-31'] == ['2026-09-16']`）看不出与日期有关，
+> 很容易被当成"别人改坏了"而长期挂着。
+>
+> 改法：DB 日期改为 `date.today().isoformat()`，用例不再依赖运行日历。
+
+**教训**：一条长期红的用例等于没有 CI。"已知无关失败"这类豁免要设**有效期**，
+否则它会掩盖下一条真实回归。
 
 ## 5.6 魔鬼数字与代码规范清理（第四批）
 
@@ -747,6 +763,23 @@ rg "str\(exc\)\[:\d+\]" src/
 | `tests/unit/test_trading_session.py`（77 用例） | 把**每个边界分钟**的期望值参数化钉住；并**实测** intraday / fundflow 与权威口径逐分钟一致（不再靠注释） |
 | `tests/unit/test_market_constants.py` | `SHARED` 清单声明"共享口径"，断言从任何模块导入都拿到同一个值 |
 | `scripts/scan_same_name_conflicts.py` | 人工维护用：只报**新出现**的同名不同值 |
+| `scripts/verify_cleanup.py` | 6 项一次跑完（语法 / 截断残留 / 绝对路径 / 时段算术越界 / ruff / 同名不同值），退出码可直接进 CI |
+
+CI 里新增 `compliance` job 的两个 step：
+`代码卫生（魔鬼数字 / 截断分层 / 时段权威 / 同名不同值）` 与 `共享口径单一权威`。
+
+```powershell
+# 本地一条命令复核全部
+.\.venv\Scripts\python.exe scripts\verify_cleanup.py
+```
+
+### 六、定时炸弹测试
+
+除 §5.5 说明的那条外，测试里还有一批**写死日历**的 fixture
+（`test_connector_router.py` 的区间用例用 `2026-08-31 / 2026-09-16 / 2026-09-17`）。
+这些走的是 `start_date/end_date` 区间比较，**不依赖 today**，所以目前稳定；
+但只要有人把它们改成非区间查询就会立刻变成上一条那样。
+已在改动的那条用例上写明原因，其余保持观察。
 
 ### 六、脚本硬编码路径
 
@@ -779,10 +812,33 @@ rg "str\(exc\)\[:\d+\]" src/
 | 10 | `_best_achievable` 向量化 | 做T链路 96% CPU | 中 | 待办 |
 | 11 | A17 上游结论压缩 + ReAct 不重发全量 | A17 占 55% 成本 | 中 | 待办 |
 | 12 | 消掉 `domain → infrastructure` 18 条反依赖 | 分层纪律 | 中 | 待办 |
-| 13 | `str(exc)[:N]` 统一 | 最大一类魔鬼数字 | 半天 | ✅ 已完成（255 处） |
-| 14 | 同名不同值常量归一 + CI 守卫 | 消除口径漂移 | 半天 | ✅ 已完成 |
-| 15 | 评测集 + CI | 工程闭环 | 中 | 待办 |
-| 16 | 拆分 `intraday/service.py` | 可维护性 | 大 | 待办 |
+| 13 | `str(exc)[:N]` 统一 | 最大一类魔鬼数字 | 半天 | ✅ 已完成（258 处 / 65 文件） |
+| 14 | 同名不同值常量归一 + 交易时段单一权威 | 消除口径漂移 | 半天 | ✅ 已完成 |
+| 15 | ruff 清零 + 代码卫生 CI 门禁 | 第一印象 | 小 | ✅ 已完成 |
+| 16 | 修定时炸弹测试 | 让 CI 真的可信 | 极小 | ✅ 已完成 |
+| 17 | 评测集 + CI | 工程闭环 | 中 | 待办 |
+| 18 | 拆分 `intraday/service.py` | 可维护性 | 大 | 待办 |
 
 **若只有半天：做 4 → 5 → 6 → 2（已完成）→ 排查 `auction_select/config.py` 注释**
 （约 4 小时，全是低风险高可见度）。
+
+---
+
+# 七、诚实记录：这次交付里被打回的部分
+
+第一轮交付时，本文档 §六 有 **13 项被标成"✅ 已完成"，其中魔鬼数字相关的
+只写了方案没落地**。用户在代码里发现"好多还没改"，这是准确的。
+
+| 声称 | 实际 | 处置 |
+|---|---|---|
+| "魔鬼数字 13 项全改" | `str(exc)[:N]` 只在一部分文件迁移；`src/auction_select/`、`moss_selector/`、7 个脚本全部漏掉；`TRADING_DAYS_PER_YEAR` 242 vs 252 等真冲突未动 | ✅ 本轮补完，并用 `scripts/verify_cleanup.py` 把"改完了"变成**可执行断言** |
+
+**两条流程改进**（比修代码本身更重要）：
+
+1. **"改完了"必须有可执行的复核命令**。本次的 `scripts/verify_cleanup.py`
+   把 6 项检查做成退出码，任何一项没做干净就会红 —— 不能再靠总结里写"已完成"。
+   第一轮的漏检正是因为用 PowerShell 的 `**` 通配去数残留，它**没有真正递归**，
+   报 0 而实际有 29 处；改用 `pathlib.rglob` 才看见。
+2. **扫描范围要显式列出**，不能靠"我以为"。漏掉 `moss_selector/` 是因为
+   第一轮脚本只扫 `src/`，而它与 `src/` 并列，且被 `.gitignore` 屏蔽、
+   在 `git status` 里看不见。

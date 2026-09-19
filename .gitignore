@@ -37,6 +37,8 @@ node_modules/
 # 本地临时探针脚本与下载日志（根目录，勿提交）
 /_tmp_*.py
 /_*.log
+# 本地跑测试留下的日志（`pytest ... *> tests_full.log`），不是产物
+/*.log
 
 # 备份文件与下载缓存
 *.bak*
