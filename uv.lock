@@ -669,6 +669,19 @@ wheels = [
 ]
 
 [[package]]
+name = "eltdx"
+version = "3.2.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/aa/ea/c5c790d3c6e33d1ea83591c21ecd8a217f9a0df24e018e81fd90b03c0aeb/eltdx-3.2.2.tar.gz", hash = "sha256:5ef7c8750feaa26fa001c8e5ee0d5952ba8c424b3745ae7f66661503f1d3b955", size = 841533, upload-time = "2026-09-12T20:53:31.65Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/be/3ad2856b454702530b8f5062392a7246b41c6888854c60c3f7048418895d/eltdx-3.2.2-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:5f4d0c4988f07223b24e775e76c48c4745139cf2fc4038bc4e7047a9e21ddc60", size = 1924474, upload-time = "2026-09-12T20:53:23.616Z" },
+    { url = "https://files.pythonhosted.org/packages/ed/ce/99fd16af455ff8bf19aa9e8f0124ab41513ec85a92e695db1288102715a8/eltdx-3.2.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:20f0a78dff4b2b7c701d288fe80db9b68b1d2662431b95af62084a45b7780b68", size = 1900000, upload-time = "2026-09-12T20:53:25.523Z" },
+    { url = "https://files.pythonhosted.org/packages/83/8d/0cefebd2debefabb6828b36b5e1fac90a37023a593ee4251393f62aa8356/eltdx-3.2.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8ddbf8db27812e5df5f2ec274c1e07dc8c3ee093928ac67dbf4b539b9803d8f1", size = 1995162, upload-time = "2026-09-12T20:53:27.01Z" },
+    { url = "https://files.pythonhosted.org/packages/d6/41/57f06f04d4b453e36502fd34b4e1b0e248a874429569384dff7fb4c445cb/eltdx-3.2.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e63b763186debe301c51c3c5afbcddb3cc05e4ccd32ec262a7864f7e1e646267", size = 2018281, upload-time = "2026-09-12T20:53:28.406Z" },
+    { url = "https://files.pythonhosted.org/packages/ae/e3/03be497df28b512599dfabd2da8386c72a5fbbfc82d8d7b55065ffabe1a4/eltdx-3.2.2-cp310-abi3-win_amd64.whl", hash = "sha256:dab450c34388cd43d77a4f1bda039f073fa5abce9733c40be3b61b6d53fdc7f8", size = 1826816, upload-time = "2026-09-12T20:53:30.085Z" },
+]
+
+[[package]]
 name = "et-xmlfile"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1294,6 +1307,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "asyncpg" },
     { name = "celery" },
+    { name = "eltdx" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "langchain" },
@@ -1301,6 +1315,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pymysql" },
+    { name = "pypdf" },
     { name = "pypinyin" },
     { name = "pyyaml" },
     { name = "redis" },
@@ -1330,6 +1345,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.29" },
     { name = "baostock", marker = "extra == 'data'", specifier = ">=0.8" },
     { name = "celery", specifier = ">=5.4" },
+    { name = "eltdx", specifier = ">=3.2.2" },
     { name = "fastapi", specifier = ">=0.111" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "langchain", specifier = ">=0.3" },
@@ -1337,6 +1353,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.7" },
     { name = "pydantic-settings", specifier = ">=2.3" },
     { name = "pymysql", specifier = ">=1.2.0" },
+    { name = "pypdf", specifier = ">=6.19.0" },
     { name = "pypinyin", specifier = ">=0.55.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=5.0" },
@@ -2054,6 +2071,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c9/bc/1c6a92f385940f727daeecf3bacaf186e03875dff57197801046c583bcf0/pymysql-1.2.0.tar.gz", hash = "sha256:6c7b17ca686988104d7426c27895b455cdeea3e9d3ceb1270f0c3704fead8c33", size = 49021, upload-time = "2026-05-19T08:26:22.302Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c4/bd/2534e130295c8cfd4f0a2e31623baab7502278f1e97bcfe61db75656a77f/pymysql-1.2.0-py3-none-any.whl", hash = "sha256:62169ce6d5510f08e140c5e7990ee884a9764024e4a9a27b2cc11f1099322ae0", size = 45716, upload-time = "2026-05-19T08:26:20.974Z" },
+]
+
+[[package]]
+name = "pypdf"
+version = "6.19.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1f/ac/63d71aaedb59acbcdef491e6ca6469165e3771c9c74358204818fd9bc5a6/pypdf-6.19.0.tar.gz", hash = "sha256:bbc43aca292369ccc6cbc8a921991ecf2538a3587ab5a116eff06c321d647155", size = 7033266, upload-time = "2026-09-16T09:32:05.946Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3c/2c/c43c03eaf630435f023f1dc61ec4a4a78951ad5530a62c71cc89bde307b7/pypdf-6.19.0-py3-none-any.whl", hash = "sha256:7e5d6e730e7dae87d560a2cee218b852f6498c8be61966f3cd02ead971e48d14", size = 395480, upload-time = "2026-09-16T09:32:04.087Z" },
 ]
 
 [[package]]

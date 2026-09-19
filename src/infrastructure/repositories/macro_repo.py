@@ -13,7 +13,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
-import os
 import sqlite3
 from datetime import datetime
 from typing import Any
@@ -21,6 +20,7 @@ from typing import Any
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
 from src.infrastructure.repositories._mapping import COLUMNS, point_to_row
 from src.infrastructure.repositories.base import DataPointRepository
+from src.infrastructure.repositories.event_sqlite_base import connect_sqlite
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS fact_data_points (
@@ -71,10 +71,10 @@ class MacroRepository(DataPointRepository):
         self._db_path = db_path
 
     def _connect(self) -> sqlite3.Connection:
-        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        # 同一把范式：显式锁等待 + WAL。此前用裸 connect（5s 默认等待），
+        # 做T/量化/资金流并发写主库时 `CREATE TABLE IF NOT EXISTS` 会直接抛
+        # "database is locked"（见 2026-09-18 backend.log 的 85 处锁错误）。
+        return connect_sqlite(self._db_path)
 
     def _ensure_schema_sync(self) -> None:
         with self._connect() as conn:

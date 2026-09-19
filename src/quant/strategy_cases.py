@@ -46,6 +46,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 CASE_TABLE = "quant_strategy_case"
@@ -408,7 +413,7 @@ def load_sources(path: str | Path = "configs/strategy_sources.yaml") -> list[Sou
 
         payload = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
     except Exception as exc:  # noqa: BLE001 配置坏了不该让抓取整体失效
-        logger.warning("源清单解析失败(%s)，改用内置清单", str(exc)[:80])
+        logger.warning("源清单解析失败(%s)，改用内置清单", brief(exc, BRIEF_TIGHT))
         return list(DEFAULT_SOURCES)
     specs: list[SourceSpec] = []
     for item in payload.get("sources", []):
@@ -453,9 +458,9 @@ def crawl(sources: list[SourceSpec] | None = None, *,
             items = adapter(spec)
         except Exception as exc:  # noqa: BLE001 单源失败不影响其它源
             results.append({"source": spec.name, "ok": False,
-                            "error": f"{type(exc).__name__}: {str(exc)[:120]}"})
+                            "error": f"{type(exc).__name__}: {brief(exc, BRIEF_TIGHT)}"})
             if progress:
-                progress(f"{spec.name} 失败：{str(exc)[:60]}")
+                progress(f"{spec.name} 失败：{brief(exc, BRIEF_TIGHT)}")
             continue
         elapsed = round(time.perf_counter() - started, 1)
         results.append({"source": spec.name, "ok": bool(items),

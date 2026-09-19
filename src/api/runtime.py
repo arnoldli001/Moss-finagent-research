@@ -57,9 +57,16 @@ from src.infrastructure.connectors.star_chinext_connector import (
 from src.infrastructure.connectors.sw_industry_valuation_connector import (
     SWIndustryValuationConnector,
 )
+from src.infrastructure.connectors.tencent_daily_connector import (
+    TencentDailyConnector,
+)
+from src.infrastructure.connectors.tushare_connector import TushareConnector
 from src.infrastructure.connectors.xtquant_connector import XtQuantConnector
 from src.infrastructure.llm import LLMGateway
 from src.infrastructure.repositories.base import DataPointRepository
+from src.infrastructure.repositories.fund_flow_sqlite_repo import (
+    build_fund_flow_repository,
+)
 from src.infrastructure.repositories.repository_factory import (
     build_intraday_profile_repository,
     build_repository,
@@ -88,6 +95,11 @@ class Runtime:
     intraday: Any = None
     # 做T权重档案仓储（用户按个股股性保存的权重/档位；装配失败时为None）
     intraday_profile_repo: Any = None
+    # 资金流监控（板块/个股大资金动向；装配失败时为None，接口返回503）
+    fundflow: Any = None
+    fundflow_repo: Any = None
+    # 量化选股（3 档模型定时选股 + 自定义板块；装配失败时为None，接口返回503）
+    quant_select: Any = None
 
 
 def build_runtime() -> Runtime:
@@ -99,7 +111,9 @@ def build_runtime() -> Runtime:
     # 1) QMT本地终端日线（全历史，XtMiniQmt需运行；未启动自动回退）
     # 2) 本地QMT导出CSV（LOCAL_QUOTE_DIR配置后启用，QMT服务未开时的本地兜底）
     # 3) AkShare在线：CPI/PPI/M2/社融/行情兜底/个股PE/PB/财务比率/社零/煤价真实序列
-    # 4) 模拟产业数据(其余ind:前缀，付费产业接口接入前占位，三重模拟标记)
+    # 4) 腾讯财经日K（独立于东财/新浪的通道，前复权）
+    # 5) Tushare Pro个股日线（在线兜底；前4个源都拿不到或都比本地DB旧时才用）
+    # 6) 模拟产业数据(其余ind:前缀，付费产业接口接入前占位，三重模拟标记)
     qmt = XtQuantConnector()
     routes: list[tuple[Any, Any]] = [(qmt, XtQuantConnector.supports)]
     if settings.local_quote_dir:
@@ -107,6 +121,16 @@ def build_runtime() -> Runtime:
         routes.append((csv_connector, LocalCsvConnector.supports))
     akshare = AkshareConnector()
     routes.append((akshare, AkshareConnector.supports))
+    # 腾讯财经日K：**独立于东财/新浪的通道**。实测（2026-09-17）AkShare 的东财主源
+    # 被阻断、新浪回退断连**同时**发生，而腾讯通道正常（做T面板的实时链路一直走它）。
+    tencent_daily = TencentDailyConnector()
+    routes.append((tencent_daily, TencentDailyConnector.supports))
+    # Tushare Pro 个股日线：**日线链的最后一道在线兜底**。
+    # 实测 QMT 一掉线，链上就没有源能给出 300308 的日线（本地CSV没有这只票的文件、
+    # AkShare 两个子源同时失败）；Tushare 0.14 秒返回最新 2026-09-16（前复权，与 QMT 一致）。
+    # 放在最后：前面的源够新就不会打它（不增加常态延迟）。
+    tushare_connector = TushareConnector()
+    routes.append((tushare_connector, TushareConnector.supports))
     # 申万行业估值（一级/二级/三级PE/PB/股息率截面，AKShare免费接口）
     sw_valuation = SWIndustryValuationConnector()
     routes.append((sw_valuation, SWIndustryValuationConnector.supports))
@@ -216,10 +240,42 @@ def build_runtime() -> Runtime:
 
             logging.getLogger(__name__).exception(
                 "做T辅助子系统装配失败（降级：接口将返回503）")
+    # 资金流监控（板块/个股大资金动向）：不依赖做T是否启用 ——
+    # 它读的是同花顺即时板块资金流 + 本地 Tushare 仓库，两条链都是独立的。
+    # 仓储不可用时"选择列表"无法持久化（接口会 503），但榜单/走势仍可用。
+    fundflow = None
+    fundflow_repo = None
+    try:
+        from src.fundflow.provider import FundFlowProvider
+        from src.fundflow.service import FundFlowService
+
+        fundflow_repo = build_fund_flow_repository(settings)
+        fundflow = FundFlowService(provider=FundFlowProvider(), repo=fundflow_repo)
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "资金流监控装配失败（降级：该页签接口返回503）", exc_info=True)
+    # 量化选股：3 档 LightGBM 模型 + 自定义板块。它不依赖做T/资金流是否启用
+    # （模型与板块都在本地 SQLite + moss_selector 目录里），装配失败只影响该页签。
+    quant_select = None
+    try:
+        from src.quant.quant_select_repo import QuantSelectSqliteRepository
+        from src.quant.quant_select_service import QuantSelectService
+
+        quant_select = QuantSelectService(
+            repo=QuantSelectSqliteRepository(settings.sqlite_path))
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "量化选股装配失败（降级：该模块接口返回503）", exc_info=True)
     return Runtime(
         gateway=gateway, repo=repo, agents=agents, graph=graph, backend=backend,
         news_fetcher=news_fetcher, intraday=intraday,
         intraday_profile_repo=intraday_profile_repo,
+        fundflow=fundflow, fundflow_repo=fundflow_repo,
+        quant_select=quant_select,
     )
 
 

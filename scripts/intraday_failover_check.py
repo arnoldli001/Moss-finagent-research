@@ -38,6 +38,7 @@ import httpx  # noqa: E402
 from src.core.exceptions import DataFetchError  # noqa: E402
 from src.intraday.config import load_intraday_config  # noqa: E402
 from src.intraday.sources import IntradayDataProvider  # noqa: E402
+from src.core.errors import BRIEF_DEFAULT
 
 CODE = "600519"
 PERIOD = "5m"
@@ -83,7 +84,7 @@ async def tick(provider: IntradayDataProvider, label: str,
     except Exception as exc:  # noqa: BLE001 全链失败正是要观测的结果
         elapsed = (time.perf_counter() - started) * 1000
         print(f"  {label:<20} → 全部失败 {elapsed:>7.1f}ms "
-              f"{type(exc).__name__}: {str(exc)[:70]}")
+              f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}")
         return ""
 
 

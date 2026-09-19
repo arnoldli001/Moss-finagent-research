@@ -11,6 +11,10 @@ from collections import defaultdict
 
 from fastapi import WebSocket
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.domain.alerts.models import DEFAULT_TENANT, Alert
 from src.domain.alerts.normalize import now_iso
 
@@ -47,7 +51,7 @@ class AlertHub:
                 await websocket.send_json(message)
                 sent += 1
             except Exception as exc:  # noqa: BLE001 对端断开/序列化失败
-                logger.info("WS推送失败，清理连接: %s", str(exc)[:120])
+                logger.info("WS推送失败，清理连接: %s", brief(exc, BRIEF_TIGHT))
                 dead.append(websocket)
         for websocket in dead:
             self._clients[tenant_id].discard(websocket)

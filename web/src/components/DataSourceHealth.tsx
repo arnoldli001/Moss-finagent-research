@@ -134,7 +134,7 @@ export default function DataSourceHealth({ compact = false }: { compact?: boolea
           </table>
           {(intraday.sources ?? []).length === 0 && (
             <p className="muted-text">
-              尚无调用记录：打开一次「做T辅助」面板后即开始统计真实延迟。
+              尚无调用记录：打开一次「量化交易」面板后即开始统计真实延迟。
             </p>
           )}
         </>

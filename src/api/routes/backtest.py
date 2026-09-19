@@ -15,6 +15,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from src.api.job_table import BACKTEST_RETENTION, purge_jobs
 from src.backtest.data import align_monthly, month_key
 from src.backtest.engine import CostConfig, result_to_dict, run_backtest
 from src.backtest.signals import TrendPEConfig
@@ -54,8 +55,7 @@ _STAGE_ESTIMATES = {
     "fetch_price": 20,
     "fetch_pe": 40,
 }
-_JOB_TTL_SECONDS = 900.0
-_JOB_MAX = 50
+# 前端轮询间隔（秒）：回测各阶段最短约 8 秒，1.5 秒轮询既不显卡顿也不打爆接口
 _POLL_INTERVAL_SECONDS = 1.5
 _jobs: dict[str, dict] = {}
 
@@ -68,19 +68,7 @@ def clear_fetch_cache() -> None:
 
 def _purge_jobs() -> None:
     """淘汰过期与超额的已完成/失败任务（运行中任务保留）。"""
-    now = time.monotonic()
-    for jid in [
-        jid for jid, j in _jobs.items()
-        if j["status"] != "running" and now - j["finished_at"] > _JOB_TTL_SECONDS
-    ]:
-        _jobs.pop(jid, None)
-    finished = [
-        (j["finished_at"], jid) for jid, j in _jobs.items()
-        if j["status"] != "running"
-    ]
-    overflow = len(_jobs) - _JOB_MAX
-    for _, jid in sorted(finished)[:max(overflow, 0)]:
-        _jobs.pop(jid, None)
+    purge_jobs(_jobs, BACKTEST_RETENTION)
 
 
 async def _cached_fetch(backend, indicator: str) -> tuple[list[DataPoint], bool]:

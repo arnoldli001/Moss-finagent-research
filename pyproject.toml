@@ -19,6 +19,8 @@ dependencies = [
     "langchain>=0.3",
     "pymysql>=1.2.0",
     "pypinyin>=0.55.0",
+    "eltdx>=3.2.2",
+    "pypdf>=6.19.0",
 ]
 
 [project.optional-dependencies]
@@ -58,3 +60,10 @@ select = ["E", "F", "I", "W", "UP", "B"]
 "src/infrastructure/security/rls.py" = ["E402"]
 # scripts/ 下临时脚本质量要求低
 "scripts/*" = ["F", "E402", "I001", "F541"]
+# 这两处的文档字符串里有大量中文对照表与推导说明，行宽按"列"算没有意义
+"src/intraday/engine.py" = ["E501"]
+"src/intraday/level_fit.py" = ["E501"]
+"src/intraday/impact.py" = ["E501"]
+"src/fundflow/*" = ["E501"]
+# moss_selector 的 docstring 里是口径对照表与复用来源表，列宽同样无意义
+"moss_selector/*" = ["E501"]

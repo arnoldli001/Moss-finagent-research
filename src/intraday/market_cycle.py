@@ -31,6 +31,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 Stage = Literal["冰点", "试错期", "发酵期", "主升期", "高位震荡期", "退潮期"]
@@ -336,7 +341,7 @@ class MarketCycleProvider:
             try:
                 pools = self._fetcher(date)
             except Exception as exc:  # noqa: BLE001 网络/接口变动都不该打断做T主链路
-                last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+                last_error = f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"
                 logger.info("情绪周期取数失败(%s): %s", date, last_error)
                 continue
             cycle = build_market_cycle(

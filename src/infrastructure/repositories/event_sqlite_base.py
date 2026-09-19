@@ -9,7 +9,10 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from typing import Any
+import time
+from collections.abc import Callable
+from contextlib import suppress
+from typing import Any, TypeVar
 
 from src.domain.alerts.models import (
     Alert,
@@ -157,6 +160,75 @@ def insert_sql(table: str, cols: tuple[str, ...]) -> str:
     )
 
 
+#: 与项目其它仓储（fund_flow / intraday_profile / quant / auction_select）同范式：
+#: 主库 data/moss_finagent.db 有做T采集、量化仓库、资金流等多条链并发写入，
+#: 单靠 WAL 不足以保证每个短连接都能排到队 —— 必须显式给锁等待时间。
+#:
+#: 但等待时间**按代价分级**（2026-09-18 实测教训）：服务是单事件循环 +
+#: to_thread 默认线程池，一个请求阻塞在写锁上就占住一个线程。把"读路径里
+#: 顺带的清理写"也设成 20s 排队，主库被占时线程池会被打满，连看列表都超时，
+#: 比原来的 500 更糟（实测：占锁 12s 时 4 次请求全部超时）。
+#:   - 关键写（事件/告警入库）值得排队：CONNECT_TIMEOUT_S
+#:   - 顺带写（懒过期）/用户点击写：秒级失败即降级：FAST_TIMEOUT_S
+CONNECT_TIMEOUT_S = 20.0
+BUSY_TIMEOUT_MS = 20000
+FAST_TIMEOUT_S = 2.0
+FAST_BUSY_TIMEOUT_MS = 2000
+#: 读路径里懒过期的单次抢锁上限：必须远小于前端轮询间隔(1.5s)，
+#: 否则"清理"会把列表接口本身拖慢。
+EXPIRE_TIMEOUT_S = 0.4
+
+
+def connect_sqlite(db_path: str, timeout_s: float | None = None,
+                   busy_timeout_ms: int | None = None) -> sqlite3.Connection:
+    """打开主库连接（显式锁等待 + WAL + busy_timeout + synchronous=NORMAL）。
+
+    事件/告警仓储与宏观数据点仓储共用。历史实现用裸 `sqlite3.connect()`：
+    Python 默认只有 5s 锁等待，实测在主库被做T/量化写入者占用时会抛
+    `sqlite3.OperationalError: database is locked`，告警列表接口直接 500
+    （见 2026-09-18 backend.log traceback）。
+
+    等待参数在调用点读取模块常量（不用默认参数），用例可 monkeypatch 成 0
+    立刻复现锁竞争。
+    """
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    conn = sqlite3.connect(
+        db_path, timeout=CONNECT_TIMEOUT_S if timeout_s is None else timeout_s)
+    conn.row_factory = sqlite3.Row
+    busy = BUSY_TIMEOUT_MS if busy_timeout_ms is None else busy_timeout_ms
+    with suppress(sqlite3.Error):  # journal_mode 需要写锁，失败不阻断本次连接
+        conn.execute(f"PRAGMA busy_timeout={int(busy)}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+_T = TypeVar("_T")
+
+
+def is_locked_error(exc: BaseException) -> bool:
+    """是否为 SQLite 锁竞争类错误（busy / locked）。"""
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "locked" in str(exc).lower() or "busy" in str(exc).lower())
+
+
+def retry_on_locked(fn: Callable[[], _T], attempts: int = 3,
+                    delay_s: float = 0.2) -> _T:
+    """写路径的锁重试：并发写入者短暂持锁时不丢一次采集/告警入库。
+
+    仅对锁竞争重试（其它 SQLite 错误立即上抛），最多 attempts 次，
+    退避 delay_s 线性递增。busy_timeout 已经排过一轮队，这里是兜底。
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if not is_locked_error(exc) or attempt == attempts:
+                raise
+            time.sleep(delay_s * attempt)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 class EventSqliteStore:
     """SQLite连接与轻量schema迁移（进程内只执行一次DDL同步）。"""
 
@@ -165,13 +237,21 @@ class EventSqliteStore:
         self._synced = False
 
     def _connect(self) -> sqlite3.Connection:
-        os.makedirs(os.path.dirname(self._db_path) or ".", exist_ok=True)
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return connect_sqlite(self._db_path)
+
+    def _connect_fast(self) -> sqlite3.Connection:
+        """交互式短超时连接：用户点击（已读等）不必为写锁排队 20s。"""
+        return connect_sqlite(
+            self._db_path, timeout_s=FAST_TIMEOUT_S,
+            busy_timeout_ms=FAST_BUSY_TIMEOUT_MS)
 
     def _schema_sync(self) -> None:
-        with self._connect() as conn:
+        # DDL 需要写锁：用短超时连接重试（幂等 DDL），不让首个读请求为建表排队。
+        retry_on_locked(self._schema_sync_locked)
+        self._synced = True
+
+    def _schema_sync_locked(self) -> None:
+        with self._connect_fast() as conn:
             conn.executescript(_SCHEMA)
             event_cols = {r["name"] for r in conn.execute(
                 "PRAGMA table_info(fact_events)").fetchall()}
@@ -196,7 +276,6 @@ class EventSqliteStore:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_alerts_content "
                 "ON fact_alerts(tenant_id, content_key)")
-        self._synced = True
 
     def _sync_once(self) -> None:
         """写入路径幂等同步：进程内只做一次DDL/迁移（S2：避免每写必PRAGMA）。"""

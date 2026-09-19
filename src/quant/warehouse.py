@@ -47,6 +47,12 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATABASE = "moss_quant"
@@ -307,7 +313,7 @@ class QuantWarehouse:
                 connection.execute(text("SELECT 1"))
             return True
         except Exception as exc:  # noqa: BLE001 不可用是正常状态（未配置）
-            logger.debug("数据仓库不可用：%s", str(exc)[:140])
+            logger.debug("数据仓库不可用：%s", brief(exc, BRIEF_DEFAULT))
         if self.config.dialect in ("mysql", "postgresql"):
             try:
                 self.ensure_database()
@@ -315,7 +321,7 @@ class QuantWarehouse:
                     connection.execute(text("SELECT 1"))
                 return True
             except Exception as exc:  # noqa: BLE001 建库也不行就真不可用
-                logger.debug("建库后仍不可用：%s", str(exc)[:140])
+                logger.debug("建库后仍不可用：%s", brief(exc, BRIEF_DEFAULT))
         return False
 
     def engine(self) -> Any:
@@ -505,7 +511,7 @@ class QuantWarehouse:
                     self.engine())
                 built.append(name)
             except Exception as exc:  # noqa: BLE001 索引已存在等
-                logger.debug("建索引 %s 失败（可忽略）：%s", name, str(exc)[:120])
+                logger.debug("建索引 %s 失败（可忽略）：%s", name, brief(exc, BRIEF_TIGHT))
         self._indexed = getattr(self, "_indexed", set())
         self._indexed.add(dataset)
         return built
@@ -533,7 +539,7 @@ class QuantWarehouse:
                 written = self.upsert(dataset, frame, key=key,
                                       batch_rows=batch_rows)
             except Exception as exc:  # noqa: BLE001 单分区失败不影响整批
-                result.failed[key] = f"{type(exc).__name__}: {str(exc)[:140]}"
+                result.failed[key] = f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"
                 continue
             result.partitions += 1
             result.rows += written
@@ -820,10 +826,6 @@ class QuantWarehouse:
                 "last": str(row[2] or "")})
         output["total_rows"] = sum(item["rows"] for item in output["tables"])
         return output
-
-
-# 兼容别名（早期版本叫 MySqlWarehouse）
-MySqlWarehouse = QuantWarehouse
 
 
 # ==================================================================
@@ -1376,7 +1378,7 @@ def load_dataset(dataset: str, *, start: str = "", end: str = "",
                     return frame, f"db:{warehouse.config.dialect}.{table}"
             except Exception as exc:  # noqa: BLE001 查询失败回退 CSV
                 logger.warning("数据库查询 %s 失败，回退 CSV：%s",
-                               dataset, str(exc)[:140])
+                               dataset, brief(exc, BRIEF_DEFAULT))
             finally:
                 warehouse.close()
     from src.quant.dataset_store import DatasetStore
@@ -1411,7 +1413,7 @@ def warehouse_status(root: str | Path = DEFAULT_ROOT) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return {"available": False, "dialect": config.dialect,
                 "description": config.description,
-                "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                "error": f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"}
     finally:
         warehouse.close()
 

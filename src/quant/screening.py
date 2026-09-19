@@ -25,6 +25,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.quant.factor_analyzer import compute_ic_series, evaluate_factor, quantile_backtest
 from src.quant.factor_base import mad_winsorize, neutralize, zscore
 from src.quant.factor_library_v2 import FACTORS
@@ -441,7 +445,7 @@ def screen(
                     "periods_per_year": periods_per_year,
                 }
             except Exception as exc:  # noqa: BLE001 分层回测失败不该丢掉筛选结果
-                notes.append(f"{label} 分层回测失败：{str(exc)[:120]}")
+                notes.append(f"{label} 分层回测失败：{brief(exc, BRIEF_TIGHT)}")
         oos_periods = int(quantile.get("oos", {}).get("periods", 0))
         notes.append(f"分层回测按 {stride} 日持有期、非重叠抽样"
                      f"（样本外 {len(quantile.get('oos', {}).get('group_stats', []))} 组 × "

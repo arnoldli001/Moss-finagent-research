@@ -15,6 +15,10 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
 from src.domain.agents.analysis.base import parse_llm_json
 from src.domain.alerts import prompts
 from src.domain.alerts.models import (
@@ -173,7 +177,7 @@ class EventAnalyzer:
             data = parse_llm_json(AGENT_ID, resp.content)
             return self._parse_stage1(data.get("events"), events)
         except Exception as exc:  # noqa: BLE001 降级为本地分类，扫描不中断
-            logger.warning("阶段一分类失败，使用本地兜底: %s", str(exc)[:200])
+            logger.warning("阶段一分类失败，使用本地兜底: %s", brief(exc, BRIEF_DEFAULT))
             return _stage1_fallback(events)
 
     def _parse_stage1(
@@ -218,7 +222,7 @@ class EventAnalyzer:
                 agent_id=AGENT_ID, json_mode=True, use_cache=False,
             )
         except Exception as exc:  # noqa: BLE001 打分层不可用→本轮无告警
-            logger.warning("阶段二评估失败，本轮不产生LLM评估: %s", str(exc)[:200])
+            logger.warning("阶段二评估失败，本轮不产生LLM评估: %s", brief(exc, BRIEF_DEFAULT))
             return {}, ""
         try:
             data = parse_llm_json(AGENT_ID, resp.content)

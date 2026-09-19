@@ -40,11 +40,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.core.market_constants import TRADING_DAYS_PER_YEAR
 from src.quant.condition_dsl import Condition, ConditionError, parse_condition
 
 logger = logging.getLogger(__name__)
 
-TRADING_DAYS_PER_YEAR = 252
 LOT_SIZE = 100          # A 股一手 = 100 股
 RISK_FREE_RATE = 0.02   # 夏普的无风险利率（年化）
 

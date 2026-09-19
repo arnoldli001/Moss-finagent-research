@@ -33,10 +33,14 @@ function niceStep(span: number, target = 4): number {
 type Hover = { index: number; bar: IntradayDailyBar } | null;
 
 function DailyCandleChart({
-  snapshot, height = H,
+  snapshot, height = H, emptyReason = "", emptyHint = "",
 }: {
   snapshot: IntradayDailySnapshot;
   height?: number;
+  /** 空图时的具体原因（由面板给出：正在加载 / 请求失败 / 后端确实无数据） */
+  emptyReason?: string;
+  /** 补充线索（数据源、耗时等），展示在原因后面 */
+  emptyHint?: string;
 }) {
   const bars = snapshot.bars;
   const markers = useMemo(() => snapshot.signal_history ?? [], [snapshot]);
@@ -174,7 +178,17 @@ function DailyCandleChart({
   };
 
   if (!total || !domain) {
-    return <div className="empty-tip muted-text">日K数据不可用</div>;
+    // 空状态必须**说清原因**：这里原来只写死「日K数据不可用」，于是"请求失败"
+    // 与"后端确实没有日线"看起来一模一样，用户无法判断是自己网络问题还是数据问题
+    // （实测用户报"非开盘时间强制刷新刷不出日K"，就是被这句笼统提示挡住了排查）。
+    const reason = emptyReason
+      || (total === 0 ? "该标的没有可用日K数据" : "当前可视区间没有K线");
+    return (
+      <div className="empty-tip muted-text">
+        日K数据不可用：{reason}
+        {emptyHint ? <span className="muted-text">（{emptyHint}）</span> : null}
+      </div>
+    );
   }
 
   const maSeries: { key: "ma5" | "ma10" | "ma20" | "ma60"; label: string;

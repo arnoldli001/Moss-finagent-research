@@ -26,6 +26,11 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 # 东财业绩报表 → 规范化英文字段（因子层用英文键，避免中文列名在代码里到处传）
@@ -169,7 +174,7 @@ async def fetch_performance_report(
     try:
         frame = await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout)
     except Exception as exc:  # noqa: BLE001 akshare 抛的异常种类很多
-        detail = f"{type(exc).__name__}: {str(exc)[:160]}"
+        detail = f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"
         logger.warning("业绩报表取数失败(%s): %s", period, detail)
         return pd.DataFrame(), FetchAttempt(
             source="东财业绩报表(akshare)", ok=False, detail=detail)
@@ -194,7 +199,7 @@ async def fetch_stock_indicators(
     try:
         frame = await asyncio.wait_for(asyncio.to_thread(_call), timeout=timeout)
     except Exception as exc:  # noqa: BLE001
-        detail = f"{type(exc).__name__}: {str(exc)[:160]}"
+        detail = f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"
         logger.warning("新浪财务指标取数失败(%s): %s", code, detail)
         return pd.DataFrame(), FetchAttempt(
             source="新浪财务分析指标(akshare)", ok=False, detail=detail)

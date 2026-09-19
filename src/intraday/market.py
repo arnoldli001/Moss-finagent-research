@@ -29,6 +29,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from src.core.trading_session import (
+    elapsed_session_ratio as _elapsed_session_ratio,
+)
 from src.intraday.config import OverseasParams
 from src.intraday.features import safe_float
 
@@ -49,11 +52,6 @@ INDEX_BY_BOARD: list[tuple[tuple[str, ...], str, str]] = [
 ]
 DEFAULT_INDEX = ("000001", "上证指数")
 
-# 交易时段（北京时间）总分钟数与各时段起点，用于「已交易时间占比」
-_MORNING = (9 * 60 + 30, 11 * 60 + 30)
-_AFTERNOON = (13 * 60, 15 * 60)
-_TRADING_MINUTES = (_MORNING[1] - _MORNING[0]) + (_AFTERNOON[1] - _AFTERNOON[0])
-
 
 def board_index_for(code: str) -> tuple[str, str]:
     """证券代码 → 所属指数（个股按板块、ETF按上市交易所/科创板归属）。"""
@@ -67,22 +65,9 @@ def elapsed_session_ratio(now: datetime | None = None) -> float:
     """当前时点「已交易时间」占全天比例（0~1），用于折算全天预测量。
 
     非交易日/盘前返回 0（调用方据此跳过预测），收盘后返回 1.0。
+    时段边界来自 `core.trading_session`，与盘中状态判定共用同一套常量。
     """
-    moment = now or datetime.now()
-    if moment.weekday() >= 5:
-        return 0.0
-    minutes = moment.hour * 60 + moment.minute
-    if minutes < _MORNING[0]:
-        return 0.0
-    if minutes <= _MORNING[1]:
-        done = minutes - _MORNING[0]
-    elif minutes < _AFTERNOON[0]:
-        done = _MORNING[1] - _MORNING[0]  # 午休：已完成上午全部
-    elif minutes <= _AFTERNOON[1]:
-        done = (_MORNING[1] - _MORNING[0]) + (minutes - _AFTERNOON[0])
-    else:
-        done = _TRADING_MINUTES
-    return max(0.0, min(1.0, done / _TRADING_MINUTES))
+    return _elapsed_session_ratio(now)
 
 
 @dataclass

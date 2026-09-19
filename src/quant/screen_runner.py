@@ -18,6 +18,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_LOG,
+    brief,
+)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
@@ -188,7 +194,7 @@ def run_single_request(payload: dict) -> dict:
                                      "auto_saved": True}
         except StrategyError as exc:
             # 未达门槛不算失败：回测结果照常返回，只是说明为什么没存
-            out["saved_strategy"] = {"auto_saved": False, "reason": str(exc)[:200]}
+            out["saved_strategy"] = {"auto_saved": False, "reason": brief(exc, BRIEF_DEFAULT)}
     return out
 
 
@@ -240,7 +246,7 @@ def main(argv: list[str] | None = None) -> int:
 
         Path(args.response).write_text(json.dumps({
             "ok": False,
-            "error": f"{type(exc).__name__}: {str(exc)[:400]}",
+            "error": f"{type(exc).__name__}: {brief(exc, BRIEF_LOG)}",
             "traceback": traceback.format_exc()[-1200:],
         }, ensure_ascii=False), encoding="utf-8")
         return 1

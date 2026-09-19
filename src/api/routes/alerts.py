@@ -13,6 +13,11 @@ import logging
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from src.core.config import get_settings
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.domain.alerts.dedup import dedupe_events
 from src.domain.alerts.models import DEFAULT_TENANT, DISCLAIMER, ScanResult
 from src.domain.alerts.normalize import normalize_events, now_iso
@@ -108,13 +113,13 @@ async def trigger_scan(request: Request) -> dict:
             # 与定时作业/调度器手动入口的共享锁冲突：跳过而非失败
             scan["result"] = ScanResult(
                 trigger="manual", status="success",
-                data_gaps=[f"扫描已在执行中，本次跳过：{str(exc)[:120]}"],
+                data_gaps=[f"扫描已在执行中，本次跳过：{brief(exc, BRIEF_TIGHT)}"],
                 started_at=scan["started_at"], finished_at=now_iso()).model_dump()
         except Exception as exc:  # noqa: BLE001 服务总异常也要让轮询可见
             logger.exception("手动事件扫描失败")
             scan["result"] = ScanResult(
                 trigger="manual", status="failed",
-                errors=[f"扫描异常: {str(exc)[:200]}"],
+                errors=[f"扫描异常: {brief(exc, BRIEF_DEFAULT)}"],
                 started_at=scan["started_at"], finished_at=now_iso()).model_dump()
         finally:
             scan["running"] = False

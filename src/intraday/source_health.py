@@ -25,6 +25,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
+
 # 各源能力（用于排序先验与前端展示的口径说明）
 SOURCE_CAPABILITIES: dict[str, dict[str, Any]] = {
     "qmt": {
@@ -251,7 +256,7 @@ class SourceHealthTracker:
             stat.failures += 1
             stat.total_calls += 1
             stat.total_failures += 1
-            stat.last_error = str(error)[:200]
+            stat.last_error = brief(error, BRIEF_DEFAULT)
             stat.last_attempt_at = time.monotonic()
             if self._cooldown_seconds > 0:
                 stat.cooldown_until = time.monotonic() + self._cooldown_seconds

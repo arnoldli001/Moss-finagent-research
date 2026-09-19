@@ -23,6 +23,11 @@ data/
 logs/
 output/
 
+# moss_selector 的运行产物（模型/面板/备份体积大，不入库；config 与代码要入库）
+moss_selector/data/
+moss_selector/models/
+moss_selector/logs/
+
 # 前端（后续阶段）
 node_modules/
 
@@ -32,3 +37,73 @@ node_modules/
 # 本地临时探针脚本与下载日志（根目录，勿提交）
 /_tmp_*.py
 /_*.log
+
+# 备份文件与下载缓存
+*.bak*
+downloads/
+
+# ==================== 私有核心资产（本地保留，不进入公开仓库） ====================
+# 竞价选股：逻辑/参数/情绪周期/综合打分（含根目录配置与API路由）
+/src/auction_select/
+/auction_select/
+/src/api/routes/auction_select.py
+# 私有核心skills（情绪周期/短线招式/卖点）
+/skills/auction-selection/
+/skills/jianmen-shortterm/
+/skills/intraday-sell-points/
+# 擒牛线公式与卖点判定
+/src/intraday/niuline.py
+/src/intraday/sell_points.py
+# 量化选股模型/标签参数/重训/回测（仓储与API路由）
+/src/quant/quant_select_repo.py
+/src/quant/quant_select_runner.py
+/src/quant/quant_select_service.py
+/src/quant/quant_select_worker.py
+/src/quant/model_backtest.py
+/src/quant/model_retrain_service.py
+/src/quant/stock_news.py
+/src/api/routes/quant_select.py
+/src/backtest/shortterm.py
+/moss_selector/
+/config_label10_2bucket.yaml
+# 涨停/竞价统计与探针脚本（体现策略细节）
+/scripts/_probe_*.py
+/scripts/limit_up_*.py
+/scripts/bt_*.py
+# QMT侧竞价策略/信号服务器/模拟盘实现（79KB策略核心）
+/qmt/
+/scripts/auction_replay.py
+/scripts/shortterm_backtest.py
+/scripts/model_backtest_variants.py
+/scripts/run_model_backtest.py
+/scripts/train_label_variant.py
+/scripts/first_screen_probe.py
+# 前端私有面板（引用处以「商业版功能」提示组件替代）
+/web/src/components/AuctionSelectPanel.tsx
+/web/src/components/QuantSelectPanel.tsx
+/web/src/components/NiuLineChart.tsx
+/web/src/auctionApi.ts
+# 暴露私有逻辑/公式的文档与决策明细
+/docs/AUCTION_SELECT.md
+/docs/MODEL_BACKTEST.md
+/docs/QUANT_SELECT.md
+/docs/SHORTTERM_BACKTEST.md
+/docs/SELECTOR_DAILY_K.md
+/docs/NIULINE_DAILY_CHART.md
+/docs/竞价选股_*
+# 暴露私有公式/skill的测试用例
+/tests/unit/test_auction_golden.py
+/tests/unit/test_auction_rulebook.py
+/tests/unit/test_stock_news.py
+/tests/unit/test_niuline.py
+/tests/unit/test_niuline_daily_integration.py
+/tests/unit/test_sell_points.py
+/tests/unit/test_quant_select.py
+/tests/unit/test_shortterm_backtest.py
+/tests/unit/test_auction_jump_rush.py
+/tests/unit/test_auction_select.py
+/tests/unit/test_auction_sentiment.py
+/tests/unit/test_auction_universe_pinning.py
+/tests/unit/test_moss_selector.py
+/tests/unit/test_selector_labels_and_buckets.py
+/tests/unit/test_preheat_cache.py

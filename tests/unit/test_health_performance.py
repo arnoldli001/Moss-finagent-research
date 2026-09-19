@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import pandas as pd
@@ -91,6 +92,7 @@ def test_warehouse_health_uses_disk_cache(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE",
                         tmp_path / "warehouse_stats.json")
 
+    # 预热路径（force）：算出来并落盘，冷启动后第一次请求就是热的
     first = data_health._warehouse_health(force=True)  # noqa: SLF001
     assert calls["n"] == 1
     assert first["dataset_count"] == 1
@@ -104,6 +106,7 @@ def test_warehouse_health_uses_disk_cache(tmp_path, monkeypatch) -> None:
 
 
 def test_warehouse_health_survives_corrupt_cache(tmp_path, monkeypatch) -> None:
+    """缓存文件坏了：当次给"生成中"占位并起后台重算，**不阻塞请求**。"""
     from src.api import data_health
 
     broken = tmp_path / "warehouse_stats.json"
@@ -112,10 +115,12 @@ def test_warehouse_health_survives_corrupt_cache(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("src.quant.warehouse.warehouse_status",
                         lambda root="": {"tables": []})
     result = data_health._warehouse_health()  # noqa: SLF001
+    assert result["stats_pending"] is True
     assert result["dataset_count"] == 0
 
 
 def test_warehouse_health_reports_errors_without_raising(monkeypatch) -> None:
+    """预热路径（force=True）里仓库报错要转成 available=False，不能抛。"""
     from src.api import data_health
 
     def boom(root: str = ""):
@@ -129,15 +134,46 @@ def test_warehouse_health_reports_errors_without_raising(monkeypatch) -> None:
     assert "库坏了" in result["error"]
 
 
+def test_warehouse_health_cold_request_does_not_block(tmp_path, monkeypatch) -> None:
+    """**关键回归**：没有缓存时请求路径不能去扫 14GB 的库（实测冷页 28 秒）。
+
+    预热线程会用 force=True 把统计算好落盘，所以冷启动后第一次请求就是热的；
+    万一请求抢在预热前面，也必须秒回占位结构而不是等几十秒。
+    """
+    from src.api import data_health
+
+    monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE",
+                        tmp_path / "warehouse_stats.json")
+    started = {"n": 0}
+
+    def slow_status(root: str = "") -> dict:
+        started["n"] += 1
+        time.sleep(1.0)                     # 模拟慢查询（不该被请求路径等待）
+        return {"dialect": "sqlite", "tables": []}
+
+    monkeypatch.setattr("src.quant.warehouse.warehouse_status", slow_status)
+
+    t = time.perf_counter()
+    result = data_health._warehouse_health()  # noqa: SLF001
+    elapsed = time.perf_counter() - t
+
+    assert elapsed < 0.5, f"请求路径等了 {elapsed:.2f}s，说明又在同步扫库"
+    assert result["stats_pending"] is True
+    deadline = time.time() + 5
+    while started["n"] == 0 and time.time() < deadline:
+        time.sleep(0.05)
+    assert started["n"] == 1, "应起后台重算"
+
+
 def test_build_data_health_is_cached(monkeypatch) -> None:
     """整份健康度带 5 分钟缓存：面板轮询不该反复付 4.5 秒。"""
     from src.api import data_health
 
     calls = {"n": 0}
 
-    def fake_uncached(runtime):
+    def fake_uncached(runtime, *, force: bool = False):
         calls["n"] += 1
-        return {"generated_at": "now", "tables": []}
+        return {"generated_at": "now", "tables": [], "forced": force}
 
     monkeypatch.setattr(data_health, "_build_data_health_uncached", fake_uncached)
     data_health.invalidate_cache()
@@ -148,19 +184,170 @@ def test_build_data_health_is_cached(monkeypatch) -> None:
     third = data_health.build_data_health(None, force=True)
     assert calls["n"] == 2
     assert third is not first
+    assert third["forced"] is True, "force 必须一路透传给子统计（否则只重算了外壳）"
 
 
 def test_health_route_runs_health_build_off_the_event_loop() -> None:
-    """回归：build_data_health 必须在线程里跑。
+    """回归：build_data_health 必须在**线程**里跑，且要在**关键路径线程池**里跑。
 
-    旧实现直接同步调用 → 整段 I/O 压在事件循环上，一次 /health 让**所有**并发请求
-    一起卡（实测 300 秒超时，做T面板同时卡死）。
+    两层原因，都是实测踩出来的：
+
+    1. 同步调用 → 整段 I/O 压在事件循环上，一次 /health 让**所有**并发请求一起卡
+       （实测 300 秒超时，做T面板同时卡死）；
+    2. 用 `asyncio.to_thread`（默认执行器）→ 与自选池首屏（26 只票并发取数）
+       抢同一个池子，池满时 /health 要**排队 144.5 秒**，而它自己只要 3.74 秒。
+       改用 `run_infra`（`src/core/executors.py` 的独立线程池）后不再被业务挤掉。
     """
     from pathlib import Path
 
     source = Path("src/api/routes/research.py").read_text(encoding="utf-8")
-    assert "asyncio.to_thread(_data_health" in source, \
-        "健康度组装必须放到线程里，不能在事件循环里同步跑"
+    assert "asyncio.to_thread(_data_health" not in source, \
+        "健康度不能再用默认执行器（会被自选池首屏挤到排队 144 秒）"
+    assert "run_infra(_data_health" in source, \
+        "健康度组装必须放到关键路径线程池里，不能在事件循环里同步跑"
+
+
+@pytest.fixture(autouse=True)
+def _reset_refresh_flags():
+    """每例前后清掉"后台刷新中"标记：它们是模块级全局量，跨例会互相抑制。"""
+    from src.api import data_health
+
+    for name in ("_TUSHARE_REFRESHING", "_WAREHOUSE_REFRESHING"):
+        setattr(data_health, name, False)
+    yield
+    for name in ("_TUSHARE_REFRESHING", "_WAREHOUSE_REFRESHING"):
+        setattr(data_health, name, False)
+
+
+def test_tushare_health_uses_disk_cache(tmp_path, monkeypatch) -> None:
+    """Tushare 覆盖要落盘：请求路径不能去遍历 35,711 个分区目录。
+
+    实测（2026-09-17）：平时 2.9 秒，但服务刚起来、磁盘被 akshare 子进程占满时
+    膨胀到 **140 秒以上** —— 首个 /health 要 142.8 秒才返回。
+    """
+    from src.api import data_health
+
+    calls = {"n": 0}
+
+    def fake_build(root: str, universe: str) -> dict:
+        calls["n"] += 1
+        return {"source": "tushare", "partitions": 35711, "datasets": []}
+
+    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE",
+                        tmp_path / "tushare_stats.json")
+    monkeypatch.setattr(data_health, "_build_tushare_health", fake_build)
+
+    # 第一次：没有缓存 → **立刻**返回"生成中"占位，同时后台重算
+    first = data_health._tushare_health()  # noqa: SLF001
+    assert first["stats_pending"] is True
+    assert first["partitions"] == 0
+    cache_file = tmp_path / "tushare_stats.json"
+    deadline = time.time() + 5
+    while (calls["n"] == 0 or not cache_file.exists()) and time.time() < deadline:
+        time.sleep(0.05)
+    assert calls["n"] == 1
+    assert cache_file.exists(), "后台线程算完必须落盘"
+
+    # 第二次：读缓存，不再重算
+    second = data_health._tushare_health()  # noqa: SLF001
+    assert calls["n"] == 1, "第二次必须读缓存，不能再去遍历分区目录"
+    assert second["partitions"] == 35711
+
+
+def test_tushare_health_refreshes_in_background_when_stale(
+    tmp_path, monkeypatch,
+) -> None:
+    """缓存过期时：**立即返回旧值**，同时在后台线程重算（绝不阻塞请求）。"""
+    from src.api import data_health
+
+    path = tmp_path / "tushare_stats.json"
+    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE", path)
+    monkeypatch.setattr(data_health, "_TUSHARE_TTL", 60.0)
+    path.write_text(json.dumps({"_cached_at": time.time() - 3600,
+                                "partitions": 1, "datasets": [],
+                                "source": "tushare"}), encoding="utf-8")
+    started = {"n": 0}
+
+    def fake_build(root: str, universe: str) -> dict:
+        started["n"] += 1
+        return {"source": "tushare", "partitions": 2, "datasets": []}
+
+    monkeypatch.setattr(data_health, "_build_tushare_health", fake_build)
+
+    t = time.perf_counter()
+    result = data_health._tushare_health()  # noqa: SLF001
+    elapsed = time.perf_counter() - t
+
+    assert result["partitions"] == 1, "必须立刻返回旧值"
+    assert elapsed < 0.5, f"请求路径不能等重算（实测 {elapsed:.2f}s）"
+    deadline = time.time() + 5
+    while started["n"] == 0 and time.time() < deadline:
+        time.sleep(0.05)
+    assert started["n"] == 1, "过期后应起后台刷新"
+
+
+def test_tushare_health_survives_corrupt_cache(tmp_path, monkeypatch) -> None:
+    """缓存坏了：给"生成中"占位并起后台重算，不在请求路径上遍历分区。"""
+    from src.api import data_health
+
+    broken = tmp_path / "tushare_stats.json"
+    broken.write_text("{不是JSON", encoding="utf-8")
+    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE", broken)
+    monkeypatch.setattr(data_health, "_build_tushare_health",
+                        lambda root, universe: {"source": "tushare",
+                                                "partitions": 3, "datasets": []})
+    result = data_health._tushare_health()  # noqa: SLF001
+    assert result["stats_pending"] is True
+    assert result["partitions"] == 0
+
+
+def test_tushare_health_cold_request_does_not_block(tmp_path, monkeypatch) -> None:
+    """**关键回归**：没有缓存时请求路径不能去遍历 3.5 万个分区。
+
+    实测（2026-09-17）：服务刚起来、磁盘被 akshare 子进程占满时，这一步要
+    **140 秒以上** —— 首个 /health 因此 142.8 秒才返回。
+    """
+    from src.api import data_health
+
+    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE",
+                        tmp_path / "tushare_stats.json")
+    started = {"n": 0}
+
+    def slow_build(root: str, universe: str) -> dict:
+        started["n"] += 1
+        time.sleep(1.0)
+        return {"source": "tushare", "partitions": 35711, "datasets": []}
+
+    monkeypatch.setattr(data_health, "_build_tushare_health", slow_build)
+
+    t = time.perf_counter()
+    result = data_health._tushare_health()  # noqa: SLF001
+    elapsed = time.perf_counter() - t
+
+    assert elapsed < 0.5, f"请求路径等了 {elapsed:.2f}s"
+    assert result["stats_pending"] is True
+    deadline = time.time() + 5
+    while started["n"] == 0 and time.time() < deadline:
+        time.sleep(0.05)
+    assert started["n"] == 1, "应起后台重算"
+
+
+def test_invalidate_cache_include_disk_clears_both_stats_files(
+    tmp_path, monkeypatch,
+) -> None:
+    """运维/测试清缓存要连落盘统计一起删，否则会读到旧结果。"""
+    from src.api import data_health
+
+    wh = tmp_path / "warehouse_stats.json"
+    ts = tmp_path / "tushare_stats.json"
+    wh.write_text("{}", encoding="utf-8")
+    ts.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE", wh)
+    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE", ts)
+
+    data_health.invalidate_cache(include_disk=True)
+
+    assert not wh.exists() and not ts.exists()
 
 
 def test_notes_disclose_row_count_method() -> None:

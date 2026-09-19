@@ -13,6 +13,10 @@ import math
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.infrastructure.connectors.event_collectors.base import (
     iter_rows,
     make_raw_item,
@@ -163,7 +167,7 @@ class CalendarCollector:
                 df = await asyncio.to_thread(ak.news_economic_baidu, date=day)
                 items.extend(_map_macro_df(df))
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"宏观日历 {day} 拉取失败: {str(exc)[:100]}")
+                errors.append(f"宏观日历 {day} 拉取失败: {brief(exc, BRIEF_TIGHT)}")
         return items, errors
 
     async def _collect_stock_calendar(self) -> tuple[list[dict], list[str]]:
@@ -178,7 +182,7 @@ class CalendarCollector:
                 df = await asyncio.to_thread(getattr(ak, fn_name), **kwargs)
                 items.extend(mapper(df))
             except Exception as exc:  # noqa: BLE001
-                errors.append(f"个股日程 {fn_name} 拉取失败: {str(exc)[:100]}")
+                errors.append(f"个股日程 {fn_name} 拉取失败: {brief(exc, BRIEF_TIGHT)}")
         # 财报披露按当日查询，扫今天+7天内安排（逐天失败静默计一次）
         try:
             offsets = range(0, _STOCK_WINDOW_DAYS + 1)
@@ -190,7 +194,7 @@ class CalendarCollector:
                 except Exception:  # noqa: BLE001 逐天接口波动不记噪声
                     continue
         except Exception as exc:  # noqa: BLE001 防御 ak 模块本身异常
-            errors.append(f"财报日程拉取失败: {str(exc)[:100]}")
+            errors.append(f"财报日程拉取失败: {brief(exc, BRIEF_TIGHT)}")
         return items, errors
 
     async def collect(self) -> tuple[list[dict], list[str]]:
@@ -200,8 +204,8 @@ class CalendarCollector:
             try:
                 part, errs = await coro
             except Exception as exc:  # noqa: BLE001
-                logger.warning("投资日历分组采集异常: %s", str(exc)[:120])
-                errors.append(f"投资日历分组异常: {str(exc)[:100]}")
+                logger.warning("投资日历分组采集异常: %s", brief(exc, BRIEF_TIGHT))
+                errors.append(f"投资日历分组异常: {brief(exc, BRIEF_TIGHT)}")
                 continue
             items.extend(part)
             errors.extend(errs)

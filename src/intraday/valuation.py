@@ -26,6 +26,10 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.core.exceptions import DataFetchError
 from src.intraday.config import IntradayConfig, WatchConfig
 from src.intraday.features import safe_float
@@ -241,9 +245,9 @@ class ValuationProvider:
                 result = await self._backend.fetch(indicator)
                 points[prefix] = result or []
             except DataFetchError as exc:
-                gaps.append(f"{indicator} 取数失败：{str(exc)[:80]}")
+                gaps.append(f"{indicator} 取数失败：{brief(exc, BRIEF_TIGHT)}")
             except Exception as exc:  # noqa: BLE001 数据层任何异常都不应打断面板
-                gaps.append(f"{indicator} 取数异常：{str(exc)[:80]}")
+                gaps.append(f"{indicator} 取数异常：{brief(exc, BRIEF_TIGHT)}")
         return points.get("PE(TTM)", []), points.get("PB", []), gaps
 
     @staticmethod
@@ -291,7 +295,7 @@ class ValuationProvider:
         try:
             quotes, _, _ = await self._data.fetch_peer_quotes(codes)
         except DataFetchError as exc:
-            return [], f"同业快照失败：{str(exc)[:100]}", False
+            return [], f"同业快照失败：{brief(exc, BRIEF_TIGHT)}", False
         peers = [
             ValuationPeer(
                 code=quote.code, name=quote.name, pe_ttm=quote.pe_ttm,
@@ -335,7 +339,7 @@ class ValuationProvider:
                     date=month.strftime("%Y%m%d"))
             except Exception as exc:  # noqa: BLE001 巨潮接口偶发为空
                 logger.warning("巨潮行业市盈率取数失败(%s): %s",
-                               month.strftime("%Y%m"), str(exc)[:120])
+                               month.strftime("%Y%m"), brief(exc, BRIEF_TIGHT))
                 continue
             if frame is not None and len(frame):
                 return frame

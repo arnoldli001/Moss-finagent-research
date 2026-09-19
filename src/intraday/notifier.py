@@ -20,6 +20,10 @@ from typing import Any
 import httpx
 
 from src.core.config import Settings, get_settings
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
 from src.intraday.config import IntradayConfig
 from src.intraday.models import IntradaySnapshot, NotifyResult, TradeSignal
 
@@ -148,9 +152,9 @@ class SignalNotifier:
                 results.append(NotifyResult(
                     channel=channel, status="sent", detail="群机器人已送达"))
             except Exception as exc:  # noqa: BLE001 单个渠道失败不影响其它渠道
-                logger.warning("做T推送失败 %s: %s", channel, str(exc)[:150])
+                logger.warning("做T推送失败 %s: %s", channel, brief(exc, BRIEF_DEFAULT))
                 results.append(NotifyResult(
-                    channel=channel, status="failed", detail=str(exc)[:200]))
+                    channel=channel, status="failed", detail=brief(exc, BRIEF_DEFAULT)))
         if not any(result.status == "sent" for result in results) and notify.email_fallback:
             results.append(await self._send_email(title, text))
         return results
@@ -200,9 +204,9 @@ class SignalNotifier:
                 channel="email", status="sent",
                 detail=f"已发送至{settings.alert_email_to}")
         except Exception as exc:  # noqa: BLE001
-            logger.warning("做T邮件推送失败: %s", str(exc)[:150])
+            logger.warning("做T邮件推送失败: %s", brief(exc, BRIEF_DEFAULT))
             return NotifyResult(
-                channel="email", status="failed", detail=str(exc)[:200])
+                channel="email", status="failed", detail=brief(exc, BRIEF_DEFAULT))
 
     def _send_email_sync(self, title: str, text: str) -> None:
         import smtplib

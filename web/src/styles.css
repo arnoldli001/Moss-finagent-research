@@ -566,6 +566,105 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .app-wide { max-width: 1760px; }
 
 .intraday-root { display: flex; flex-direction: column; gap: 14px; }
+
+/* ---- 两栏骨架：左=自选滑动窗口，右=个股工作面（参考同花顺持仓栏布局） ----
+   为什么不再把自选横向平铺：十几只票会占掉 2~3 行高度，把分时图挤到下面，
+   而且每加一只就再挤一行（用户报障「容不下较多自选股」）。 */
+.intraday-body {
+  display: flex; align-items: flex-start; gap: 12px; position: relative;
+}
+.intraday-main {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.intraday-drawer {
+  flex: 0 0 246px; width: 246px;
+  position: sticky; top: 12px;
+  max-height: calc(100vh - 120px);
+  display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transform: translateX(-108%);
+  margin-right: -258px;                 /* 收起时不占宽度 */
+  opacity: 0; pointer-events: none;
+  transition: transform 0.18s ease, opacity 0.18s ease, margin-right 0.18s ease;
+}
+.intraday-body.drawer-open .intraday-drawer {
+  transform: translateX(0); margin-right: 0; opacity: 1; pointer-events: auto;
+}
+.drawer-toggle { display: inline-flex; align-items: center; gap: 6px; }
+.drawer-toggle.active { border-color: var(--accent); color: var(--accent); }
+.drawer-icon { font-size: 13px; line-height: 1; }
+.drawer-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+.drawer-head .btn-ghost.tiny { min-width: auto; padding: 2px 8px; font-size: 11px; }
+.drawer-head .drawer-hide { margin-left: auto; }
+.drawer-status { margin: 6px 10px 0; font-size: 10px; }
+.watch-list {
+  list-style: none; margin: 0; padding: 6px;
+  overflow-y: auto; flex: 1 1 auto; min-height: 0;
+}
+.watch-empty { padding: 8px 6px; line-height: 1.7; }
+.watch-row {
+  display: flex; align-items: stretch;
+  border: 1px solid transparent; border-radius: 6px;
+}
+.watch-row:hover { background: rgba(255,255,255,0.03); }
+.watch-row.active {
+  background: rgba(74,158,255,0.12); border-color: var(--accent);
+}
+.watch-row .watch-pick {
+  flex: 1 1 auto; min-width: 0;
+  display: grid; gap: 1px 6px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "name chg" "code score" "badge badge";
+  align-items: center; text-align: left;
+  background: transparent; color: var(--text); border: none;
+  border-radius: 6px; padding: 6px 8px; font-size: 12px; cursor: pointer;
+}
+.watch-row .watch-pick:hover { background: rgba(74,158,255,0.1); }
+.watch-name {
+  grid-area: name; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.watch-code { grid-area: code; font-size: 10px; }
+.watch-chg { grid-area: chg; text-align: right; font-size: 12px; }
+.watch-score { grid-area: score; text-align: right; font-size: 10px; }
+.watch-row .sig-badge { grid-area: badge; justify-self: start; margin-top: 2px; }
+.watch-row .watch-remove {
+  flex: 0 0 auto; min-width: 0; width: 20px; padding: 0;
+  background: transparent; color: var(--muted); border: none;
+  border-radius: 6px; font-size: 13px; line-height: 1; cursor: pointer;
+}
+.watch-row .watch-remove:hover:not(:disabled) {
+  background: rgba(217,92,74,0.18); color: var(--low);
+}
+.watch-row .watch-remove:disabled { opacity: 0.5; cursor: default; }
+/* 遮罩只在"抽屉盖住内容"的窄屏下出现 */
+.drawer-backdrop { display: none; }
+
+@media (max-width: 1180px) {
+  /* 窄屏：抽屉改为浮层覆盖（absolute），不再挤压正文 */
+  .intraday-drawer {
+    position: absolute; left: 0; top: 0; z-index: 30;
+    max-height: 70vh; box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+    margin-right: 0;
+  }
+  .intraday-body.drawer-open .drawer-backdrop {
+    display: block; position: fixed; inset: 0; z-index: 20;
+    background: rgba(0,0,0,0.45); border: none; border-radius: 0;
+    width: auto; min-width: 0; padding: 0; cursor: pointer;
+  }
+}
+
+/* ---- 走势图口径切换条（紧贴图上方） ---- */
+.mode-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 12px;
+}
 .intraday-toolbar {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--border);
@@ -589,8 +688,9 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .hl-price { font-size: 22px; font-weight: 700; }
 .hl-levels { font-size: 12px; }
 
-.intraday-watch { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-/* 自选池刷新状态：自动刷新中为绿色，暂停（盘前/午休/收盘/周末）为中性灰 */
+/* 自选股已改为左侧滑动窗口（见上方 .intraday-drawer / .watch-list）：
+   旧的横向 chip 样式整套删除，避免"改了一处、另一处还在生效"的幽灵样式。 */
+/* .watch-refresh 保留：抽屉头部的刷新状态条仍在用 */
 .watch-refresh {
   font-size: 11px; color: var(--muted, #8a93a6);
   border: 1px solid var(--border); border-radius: 12px; padding: 2px 8px;
@@ -598,27 +698,6 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 }
 .watch-refresh.live { color: var(--low, #3fbf7f); border-color: rgba(63,191,127,0.35);
   background: rgba(63,191,127,0.08); }
-.watch-chip {
-  display: flex; align-items: stretch; gap: 0;
-  background: var(--panel); border: 1px solid var(--border);
-  border-radius: 16px; overflow: hidden;
-}
-.watch-chip.active { border-color: var(--accent); background: rgba(74,158,255,0.12); }
-.watch-chip .chip-main {
-  display: flex; align-items: center; gap: 6px;
-  background: transparent; color: var(--text); border: none;
-  padding: 5px 8px 5px 12px; font-size: 12px; min-width: auto;
-  border-radius: 0; cursor: pointer;
-}
-.watch-chip .chip-main:hover { background: rgba(74,158,255,0.1); }
-.watch-chip .chip-remove {
-  background: transparent; color: var(--muted); border: none;
-  border-left: 1px solid var(--border);
-  padding: 0 8px; font-size: 13px; min-width: auto; border-radius: 0;
-  cursor: pointer; line-height: 1;
-}
-.watch-chip .chip-remove:hover:not(:disabled) { background: rgba(217,92,74,0.18); color: var(--low); }
-.watch-chip .chip-remove:disabled { opacity: 0.5; cursor: default; }
 .loading-pill {
   display: inline-flex; align-items: center; gap: 6px;
   font-size: 11px; color: var(--accent);
@@ -632,11 +711,22 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .sig-hollow { background: transparent; border: 1px solid var(--accent); color: var(--accent); }
 .sig-none { background: var(--border); color: var(--muted); }
 
+/* 左：估值空间（窄列）｜右：分时图与提示点（吃掉剩余全部宽度）
+ *
+ * 列顺序**故意**是"估值在前、图在后"：DOM 顺序是 估值 → 图（用户习惯先看结论、
+ * 再看图），所以估值必须写成窄的**第一**列。早期把宽列写在前面（minmax(360,460)
+ * 在前），结果图只拿到 360~460px、估值反而占满剩余宽度 —— 正是"分时图被挤得
+ * 文字看不清"的根因。
+ *
+ * 估值给 minmax(320px, 400px)：再窄 PE/PB 那几行数字会换行；再宽就是白占图的宽度。
+ * 图给 minmax(0, 1fr)：1fr 而不是 auto，保证它一定能被压缩（否则窄屏溢出横向滚动）。
+ */
 .intraday-top {
-  display: grid; grid-template-columns: minmax(360px, 460px) minmax(0, 1fr);
+  display: grid; grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
   gap: 14px; align-items: start;
 }
-@media (max-width: 1180px) { .intraday-top { grid-template-columns: 1fr; } }
+/* 1320px 以下改上下堆叠：并排时图会窄于 ~880px，分时图的坐标标签就开始挤了 */
+@media (max-width: 1320px) { .intraday-top { grid-template-columns: 1fr; } }
 .intraday-panel { margin-bottom: 0; }
 .panel-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
 .panel-head h2 { margin: 0; }
@@ -718,6 +808,28 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .lv-box text { fill: var(--muted); }
 .lv-boll line { stroke: var(--accent); opacity: 0.35; stroke-dasharray: 3 5; }
 .lv-boll text { fill: var(--accent); }
+/* 档位漂移曲线也是同一批颜色，但选择器必须覆盖 `path` ——
+   早期只写了 `line`，于是带 class 的 <path> 按 SVG 默认 stroke:none 渲染 = 看不见。 */
+.lv-sell path { stroke: var(--low); }
+.lv-buy path { stroke: var(--high); }
+.lv-stop path { stroke: #e0b020; }
+/* 十字光标上的数值标（轴标与交点读数） */
+.crosshair-label {
+  font-family: ui-monospace, Consolas, monospace;
+  font-weight: 600;
+}
+.crosshair-readout {
+  padding: 1px 8px; border-radius: 9px;
+  background: rgba(74,158,255,0.16); color: var(--accent);
+}
+.crosshair-levels { font-size: 11px; }
+.chart-readout .mono { font-variant-numeric: tabular-nums; }
+/* 档位清单里的显示开关 */
+.level-chip input[type="checkbox"] {
+  accent-color: var(--accent); margin: 0 2px 0 0; cursor: pointer;
+}
+.level-chip.hidden-line { opacity: 0.45; border-style: dashed; }
+.level-chip.hidden-line b { text-decoration: line-through; }
 .chart-readout {
   display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
   font-size: 12px; min-height: 20px;
@@ -1042,3 +1154,640 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .cycle-strip .gate-text {
   color: var(--low); font-weight: 600; flex-basis: 100%;
 }
+.cycle-strip .muted-text { flex: 1 1 320px; line-height: 1.6; }
+
+/* ---- 权重编辑：实时价格线影响面板 ---- */
+.badge-tag.live-badge { background: rgba(46,168,110,0.18); color: var(--high); }
+.badge-tag.warn-badge { background: rgba(217,161,59,0.2); color: var(--medium); }
+.weight-editor-block h3 .muted-text { font-weight: 400; font-size: 11px; margin-left: 6px; }
+.level-scale { margin: 8px 0 10px; }
+.level-scale-label { display: block; margin-bottom: 3px; }
+.level-scale-track {
+  position: relative; height: 22px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: linear-gradient(90deg,
+    rgba(217,92,74,0.10) 0%, rgba(255,255,255,0.02) 45%,
+    rgba(255,255,255,0.02) 55%, rgba(46,168,110,0.10) 100%);
+}
+.level-scale-zero {
+  position: absolute; left: 50%; top: 0; bottom: 0; width: 1px;
+  background: var(--muted); opacity: 0.6;
+}
+.level-scale-mark {
+  position: absolute; top: 2px; bottom: 2px; width: 3px;
+  border-radius: 2px; transform: translateX(-1.5px);
+}
+.level-scale-mark.mark-low_buy { background: var(--high); }
+.level-scale-mark.mark-high_sell { background: var(--low); }
+.level-scale-mark.mark-stop_loss { background: var(--medium); }
+.gate-ok { color: var(--high); font-size: 12px; }
+.gate-no { color: var(--low); font-size: 12px; }
+.weight-editor-table tr.row-stop td { color: var(--medium); }
+
+/* ---- 资金流监控页签 ---- */
+.fundflow-root { display: flex; flex-direction: column; gap: 12px; }
+.fundflow-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 14px; font-size: 12px;
+}
+.fundflow-head .mode-switch { margin: 0; }
+.fundflow-head select { padding: 4px 8px; font-size: 12px; }
+.fundflow-head button { min-width: auto; padding: 5px 12px; font-size: 12px; }
+.flow-source {
+  font-size: 11px; padding: 1px 8px; border-radius: 9px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.fundflow-body {
+  display: grid; grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
+  gap: 12px; align-items: start;
+}
+@media (max-width: 1180px) { .fundflow-body { grid-template-columns: 1fr; } }
+.fundflow-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.flow-block {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px 12px; min-width: 0;
+}
+.flow-block h3 { margin: 0 0 8px; font-size: 13px; }
+.flow-block h3 .muted-text { font-weight: 400; font-size: 11px; margin-left: 6px; }
+.flow-block .mode-switch { margin-bottom: 8px; }
+.flow-block .mode-btn { padding: 3px 10px; font-size: 11px; }
+.flow-table { width: 100%; }
+.flow-table .row-active td { background: rgba(74,158,255,0.10); }
+.flow-pick {
+  background: transparent; border: none; color: var(--text);
+  min-width: auto; padding: 0; font-size: 11px; cursor: pointer;
+  text-decoration: underline dotted rgba(139,152,165,0.6);
+}
+.flow-pick:hover { color: var(--accent); }
+/* 入榜类别徽标：说明"这只票为什么在榜上"（昨日涨停 / 净流入前10 / 净流出前10…） */
+.flow-group {
+  display: inline-block; margin-left: 5px; padding: 0 5px;
+  border-radius: 8px; font-size: 10px; line-height: 15px;
+  border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+}
+.flow-group.group-limit {
+  color: #f0a020; border-color: rgba(240,160,32,0.55);
+  background: rgba(240,160,32,0.12);
+}
+.flow-group.group-in {
+  color: var(--low); border-color: rgba(46,168,110,0.5);
+  background: rgba(46,168,110,0.10);
+}
+.flow-group.group-out {
+  color: var(--high); border-color: rgba(224,90,80,0.5);
+  background: rgba(224,90,80,0.10);
+}
+.flow-group.group-watch { color: var(--accent); border-color: rgba(74,158,255,0.5); }
+.flow-table td.factor-name { max-width: 210px; }
+.flow-search { display: flex; gap: 6px; margin-bottom: 8px; }
+.flow-search select { padding: 4px 6px; font-size: 12px; }
+.flow-search input { flex: 1 1 auto; min-width: 0; padding: 4px 8px; font-size: 12px; }
+.flow-search button { min-width: auto; padding: 4px 10px; font-size: 12px; }
+.flow-results {
+  list-style: none; margin: 0 0 8px; padding: 4px 0 0; max-height: 190px;
+  overflow-y: auto; border-top: 1px dashed var(--border);
+}
+.flow-results li {
+  display: flex; align-items: center; gap: 6px;
+  padding: 2px 0; font-size: 12px;
+}
+.flow-results li span:first-child { flex: 0 1 auto; }
+.flow-results li .btn-ghost { margin-left: auto; }
+/* 已加入：按钮变"✓ 已加入"并禁用 —— 点了没反应最容易被当成功能坏了 */
+.flow-results li .btn-ghost.done {
+  color: var(--low); border-color: rgba(46,168,110,0.55);
+  background: rgba(46,168,110,0.10); cursor: default; opacity: 0.9;
+}
+.flow-results li .btn-ghost:disabled:not(.done) { opacity: 0.6; }
+/* 「＋ 加自选」成功后的短暂回执（1.6 秒）——替代原来的提示气泡，
+   只是按钮变绿 + 文案变「✓ 已加入」，不遮挡任何内容 */
+.btn-ghost.done {
+  color: var(--low); border-color: rgba(46,168,110,0.55);
+  background: rgba(46,168,110,0.10); cursor: default; opacity: 0.95;
+}
+
+/* ---- 关联板块选择器（带联想） ---- */
+.board-picker { position: relative; flex: 0 1 auto; min-width: 200px; }
+.board-picker-row {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel-2, rgba(255,255,255,0.02));
+  padding: 3px 6px; min-height: 30px;
+}
+.board-picker-row .board-input {
+  flex: 1 1 90px; min-width: 90px; border: none; background: transparent;
+  padding: 2px 4px; font-size: 12px; outline: none;
+}
+.board-chip {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 1px 3px 1px 7px; border-radius: 9px; font-size: 11px;
+  border: 1px solid rgba(74,158,255,0.5); background: rgba(74,158,255,0.12);
+  white-space: nowrap;
+}
+.board-chip .chip-x {
+  background: transparent; border: none; color: var(--muted);
+  min-width: auto; padding: 0 3px; font-size: 11px; cursor: pointer; line-height: 1;
+}
+.board-chip .chip-x:hover { color: var(--low); }
+.board-suggest {
+  position: absolute; z-index: 40; top: calc(100% + 4px); left: 0; right: 0;
+  max-height: 230px; overflow-y: auto; margin: 0; padding: 4px 0;
+  list-style: none; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel); box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+}
+.board-suggest li {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; padding: 4px 10px; font-size: 12px; cursor: pointer;
+}
+.board-suggest li:hover { background: rgba(74,158,255,0.14); }
+/* 「以下是『X』的结果，正在查询『Y』…」：竞态兜底说明行，不该有 hover 效果 */
+.suggest-list li.suggest-stale {
+  font-size: 11px; cursor: default; border-bottom: 1px dashed var(--border);
+}
+.suggest-list li.suggest-stale:hover { background: transparent; }
+
+.flow-watch {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  border-top: 1px dashed var(--border); padding-top: 8px; font-size: 11px;
+}
+.flow-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 4px 1px 8px; border-radius: 10px;
+  border: 1px solid rgba(74,158,255,0.5); background: rgba(74,158,255,0.10);
+}
+.flow-chip.stock { border-color: rgba(46,168,110,0.5); background: rgba(46,168,110,0.10); }
+.flow-chip .chip-x {
+  background: transparent; border: none; color: var(--muted);
+  min-width: auto; padding: 0 4px; font-size: 12px; cursor: pointer;
+}
+.flow-chip .chip-x:hover { color: var(--low); }
+.flow-toggles { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.flow-toggle {
+  background: transparent; color: var(--text); min-width: auto;
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 2px 8px; font-size: 11px; cursor: pointer;
+}
+.flow-toggle.off { opacity: 0.45; text-decoration: line-through; }
+.flow-toggle:hover { border-color: var(--accent); }
+.flow-chart-wrap { display: flex; flex-direction: column; gap: 6px; }
+.flow-svg { width: 100%; height: auto; display: block; cursor: crosshair; }
+.flow-legend {
+  display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; color: var(--muted);
+}
+.flow-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.flow-legend-item i {
+  width: 10px; height: 3px; border-radius: 2px; display: inline-block;
+}
+.flow-legend-item b { font-weight: 600; }
+
+/* ---- 档位神经网络拟合条（② 分时图下方） ---- */
+.level-fit-strip {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 8px; padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  font-size: 12px;
+}
+.level-fit-strip .btn-ghost.tiny { min-width: auto; padding: 2px 8px; font-size: 11px; }
+.fit-on { color: var(--high); }
+.fit-off { color: var(--medium); }
+.level-fit-detail {
+  flex-basis: 100%; margin-top: 6px;
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+  background: rgba(255,255,255,0.02);
+}
+.level-fit-detail p { margin: 6px 0 0; line-height: 1.7; }
+.level-fit-detail .stat-chip em { font-style: normal; font-size: 10px; }
+
+/* ---- 顶部提示条（可关闭 + 自动消失） ---- */
+/* 悬浮提示（toast）：**fixed 定位，不占文档流**。
+   之前用的是面板内的 info-box，一出现就把下面所有面板整体下移（用户报障）。
+   现在浮在右下角，覆盖的是页面空白区，不影响任何布局。 */
+/* 自选排序下拉：窄一点，别把「刷新」按钮挤走 */
+.watch-sort {
+  flex: 0 0 auto; max-width: 92px; min-width: 72px;
+  padding: 2px 4px; font-size: 11px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+
+/* 置顶按钮：置顶后高亮，且置顶行的整体色调略作区分（一眼看出"这些是我钉住的"） */
+.watch-pin {
+  flex: 0 0 auto; min-width: 0; width: 22px; height: 22px; padding: 0;
+  line-height: 1; font-size: 11px; cursor: pointer;
+  background: transparent; color: var(--muted);
+  border: 1px solid transparent; border-radius: 4px; opacity: 0.55;
+}
+.watch-row:hover .watch-pin { opacity: 1; }
+.watch-pin.on {
+  opacity: 1; color: #f0a020;
+  border-color: rgba(240,160,32,0.45); background: rgba(240,160,32,0.12);
+}
+.watch-pin:hover { border-color: var(--border); }
+.watch-row.pinned { background: rgba(240,160,32,0.07); }
+
+.notice-toast {
+  position: fixed; right: 20px; bottom: 24px; z-index: 60;
+  display: flex; align-items: flex-start; gap: 10px;
+  max-width: min(420px, calc(100vw - 40px));
+  padding: 10px 12px; border-radius: var(--radius);
+  background: var(--panel); border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.38);
+  font-size: 12px; line-height: 1.6;
+  animation: notice-in 160ms ease-out;
+}
+.notice-toast.info { border-left: 3px solid var(--accent); }
+.notice-toast.warn { border-left: 3px solid #f0a020; }
+.notice-toast .notice-text { flex: 1 1 auto; word-break: break-word; }
+.notice-toast .notice-close {
+  flex: 0 0 auto; min-width: 0; width: 20px; height: 20px;
+  padding: 0; line-height: 1; font-size: 14px; cursor: pointer;
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.notice-toast .notice-close:hover { color: var(--text); border-color: var(--muted); }
+@keyframes notice-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.notice-box {
+  display: flex; align-items: flex-start; gap: 10px;
+}
+.notice-box .notice-text { flex: 1 1 auto; line-height: 1.6; word-break: break-word; }
+.notice-box .notice-close {
+  flex: 0 0 auto; min-width: 0; width: 20px; height: 20px;
+  padding: 0; line-height: 1; font-size: 14px; cursor: pointer;
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.notice-box .notice-close:hover { color: var(--text); border-color: var(--muted); }
+/* ==================================================================
+   量化选股（量化交易 tab 的子模块）
+   ==================================================================
+   组合级模块：状态条 + 三个子页签（选股结果 / 自定义板块 / 历史记录）。
+   颜色沿用全局变量（--low 涨 / --high 跌 / --accent 主色），不引入新色板。 */
+.qsel { display: flex; flex-direction: column; gap: 10px; }
+.qsel-status {
+  background: var(--panel, #1b2028); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 12px;
+}
+.qsel-status-main { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.qsel-status-meta { margin-top: 4px; font-size: 11px; line-height: 1.7; }
+.qsel-live { color: var(--accent); }
+.qsel-tabs { margin: 0; }
+.qsel-body { display: flex; flex-direction: column; gap: 10px; }
+.qsel-runbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+}
+.qsel-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.qsel-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 10px; font-size: 11px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--muted); cursor: pointer; min-width: 0;
+}
+.qsel-chip:hover { color: var(--text); border-color: var(--muted); }
+.qsel-chip.on {
+  color: var(--accent); border-color: rgba(74,158,255,0.55);
+  background: rgba(74,158,255,0.10);
+}
+.qsel-chip-x {
+  min-width: 0; padding: 0 2px; background: transparent; border: none;
+  color: inherit; cursor: pointer; font-size: 12px; line-height: 1;
+}
+.qsel-chip-x:hover { color: var(--high); }
+.qsel-runmeta { font-size: 11px; }
+.qsel-model { font-size: 11px; }
+/* 选股结果的批量动作行（一键全部加自选 / 导出名称 txt） */
+.qsel-actions {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 0;
+}
+.qsel-actions .muted-text { font-size: 11px; }
+/* 数据滞后横幅：内容较多，允许换行并排成一段 */
+.qsel-stale { display: flex; flex-direction: column; gap: 4px; }
+.qsel-stale .muted-text { font-size: 11px; line-height: 1.6; }
+/* 刚加进自选的票：滚进视野 + 短暂高亮。
+   自选池是追加顺序，新票在末尾 —— 没有这个高亮，用户在一屏之外
+   根本看不出"加进去的那只"在哪（实测报障过）。 */
+@keyframes watch-just-added {
+  0%, 60% { background: rgba(74, 158, 255, 0.22); }
+  100% { background: transparent; }
+}
+.watch-row.just-added {
+  animation: watch-just-added 4s ease-out 1;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.qsel-err { color: var(--high); }
+/* 结果表：表头与数据**统一居中** + 完整表格线（用户口径 2026-09-18）。
+   原来用 .audit-table：表头 text-align:left、数据居中 → 看着"对不齐很丑"。
+   这里显式覆盖对齐方式，并补上列间竖线（只留底边线时横向扫读容易串行）。 */
+.qsel-table { width: 100%; }
+.qsel-table th { white-space: nowrap; }
+.qsel-result-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  table-layout: fixed;          /* 列宽按 th 上的 width 固定，内容再长也不挤歪表头 */
+}
+.qsel-result-table th,
+.qsel-result-table td {
+  text-align: center;
+  vertical-align: middle;
+  padding: 7px 8px;
+  border: 1px solid var(--border);   /* 完整表格线 */
+}
+.qsel-result-table th {
+  color: var(--muted);
+  font-weight: 500;
+  background: rgba(255, 255, 255, 0.03);   /* 表头与数据行区分开 */
+}
+.qsel-result-table tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.015);  /* 斑马纹：横向长表更好读 */
+}
+.qsel-result-table tbody tr:hover { background: rgba(255, 255, 255, 0.05); }
+.qsel-result-table tbody tr.row-active { background: rgba(90, 160, 255, 0.14); }
+/* 消息列：正文居中但**左对齐排布**更好读；超长标题省略，悬停看全文 */
+.qsel-result-table td.qsel-news-cell { text-align: left; }
+.qsel-news {
+  display: flex; flex-direction: column; gap: 2px;
+  max-width: 100%; overflow: hidden;
+}
+.qsel-news > a, .qsel-news > span:first-child {
+  display: block;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.qsel-news > a { color: var(--accent); text-decoration: none; }
+.qsel-news > a:hover { text-decoration: underline; }
+.qsel-news-time { font-size: 10.5px; white-space: nowrap; }
+.qsel-news-detail {
+  border-top: 1px dashed var(--border); padding-top: 6px;
+  display: flex; flex-direction: column; gap: 3px; font-size: 12px;
+}
+.qsel-news-detail-item { display: flex; gap: 6px; align-items: baseline; }
+.qsel-news-detail-item a { color: var(--accent); text-decoration: none; }
+.qsel-news-detail-item a:hover { text-decoration: underline; }
+.qsel-detail {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.qsel-detail b { font-size: 13px; }
+.qsel-detail .data-table { width: auto; min-width: 320px; }
+.qsel-sector-form {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.qsel-form-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.qsel-input {
+  padding: 3px 8px; font-size: 12px; min-width: 120px;
+  background: var(--bg, #12161c); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.qsel-input.qsel-num { width: 64px; min-width: 64px; margin: 0 3px; }
+.qsel-sector-list { display: flex; flex-direction: column; gap: 8px; }
+.qsel-sector-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 12px; display: flex; flex-direction: column; gap: 8px;
+}
+.qsel-sector-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* ==================================================================
+   擒牛线主图（日K做T）：口径条 + 用法状态条 + 读数条
+   ==================================================================
+   用户 2026-09-18 口径：原来的蜡烛K线图下线，主图换成擒牛线五条档位线。
+   Y 轴按线值定标（不并入K线极值），因此原本被极值压平的细节能看清。 */
+.niuline-wrap .chart-toolbar { flex-wrap: wrap; }
+.niuline-meta {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 11px; margin: 2px 0 6px;
+}
+.niuline-variant {
+  padding: 1px 7px; border-radius: 9px; font-size: 11px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.niuline-variant.v-stock {
+  color: var(--accent); border-color: rgba(74,158,255,0.55);
+  background: rgba(74,158,255,0.10);
+}
+.niuline-variant.v-index {
+  color: var(--medium); border-color: rgba(240,160,32,0.55);
+  background: rgba(240,160,32,0.10);
+}
+.niuline-note { color: var(--medium); }
+.niuline-stance {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 5px 8px; margin-bottom: 6px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  font-size: 11px;
+}
+.niuline-stance-item {
+  display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+}
+.niuline-stance-item.off { opacity: 0.45; }
+.niuline-stance-item input { margin: 0; }
+.niuline-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+}
+.niuline-key { color: var(--text); }
+.niuline-state.above { color: var(--low); }
+.niuline-state.below { color: var(--high); }
+.niuline-state.none { color: var(--muted); }
+.niuline-readout {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 11px; margin-top: 4px;
+}
+.niuline-readout .up { color: var(--low); }
+.niuline-readout .down { color: var(--high); }
+
+/* ==================================================================
+   板块概念拥挤度（资金流监控面板第三个页签）
+   ==================================================================
+   结构：一键刷新栏 → 高拥挤度告警面板 → 全板块水位总览 → 单板块详情 → 自选池。 */
+.crowding-root { display: flex; flex-direction: column; gap: 10px; }
+.crowding-refreshbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+}
+.btn-ghost.primary {
+  border-color: rgba(74,158,255,0.6); color: var(--accent);
+  background: rgba(74,158,255,0.10);
+}
+.btn-ghost.primary:disabled { opacity: 0.55; }
+.crowding-progress { display: flex; align-items: center; gap: 8px; flex: 1 1 260px; }
+.crowding-progress-track {
+  flex: 1 1 auto; height: 8px; min-width: 120px;
+  background: rgba(139,152,165,0.18); border-radius: 4px; overflow: hidden;
+}
+.crowding-progress-fill {
+  height: 100%; background: var(--accent); transition: width 0.3s ease;
+}
+.crowding-done { color: var(--low); font-size: 12px; }
+.warn-text { color: var(--medium); }
+.error-text { color: var(--high); }
+.crowding-meta {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px;
+}
+/* 告警面板 */
+.crowding-alert-panel {
+  border: 1px solid rgba(224,90,80,0.45); border-radius: var(--radius);
+  background: rgba(224,90,80,0.06); padding: 8px 12px;
+}
+.crowding-alert-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.crowding-alert-head h3 { margin: 0; font-size: 13px; }
+.crowding-alert-empty { padding: 6px 0; font-size: 12px; color: var(--muted); }
+.crowding-alert-list, .crowding-watch-list {
+  list-style: none; margin: 6px 0 0; padding: 0;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.crowding-alert-item, .crowding-watch-item {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 4px 8px; border-radius: 4px; font-size: 12px;
+}
+.crowding-alert-item.tone-high {
+  background: rgba(224,90,80,0.16); border-left: 3px solid var(--high);
+}
+.crowding-alert-item.tone-warn {
+  background: rgba(240,160,32,0.13); border-left: 3px solid var(--medium);
+}
+.crowding-watch-item.tone-high { border-left: 3px solid var(--high); }
+.crowding-watch-item.tone-warn { border-left: 3px solid var(--medium); }
+.crowding-alert-name {
+  background: transparent; border: none; color: var(--text); cursor: pointer;
+  min-width: auto; padding: 0; font-size: 12px; font-weight: 600;
+  text-decoration: underline dotted rgba(139,152,165,0.55);
+}
+.crowding-alert-name:hover { color: var(--accent); }
+.crowding-water { font-weight: 600; }
+.crowding-water.tone-high { color: var(--high); }
+.crowding-water.tone-warn { color: var(--medium); }
+.crowding-water.tone-none { color: var(--muted); }
+/* 总览散点 / 详情 */
+.crowding-overview { display: flex; flex-direction: column; }
+.crowding-hover {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  font-size: 11px; margin-top: 4px; padding: 3px 6px;
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.crowding-detail { display: flex; flex-direction: column; }
+/* 自选池 */
+.crowding-watchlist {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px;
+}
+.crowding-search { position: relative; flex: 1 1 260px; min-width: 220px; }
+.crowding-search .qsel-input { width: 100%; }
+.crowding-suggest {
+  position: absolute; z-index: 30; left: 0; right: 0; top: 100%;
+  margin: 2px 0 0; padding: 0; list-style: none; max-height: 260px;
+  overflow-y: auto; background: var(--panel, #1b2028);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+}
+.crowding-suggest li { border-bottom: 1px solid var(--border); }
+.crowding-suggest li:last-child { border-bottom: none; }
+.crowding-suggest button {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  background: transparent; border: none; color: var(--text);
+  padding: 5px 8px; font-size: 12px; cursor: pointer; text-align: left;
+}
+.crowding-suggest button:hover { background: rgba(74,158,255,0.12); }
+
+/* ==================================================================
+   集合竞价选股（量化交易 → 竞价选股页签）
+   ==================================================================
+   结构：运行状态条 → 运行摘要 → 选股池 → 差一点 → 个股详情 → 落选区。 */
+.quant-tab-root { display: flex; flex-direction: column; }
+.auction-root { display: flex; flex-direction: column; gap: 10px; }
+.auction-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+}
+.auction-status { font-size: 12px; color: var(--muted); }
+.auction-status.live { color: var(--accent); }
+.auction-meta {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px;
+}
+.ok-text { color: var(--low); }
+.auction-gaps { font-size: 12px; }
+.auction-gaps summary { cursor: pointer; color: var(--muted); }
+.auction-gaps ul { margin: 4px 0 0 18px; padding: 0; }
+/* 选股池 */
+.auction-pick-list { list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 6px; }
+.auction-pick {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 6px 10px; display: flex; flex-direction: column; gap: 4px;
+}
+.auction-pick.active { border-color: var(--accent); background: rgba(74,158,255,0.06); }
+.auction-pick-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.auction-rank { font-size: 12px; font-weight: 600; color: var(--muted); min-width: 26px; }
+.auction-score { font-weight: 700; font-size: 16px; }
+.auction-score small { font-size: 10px; font-weight: 400; color: var(--muted); }
+.auction-score.big { font-size: 30px; }
+.auction-score.tone-strong { color: var(--high); }
+.auction-score.tone-ok { color: var(--medium); }
+.auction-score.tone-weak { color: var(--muted); }
+.auction-tag {
+  font-size: 10px; padding: 1px 6px; border-radius: 3px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.auction-tag.strong { border-color: rgba(74,158,255,0.6); color: var(--accent); }
+.auction-tag.warn { border-color: rgba(240,160,32,0.6); color: var(--medium); }
+.auction-tag.plain { border-color: var(--border); }
+.auction-pick-facts {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 11px;
+}
+/* 分项条 */
+.auction-dims {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 2px 12px;
+}
+.auction-dim { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.auction-dim-name { min-width: 56px; color: var(--muted); }
+.auction-dim-track {
+  flex: 1 1 auto; height: 6px; min-width: 40px;
+  background: rgba(139,152,165,0.18); border-radius: 3px; overflow: hidden;
+}
+.auction-dim-fill { display: block; height: 100%; }
+.auction-dim-fill.tone-strong { background: var(--high); }
+.auction-dim-fill.tone-ok { background: var(--medium); }
+.auction-dim-fill.tone-weak { background: var(--muted); }
+.auction-dim-value { min-width: 34px; text-align: right; color: var(--muted); }
+.auction-reason { font-size: 11px; color: var(--muted); line-height: 1.5; }
+/* 个股详情 */
+.auction-detail { display: flex; flex-direction: column; gap: 8px; }
+.auction-detail-score {
+  border-top: 1px solid var(--border); padding-top: 8px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.auction-detail-total { display: flex; align-items: center; gap: 12px; }
+.auction-detail-total-meta { display: flex; flex-direction: column; gap: 2px; }
+.auction-feature-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.auction-feature-table th {
+  text-align: left; color: var(--muted); font-weight: 400;
+  padding: 3px 8px 3px 0; white-space: nowrap; width: 90px;
+}
+.auction-feature-table td { padding: 3px 12px 3px 0; }
+.auction-dim-notes { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+.auction-dim-notes li { display: flex; gap: 8px; padding: 2px 0; }
+.auction-dim-notes b { min-width: 56px; color: var(--muted); font-weight: 400; }
+.auction-theme-reason { font-size: 11px; line-height: 1.5; }
+/* 落选区 */
+.auction-veto-list { list-style: none; margin: 0; padding: 0; font-size: 11px; }
+.auction-veto-list li {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 3px 6px; border-left: 3px solid var(--high);
+  background: rgba(224,90,80,0.06); margin-bottom: 2px;
+}
+/* 自定义战术标签（追击式/破冰式/无极式/龙回式/反核/趋龙）
+   —— 语料里没有这个体系，用虚线边框与其它标签区分，提示"来源不同"。 */
+.auction-tag.tactic {
+  border-style: dashed; border-color: rgba(160,120,255,0.7); color: #b49bff;
+}
+/* 新龙头 / 有梯队标签（用户规则2 后半段；市场级判定下发到龙头个股） */
+.auction-tag.leader {
+  border-color: rgba(255,120,60,0.8); color: #ff9a5c; font-weight: 600;
+}
+.auction-tag.tier { border-color: rgba(80,200,160,0.8); color: #5fd8a8; }

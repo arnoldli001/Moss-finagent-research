@@ -12,6 +12,10 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.domain.alerts.keywords import is_relevant
 from src.infrastructure.connectors.event_collectors.base import (
     iter_rows,
@@ -132,7 +136,7 @@ class NewsFlashCollector:
                 self._fetch_source_sync, tag, fn_name, mapper)
             return items, None
         except Exception as exc:  # noqa: BLE001 单源失败降级，不阻断其余源
-            msg = f"快讯源 {tag} 采集失败: {str(exc)[:120]}"
+            msg = f"快讯源 {tag} 采集失败: {brief(exc, BRIEF_TIGHT)}"
             logger.warning(msg)
             return [], msg
 

@@ -47,6 +47,7 @@ from src.quant.single_backtest import (  # noqa: E402
     run_single_backtest,
 )
 from src.quant.strategy_presets import PRESETS, get_preset  # noqa: E402
+from src.core.errors import BRIEF_DEFAULT
 
 DEFAULT_UNIVERSE_SIZE = 30
 MIN_EXCESS_DEFAULT = 10.0      # "跑赢买入持有 10% 以上"
@@ -101,7 +102,7 @@ def scan_basket(keys: list[str], codes: list[str], days: list[str], *,
                 output[key].append({
                     "code": code,
                     "error": f"面板装配失败 {type(exc).__name__}: "
-                             f"{str(exc)[:80]}"})
+                             f"{brief(exc, BRIEF_DEFAULT)}"})
             continue
         for key in keys:
             preset = get_preset(key)
@@ -115,7 +116,7 @@ def scan_basket(keys: list[str], codes: list[str], days: list[str], *,
             except Exception as exc:  # noqa: BLE001 单个策略失败不影响其它
                 output[key].append({
                     "code": code,
-                    "error": f"{type(exc).__name__}: {str(exc)[:80]}"})
+                    "error": f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"})
                 continue
             output[key].append(_row_from(result, preset, key, min_trades))
         if progress:
@@ -275,7 +276,7 @@ def _archive_winners(scored: list[dict], *, min_excess: float, top: int,
             item["archived"] = True
         except Exception as exc:  # noqa: BLE001 存档失败不该丢掉扫描结果
             item["archived"] = False
-            item["archive_error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
+            item["archive_error"] = f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"
     status["stats"] = archive.stats()
     status["context"] = context
     return saved, status

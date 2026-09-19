@@ -32,6 +32,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_DIR = Path("data/quant/strategies")
@@ -191,7 +196,7 @@ class StrategyStore:
             self.root.mkdir(parents=True, exist_ok=True)
             return True
         except OSError as exc:
-            logger.warning("策略目录不可用：%s", str(exc)[:120])
+            logger.warning("策略目录不可用：%s", brief(exc, BRIEF_TIGHT))
             return False
 
     # ---------- 保存 ----------
@@ -274,7 +279,7 @@ class StrategyStore:
                 records.append(StrategyRecord.from_dict(payload))
             except (OSError, json.JSONDecodeError, TypeError) as exc:
                 logger.warning("策略文件损坏，跳过 %s：%s", path.name,
-                               str(exc)[:100])
+                               brief(exc, BRIEF_TIGHT))
         records.sort(key=lambda item: item.updated_at or item.created_at,
                      reverse=True)
         return records
@@ -287,7 +292,7 @@ class StrategyStore:
             payload = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, json.JSONDecodeError) as exc:
             raise StrategyError(
-                f"策略文件损坏：{strategy_id}（{str(exc)[:80]}）") from exc
+                f"策略文件损坏：{strategy_id}（{brief(exc, BRIEF_TIGHT)}）") from exc
         return StrategyRecord.from_dict(payload)
 
     def delete(self, strategy_id: str) -> bool:

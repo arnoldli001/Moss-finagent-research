@@ -24,6 +24,11 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 # 6位A股代码（前后不能紧邻数字/字母，避免从长串中误切）
@@ -121,7 +126,7 @@ def resolve_stock_sync(text: str) -> tuple[str, str] | None:
     try:
         pairs = _name_pairs()
     except Exception as exc:  # noqa: BLE001 akshare缺失/断网/超时且无缓存
-        logger.warning("证券名称表不可用，无法解析 '%s': %s", text[:30], str(exc)[:100])
+        logger.warning("证券名称表不可用，无法解析 '%s': %s", text[:30], brief(exc, BRIEF_TIGHT))
         return None
     # 精确匹配（target通常就是"中际旭创"）
     for c, n in pairs:

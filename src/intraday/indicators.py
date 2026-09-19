@@ -17,6 +17,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.core.trading_session import (
+    AFTERNOON_CLOSE,
+    AFTERNOON_OPEN,
+    MORNING_CLOSE,
+    session_offset,
+)
+
 # 分钟级周期字符串 → 分钟数（用于分时聚合与周期换算）
 PERIOD_MINUTES: dict[str, int] = {
     "1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "1d": 240,
@@ -307,13 +314,10 @@ def _bucket_end_label(minutes_of_day: int, minutes: int) -> int:
       - 桶起点 ≥ 15:00 → 并入收盘 15:00；
       - 其余按起点+M分钟。
     """
-    morning_close = 11 * 60 + 30
-    afternoon_open = 13 * 60
-    close = 15 * 60
-    if morning_close <= minutes_of_day < afternoon_open:
-        return morning_close
-    if minutes_of_day >= close:
-        return close
+    if MORNING_CLOSE <= minutes_of_day < AFTERNOON_OPEN:
+        return MORNING_CLOSE
+    if minutes_of_day >= AFTERNOON_CLOSE:
+        return AFTERNOON_CLOSE
     return minutes_of_day + minutes
 
 
@@ -370,18 +374,10 @@ def session_minutes_of(ts: str) -> int | None:
     """时间戳 → 当日交易分钟序号（09:30 起算，午休跳过）；解析失败返回 None。
 
     用于跨午休对齐分时图的 x 轴，使 11:30 与 13:00 相邻而不留空隙。
+    越界点（集合竞价、盘后）夹到两端，边界常量见 `core.trading_session`。
     """
     try:
         dt = pd.to_datetime(ts)
     except (ValueError, TypeError):
         return None
-    minutes = int(dt.hour) * 60 + int(dt.minute)
-    morning_open, morning_close = 9 * 60 + 30, 11 * 60 + 30
-    afternoon_open, afternoon_close = 13 * 60, 15 * 60
-    if morning_open <= minutes <= morning_close:
-        return minutes - morning_open
-    if afternoon_open <= minutes <= afternoon_close:
-        return (morning_close - morning_open) + (minutes - afternoon_open)
-    if minutes < morning_open:  # 集合竞价（09:15-09:25）归入开盘前
-        return 0
-    return (morning_close - morning_open) + (afternoon_close - afternoon_open)
+    return session_offset(int(dt.hour) * 60 + int(dt.minute))

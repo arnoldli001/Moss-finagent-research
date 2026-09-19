@@ -6,7 +6,8 @@ import AlertBell from "./components/AlertBell";
 import AlertsPanel from "./components/AlertsPanel";
 import AlertToasts from "./components/AlertToasts";
 import BacktestPanel from "./components/BacktestPanel";
-import IntradayTPanel from "./components/IntradayTPanel";
+import FundFlowPanel from "./components/FundFlowPanel";
+import QuantTabContainer from "./components/QuantTabContainer";
 import MetricsPanel from "./components/MetricsPanel";
 import ReportView from "./components/ReportView";
 import SchedulerPanel from "./components/SchedulerPanel";
@@ -30,10 +31,19 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 默认落地页 = 量化交易（用户口径 2026-09-18）。
+  //
+  // 为什么直接改默认值而不是做"记住上次"：本应用**没有**把 view 持久化到
+  // localStorage/URL，所以每次打开都是全新挂载 —— 改 useState 初值就等于
+  // "每次打开都默认显示量化交易"，语义完全吻合，不需要额外的持久化逻辑
+  // （那种做法反而会让"想回到默认页"变得要清缓存）。
+  //
+  // ⚠️ 键名必须是 `"intraday"`：顶部导航的「量化交易」按钮绑的就是它
+  // （`view === "intraday"` 判高亮）。写成 `"quant"` 之类会编译不过或落空。
   const [view, setView] =
     useState<"research" | "scheduler" | "metrics" | "backtest" | "alerts"
-      | "intraday">(
-      "research");
+      | "intraday" | "fundflow">(
+      "intraday");
   const timer = useRef<number | null>(null);
 
   // 启动时拉取 agent 中文名/置信度中文映射（失败有本地兜底，不阻断渲染）
@@ -141,7 +151,7 @@ export default function App() {
   const running = task !== null && (task.status === "queued" || task.status === "running");
 
   return (
-    <div className={view === "intraday" ? "app app-wide" : "app"}>
+    <div className={view === "intraday" || view === "fundflow" ? "app app-wide" : "app"}>
       <header className="header">
         <h1>Moss-FinAgent-Research</h1>
         <span className="subtitle">多Agent投研工作台 · 全链路可溯源</span>
@@ -174,7 +184,13 @@ export default function App() {
             className={view === "intraday" ? "tab active" : "tab"}
             onClick={() => setView("intraday")}
           >
-            做T辅助
+            量化交易
+          </button>
+          <button
+            className={view === "fundflow" ? "tab active" : "tab"}
+            onClick={() => setView("fundflow")}
+          >
+            资金流监控
           </button>
           <button
             className={view === "alerts" ? "tab active" : "tab"}
@@ -194,7 +210,9 @@ export default function App() {
       ) : view === "backtest" ? (
         <BacktestPanel />
       ) : view === "intraday" ? (
-        <IntradayTPanel />
+        <QuantTabContainer />
+      ) : view === "fundflow" ? (
+        <FundFlowPanel />
       ) : view === "alerts" ? (
         <AlertsPanel
           incomingTick={incomingTick}

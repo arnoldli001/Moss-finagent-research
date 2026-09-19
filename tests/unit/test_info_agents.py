@@ -1,6 +1,7 @@
 """信息层三Agent测试（A05去伪/A06提取/A07舆情，FakeGateway注入，不联网）。"""
 
 import json
+import time
 
 import pytest
 
@@ -39,7 +40,11 @@ def _make_input(payload: dict, task_id: str = "t_info") -> AgentInput:
 # ---------- A05 本地规则评分 ----------
 
 def test_score_item_official_source_high():
-    s = score_item({"source_name": "国家统计局", "publish_time": "2026-09-10T09:00:00+08:00",
+    # `publish_time` 必须**跟当天走**：这个用例断言的是"两天内 → recency=1.0"，
+    # 写死日期的断言会随日历推进自己烂掉（实测：写死 2026-09-10 时，
+    # 到 2026-09-17 就变成 0.9 而失败 —— 那不是回归，是测试过时）。
+    fresh = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime(time.time()))
+    s = score_item({"source_name": "国家统计局", "publish_time": fresh,
                     "text": "8月CPI同比上涨0.4%，涨幅比上月扩大0.1个百分点"})
     assert s["source_score"] == 1.0
     assert s["recency_factor"] == 1.0  # 两天内

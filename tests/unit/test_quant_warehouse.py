@@ -375,11 +375,21 @@ def test_dataset_tables_registry_covers_all_datasets() -> None:
 
 def test_data_health_exposes_warehouse(monkeypatch: pytest.MonkeyPatch,
                                        tmp_path: Path) -> None:
-    """「数据健康度」必须带仓库层，且仓库不可用时也不能让接口 500。"""
-    from src.api.data_health import build_data_health
+    """「数据健康度」必须带仓库层，且仓库不可用时也不能让接口 500。
+
+    **必须 `invalidate_cache(include_disk=True)`**：仓库统计有落盘缓存
+    （`data/quant/warehouse_stats.json`，为避开对 14GB 库做全表 COUNT(*)）。
+    同文件的 `test_data_health_survives_broken_warehouse` 会把「指向坏连接串」的
+    结果写进**同一个文件**，于是本用例在下一次运行时读到上一次的 mysql 结果 →
+    报 `assert 'mysql' == 'sqlite'`。
+    这是实测踩到的顺序依赖：清过一次缓存后首轮通过、之后每轮都失败
+    （缓存文件 mtime 停在上一轮）。
+    """
+    from src.api.data_health import build_data_health, invalidate_cache
 
     monkeypatch.setenv("MOSS_QUANT_SQLITE", str(tmp_path / "health.db"))
-    health = build_data_health(None)
+    invalidate_cache(include_disk=True)
+    health = build_data_health(None, force=True)
     assert "warehouse" in health
     assert health["warehouse"]["dialect"] == "sqlite"
     assert "notes" in health and health["notes"]

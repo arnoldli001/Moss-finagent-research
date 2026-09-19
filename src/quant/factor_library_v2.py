@@ -30,6 +30,10 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
 from src.quant.panels import FactorPanels
 
 logger = logging.getLogger(__name__)
@@ -453,7 +457,7 @@ def compute_factors(panels: FactorPanels, *,
         try:
             frame = spec.func(panels)
         except Exception as exc:  # noqa: BLE001 单个因子失败不该拖垮整批
-            logger.warning("因子 %s 计算失败：%s", key, str(exc)[:150])
+            logger.warning("因子 %s 计算失败：%s", key, brief(exc, BRIEF_DEFAULT))
             frame = pd.DataFrame(index=panels.dates, columns=panels.codes,
                                  dtype="float64")
         if frame is None or frame.empty:

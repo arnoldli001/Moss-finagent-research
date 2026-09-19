@@ -33,6 +33,11 @@ from typing import Any
 
 import requests
 
+from src.core import symbols
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.core.exceptions import DataFetchError
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
 from src.infrastructure.connectors.base import BaseConnector
@@ -571,7 +576,7 @@ class AkshareConnector(BaseConnector):
         cached = self._etf_name_cache.get(code)
         if cached and now - cached[0] < _ETF_NAME_TTL_SEC:
             return cached[1]
-        market = "sh" if code.startswith(("5", "6", "9")) else "sz"
+        market = symbols.market_of(code)
         name = ""
         try:
             resp = requests.get(
@@ -583,7 +588,7 @@ class AkshareConnector(BaseConnector):
                 if len(payload) > 1:
                     name = payload[1].strip()
         except requests.RequestException as exc:
-            logger.warning("ETF简称解析失败(%s): %s", code, str(exc)[:80])
+            logger.warning("ETF简称解析失败(%s): %s", code, brief(exc, BRIEF_TIGHT))
         self._etf_name_cache[code] = (now, name)
         return name
 
@@ -657,9 +662,9 @@ class AkshareConnector(BaseConnector):
                     if not oss_code:
                         raise DataFetchError(
                             f"乐咕宽基PE({idx_name})不可用且无中证官网兜底: "
-                            f"{str(exc)[:80]}") from exc
+                            f"{brief(exc, BRIEF_TIGHT)}") from exc
                     logger.info("乐咕PE(%s)失败，降级中证官网: %s",
-                                idx_name, str(exc)[:80])
+                                idx_name, brief(exc, BRIEF_TIGHT))
                     return self._etf_csindex_points(
                         indicator, code, etf_name, oss_code, idx_name,
                         "broad_index", note, start_date, end_date,
@@ -680,7 +685,7 @@ class AkshareConnector(BaseConnector):
             except Exception as exc:  # noqa: BLE001
                 raise DataFetchError(
                     f"ETF代理PB：乐咕{idx_name}市净率不可用"
-                    f"（中证官网仅提供PE）：{str(exc)[:80]}") from exc
+                    f"（中证官网仅提供PE）：{brief(exc, BRIEF_TIGHT)}") from exc
             if not points:
                 raise DataFetchError(f"乐咕宽基PB({idx_name})返回空序列")
             return points
@@ -710,11 +715,11 @@ class AkshareConnector(BaseConnector):
                     records = list(snap["records"])
                     storage_fallback = True
                     logger.warning("中证官网PE(%s)失败，使用本地快照: %s",
-                                   idx_code, str(exc)[:80])
+                                   idx_code, brief(exc, BRIEF_TIGHT))
             if not records:
                 raise DataFetchError(
                     f"关联指数{idx_name}({idx_code})中证官网PE获取失败: "
-                    f"{str(exc)[:80]}") from exc
+                    f"{brief(exc, BRIEF_TIGHT)}") from exc
         extra = self._proxy_extra(
             valuation="市盈率(TTM)", etf_code=code, etf_name=etf_name,
             kind=kind, index_name=idx_name, index_code=idx_code,
@@ -743,7 +748,7 @@ class AkshareConnector(BaseConnector):
     @staticmethod
     def _sina_symbol(code: str) -> str:
         """A股代码→新浪带市场前缀符号：6/9开头沪市，其余按深市。"""
-        return f"sh{code}" if code.startswith(("6", "9")) else f"sz{code}"
+        return symbols.exchange_symbol(code)
 
     def _stock_dataframe(
         self, ak: Any, code: str, start_date: str | None, end_date: str | None

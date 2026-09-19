@@ -263,30 +263,9 @@ watchlist:
     name: "中国船舶"
     boards: ["PCB概念"]
     peers: []
-  - code: "300308"
-    name: "中际旭创"
-    boards: ["CPO概念"]
-    peers: []
-    overseas: ["usNVDA"]
-  - code: "600176"
-    name: "中国巨石"
-    boards: ["PCB概念"]
-    peers: []
-  - code: "588170"
-    name: "科创半导体ETF华夏"
-    boards: []
-    peers: []
   - code: "603083"
     name: "剑桥科技"
     boards: ["共封装光学（CPO）"]
-    peers: []
-  - code: "002463"
-    name: "沪电股份"
-    boards: ["PCB概念"]
-    peers: []
-  - code: "688825"
-    name: "长鑫科技"
-    boards: ["存储芯片"]
     peers: []
   - code: "600105"
     name: "永鼎股份"
@@ -295,6 +274,227 @@ watchlist:
   - code: "600036"
     name: "招商银行"
     boards: ["银行"]
+    peers: []
+  - code: "600498"
+    name: "烽火通信"
+    boards: []
+    peers: []
+    overseas: ["usNVDA"]
+  - code: "603618"
+    name: "杭电股份"
+    boards: []
+    peers: []
+  - code: "600721"
+    name: "百花医药"
+    boards: []
+    peers: []
+  - code: "002297"
+    name: "博云新材"
+    boards: []
+    peers: []
+  - code: "688432"
+    name: "有研硅"
+    boards: []
+    peers: []
+  - code: "600737"
+    name: "中粮糖业"
+    boards: []
+    peers: []
+  - code: "300319"
+    name: "麦捷科技"
+    boards: []
+    peers: []
+  - code: "601869"
+    name: "长飞光纤"
+    boards: []
+    peers: []
+  - code: "600667"
+    name: "太极实业"
+    boards: []
+    peers: []
+  - code: "301511"
+    name: "德福科技"
+    boards: []
+    peers: []
+  - code: "300913"
+    name: "兆龙互连"
+    boards: ["光纤概念"]
+    peers: []
+  - code: "002855"
+    name: "捷荣技术"
+    boards: []
+    peers: []
+  - code: "000402"
+    name: "金融街"
+    boards: []
+    peers: []
+  - code: "688017"
+    name: "绿的谐波"
+    boards: ["F5G概念"]
+    peers: []
+  - code: "603402"
+    name: "陕西旅游"
+    boards: ["旅游综合"]
+    peers: []
+  - code: "688372"
+    name: "伟测科技"
+    boards: []
+    peers: []
+  - code: "301018"
+    name: "申菱环境"
+    boards: []
+    peers: []
+  - code: "300189"
+    name: "神农种业"
+    boards: []
+    peers: []
+  - code: "600869"
+    name: "远东股份"
+    boards: []
+    peers: []
+  - code: "002437"
+    name: "誉衡药业"
+    boards: []
+    peers: []
+  - code: "000779"
+    name: "甘咨询"
+    boards: []
+    peers: []
+  - code: "600127"
+    name: "金健米业"
+    boards: []
+    peers: []
+  - code: "300179"
+    name: "四方达"
+    boards: []
+    peers: []
+  - code: "688530"
+    name: "欧莱新材"
+    boards: []
+    peers: []
+  - code: "601118"
+    name: "海南橡胶"
+    boards: []
+    peers: []
+  - code: "002655"
+    name: "共达电声"
+    boards: []
+    peers: []
+  - code: "600172"
+    name: "黄河旋风"
+    boards: []
+    peers: []
+  - code: "688028"
+    name: "沃尔德"
+    boards: []
+    peers: []
+  - code: "600313"
+    name: "农发种业"
+    boards: []
+    peers: []
+  - code: "003040"
+    name: "楚天龙"
+    boards: []
+    peers: []
+  - code: "002365"
+    name: "永安药业"
+    boards: []
+    peers: []
+  - code: "600186"
+    name: "莲花控股"
+    boards: []
+    peers: []
+  - code: "300862"
+    name: "蓝盾光电"
+    boards: []
+    peers: []
+  - code: "000560"
+    name: "我爱我家"
+    boards: []
+    peers: []
+  - code: "301086"
+    name: "鸿富瀚"
+    boards: []
+    peers: []
+  - code: "600346"
+    name: "恒力石化"
+    boards: []
+    peers: []
+  - code: "300750"
+    name: "宁德时代"
+    boards: []
+    peers: []
+  - code: "000426"
+    name: "兴业银锡"
+    boards: []
+    peers: []
+  - code: "002460"
+    name: "赣锋锂业"
+    boards: []
+    peers: []
+  - code: "603920"
+    name: "世运电路"
+    boards: []
+    peers: []
+  - code: "300059"
+    name: "东方财富"
+    boards: []
+    peers: []
+  - code: "300124"
+    name: "汇川技术"
+    boards: []
+    peers: []
+  - code: "601609"
+    name: "金田股份"
+    boards: []
+    peers: []
+  - code: "601225"
+    name: "陕西煤业"
+    boards: []
+    peers: []
+  - code: "300765"
+    name: "石药创新"
+    boards: []
+    peers: []
+  - code: "688777"
+    name: "中控技术"
+    boards: []
+    peers: []
+  - code: "002028"
+    name: "思源电气"
+    boards: []
+    peers: []
+  - code: "002466"
+    name: "天齐锂业"
+    boards: []
+    peers: []
+  - code: "605117"
+    name: "德业股份"
+    boards: []
+    peers: []
+  - code: "300843"
+    name: "胜蓝股份"
+    boards: []
+    peers: []
+  - code: "601360"
+    name: "三六零"
+    boards: []
+    peers: []
+  - code: "300433"
+    name: "蓝思科技"
+    boards: []
+    peers: []
+  - code: "688141"
+    name: "杰华特"
+    boards: []
+    peers: []
+  - code: "301591"
+    name: "肯特股份"
+    boards: []
+    peers: []
+  - code: "688702"
+    name: "盛科通信"
+    boards: ["F5G概念", "通信网络设备及器件", "通信设备"]
     peers: []
 # <<< intraday-watchlist:end
 # ============ 信号推送（实心三角才推送；空心三角仅站内） ============

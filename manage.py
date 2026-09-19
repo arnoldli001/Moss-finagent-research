@@ -36,6 +36,13 @@ RUN_DIR = ROOT / "data" / "run"
 WEB_DIR = ROOT / "web"
 
 SERVICE_SIGNATURE = "moss-finagent-research"
+
+#: Windows 上让子进程不弹控制台窗口（等价 CREATE_NO_WINDOW 0x08000000）。
+#: 只取输出的探测类调用必须带上它：父进程（DSH/服务/守护进程）没有可继承的
+#: 控制台时，Windows 会给子进程**新分配一个可见控制台**，窗口标题就是
+#: python.exe 的全路径 —— 表现为桌面反复弹出黑窗。
+#: 前台可交互命令（uvicorn 前台、npm dev server）不要带，它们需要用户的控制台。
+_NO_CONSOLE = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 DEFAULT_BACKEND_PORT = 8100
 DEFAULT_FRONTEND_PORT = 5173
 OLLAMA_PORT = 11434
@@ -87,6 +94,8 @@ def _pid_alive(pid: int) -> bool:
         out = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
             capture_output=True, text=True, timeout=5,
+            errors="replace",  # Chinese Windows tasklist output is GBK
+            creationflags=_NO_CONSOLE,
         ).stdout or ""
         return str(pid) in out
     try:
@@ -126,6 +135,8 @@ def find_listening_pid(port: int) -> int | None:
             out = subprocess.run(
                 ["netstat", "-ano", "-p", "TCP"],
                 capture_output=True, text=True, timeout=8,
+                errors="replace",  # lenient decode: no exception, no lost lines
+                creationflags=_NO_CONSOLE,
             ).stdout or ""
             targets = {f"0.0.0.0:{port}", f"127.0.0.1:{port}", f"[::]:{port}"}
             for line in out.splitlines():
@@ -140,6 +151,7 @@ def find_listening_pid(port: int) -> int | None:
             out = subprocess.run(
                 ["bash", "-c", f"lsof -ti tcp:{port} -sTCP:LISTEN"],
                 capture_output=True, text=True, timeout=8,
+                creationflags=_NO_CONSOLE,
             ).stdout or ""
             if out.strip().isdigit():
                 return int(out.strip().splitlines()[0])
@@ -157,6 +169,7 @@ def get_cmdline(pid: int) -> str | None:
             ["powershell", "-NoProfile", "-Command",
              f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine"],
             capture_output=True, text=True, timeout=10,
+            creationflags=_NO_CONSOLE,
         ).stdout.strip()
         return out or None
     except (subprocess.SubprocessError, OSError):
@@ -193,6 +206,8 @@ def kill_pid_tree(pid: int) -> bool:
             r = subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(pid)],
                 capture_output=True, text=True, timeout=10,
+                errors="replace",  # same: localized messages must not kill the reader
+                creationflags=_NO_CONSOLE,
             )
             return r.returncode == 0
         import signal
@@ -200,6 +215,150 @@ def kill_pid_tree(pid: int) -> bool:
         return True
     except (subprocess.SubprocessError, OSError):
         return False
+
+
+def request_graceful_stop(pid: int) -> bool:
+    """先请进程自己优雅退出（Windows: CTRL_BREAK_EVENT 送给进程组）。
+
+    为什么不能一上来就 `taskkill /F`（2026-09-17 血案）：
+    `--daemon` 用 `CREATE_NEW_PROCESS_GROUP` 起进程，`kill_pid_tree` 的 `/F` 是
+    硬杀 —— FastAPI 的 lifespan 关停段根本不会执行，于是：
+
+    - SQLite 没有机会 checkpoint，`data/moss_finagent.db-wal` 被截断成 0 字节，
+      而 `-shm` 仍是上一轮的 64KB 索引；下次启动**每次**打开该库都立刻
+      `disk I/O error`，仓储 fail-open 穿透网络链 → 首个请求 182.9 秒。
+    - 端口监听者被杀掉了，但**端口之外**的历史实例活着变孤儿，一直占着
+      `-wal`/`-shm` 的文件句柄（实测有个 12:28 起的实例活到 16:51，CPU 0.0s）。
+
+    优雅退出让 uvicorn 正常走 lifespan 关停（checkpoint + 关闭连接），
+    拿不到才由调用方硬杀兜底。
+    """
+    if os.name != "nt":
+        try:
+            import signal
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            return True
+        except OSError:
+            return False
+    try:
+        import signal as _signal
+        os.kill(pid, _signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
+        return True
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
+def wait_port_closed(port: int, timeout: float = 12.0) -> bool:
+    """等到端口不再可连；超时返回 False。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not port_open("127.0.0.1", port):
+            return True
+        time.sleep(0.3)
+    return not port_open("127.0.0.1", port)
+
+
+def list_our_backend_pids() -> list[int]:
+    """枚举本机**所有**属于本项目后端的进程（不限端口）。
+
+    为什么必须按命令行全量枚举：`--replace` 原先只杀"端口监听者"，端口之外
+    的历史实例（换了端口的调试实例、上一个 PID 文件遗漏的实例）会成为孤儿，
+    一直持有 SQLite 的 `-wal`/`-shm` 句柄，导致新实例读到 `disk I/O error`。
+    只按命令行匹配 `is_our_cmdline`，不会碰到同机其他 Python/Node 服务。
+
+    ⚠️ 子进程一律按 **UTF-8 + errors="replace"** 解码：Windows 上
+    `capture_output=True, text=True` 会用系统 ANSI 代码页（本机 GBK）解码，
+    而进程命令行里的中文路径（如 `D:\\quantTrader\\东莞证券QMT实盘交易端`）
+    会让 `subprocess` 在读取线程里抛 UnicodeDecodeError、`stdout` 变成空串 ——
+    症状是**枚举结果静默为空**（实测踩到：`stop` 因此漏掉孤儿实例）。
+    """
+    pids: list[int] = []
+    for candidate in _iter_our_pids():
+        pids.append(candidate)
+    return sorted(set(pids))
+
+
+def _iter_our_pids() -> list[int]:
+    """按命令行枚举本项目的 Python 进程（多套手段依次兜底）。"""
+    if os.name != "nt":
+        out = _run_text(["ps", "-eo", "pid=,args="], timeout=10)
+        found: list[int] = []
+        for line in out.splitlines():
+            pid_text, _, cmdline = line.strip().partition(" ")
+            if pid_text.isdigit() and is_our_cmdline(cmdline):
+                found.append(int(pid_text))
+        return found
+
+    found = []
+    # 手段 1：PowerShell + CIM（能拿到完整命令行）
+    script = ("Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
+              "ForEach-Object { \"$($_.ProcessId)\t$($_.CommandLine)\" }")
+    out = _run_text(["powershell", "-NoProfile", "-NonInteractive",
+                     "-Command", script], timeout=25)
+    for line in out.splitlines():
+        pid_text, _, cmdline = line.partition("\t")
+        if pid_text.strip().isdigit() and is_our_cmdline(cmdline):
+            found.append(int(pid_text.strip()))
+    if found:
+        return found
+
+    # 手段 2：wmic（老系统 / PowerShell 被策略限制时）
+    out = _run_text(["wmic", "process", "where", "name like '%python%'",
+                     "get", "ProcessId,CommandLine", "/format:csv"], timeout=25)
+    for line in out.splitlines():
+        if not is_our_cmdline(line):
+            continue
+        for token in reversed(line.strip().split(",")):
+            if token.strip().isdigit():
+                found.append(int(token.strip()))
+                break
+    return found
+
+
+def _run_text(cmd: list[str], *, timeout: float) -> str:
+    """跑子进程并**强制 UTF-8** 解码（见 `list_our_backend_pids` 的说明）。
+
+    解码失败不抛异常、也不丢行（`errors="replace"`）；子进程起不来/超时
+    返回空串，由调用方走兜底路径。
+    """
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, timeout=timeout, check=False,
+            creationflags=_NO_CONSOLE)
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    raw = completed.stdout or b""
+    if isinstance(raw, str):        # 理论上不会（上面没给 text=True）
+        return raw
+    return raw.decode("utf-8", errors="replace")
+
+
+def stop_backend_processes(port: int, *, timeout: float = 12.0) -> list[tuple[int, bool]]:
+    """优雅停止所有本项目后端进程；返回 [(pid, 是否成功)]。
+
+    顺序：先给每个实例发优雅退出请求 → 等端口释放 → 仍有存活才硬杀。
+    这样 SQLite 有机会 checkpoint，下次启动不会再读到陈旧的 `-wal`/`-shm`。
+    """
+    targets = list_our_backend_pids()
+    if not targets:
+        pid = find_listening_pid(port)
+        if pid is not None:
+            info = diagnose_port(port)
+            if info["is_ours"]:
+                targets = [pid]
+    results: list[tuple[int, bool]] = []
+    if not targets:
+        return results
+    for pid in targets:
+        request_graceful_stop(pid)
+    wait_port_closed(port, timeout=timeout)
+    for pid in targets:
+        if not _pid_alive(pid):
+            results.append((pid, True))
+            continue
+        results.append((pid, kill_pid_tree(pid)))
+    return results
+
 
 
 # ======================================================================
@@ -219,9 +378,11 @@ def _spawn_daemon(
     """后台启动子进程，返回 PID；日志与 PID 文件落 data/run/。"""
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     log_path = RUN_DIR / f"{name}.log"
-    flags = 0
-    if os.name == "nt":
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008  # DETACHED_PROCESS
+    # 后台守护：新进程组让 Ctrl+C 只打当前前台，不误伤服务；
+    # **不能用 DETACHED_PROCESS** —— 它会让 Windows 给子进程新分配一个可见控制台
+    # （conhost 窗口，标题为 python.exe 全路径），桌面就会反复弹黑窗；
+    # 而 CREATE_NO_WINDOW 既不分配控制台、又不影响父进程退出后的存活（已实测）。
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP | _NO_CONSOLE if os.name == "nt" else 0
     log_fh = log_path.open("ab")  # noqa: SIM115 守护进程生命周期独立，不关闭
     popen_kwargs: dict[str, object] = {
         "cwd": str(cwd), "stdout": log_fh, "stderr": subprocess.STDOUT,
@@ -250,14 +411,27 @@ def cmd_start(args: argparse.Namespace) -> int:
                 pid = info["pid"]
                 print(f"检测到本项目旧实例 (PID={pid})，--replace 精确停止中…",
                       file=sys.stderr)
-                kill_pid_tree(pid)  # type: ignore[arg-type]
+                # 优雅停止**所有**实例：只杀端口监听者会留下端口外的孤儿进程，
+                # 它们持有 SQLite 的 `-wal`/`-shm` 句柄 → 新实例读到
+                # `disk I/O error` → 每个请求穿透网络（实测首请求 182.9s）。
+                for old_pid, ok in stop_backend_processes(port):
+                    if old_pid != pid:
+                        print(f"  额外清理孤儿后端实例 PID={old_pid} "
+                              f"({'成功' if ok else '失败'})", file=sys.stderr)
                 for _ in range(10):
                     if not port_open("127.0.0.1", port):
                         break
                     time.sleep(0.3)
             else:
+                others = [p for p in list_our_backend_pids() if p != info["pid"]]
                 print(f"✅ 本项目后端已在运行：http://127.0.0.1:{port} "
                       f"(PID={info['pid']})，无需重复启动。", file=sys.stderr)
+                if others and not is_single_instance([info["pid"], *others]):
+                    # 孤儿实例不会响应端口探测，但会占着 SQLite 的伴生文件，
+                    # 让新实例的每个请求都 disk I/O error —— 必须让用户看见。
+                    print(f"⚠️ 另有 {len(others)} 个端口外后端进程仍在运行："
+                          f"{others}。它们会占用数据库的 -wal/-shm 文件，"
+                          f"建议先 `python manage.py stop` 清理。", file=sys.stderr)
                 print("   如需重启：python manage.py start --replace", file=sys.stderr)
                 return 0
         else:
@@ -327,17 +501,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
     stopped = []
     for name, port in (("backend", DEFAULT_BACKEND_PORT),
                        ("frontend", DEFAULT_FRONTEND_PORT)):
-        pid = read_pid_file(RUN_DIR / f"{name}.pid") if RUN_DIR.exists() else None
-        if pid is None and port_open("127.0.0.1", port):
-            # PID 文件丢失：仅当确认是本项目实例时才按端口兜底停止
-            info = diagnose_port(port)
-            pid = info["pid"] if info["is_ours"] else None
-            if info["occupied"] and not info["is_ours"]:
-                print(f"⚠️ 端口 {port} 非本项目实例，跳过（不停止其他程序）。",
-                      file=sys.stderr)
-        if pid is not None:
-            ok = kill_pid_tree(pid)
-            stopped.append((name, pid, ok))
+        if name == "backend":
+            # 后端：按命令行枚举**所有**实例（含端口外的孤儿），先优雅后硬杀。
+            # 只按 PID 文件/端口监听者停会漏掉孤儿实例，而孤儿实例占着 SQLite
+            # 的 `-wal`/`-shm`，是"重启后前端几十秒没数据"的根因之一。
+            results = stop_backend_processes(port)
+            for pid, ok in results:
+                stopped.append((f"{name}", pid, ok))
+        else:
+            pid = (read_pid_file(RUN_DIR / f"{name}.pid")
+                   if RUN_DIR.exists() else None)
+            if pid is None and port_open("127.0.0.1", port):
+                # PID 文件丢失：仅当确认是本项目实例时才按端口兜底停止
+                info = diagnose_port(port)
+                pid = info["pid"] if info["is_ours"] else None
+                if info["occupied"] and not info["is_ours"]:
+                    print(f"⚠️ 端口 {port} 非本项目实例，跳过（不停止其他程序）。",
+                          file=sys.stderr)
+            if pid is not None:
+                stopped.append((name, pid, kill_pid_tree(pid)))
         pid_file = RUN_DIR / f"{name}.pid"
         if pid_file.exists():
             pid_file.unlink(missing_ok=True)
@@ -366,24 +548,30 @@ def cmd_status(_args: argparse.Namespace) -> int:
     rows = []
     # 后端
     if port_open("127.0.0.1", DEFAULT_BACKEND_PORT):
-        sig = health_signature(DEFAULT_BACKEND_PORT)
-        if sig == SERVICE_SIGNATURE:
+        # 判定"是不是本项目"用 `diagnose_port`（服务签名 **或** 命令行两条证据），
+        # 不能只看 `health_signature`：它只有 1 秒超时，而 /health 在冷启动、
+        # 或仓库/Tushare 统计正在生成时要几十秒才回 —— 只看签名会把**正在正常
+        # 运行**的本项目实例误报成"被其他程序占用"（实测踩到）。
+        info = diagnose_port(DEFAULT_BACKEND_PORT)
+        if info["is_ours"]:
+            extra = ""
             try:
                 with urllib.request.urlopen(
                     f"http://127.0.0.1:{DEFAULT_BACKEND_PORT}/api/v1/health",
-                    timeout=1.5,
+                    timeout=10.0,
                 ) as resp:
-                    h = json.loads(resp.read().decode("utf-8"))
+                    h = json.loads(resp.read().decode("utf-8", errors="replace"))
                 gw = h.get("model_gateway", {})
                 extra = (
                     f"status={h.get('status')} ollama={gw.get('ollama')} "
                     f"deepseek={gw.get('deepseek')}"
                 )
             except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
-                extra = ""
+                extra = "（/health 未在 10 秒内返回：可能仍在预热，稍后再试）"
             rows.append(("后端 API", DEFAULT_BACKEND_PORT, "本项目运行中", extra))
         else:
-            rows.append(("后端端口", DEFAULT_BACKEND_PORT, "被其他程序占用", ""))
+            rows.append(("后端端口", DEFAULT_BACKEND_PORT, "被其他程序占用",
+                         f"PID={info.get('pid')}"))
     else:
         rows.append(("后端 API", DEFAULT_BACKEND_PORT, "未运行",
                      "python manage.py start"))
@@ -450,6 +638,7 @@ def cmd_build(_args: argparse.Namespace) -> int:
     npm = shutil.which("npm.cmd") or shutil.which("npm") or "npm"
     return subprocess.run(
         [npm, "run", "build"], cwd=str(WEB_DIR), shell=True, check=False,
+        creationflags=_NO_CONSOLE,
     ).returncode
 
 
@@ -527,6 +716,105 @@ def cmd_logs(args: argparse.Namespace) -> int:
 # argparse 注册
 # ======================================================================
 
+def _parent_of(pid: int) -> int | None:
+    """取父进程 PID（取不到返回 None）。"""
+    if os.name != "nt":
+        return None
+    out = _run_text(["wmic", "process", "where", f"ProcessId={pid}",
+                     "get", "ParentProcessId", "/format:list"], timeout=10)
+    for line in out.splitlines():
+        _, _, value = line.partition("=")
+        if value.strip().isdigit() and int(value.strip()) > 0:
+            return int(value.strip())
+    return None
+
+
+def is_single_instance(pids: list[int]) -> bool:
+    """这些进程是否**属于同一个实例**（父进程也在列表里 → 是 reload 父子对）。
+
+    `uvicorn --reload` 会派生一个子进程（reloader 看门狗 + 真正的 worker），
+    两者命令行都含 `src.api.main:app`，从命令行看就像"两个实例"。
+    实测（2026-09-17）：`doctor` 因此报"存在多个后端实例（含端口外孤儿）"，
+    把一个**正常的** `--reload` 实例说成孤儿 —— 这种假告警会让人去清理根本
+    不该清理的东西。真正的孤儿是**父进程不在列表里**的那些。
+    """
+    if len(pids) <= 1:
+        return True
+    parents = {_parent_of(pid) for pid in pids}
+    # 只要有一个进程的父进程也在这个集合里，就说明是同一棵树
+    return any(parent in set(pids) for parent in parents if parent)
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """体检并自愈本地 SQLite（陈旧 `-wal`/`-shm` → disk I/O error）。
+
+    为什么需要这个命令：硬杀进程（`taskkill /F`）会让 `-wal` 被截断成 0 字节、
+    `-shm` 停在上一轮，此后**每次**打开该库都立刻 `disk I/O error`，仓储
+    fail-open 穿透网络 → 前端重启后几十秒没数据。启动时 lifespan 已会自动
+    自愈，这个命令用于"服务正跑着、想单独确认一下"或排查时的现场取证。
+    """
+    sys.path.insert(0, str(ROOT))
+    try:
+        from src.core.config import get_settings
+        from src.core.sqlite_recovery import ensure_sqlite_usable, sidecar_sizes
+    except Exception as exc:  # noqa: BLE001
+        print(f"❌ 无法导入自愈模块：{exc}", file=sys.stderr)
+        return 1
+
+    settings = get_settings()
+    paths = [str(settings.sqlite_path), "data/quant/warehouse.db"]
+    print("=" * 72)
+    print("SQLite 体检（只对可写库做自愈；仓库只读检查）")
+    print("=" * 72)
+    exit_code = 0
+    for raw in paths:
+        path = Path(raw)
+        if not path.exists():
+            print(f"○ {raw}：不存在（跳过）")
+            continue
+        wal, shm = sidecar_sizes(path)
+        writable = "warehouse" not in path.name
+        before = "?"
+        try:
+            import sqlite3
+            with sqlite3.connect(str(path), timeout=3) as con:
+                before = str(con.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                ).fetchone()[0])
+        except Exception as exc:  # noqa: BLE001
+            before = f"打不开（{exc}）"
+            if writable:
+                exit_code = 1
+        print(f"\n● {raw}")
+        print(f"    主库大小 : {path.stat().st_size / 1e6:.1f}MB")
+        print(f"    -wal/-shm: {wal}B / {shm}B")
+        print(f"    表数量   : {before}")
+        if writable:
+            result = ensure_sqlite_usable(path)
+            if result.healthy:
+                print("    结论     : ✅ 正常")
+            elif result.recovered:
+                print(f"    结论     : 🔧 已自愈（{result.reason}）")
+                print(f"               挪走 {result.quarantined}，"
+                      f"备份在 data/recovery/")
+                exit_code = 0
+            else:
+                print(f"    结论     : ❌ 不可用（{result.reason}）")
+                exit_code = 1
+
+    others = list_our_backend_pids()
+    listener = find_listening_pid(DEFAULT_BACKEND_PORT)
+    print("\n" + "=" * 72)
+    print(f"后端进程：端口监听者 PID={listener}，命令行匹配到的进程 {others}")
+    if len(others) > 1 and not is_single_instance(others):
+        print("⚠️ 存在多个**互相独立**的后端实例（含端口外孤儿）。孤儿会占着 "
+              "SQLite 的 -wal/-shm，请执行 `python manage.py stop` 清理。")
+    elif len(others) > 1:
+        print("（以上是同一个实例的 reload 父子进程，非孤儿）")
+    print("=" * 72)
+    return exit_code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="manage.py",
@@ -552,6 +840,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="查看服务与依赖状态")
     p_status.set_defaults(func=cmd_status)
+
+    p_doctor = sub.add_parser(
+        "doctor", help="体检/自愈本地 SQLite（陈旧 -wal/-shm 导致 disk I/O error）")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_test = sub.add_parser(
         "test", help="隔离临时数据目录运行 pytest；后续参数原样透传，如 test -q -k x",
@@ -584,6 +876,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows 控制台默认 GBK：`start`/`stop` 成功后会打印 ✅/❌，
+    # 直接抛 UnicodeEncodeError —— **命令本身已经执行了**，却在最后一步崩掉并
+    # 返回非 0，用起来像"启动失败"。这里统一把输出改成 UTF-8（不可改的流跳过）。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # 被重定向 / 非文本流
+            pass
     # parse_known_args：test 子命令后的 -q/-k 等 pytest 参数原样透传
     args, extras = build_parser().parse_known_args(argv)
     if args.command == "test":

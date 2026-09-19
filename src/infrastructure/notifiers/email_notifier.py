@@ -19,6 +19,10 @@ from email.mime.text import MIMEText
 from email.utils import formataddr
 
 from src.core.config import Settings, get_settings
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
 from src.domain.alerts.models import Alert, AlertType, EmailSendResult
 
 logger = logging.getLogger(__name__)
@@ -72,9 +76,9 @@ class EmailNotifier:
                 alert_id=alert.alert_id, status="sent", detail=detail)
         except Exception as exc:  # noqa: BLE001 邮件失败不阻断扫描
             logger.warning("告警邮件发送失败 %s: %s",
-                           alert.alert_id, str(exc)[:150])
+                           alert.alert_id, brief(exc, BRIEF_DEFAULT))
             return EmailSendResult(
-                alert_id=alert.alert_id, status="failed", detail=str(exc)[:200])
+                alert_id=alert.alert_id, status="failed", detail=brief(exc, BRIEF_DEFAULT))
 
     def _send_sync(self, alert: Alert) -> str:
         message = self._build_message(alert)

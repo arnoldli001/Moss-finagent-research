@@ -15,6 +15,13 @@ from typing import Any
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from src.api.job_table import QUANT_RETENTION, purge_jobs
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_LOG,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.quant.dataset_store import DEFAULT_ROOT, DatasetStore
 
 router = APIRouter(prefix="/api/v1/quant", tags=["quant"])
@@ -25,8 +32,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DISCLAIMER = ("⚠️ 因子统计与回测均为历史数据统计，不代表未来收益，"
                "不构成投资建议。因子有效性会衰减，请定期复核。")
 
-_JOB_TTL_SECONDS = 1800.0
-_JOB_MAX = 20
 _jobs: dict[str, dict] = {}
 
 
@@ -36,15 +41,7 @@ def clear_jobs() -> None:
 
 
 def _purge_jobs() -> None:
-    now = time.monotonic()
-    for jid in [jid for jid, job in _jobs.items()
-                if job["status"] != "running"
-                and now - job.get("finished_at", now) > _JOB_TTL_SECONDS]:
-        _jobs.pop(jid, None)
-    finished = sorted((job.get("finished_at", 0), jid) for jid, job in _jobs.items()
-                      if job["status"] != "running")
-    for _, jid in finished[:max(len(_jobs) - _JOB_MAX, 0)]:
-        _jobs.pop(jid, None)
+    purge_jobs(_jobs, QUANT_RETENTION)
 
 
 # ==================================================================
@@ -113,7 +110,7 @@ async def data_status(universe: str = "a_share", root: str = DEFAULT_ROOT) -> di
         warehouse = warehouse_status(root=root)
     except Exception as exc:  # noqa: BLE001 数据条不允许因此 500
         warehouse = {"available": False,
-                     "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+                     "error": f"{type(exc).__name__}: {brief(exc, BRIEF_TIGHT)}"}
     return {
         "universe": universe,
         "datasets": datasets,
@@ -240,7 +237,7 @@ def _run_isolated(payload: dict, *, mode: str) -> dict:
             tail = (completed.stderr or b"").decode("utf-8", "replace")[-400:]
             raise RuntimeError(
                 f"回测子进程未产出结果（exit={completed.returncode}）："
-                f"{tail or str(exc)[:200]}") from exc
+                f"{tail or brief(exc, BRIEF_DEFAULT)}") from exc
     if not result.get("ok"):
         raise RuntimeError(result.get("error", "回测失败"))
     payload_out = result["result"]
@@ -256,7 +253,7 @@ async def _run_job(job_id: str, body: ScreenRequest) -> None:
         job.update(status="done", result=payload, finished_at=time.monotonic(),
                    stage="完成")
     except Exception as exc:  # noqa: BLE001 失败也写回结果，前端能看到原因
-        job.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}",
+        job.update(status="failed", error=f"{type(exc).__name__}: {brief(exc, BRIEF_LOG)}",
                    finished_at=time.monotonic(), stage="失败")
 
 
@@ -268,7 +265,7 @@ async def _run_single_job(job_id: str, body: SingleBacktestRequest) -> None:
         job.update(status="done", result=payload, finished_at=time.monotonic(),
                    stage="完成")
     except Exception as exc:  # noqa: BLE001
-        job.update(status="failed", error=f"{type(exc).__name__}: {str(exc)[:300]}",
+        job.update(status="failed", error=f"{type(exc).__name__}: {brief(exc, BRIEF_LOG)}",
                    finished_at=time.monotonic(), stage="失败")
 
 
@@ -335,7 +332,7 @@ async def list_strategies(min_excess: float = 0.0, only_winners: bool = False,
             stats = archive.stats()
             source = f"db:{config.dialect}.{stats.get('table', 'quant_strategy')}"
         except Exception as exc:  # noqa: BLE001 库查询失败回退文件档案
-            stats = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+            stats = {"error": f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"}
 
     if source == "file":
         from src.quant.strategy_store import strategy_store
@@ -446,6 +443,51 @@ async def get_stock(code: str, auto_enrich: bool = True) -> dict:
     if entry is None:
         raise HTTPException(status_code=404, detail=f"字典里没有 {code}")
     return {"stock": entry.as_dict()}
+
+
+@router.get("/stocks/{code}/boards")
+async def get_stock_boards(code: str, limit: int = 12) -> dict:
+    """某只票的**关联概念板块**（按相关性降序）——「关联板块」输入框的默认值与联想来源。
+
+    数据源：Tushare `ths_member(con_code=…)` 反查 + `ths_index` 名词典；
+    相关性 = 0.55×窄度(1/成员数^0.35) + 0.28×人均主力净额 + 0.17×板块涨幅。
+    已剔除市场级/量化标签类概念（"同花顺全A""百元股""上市首五日"等）。
+
+    `auto_default` 是给前端**自动关联**用的：取相关性最高的那个概念名。
+    """
+    from src.quant.concept_repo import concept_repository
+    from src.quant.stock_directory import stock_directory
+
+    repo = concept_repository()
+    try:
+        name = stock_directory().name_of(code, auto_enrich=False) or ""
+    except Exception:  # noqa: BLE001 名录不可用不影响概念查询
+        name = ""
+    boards, stale = repo.boards_of(code, name=name, limit=max(1, min(limit, 40)))
+    return {
+        "code": code,
+        "name": name,
+        "count": len(boards),
+        "boards": [board.as_dict() for board in boards],
+        "auto_default": boards[0].name if boards else "",
+        "stale": stale,
+        "note": ("概念归属来自 Tushare 同花顺指数口径；相关性=窄度(55%)+人均主力净额(28%)"
+                 "+板块涨幅(17%)，已剔除市场级与量化标签概念"),
+    }
+
+
+@router.get("/concepts/suggest")
+async def suggest_concepts(q: str = "", limit: int = 12) -> dict:
+    """概念板块名联想（「关联板块」输入框打字提示用）。
+
+    按"越窄越靠前"排序：打「芯片」时 `芯片概念` 应排在泛泛的大类前；
+    同名概念会去重（实测名录里"激光雷达"有两个 ts_code）。
+    """
+    from src.quant.concept_repo import concept_repository
+
+    items = concept_repository().suggest(q, limit=max(1, min(limit, 30)))
+    return {"query": q, "count": len(items), "items": items,
+            "hint": "概念名来自 Tushare 同花顺指数名录（已剔除市场级概念）"}
 
 
 @router.post("/stocks/directory/rebuild")

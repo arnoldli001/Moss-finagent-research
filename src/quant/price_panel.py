@@ -21,6 +21,11 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 PRICE_FIELDS = ("open", "high", "low", "close", "volume", "amount")
@@ -126,7 +131,7 @@ class PriceStore:
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:  # noqa: BLE001 坏 manifest 不该致命
-            logger.warning("价格 manifest 损坏（%s），按空处理并重建", str(exc)[:100])
+            logger.warning("价格 manifest 损坏（%s），按空处理并重建", brief(exc, BRIEF_TIGHT))
             return {}
 
     def _write_manifest(self, manifest: dict[str, dict[str, Any]]) -> None:
@@ -206,7 +211,7 @@ class PriceStore:
                     if hasattr(result, "__await__"):
                         result = await result
                 except Exception as exc:  # noqa: BLE001 单只失败不中断整批
-                    info.failed[code] = f"{type(exc).__name__}: {str(exc)[:120]}"
+                    info.failed[code] = f"{type(exc).__name__}: {brief(exc, BRIEF_TIGHT)}"
                     return
             frame = result if isinstance(result, pd.DataFrame) else pd.DataFrame()
             if frame is None or len(frame) == 0:

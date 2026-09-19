@@ -19,6 +19,10 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.intraday import indicators as ind
 from src.intraday.config import IntradayConfig
 
@@ -69,7 +73,7 @@ def extract_chan_facts(
         structure = build_structure(
             bars, min_bars=params.min_bars, min_gap=params.min_gap)
     except Exception as exc:  # noqa: BLE001 结构算法异常按"不可用"处理
-        return ChanFacts(available=False, gap=f"缠论结构构建失败：{str(exc)[:120]}")
+        return ChanFacts(available=False, gap=f"缠论结构构建失败：{brief(exc, BRIEF_TIGHT)}")
     if not structure.available or not structure.pivots:
         return ChanFacts(
             available=False, bars_used=structure.bars_used,

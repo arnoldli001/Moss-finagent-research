@@ -21,7 +21,13 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.core.exceptions import DataFetchError
+from src.core.trading_session import POST_CLOSE, minutes_of
 from src.intraday.config import IntradayConfig
 from src.intraday.daily_signals import build_verdict, run_daily_signals
 from src.intraday.models import (
@@ -107,12 +113,17 @@ def analyse_daily(
     chart_bars: int = 120,
     cycle: Any = None,
     character: Any = None,
+    instrument: str = "",
 ) -> DailySnapshot:
     """由日线 DataPoint 列表生成日K做T快照（纯函数，便于单测）。
 
     `cycle`（市场情绪周期）与 `character`（个股股性画像）是运行时取到的外部上下文，
     以可选参数注入：缺席时对应的加权因子记为「不可用 + 缺口」，
     不会阻断其余六个因子出分。
+
+    `instrument`：标的类别（`stock` / `etf` / `index` / `sector`），
+    决定擒牛线用哪套公式。留空时由 `niuline.select_variant` 按代码段与名称推断
+    —— 调用方**明确知道**类别时请显式传（000001 这类歧义代码只能靠它兜住）。
 
     注意 `character=None` **不等于**"股性不可用"：本函数会用**自己这份日线**
     （`enriched`）现算一份（见 `_daily_character`）。
@@ -144,7 +155,7 @@ def analyse_daily(
     today = datetime.now().strftime("%Y-%m-%d")
     if last_date != today:
         now = datetime.now()
-        if now.weekday() < 5 and now.hour * 60 + now.minute >= 15 * 60 + 5:
+        if now.weekday() < 5 and minutes_of(now) >= POST_CLOSE:
             gaps.append(
                 f"日线最新为 {last_date}，尚未包含今日（{today}）——"
                 "日线源在收盘后需一段时间才更新；本页结论基于上一交易日，"
@@ -181,6 +192,36 @@ def analyse_daily(
     verdict = build_verdict(
         signals["buy"], signals["sell"], discipline, ctx.pattern, ctx.position)
 
+    # ---- 擒牛线（日K做T主图的档位线体系，用户 2026-09-18 提供的同花顺公式）----
+    # 两套公式按标的类别自动选：个股走 AMOUNT 口径、指数/ETF/板块走 C*V 口径
+    # （唯一差别在 CBX；选错会让成本线系统性偏移，见 src/intraday/niuline.py）。
+    # 必须用**与图同一批 bars**（tail）来算，否则线与蜡烛错位。
+    niuline_set = None
+    try:
+        from src.intraday.models import NiuLinePoint, NiuLineSet
+        from src.intraday.niuline import LINE_META, build_series
+
+        series = build_series(code, bars, instrument=instrument, name=name)
+        points = [
+            NiuLinePoint(
+                date=str(bar.date),
+                **{key: series.series[key][index]
+                   for key in series.series if index < len(series.series[key])})
+            for index, bar in enumerate(bars)
+        ]
+        niuline_set = NiuLineSet(
+            variant=series.variant, reason=series.reason,
+            price_basis=series.price_basis, cbx_scale=series.cbx_scale,
+            n=series.n, m=series.m,
+            latest=dict(series.latest), notes=list(series.notes), points=points,
+            lines=[{"key": key, "label": label, "note": note}
+                   for key, label, note in LINE_META])
+    except ImportError:  # 公开版不含擒牛线公式，属预期
+        gaps.append("擒牛线（主图档位线）为商业版功能，开源版未包含")
+    except Exception as exc:  # noqa: BLE001 主图线失败不能拖垮整个日K面板
+        gaps.append("擒牛线计算失败（主图档位线不可用，其余面板不受影响）："
+                    + brief(exc, BRIEF_DEFAULT))
+
     from src.intraday.models import ProtectiveLines
 
     # 最近 N 个交易日的买卖标记（逐bar因果回放，供K线图打点）
@@ -204,7 +245,7 @@ def analyse_daily(
             hint=config.daily_thresholds.hint,
             limit_pct=_limit_up_pct(code))
     except Exception as exc:  # noqa: BLE001 加权总分失败不能拖垮整个日K面板
-        gaps.append(f"日线做T加权总分计算失败（其余面板不受影响）：{str(exc)[:160]}")
+        gaps.append(f"日线做T加权总分计算失败（其余面板不受影响）：{brief(exc, BRIEF_DEFAULT)}")
     if scorecard is not None:
         gaps.extend(scorecard.gaps)
 
@@ -229,6 +270,7 @@ def analyse_daily(
             note=protective.get("note", "")),
         ma=ma_values, discipline=discipline,
         scorecard=scorecard,
+        niuline=niuline_set,
         verdict=verdict,
         health=DataHealth(
             chosen_daily_source=SOURCE_LABELS["router"],
@@ -285,7 +327,7 @@ def replay_daily_signals(
             ctx.pattern = classify_volume_price(window, ctx.index, params)
             signals = run_daily_signals(ctx)
         except Exception as exc:  # noqa: BLE001 单根bar异常不该打断整张图
-            logger.debug("信号回放失败(第%d根)：%s", index, str(exc)[:100])
+            logger.debug("信号回放失败(第%d根)：%s", index, brief(exc, BRIEF_TIGHT))
             continue
         date = str(window["date"].iloc[-1])
         price = _optional_float(window["close"].iloc[-1])
@@ -354,16 +396,16 @@ async def fetch_daily_snapshot(
             close_indicator(code), start_date=start_date, end_date=end_date)
     except DataFetchError as exc:
         attempts.append(SourceAttempt(
-            source=SOURCE_LABELS["router"], ok=False, detail=str(exc)[:200]))
-        gaps.append(f"日线取数失败：{str(exc)[:160]}")
+            source=SOURCE_LABELS["router"], ok=False, detail=brief(exc, BRIEF_DEFAULT)))
+        gaps.append(f"日线取数失败：{brief(exc, BRIEF_DEFAULT)}")
         return DailySnapshot(
             available=False, code=code, name=name, gaps=gaps,
             health=DataHealth(attempts=attempts, gaps=gaps),
             disclaimer=DISCLAIMER)
     except Exception as exc:  # noqa: BLE001
         attempts.append(SourceAttempt(
-            source=SOURCE_LABELS["router"], ok=False, detail=str(exc)[:200]))
-        gaps.append(f"日线取数异常：{str(exc)[:160]}")
+            source=SOURCE_LABELS["router"], ok=False, detail=brief(exc, BRIEF_DEFAULT)))
+        gaps.append(f"日线取数异常：{brief(exc, BRIEF_DEFAULT)}")
         return DailySnapshot(
             available=False, code=code, name=name, gaps=gaps,
             health=DataHealth(attempts=attempts, gaps=gaps),

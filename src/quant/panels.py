@@ -25,6 +25,10 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.quant.dataset_store import DEFAULT_ROOT, DatasetStore
 from src.quant.pit import PitPanel
 
@@ -160,7 +164,7 @@ class FactorPanels:
             return panel.as_of_panel(self.dates)
         except Exception as exc:  # noqa: BLE001 快路径失败退回逐日，宁可慢也不能错
             logger.warning("as_of_panel 快路径失败(%s)，退回逐日 as_of",
-                           str(exc)[:100])
+                           brief(exc, BRIEF_TIGHT))
             return {date: panel.as_of(date) for date in self.dates}
 
     def is_suspended(self, date: str, code: str) -> bool:
@@ -235,7 +239,7 @@ def _load_fina_frame(store: DatasetStore, keys: Sequence[str], *,
         logger.warning("财务面板未能走库（root=%s，库可用=%s），回退 CSV 分区",
                        root, warehouse.available())
     except Exception as exc:  # noqa: BLE001 库不可用就退回 CSV，不影响正确性
-        logger.warning("财务面板读库失败，回退 CSV：%s", str(exc)[:120])
+        logger.warning("财务面板读库失败，回退 CSV：%s", brief(exc, BRIEF_TIGHT))
     finally:
         warehouse.close()
     return store.load(list(keys))
@@ -282,7 +286,7 @@ def load_fundamental_panel(*, root: str | Path = DEFAULT_ROOT,
         panel = FundamentalStore("data/quant/fundamentals",
                                  universe=universe).load_panel()
     except Exception as exc:  # noqa: BLE001 缺财务不该让整条链路失败
-        notes.append(f"基本面面板装配失败：{str(exc)[:120]}")
+        notes.append(f"基本面面板装配失败：{brief(exc, BRIEF_TIGHT)}")
         return None
     if len(panel) == 0:
         notes.append("基本面 PIT 面板为空（既没有 Tushare 财务横截面，"
@@ -361,7 +365,7 @@ def build_panels(
                         and warehouse_client.covers(dataset, days[0], days[-1])):
                     choice = "db"
             except Exception as exc:  # noqa: BLE001 库不可用就走 CSV
-                logger.debug("探测 %s 的仓库来源失败：%s", dataset, str(exc)[:100])
+                logger.debug("探测 %s 的仓库来源失败：%s", dataset, brief(exc, BRIEF_TIGHT))
                 choice = "csv"
         backend[dataset] = choice
         return choice
@@ -397,7 +401,7 @@ def build_panels(
                         f".{DATASET_TABLES[dataset][0]}({len(columns)} 列)")
             except Exception as exc:  # noqa: BLE001 取失败就退回分区文件
                 logger.debug("仓库取 %s 失败，回退 CSV：%s",
-                             dataset, str(exc)[:100])
+                             dataset, brief(exc, BRIEF_TIGHT))
                 frame = pd.DataFrame()
         db_cache[dataset] = frame
         return frame

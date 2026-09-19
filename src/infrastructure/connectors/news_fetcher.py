@@ -16,6 +16,10 @@ import asyncio
 import logging
 from typing import Any, Protocol
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
 from src.core.exceptions import DataFetchError
 
 logger = logging.getLogger(__name__)
@@ -122,7 +126,7 @@ class AkshareNewsFetcher:
         try:
             return await asyncio.to_thread(self._fetch_sync, code, limit)
         except Exception as exc:  # noqa: BLE001 新闻是增强链路，失败不阻断研究主流程
-            logger.warning("个股新闻拉取失败(%s): %s", code, str(exc)[:150])
+            logger.warning("个股新闻拉取失败(%s): %s", code, brief(exc, BRIEF_DEFAULT))
             return []
 
     async def fetch_topic_news(
@@ -131,5 +135,5 @@ class AkshareNewsFetcher:
         try:
             return await asyncio.to_thread(self._fetch_topic_sync, keywords, limit)
         except Exception as exc:  # noqa: BLE001 同上，失败不阻断
-            logger.warning("主题新闻拉取失败(%s): %s", keywords[:5], str(exc)[:150])
+            logger.warning("主题新闻拉取失败(%s): %s", keywords[:5], brief(exc, BRIEF_DEFAULT))
             return []

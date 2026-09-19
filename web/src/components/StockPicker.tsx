@@ -35,28 +35,47 @@ export function StockPicker({
   const [active, setActive] = useState(0);
   const [resolved, setResolved] = useState<StockEntry | null>(null);
   const [loading, setLoading] = useState(false);
+  // 中文输入法组字中（拼音串还没上屏）：此时**不能**发查询
+  const [composing, setComposing] = useState(false);
+  // 用户是否已从联想列表里选过（决定输入框右侧显示名称还是"未找到该代码"）
+  const [picked, setPicked] = useState(false);
+  /** 结果对应的查询词：用于识别"列表内容与当前输入不匹配"（竞态兜底展示） */
+  const [resultFor, setResultFor] = useState("");
   const timerRef = useRef<number | null>(null);
   const boxRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 请求序号：**丢弃过期响应**。
+   *
+   * 实测用户报障："输入『日联科技』，下拉却出现『金融街/捷荣技术』"——
+   * 那是典型的竞态：连续输入会发出多个请求（180ms 防抖 + 打字间隔），
+   * 若**先发的请求后返回**，它会把已经正确的结果覆盖掉。
+   * 这里只认"最后一次发出的请求"，其余响应直接丢弃。
+   */
+  const querySeq = useRef(0);
 
   // 输入变化 → 防抖查询（180ms：打字过程中不打接口，停一下才查）
   const query = useCallback((text: string) => {
     if (timerRef.current) window.clearTimeout(timerRef.current);
     if (!text.trim()) {
+      querySeq.current += 1;          // 清空也要作废在途请求，否则旧结果会把空列表填回来
       setOptions([]);
       setOpen(false);
       return;
     }
+    const seq = ++querySeq.current;
     timerRef.current = window.setTimeout(async () => {
       setLoading(true);
       try {
         const data = await api.stockSearch(text.trim(), 12);
+        if (seq !== querySeq.current) return;      // 过期响应：丢弃，不覆盖新结果
         setOptions(data.stocks);
+        setResultFor(text.trim());
         setOpen(data.stocks.length > 0);
         setActive(0);
       } catch {
-        setOptions([]);
+        if (seq === querySeq.current) setOptions([]);
       } finally {
-        setLoading(false);
+        if (seq === querySeq.current) setLoading(false);
       }
     }, 180);
   }, []);
@@ -91,6 +110,7 @@ export function StockPicker({
   const pick = (entry: StockEntry) => {
     onChange(entry.code);
     setResolved(entry);
+    setPicked(true);
     onPick?.(entry);
     setOpen(false);
   };
@@ -119,10 +139,12 @@ export function StockPicker({
   const suffix = useMemo(() => {
     if (loading) return "查询中…";
     if (resolved) return resolved.name;
-    if (value && !/^\d{6}$/.test(value)) return "";
-    if (value) return "未找到该代码";
+    if (composing) return "输入中…";
+    // 只在"用户刚选过/输入的是代码"时提示未找到；拼音/中文输到一半时不该报错
+    if (value && /^\d{6}$/.test(value)) return "未找到该代码";
+    if (value && picked) return "";
     return "";
-  }, [loading, resolved, value]);
+  }, [loading, resolved, composing, picked, value]);
 
   return (
     <div className="stock-picker" ref={boxRef} style={{ width }}>
@@ -136,6 +158,17 @@ export function StockPicker({
         placeholder={placeholder ?? "代码 / 拼音首字母 / 中文名"}
         onChange={(event) => {
           const next = event.target.value.trim();
+          if (picked) setPicked(false);
+          onChange(next);
+          // 输入法组字过程中查出来的结果是"半成品拼音"的，会闪且浪费请求；
+          // 等 compositionend（上屏）再查一次即可。
+          if (composing) return;
+          query(next);
+        }}
+        onCompositionStart={() => setComposing(true)}
+        onCompositionEnd={(event) => {
+          setComposing(false);
+          const next = (event.target as HTMLInputElement).value.trim();
           onChange(next);
           query(next);
         }}
@@ -147,6 +180,13 @@ export function StockPicker({
       </span>
       {open && options.length > 0 && (
         <ul className="suggest-list stock-suggest">
+          {/* 兜底提示：仅当结果对应的是**上一次**查询词时才可能出现（竞态已被
+              序号守卫挡掉，这里保留一层可见的说明，避免用户误以为搜错了） */}
+          {resultFor && value.trim() && resultFor !== value.trim() && (
+            <li className="muted-text suggest-stale">
+              以下是「{resultFor}」的结果，正在查询「{value.trim()}」…
+            </li>
+          )}
           {options.map((item, index) => (
             <li key={item.code}
                 className={index === active ? "active" : ""}

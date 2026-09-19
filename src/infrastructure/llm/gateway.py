@@ -86,6 +86,28 @@ class LLMGateway:
     def audit_log(self) -> LLMAuditLog:
         return self._audit
 
+    def _truncate(self, prompt: str) -> str:
+        """超长 prompt 截断：**保留头尾、压缩中段**。
+
+        为什么不能只截尾部：分析类 prompt 的结构是
+        `[数据正文]` + `## 任务要求`（JSON schema）+ `## 专业技能指引`。
+        指令段在**尾部**，一刀切尾部会把输出 schema 整段丢掉 ——
+        模型拿不到 schema 就会输出不合规，触发 repair 重试
+        （且重试走 `use_cache=False`、prompt 更长），单次成本反而翻倍。
+
+        所以按 7:3 保留头尾：头部是数据（模型的主要输入），
+        尾部是指令与 schema（必须完整）。
+        """
+        cap = int(self._settings.llm_input_char_hard_cap or 0)
+        if cap <= 0 or len(prompt) <= cap:
+            return prompt
+        head = int(cap * 0.7)
+        tail = cap - head
+        dropped = len(prompt) - cap
+        return (prompt[:head]
+                + f"\n…（中段已省略 {dropped} 字符）\n"
+                + prompt[-tail:])
+
     def _spec(self, model_name: str) -> ModelSpec:
         try:
             return self._specs[model_name]
@@ -114,14 +136,14 @@ class LLMGateway:
         # 取消检查：在调用provider前拦截，避免浪费token
         if cancel_token is not None:
             cancel_token.check()
-        # 输入截断：超长prompt尾部截断（保留头部用户提问与数据，丢弃尾部冗余）
-        cap = self._settings.llm_input_char_hard_cap
-        if len(prompt) > cap:
-            prompt = prompt[:cap] + "\n…（已截断）"
+        prompt = self._truncate(prompt)
         chain = self._routing[task_tier]
+        # 缓存作用域：同一 system/prompt 在不同层级/输出格式下**不可互相复用**
+        # —— light 层本地 1.5B 的回答不能当 decision 层的结论。
+        scope = f"{task_tier}|json={int(json_mode)}"
 
         if self._cache and use_cache:
-            hit = self._cache.get(system, prompt, agent_id)
+            hit = self._cache.get(system, prompt, agent_id, scope=scope)
             if hit is not None:
                 hit.trace_id = trace_id
                 self._audit.record(
@@ -209,7 +231,7 @@ class LLMGateway:
                     + resp.tokens_in + resp.tokens_out
                 )
             if self._cache and use_cache:
-                self._cache.put(system, prompt, resp, agent_id)
+                self._cache.put(system, prompt, resp, agent_id, scope=scope)
             self._audit.record(
                 trace_id=trace_id, agent_id=agent_id, task_tier=task_tier,
                 response=resp, cached=False,

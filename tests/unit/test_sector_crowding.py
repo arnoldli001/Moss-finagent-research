@@ -1,0 +1,667 @@
+"""板块概念拥挤度：计算 / 存储 / 刷新 的单元测试。
+
+重点钉住四个"看起来对、实际会错"的地方：
+
+1. **水位分母必须是 expanding**：第 i 天只能看到第 i 天为止的最大值。
+   若用全样本 `max()`，历史水位会被后来的高点压低 —— 回看曲线时
+   "当时到底警没警"就失真了（而且这是典型的前视函数泄漏）。
+2. **MA5 不足窗口的天数**：`min_periods=1` 让开头也有值，但水位另有
+   `min_bars` 把关 —— 否则次新板块用 2 天数据算出水位 100% 直接误告警。
+3. **分母为 0 / 缺失 → water_level = NULL**：把 NULL 当 0 会漏告警、
+   当 100 会误告警，都是错的。
+4. **增量刷新的水位线只在成功时推进**：中途失败还推进会让那段日期成为
+   永久空洞（下次从错误日期开始，谁也补不回来）。
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from src.sector_crowding import db, refresh
+from src.sector_crowding.config import (
+    SectorCrowdingConfig,
+    is_concept_board,
+    load_config,
+)
+from src.sector_crowding.refresh import RefreshTask
+
+
+@pytest.fixture
+def conn(tmp_path: Path) -> sqlite3.Connection:
+    connection = db.get_db_connection(path=tmp_path / "crowding.db")
+    db.init_tables(connection)
+    yield connection
+    connection.close()
+
+
+@pytest.fixture
+def config(tmp_path: Path) -> SectorCrowdingConfig:
+    """指向临时库的配置（不碰真实库）。"""
+    base = load_config()
+    base.database.path = str(tmp_path / "crowding.db")
+    return base
+
+
+def _rows(count: int, *, share: float = 0.01, market: float = 1e12,
+          ramp: bool = False) -> list[dict]:
+    """造 `count` 天数据；`ramp=True` 时占比逐日上升。"""
+    out = []
+    for index in range(count):
+        ratio = share * (1 + index / max(1, count)) if ramp else share
+        out.append({
+            "trade_date": f"2026{1 + index // 28:02d}{1 + index % 28:02d}",
+            "sector_amount": market * ratio,
+            "market_amount": market,
+        })
+    return out
+
+
+# ======================================================================
+# compute_series：口径正确性
+# ======================================================================
+
+def test_raw_crowding_is_ratio() -> None:
+    rows = refresh.compute_series(_rows(3, share=0.02), min_bars=1)
+    assert all(item["raw_crowding"] == pytest.approx(0.02) for item in rows)
+
+
+def test_ma_is_rolling_mean_of_configured_window() -> None:
+    """MA5 是**滚动**均值：前 4 天是不足窗口的均值（min_periods=1），第 5 天起才是 5 日均值。"""
+    rows = refresh.compute_series(_rows(6, ramp=True), ma_window=5, min_bars=1)
+    raws = [item["raw_crowding"] for item in rows]
+    for index in range(len(raws)):
+        window = raws[max(0, index - 4): index + 1]
+        assert rows[index]["ma5_crowding"] == pytest.approx(
+            sum(window) / len(window)), f"第 {index} 天"
+
+
+def test_water_level_normalises_to_own_history_max() -> None:
+    """水位 = 当前 MA / 自身历史 MA 最大值。占比恒定时 100% 封顶。"""
+    rows = refresh.compute_series(_rows(30, share=0.01), min_bars=1)
+    for item in rows:
+        assert item["water_level"] == pytest.approx(1.0)
+
+
+def test_water_level_denominator_is_expanding_not_global() -> None:
+    """**关键**：分母只能看到"当天为止"的最大值（无未来函数）。
+
+    占比从 1% 一路升到 2%：前 15 天的水位必须都 ≤ 1.0（因为当时的历史最高
+    就是当时的自己），第 30 天才会接近 1.0。若误用全样本 max，
+    前面那段会被后来的高点压到 ~0.5 —— 测试就是抓这个。
+    """
+    rows = refresh.compute_series(_rows(30, share=0.01, ramp=True), min_bars=1)
+    first_half = [item["water_level"] for item in rows[:15]]
+    assert all(value is not None and value <= 1.0 + 1e-9 for value in first_half)
+    # 前半段接近 1.0（每天都创出新高 → 当天就是历史最高）
+    assert min(value for value in first_half if value is not None) > 0.9
+    # 后半段仍在 1.0 附近（单调上升序列）
+    assert rows[-1]["water_level"] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_water_level_null_when_insufficient_bars() -> None:
+    """样本不足 → NULL（前端显示"数据不足"），**不是** 0 或 100。"""
+    rows = refresh.compute_series(_rows(10, share=0.01), min_bars=60)
+    assert all(item["water_level"] is None for item in rows)
+    rows = refresh.compute_series(_rows(70, share=0.01), min_bars=60)
+    assert rows[58]["water_level"] is None       # 第 59 根：只有 59 个有效值
+    assert rows[59]["water_level"] is not None   # 第 60 根起才够 min_bars
+
+
+def test_water_level_none_not_nan() -> None:
+    """**关键**：输出必须是 `None`（JSON null），不能是 `nan`。
+
+    pandas 的 float 列会把 None 还原成 nan —— 接口返回 nan 时前端的
+    "数据不足"判断（`value === null`）会失效，图上会画出一个 NaN 点。
+    """
+    rows = refresh.compute_series(_rows(20, share=0.01), min_bars=60)
+    for item in rows:
+        for key in ("raw_crowding", "ma5_crowding", "water_level"):
+            value = item[key]
+            assert not (isinstance(value, float) and value != value), \
+                f"{key} 是 nan，应为 None"
+    assert all(item["water_level"] is None for item in rows)
+
+
+def test_water_level_null_when_market_amount_missing_or_zero() -> None:
+    rows = [{"trade_date": "20260101", "sector_amount": 100.0, "market_amount": 0.0},
+            {"trade_date": "20260102", "sector_amount": 100.0, "market_amount": None},
+            {"trade_date": "20260103", "sector_amount": 100.0, "market_amount": 1e6}]
+    out = refresh.compute_series(rows, min_bars=1)
+    assert out[0]["water_level"] is None
+    assert out[1]["water_level"] is None
+    assert out[2]["water_level"] is not None
+
+
+def test_compute_series_empty_and_single() -> None:
+    assert refresh.compute_series([]) == []
+    single = refresh.compute_series(_rows(1, share=0.02), min_bars=1)
+    assert len(single) == 1
+    assert single[0]["water_level"] == pytest.approx(1.0)
+
+
+def test_compute_series_sorts_by_date() -> None:
+    rows = list(reversed(_rows(5, share=0.01)))
+    out = refresh.compute_series(rows, min_bars=1)
+    assert [item["trade_date"] for item in out] == sorted(
+        item["trade_date"] for item in rows)
+
+
+# ======================================================================
+# 概念判定
+# ======================================================================
+
+@pytest.mark.parametrize(("code", "name", "expected"), [
+    ("885800.TI", "半导体", True),
+    ("885801.TI", "光刻胶", True),
+    ("700001.TI", "同花顺全A(加权)", False),
+    ("700002.TI", "同花顺全A(除金融、石油石化)", False),
+    ("882001.TI", "安徽", False),
+    ("883300.TI", "沪深300样本股", False),
+    ("883301.TI", "上证50样本股", False),
+    ("700051R.TI", "同花顺金仓30全收益", False),
+    ("864001.TI", "昨日涨幅超过10%", False),
+    # 行业Ⅲ（dim_concept 独有、无 type）：靠 861 前缀 + 名称兜住
+    ("861003.TI", "化学制品", False),
+    ("861006.TI", "金属与采矿", False),
+    ("700668.TI", "木材加工和木、竹、藤、棕、草制品业指数", False),
+])
+def test_is_concept_board(code, name, expected) -> None:
+    assert is_concept_board(code, name) is expected
+
+
+@pytest.mark.parametrize(("board_type", "name", "expected"), [
+    # **同花顺 type 是权威分类**，优先于名称规则：
+    # 实测 type='I' 的 777 个行业板块里，有 701 个靠名称规则会被误判成概念
+    ("I", "半导体产品与设备Ⅲ", False),
+    ("I", "化学制品", False),
+    ("R", "临沂市指数", False),
+    ("S", "昨日涨幅超过10%", False),
+    ("BB", "同花顺全A(加权)", False),
+    ("TH", "同花顺金仓30", False),
+    ("ST", "同花顺小盘", False),
+])
+def test_is_concept_board_uses_authoritative_type(board_type, name, expected) -> None:
+    """有 `board_type` 时按它判 —— 名称规则会漏掉「化学制品」这类不带"业指数"的行业。"""
+    assert is_concept_board("861003.TI", name,
+                            board_type=board_type) is expected
+
+
+@pytest.mark.parametrize(("code", "name"), [
+    # ⚠️ **N 不能一刀切成非概念**：实测「半导体」= 885800.TI 的 type 就是 N ——
+    # 这个 type 是同花顺的"指数族"，里面既有沪深300样本股（883xxx，非概念）
+    # 也有半导体/光刻胶（885xxx，是概念）。所以 N 交回名称/代码规则判。
+    ("885800.TI", "半导体"),
+    ("885801.TI", "光刻胶"),
+    ("885802.TI", "低空经济"),
+    ("886001.TI", "PCB概念"),
+])
+def test_type_n_is_not_blanket_excluded(code, name) -> None:
+    assert is_concept_board(code, name, board_type="N") is True
+
+
+def test_index_sample_boards_excluded_by_name_even_with_type_n() -> None:
+    """type=N 里的"样本股"仍要被名称规则挡掉。"""
+    assert is_concept_board("883300.TI", "沪深300样本股", board_type="N") is False
+    assert is_concept_board("883301.TI", "上证50样本股", board_type="N") is False
+
+
+@pytest.mark.parametrize(("code", "name"), [
+    ("885800.TI", "光刻胶"),
+    ("885801.TI", "低空经济"),
+    ("885802.TI", "PCB概念"),
+])
+def test_concept_boards_without_type_are_kept(code, name) -> None:
+    """`type` 为空（dim_concept 独有）且代码段/名称都不命中排除规则 → 仍算概念。"""
+    assert is_concept_board(code, name, board_type="") is True
+
+
+def test_is_concept_board_survives_bad_regex(monkeypatch) -> None:
+    """配置里写了坏正则：忽略那一条，不能因此把所有板块判成非概念。"""
+    config = load_config()
+    original = list(config.data.non_concept_name_patterns)
+    config.data.non_concept_name_patterns = ["([unclosed", *original]
+    try:
+        assert is_concept_board("885800.TI", "半导体", config) is True
+    finally:
+        config.data.non_concept_name_patterns = original
+
+
+# ======================================================================
+# 存储
+# ======================================================================
+
+def test_init_tables_idempotent(conn: sqlite3.Connection) -> None:
+    db.init_tables(conn)
+    db.init_tables(conn)
+    names = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {db.DAILY_TABLE, db.META_TABLE, db.MEMBER_TABLE, db.WATCH_TABLE} <= names
+
+
+def test_upsert_is_idempotent_and_updates_values(conn: sqlite3.Connection) -> None:
+    """同一 (trade_date, sector_code) 重复写不产生新行，数值被更新。"""
+    base = {"trade_date": "20260915", "sector_code": "885800.TI",
+            "sector_name": "半导体", "sector_amount": 100.0,
+            "market_amount": 1000.0, "raw_crowding": 0.1,
+            "ma5_crowding": 0.1, "water_level": 0.5}
+    assert db.upsert_sector_crowding(conn, [base]) == 1
+    assert db.count_rows(conn) == 1
+    assert db.upsert_sector_crowding(conn, [{**base, "water_level": 0.9}]) == 1
+    assert db.count_rows(conn) == 1
+    stored = db.query_sector_crowding(conn, "885800.TI")
+    assert stored[0]["water_level"] == pytest.approx(0.9)
+    assert stored[0]["created_at"] == stored[0]["created_at"]   # 不置空
+
+
+def test_get_last_update_date_roundtrip(conn: sqlite3.Connection) -> None:
+    assert db.get_last_update_date(conn, "885800.TI") == ""
+    db.update_sector_meta(conn, sector_code="885800.TI", sector_name="半导体",
+                          last_update_date="20260915")
+    assert db.get_last_update_date(conn, "885800.TI") == "20260915"
+
+
+def test_update_sector_meta_can_refuse_to_advance_watermark(
+        conn: sqlite3.Connection) -> None:
+    """**关键**：`advance_watermark=False` 时水位线不动（失败不许推进）。"""
+    db.update_sector_meta(conn, sector_code="A.TI", last_update_date="20260910")
+    db.update_sector_meta(conn, sector_code="A.TI", last_update_date="20260915",
+                          advance_watermark=False)
+    assert db.get_last_update_date(conn, "A.TI") == "20260910"
+    db.update_sector_meta(conn, sector_code="A.TI", last_update_date="20260915")
+    assert db.get_last_update_date(conn, "A.TI") == "20260915"
+
+
+def test_update_sector_meta_keeps_existing_name_when_blank(
+        conn: sqlite3.Connection) -> None:
+    db.update_sector_meta(conn, sector_code="A.TI", sector_name="半导体")
+    db.update_sector_meta(conn, sector_code="A.TI", sector_name="")
+    meta = db.query_sector_meta(conn)[0]
+    assert meta["sector_name"] == "半导体"
+
+
+def test_query_alerts_threshold_and_sorting(conn: sqlite3.Connection) -> None:
+    day = "20260915"
+    rows = [
+        {"trade_date": day, "sector_code": "A.TI", "sector_name": "低",
+         "water_level": 0.5, "ma5_crowding": 0.001},
+        {"trade_date": day, "sector_code": "B.TI", "sector_name": "中",
+         "water_level": 0.85, "ma5_crowding": 0.002},
+        {"trade_date": day, "sector_code": "C.TI", "sector_name": "高",
+         "water_level": 0.95, "ma5_crowding": 0.003},
+        {"trade_date": day, "sector_code": "D.TI", "sector_name": "无数据",
+         "water_level": None, "ma5_crowding": None},
+    ]
+    db.upsert_sector_crowding(conn, rows)
+    alerts = db.query_alerts(conn, threshold=0.8)
+    assert [item["sector_name"] for item in alerts] == ["高", "中"]   # 降序
+    # NULL 水位不参与告警（"不知道"不等于"拥挤"）
+    assert all(item["water_level"] is not None for item in alerts)
+    assert len(db.query_alerts(conn, threshold=0.99)) == 0
+
+
+def test_query_alerts_concepts_only_filter(conn: sqlite3.Connection) -> None:
+    day = "20260915"
+    db.upsert_sector_crowding(conn, [
+        {"trade_date": day, "sector_code": "885800.TI", "sector_name": "半导体",
+         "water_level": 0.9},
+        {"trade_date": day, "sector_code": "882001.TI", "sector_name": "安徽",
+         "water_level": 0.95},
+    ])
+    db.update_sector_meta(conn, sector_code="885800.TI", sector_name="半导体",
+                          is_concept=True)
+    db.update_sector_meta(conn, sector_code="882001.TI", sector_name="安徽",
+                          is_concept=False)
+    only_concepts = db.query_alerts(conn, threshold=0.8, concepts_only=True)
+    assert [item["sector_name"] for item in only_concepts] == ["半导体"]
+    everything = db.query_alerts(conn, threshold=0.8, concepts_only=False)
+    assert [item["sector_name"] for item in everything] == ["安徽", "半导体"]
+
+
+def test_query_all_latest_uses_single_trade_date(conn: sqlite3.Connection) -> None:
+    """总览只取**全库最大交易日**：不能各板块取各自最新日（停牌板块会混进来）。"""
+    db.upsert_sector_crowding(conn, [
+        {"trade_date": "20260914", "sector_code": "A.TI", "water_level": 0.9},
+        {"trade_date": "20260915", "sector_code": "B.TI", "water_level": 0.3},
+    ])
+    rows = db.query_all_latest_water_level(conn)
+    assert [item["sector_code"] for item in rows] == ["B.TI"]
+
+
+def test_watchlist_crud(conn: sqlite3.Connection) -> None:
+    assert db.add_to_watchlist(conn, "885800.TI", sector_name="半导体") is True
+    assert db.add_to_watchlist(conn, "885800.TI", sector_name="半导体") is False
+    assert db.watchlist_codes(conn) == {"885800.TI"}
+    assert db.remove_from_watchlist(conn, "885800.TI") is True
+    assert db.remove_from_watchlist(conn, "885800.TI") is False
+    assert db.watchlist_codes(conn) == set()
+
+
+def test_watchlist_joins_latest_water_level(conn: sqlite3.Connection) -> None:
+    db.upsert_sector_crowding(conn, [
+        {"trade_date": "20260915", "sector_code": "A.TI", "sector_name": "半导体",
+         "water_level": 0.87, "ma5_crowding": 0.002}])
+    db.update_sector_meta(conn, sector_code="A.TI", sector_name="半导体")
+    db.add_to_watchlist(conn, "A.TI", sector_name="半导体")
+    items = db.list_watchlist(conn)
+    assert len(items) == 1
+    assert items[0]["water_level"] == pytest.approx(0.87)
+
+
+def test_add_to_watchlist_rejects_blank(conn: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError):
+        db.add_to_watchlist(conn, "   ")
+
+
+def test_search_sectors(conn: sqlite3.Connection) -> None:
+    db.update_sector_meta(conn, sector_code="885800.TI", sector_name="半导体")
+    db.update_sector_meta(conn, sector_code="885801.TI", sector_name="半导体材料")
+    db.update_sector_meta(conn, sector_code="885900.TI", sector_name="白酒")
+    assert len(db.search_sectors(conn, "半导体")) == 2
+    assert len(db.search_sectors(conn, "白酒")) == 1
+    assert db.search_sectors(conn, "") == []
+
+
+# ======================================================================
+# 刷新任务（不碰网络）
+# ======================================================================
+
+def test_refresh_task_progress_and_message() -> None:
+    task = RefreshTask(task_id="t1", status="running", total=10, processed=4)
+    assert task.progress == pytest.approx(0.4)
+    assert "已处理 4/10" in task.to_dict()["message"]
+
+    task.status = "done"
+    task.inserted = 123
+    task.last_update_date = "20260915"
+    message = task.to_dict()["message"]
+    assert "新增 123 条" in message and "20260915" in message
+
+    task.status = "failed"
+    task.error = "boom"
+    assert "boom" in task.to_dict()["message"]
+
+
+def test_refresh_task_progress_never_exceeds_one() -> None:
+    task = RefreshTask(task_id="t", total=3, processed=99)
+    assert task.progress == 1.0
+    assert RefreshTask(task_id="t", total=0).progress == 0.0
+
+
+def test_get_refresh_progress_idle_and_unknown() -> None:
+    from src.sector_crowding import refresh as refresh_module
+
+    with refresh_module._TASKS_LOCK:            # noqa: SLF001 测试需要清空任务表
+        refresh_module._TASKS.clear()
+    assert refresh.get_refresh_progress()["status"] == "idle"
+    assert refresh.get_refresh_progress("nope")["status"] == "unknown"
+
+
+def test_start_refresh_all_reuses_running_task(monkeypatch) -> None:
+    """已有任务在跑时**复用**它 —— 并发跑两轮会互相抢数据库锁。"""
+    from src.sector_crowding import refresh as refresh_module
+
+    with refresh_module._TASKS_LOCK:            # noqa: SLF001
+        refresh_module._TASKS.clear()
+        running = RefreshTask(task_id="running1", status="running", total=5)
+        running.started_at = "2026-09-18T10:00:00+08:00"
+        refresh_module._TASKS["running1"] = running
+
+    started_threads: list[str] = []
+
+    def fake_thread(**kwargs):
+        started_threads.append(kwargs.get("name", ""))
+        return None
+
+    monkeypatch.setattr(refresh_module.threading, "Thread", fake_thread)
+    outcome = refresh.start_refresh_all()
+    assert outcome["task_id"] == "running1"
+    assert started_threads == []                # 没有起新线程
+
+    with refresh_module._TASKS_LOCK:            # noqa: SLF001
+        refresh_module._TASKS.clear()
+
+
+def test_task_registry_is_bounded() -> None:
+    """任务表不能无限增长（长期运行会累积内存）。"""
+    from src.sector_crowding import refresh as refresh_module
+
+    with refresh_module._TASKS_LOCK:            # noqa: SLF001
+        refresh_module._TASKS.clear()
+    for index in range(refresh_module._TASKS_MAX + 6):
+        task = RefreshTask(task_id=f"t{index:03d}")
+        task.started_at = f"2026-09-18T10:{index:02d}:00+08:00"
+        refresh_module._register(task)          # noqa: SLF001
+    with refresh_module._TASKS_LOCK:            # noqa: SLF001
+        size = len(refresh_module._TASKS)
+        refresh_module._TASKS.clear()
+    assert size <= refresh_module._TASKS_MAX
+
+
+# ======================================================================
+# 刷新水位线逻辑（用假数据源，不碰网络）
+# ======================================================================
+
+def test_refresh_single_sector_full_backfill_then_incremental(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """首次全量回填 → 第二次走增量 → 第三次幂等跳过。
+
+    这是"一键刷新"最核心的行为，且必须验证 `last_update_date` 被正确推进。
+    """
+    config = load_config()
+    config.database.path = str(tmp_path / "c.db")
+    warehouse_path = tmp_path / "w.db"
+    _make_warehouse(warehouse_path, days=["20260910", "20260911", "20260914"])
+    config.database.warehouse_path = str(warehouse_path)
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_fetch(_config, sector_code, *, start, end):
+        calls.append((start, end))
+        return [{"trade_date": day, "sector_amount": 1e10}
+                for day in ("20260910", "20260911", "20260914")
+                if start <= day <= end]
+
+    monkeypatch.setattr(refresh.sources, "fetch_board_daily", fake_fetch)
+
+    conn = db.get_db_connection(config)
+    db.init_tables(conn)
+    try:
+        first = refresh.refresh_single_sector("885800.TI", conn=conn,
+                                             sector_name="半导体", config=config)
+        assert first["status"] == "ok"
+        assert first["full_backfill"] is True
+        assert db.get_last_update_date(conn, "885800.TI") == "20260914"
+        assert first["inserted"] == 3
+
+        second = refresh.refresh_single_sector("885800.TI", conn=conn,
+                                              config=config)
+        assert second["status"] == "skipped"      # 已是最新
+        assert db.count_rows(conn) == 3           # 没有重复行
+    finally:
+        conn.close()
+
+
+def test_refresh_does_not_advance_watermark_on_fetch_failure(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**关键**：拉取失败时水位线不许推进，否则那段日期成为永久空洞。"""
+    config = load_config()
+    config.database.path = str(tmp_path / "c2.db")
+    warehouse_path = tmp_path / "w2.db"
+    _make_warehouse(warehouse_path, days=["20260914"])
+    config.database.warehouse_path = str(warehouse_path)
+
+    conn = db.get_db_connection(config)
+    db.init_tables(conn)
+    try:
+        # 先成功写入一天并推进水位线
+        db.update_sector_meta(conn, sector_code="A.TI", last_update_date="20260910")
+        before = db.get_last_update_date(conn, "A.TI")
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("Tushare 挂了")
+
+        monkeypatch.setattr(refresh.sources, "fetch_board_daily", boom)
+        with pytest.raises(RuntimeError):
+            refresh.refresh_single_sector("A.TI", conn=conn, config=config)
+        assert db.get_last_update_date(conn, "A.TI") == before
+    finally:
+        conn.close()
+
+
+def test_refresh_skips_when_warehouse_missing(tmp_path: Path) -> None:
+    config = load_config()
+    config.database.path = str(tmp_path / "c3.db")
+    config.database.warehouse_path = str(tmp_path / "missing.db")
+    conn = db.get_db_connection(config)
+    db.init_tables(conn)
+    try:
+        with pytest.raises(RuntimeError, match="仓库"):
+            refresh.refresh_single_sector("A.TI", conn=conn, config=config)
+    finally:
+        conn.close()
+
+
+def _make_warehouse(path: Path, *, days: list[str]) -> None:
+    """造一个最小仓库：只要 quant_daily(trade_date, amount) 够用。"""
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute(
+            "CREATE TABLE quant_daily (trade_date TEXT, code TEXT, amount REAL)")
+        connection.executemany(
+            "INSERT INTO quant_daily VALUES (?,?,?)",
+            [(day, "600150", 1e9) for day in days])
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_market_amount_excludes_zero_rows(tmp_path: Path) -> None:
+    """`amount <= 0` 的行不参与求和：当 0 算会低估分母、把正常板块顶成告警。"""
+    path = tmp_path / "m.db"
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.execute(
+            "CREATE TABLE quant_daily (trade_date TEXT, code TEXT, amount REAL)")
+        connection.executemany("INSERT INTO quant_daily VALUES (?,?,?)", [
+            ("20260915", "600150", 100.0),
+            ("20260915", "300308", 0.0),
+            ("20260915", "000001", None),
+        ])
+        connection.commit()
+    finally:
+        connection.close()
+
+    from src.sector_crowding import sources
+
+    sources.clear_market_cache()
+    with sqlite3.connect(str(path)) as connection:
+        result = sources.market_amount_by_day(connection, start="20260901",
+                                              end="20260930", use_cache=False)
+    assert result["20260915"] == pytest.approx(100.0)
+
+
+def test_lookback_start_uses_calendar_years() -> None:
+    """近 6 年按**日历**推：按 250×6 交易日会少几周窗口。"""
+    from src.sector_crowding import sources
+
+    assert sources.lookback_start("20260915", 6) == "20200916"
+    assert sources.lookback_start("20260915", 1) == "20250915"
+
+
+def test_amount_from_row_prefers_amount_then_vol_times_price() -> None:
+    from src.sector_crowding.sources import _amount_from_row
+
+    assert _amount_from_row({"amount": 500.0, "vol": 10.0,
+                             "avg_price": 20.0}) == pytest.approx(500.0)
+    assert _amount_from_row({"vol": 10.0, "avg_price": 20.0}) == pytest.approx(200.0)
+    # avg_price 缺失退到 close（口径略差但不静默丢数据）
+    assert _amount_from_row({"vol": 10.0, "close": 20.0}) == pytest.approx(200.0)
+    # 都没有 → None（不编造 0）
+    assert _amount_from_row({"vol": 10.0}) is None
+    assert _amount_from_row({"vol": 0.0, "avg_price": 20.0}) is None
+
+
+# ======================================================================
+# 参数变更后的本地重算 / 重分类（不联网）
+# ======================================================================
+
+def test_recompute_clears_water_level_when_below_min_bars(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**关键**：`min_bars` 调高后，样本不足的板块水位必须被**清成 NULL**。
+
+    实测踩到的场景：首次全量回填后把 `min_bars_for_water_level` 从 60 提到 750，
+    若不重算，库里仍留着按 60 根算出的水位 —— 那些"历史太短所以恒为 100%"的板块
+    会继续误告警（实测 218 个 → 50 个）。
+    """
+    config = load_config()
+    config.database.path = str(tmp_path / "rc.db")
+    conn = db.get_db_connection(config)
+    db.init_tables(conn)
+    try:
+        # 用很低的 min_bars 先算出水位并写库
+        raw = _rows(100, share=0.01)
+        computed = refresh.compute_series(raw, ma_window=5, min_bars=1)
+        db.upsert_sector_crowding(conn, [
+            {**item, "sector_code": "A.TI", "sector_name": "小样本"} for item in computed])
+        assert db.query_sector_crowding(conn, "A.TI")[-1]["water_level"] is not None
+
+        # 把闸门提到 750（> 100 行）后本地重算
+        config.window.min_bars_for_water_level = 750
+        stats = refresh.recompute_stored_water_levels(config=config, conn=conn)
+        assert stats["skipped"] == 1 and stats["sectors"] == 0
+        assert db.query_sector_crowding(conn, "A.TI")[-1]["water_level"] is None
+    finally:
+        conn.close()
+
+
+def test_recompute_keeps_water_level_when_enough_bars(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_config()
+    config.database.path = str(tmp_path / "rc2.db")
+    conn = db.get_db_connection(config)
+    db.init_tables(conn)
+    try:
+        raw = _rows(80, share=0.01)
+        computed = refresh.compute_series(raw, ma_window=5, min_bars=1)
+        db.upsert_sector_crowding(conn, [
+            {**item, "sector_code": "B.TI", "sector_name": "足样本"} for item in computed])
+        config.window.min_bars_for_water_level = 60
+        stats = refresh.recompute_stored_water_levels(config=config, conn=conn)
+        assert stats["sectors"] == 1
+        assert db.query_sector_crowding(conn, "B.TI")[-1]["water_level"] is not None
+    finally:
+        conn.close()
+
+
+def test_reclassify_updates_is_concept_without_touching_watermark(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """重分类只改 `is_concept`，**不能**动 `last_update_date`（否则增量会重抓）。"""
+    config = load_config()
+    config.database.path = str(tmp_path / "rf.db")
+    conn = db.get_db_connection(config)
+    db.init_tables(conn)
+    try:
+        db.update_sector_meta(conn, sector_code="885800.TI", sector_name="半导体",
+                              is_concept=True, last_update_date="20260915")
+        db.update_sector_meta(conn, sector_code="861003.TI", sector_name="化学制品",
+                              is_concept=True, last_update_date="20260915")
+
+        monkeypatch.setattr(refresh.sources, "list_boards", lambda _config: [
+            {"sector_code": "885800.TI", "sector_name": "半导体",
+             "is_concept": True, "board_type": "N"},
+            {"sector_code": "861003.TI", "sector_name": "化学制品",
+             "is_concept": False, "board_type": ""},
+        ])
+        outcome = refresh.reclassify_boards(config=config, conn=conn)
+        assert outcome["changed"] == 1
+        meta = {row["sector_code"]: row for row in db.query_sector_meta(conn)}
+        assert bool(meta["861003.TI"]["is_concept"]) is False
+        assert bool(meta["885800.TI"]["is_concept"]) is True
+        # 水位线没有被碰
+        assert meta["861003.TI"]["last_update_date"] == "20260915"
+        assert meta["885800.TI"]["last_update_date"] == "20260915"
+    finally:
+        conn.close()

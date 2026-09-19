@@ -18,6 +18,7 @@ from src.infrastructure.repositories.event_sqlite_base import (
     EventSqliteStore,
     event_to_row,
     insert_sql,
+    retry_on_locked,
     row_to_event,
 )
 
@@ -31,10 +32,16 @@ class EventSqliteRepository(AlertSqliteMixin, EventSqliteStore, EventRepository)
     def _upsert_events_sync(self, events: list[Event]) -> dict[str, int]:
         self._sync_once()
         sql = insert_sql("fact_events", _EVENT_COLS)
-        inserted = 0
-        with self._connect() as conn:
-            for event in events:
-                inserted += conn.execute(sql, event_to_row(event)).rowcount
+
+        def _write() -> int:
+            inserted = 0
+            with self._connect() as conn:
+                for event in events:
+                    inserted += conn.execute(sql, event_to_row(event)).rowcount
+            return inserted
+
+        # 采集入库撞上主库其它写入者时重试，避免整轮扫描的采集结果白丢。
+        inserted = retry_on_locked(_write)
         return {"inserted": inserted, "skipped": len(events) - inserted}
 
     async def upsert_events(self, events: list[Event]) -> dict[str, int]:
@@ -108,13 +115,18 @@ class EventSqliteRepository(AlertSqliteMixin, EventSqliteStore, EventRepository)
             return 0
         self._sync_once()
         placeholders = ",".join("?" for _ in event_ids)
-        with self._connect() as conn:
-            cur = conn.execute(
-                f"UPDATE fact_events SET analyzed = 1 "
-                f"WHERE tenant_id = ? AND event_id IN ({placeholders})",
-                [tenant_id, *event_ids],
-            )
-            return cur.rowcount
+
+        def _write() -> int:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    f"UPDATE fact_events SET analyzed = 1 "
+                    f"WHERE tenant_id = ? AND event_id IN ({placeholders})",
+                    [tenant_id, *event_ids],
+                )
+                return cur.rowcount
+
+        # 标记失败会导致下轮重复LLM分析（浪费额度），因此同样做锁重试。
+        return retry_on_locked(_write)
 
     async def mark_events_analyzed(
         self, event_ids: list[str], tenant_id: str = DEFAULT_TENANT,

@@ -23,7 +23,7 @@ from datetime import datetime
 
 import pytest
 
-from src.intraday.config import IntradayConfig
+from src.intraday.config import IntradayConfig, WatchConfig
 from src.intraday.models import WatchItem
 from src.intraday.service import (
     IntradayService,
@@ -39,6 +39,23 @@ def _at(text: str) -> datetime:
 
 def asyncio_run(coro):
     return asyncio.run(coro)
+
+
+@pytest.fixture(autouse=True)
+def _market_clock_matches_test_date(monkeypatch):
+    """把「市场时钟」钉到测试用的那一天（2026-09-16）。
+
+    为什么必须钉：`watchlist_refresh_window(now)` 除了用注入的 `now` 判时段，
+    还会**再问一次市场自己的时钟**（`live_session_date()`，取 QMT tick 的 timetag）
+    来排除节假日。测试注入的是写死的 2026-09-16，而市场时钟返回的是**真实当天** ——
+    于是"测试日期 != 市场日期"被判成"非交易日"，这几个用例会随着日历推进突然变红
+    （实测：2026-09-17 起 `test_window_open_during_trading_hours` 全挂）。
+    钉住后，本文件里的时钟一律由用例自己控制（`test_holiday_*` 等会再覆盖一次）。
+    """
+    from src.intraday import sources as sources_module
+
+    monkeypatch.setattr(sources_module, "live_session_date",
+                        lambda **_: "2026-09-16")
 
 
 # ==================== 窗口判定 ====================
@@ -141,6 +158,10 @@ class _FakeService(IntradayService):
         # 直接改 self._config.data 会把改动泄漏给后续用例（实测：一个用例把
         # refresh_seconds 设成 0，后面的用例拿到的默认值也变成了 0）。
         self._config = self._config.model_copy(deep=True)
+        # 关掉启动宽限期：本文件测的是"请求路径/循环"的语义，不是启动时序。
+        # 生产默认把第一次整表重算延后 `_WATCHLIST_STARTUP_GRACE`（20 秒）以免
+        # 和首屏抢 CPU；宽限期内无缓存时返回的是占位列表，会盖住这些用例的被测行为。
+        self._startup_grace_seconds = 0.0
         self.computes = 0
         self.delay = 0.05
 
@@ -249,9 +270,34 @@ def test_cached_watchlist_survives_config_reload_branch() -> None:
 # ==================== 刷新循环 ====================
 
 
+def _no_startup_grace(service: IntradayService) -> IntradayService:
+    """关掉启动宽限期，让"第一轮就刷"这类窗口语义能被直接验证。
+
+    生产默认把第一次**整表重算**延后 `_WATCHLIST_STARTUP_GRACE`（20 秒）：
+    冷启动整表重算是 50 只 × 3~5 秒的 CPU 活儿，会和首屏那次完整快照抢 GIL
+    （实测首屏因此要 220 秒以上）。这条时序与"盘中要每分钟刷新"无关，
+    所以涉及循环轮次的用例先把宽限置 0。
+    """
+    service._startup_grace_seconds = 0.0
+    return service
+
+
+#: 真实的 `_schedule_watchlist_refresh`（在 **fixture 生效前** 取到）。
+#:
+#: `tests/conftest.py` 的 autouse fixture 会把它换成 no-op（避免测试进程里真的
+#: 发网络请求）。要验证"读请求触发的后台重算"本身，就得用这个引子把它换回来 ——
+#: 关键是**在导入期**取，此时 fixture 还没跑。
+_REAL_SCHEDULE_REFRESH = IntradayService._schedule_watchlist_refresh
+
+
+def _restore_schedule_refresh(monkeypatch) -> None:
+    monkeypatch.setattr(IntradayService, "_schedule_watchlist_refresh",
+                        _REAL_SCHEDULE_REFRESH)
+
+
 def test_loop_refreshes_immediately_when_in_window(monkeypatch) -> None:
     """服务在盘中启动时要**立刻**刷一次，而不是等满一分钟。"""
-    service = _FakeService()
+    service = _no_startup_grace(_FakeService())
     service._config.data.watchlist_refresh_seconds = 60
     monkeypatch.setattr(
         "src.intraday.service.watchlist_refresh_window",
@@ -271,7 +317,7 @@ def test_loop_refreshes_immediately_when_in_window(monkeypatch) -> None:
 
 def test_loop_skips_when_window_closed(monkeypatch) -> None:
     """非盘中一秒数据都不取（这是用户明确的"不需要每分钟刷新"）。"""
-    service = _FakeService()
+    service = _no_startup_grace(_FakeService())
     monkeypatch.setattr(
         "src.intraday.service.watchlist_refresh_window",
         lambda now=None: (False, "已收盘"))
@@ -287,7 +333,7 @@ def test_loop_skips_when_window_closed(monkeypatch) -> None:
 
 def test_loop_survives_refresh_failure(monkeypatch) -> None:
     """单轮失败不能让循环死掉：数据源抖动、某只票停牌都只影响这一轮。"""
-    service = _FakeService()
+    service = _no_startup_grace(_FakeService())
     monkeypatch.setattr(
         "src.intraday.service.watchlist_refresh_window",
         lambda now=None: (True, "盘中自动刷新中"))
@@ -355,6 +401,198 @@ def test_default_config_enables_per_minute_refresh() -> None:
     config = IntradayConfig()
     assert config.data.watchlist_refresh_seconds == 60
     assert config.data.watchlist_cache_ttl == 60
+
+
+# ==================== 整表重算不能把事件循环饿死（2026-09-18 报障回归） ====================
+
+
+class _CountingService(IntradayService):
+    """把 `snapshot` 换成"同时进行几只"的计数器，专测整表重算的并发上限。"""
+
+    def __init__(self, codes: list[str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._config = self._config.model_copy(deep=True)
+        self._config.watchlist = [
+            WatchConfig(code=code, name=f"票{code}") for code in codes]
+        # 单只桩快照的耗时（用例可调大，用来模拟"整表要很久"）
+        self.delay = 0.02
+        self.live = 0
+        self.max_live = 0
+        self.started: list[str] = []
+
+    def _reload_config(self) -> IntradayConfig:
+        return self._config
+
+    async def snapshot(self, code: str, *, light: bool = False, **kwargs):
+        self.started.append(code)
+        self.live += 1
+        self.max_live = max(self.max_live, self.live)
+        await asyncio.sleep(self.delay)
+        self.live -= 1
+        return None      # 失败分支：条目仍会生成（只带 code/name）
+
+
+def test_full_recompute_bounds_concurrency() -> None:
+    """整表重算**必须限制同时进行的只数**：50 只并发会把事件循环饿死 36 秒。
+
+    实测（冷启动 50 只自选，见 `IntradayService._gather_light_snapshots`）：
+
+    | 并发 | 整表耗时 | 事件循环最长被占用 |
+    |---|---|---|
+    | 50（旧） | 198s | **36.5s** |
+    | 1（现在） | 200s | **0.4s** |
+
+    总耗时不变（那是跑不掉的 CPU 时间），但"任何请求都要等几分钟"被治掉了。
+    """
+    codes = [f"60000{i}" for i in range(6)]
+    service = _no_startup_grace(_CountingService(codes))
+
+    async def _run():
+        return await service.watchlist(limit=50)
+
+    items = asyncio_run(_run())
+    assert [item.code for item in items] == codes       # 顺序按配置，不因分批而乱
+    assert service.max_live == IntradayService._WATCH_COMPUTE_BATCH
+    assert service.max_live < len(codes)
+
+
+def test_full_recompute_yields_between_batches() -> None:
+    """批与批之间必须让出事件循环，别的协程才有机会跑。"""
+    codes = [f"60000{i}" for i in range(4)]
+    service = _no_startup_grace(_CountingService(codes))
+    ticks = {"n": 0}
+
+    async def ticker() -> None:
+        while True:
+            ticks["n"] += 1
+            await asyncio.sleep(0.001)
+
+    async def _run():
+        task = asyncio.create_task(ticker())
+        try:
+            await service.watchlist(limit=50)
+        finally:
+            task.cancel()
+        return ticks["n"]
+
+    # 4 只 × 20ms 的桩，若一次 gather 到底则 ticker 几乎没机会跑
+    assert asyncio_run(_run()) >= len(codes)
+
+
+def test_cold_start_watchlist_never_blocks_the_first_screen() -> None:
+    """完全没缓存时，`/watchlist` 也不能挂住首屏（实测旧行为 200~220 秒）。
+
+    场景：首次部署 / 快照超过 24 小时（周一早上开机）/ 自选池大改导致热缓存整体
+    丢弃。此时要给的是"立刻可用的占位列表"（只有代码/名称/板块，数字留空），
+    整表重算转后台，算完由 WS 推送补上。
+    """
+    codes = [f"60000{i}" for i in range(6)]
+    service = _no_startup_grace(_CountingService(codes))
+    service._cold_watchlist_wait = 0.2      # 生产是 3 秒
+    service.delay = 5.0                     # 模拟"整表要 5 秒"（真实冷启动是 200 秒）
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        items = await service.watchlist(limit=50)
+        elapsed = loop.time() - started
+        task = service._cold_task
+        # 重算仍在后台继续跑（不是被取消了），算完会写回缓存并由 WS 推送
+        return elapsed, items, (task is not None and not task.done())
+
+    elapsed, items, still_running = asyncio_run(_run())
+    assert elapsed < 1.0, f"首屏不该等整表重算（实测 {elapsed:.2f}s）"
+    assert [item.code for item in items] == codes
+    # 数字一律留空 —— 宁可显示 "—"，也不伪造分数/价格
+    assert all(item.total_score is None for item in items)
+    assert all(item.price is None for item in items)
+    assert all(item.signal_strength == "none" for item in items)
+    assert service.watchlist_refresh_status()["warming"] is True
+    assert still_running is True
+
+
+def test_cold_start_defers_full_recompute_until_grace_ends(monkeypatch) -> None:
+    """启动宽限期内：首屏拿占位值，整表重算**排上但先不跑**。"""
+    _restore_schedule_refresh(monkeypatch)
+    service = _CountingService([f"60000{i}" for i in range(3)])
+    assert service._startup_grace_left() > 0
+
+    async def _run():
+        items = await service.watchlist(limit=50)
+        return items, len(service.started), len(service._watch_refresh_tasks)
+
+    items, computes, pending = asyncio_run(_run())
+    assert len(items) == 3              # 占位列表（来自配置）
+    assert computes == 0                # 宽限期内一次整表都没跑
+    assert pending == 1                 # 但已经排上，宽限一到就会补算
+
+
+def test_scheduled_refresh_deferred_during_startup_grace(monkeypatch) -> None:
+    """启动宽限期内排下的后台重算不会立刻跑（首屏优先），宽限后才跑。"""
+    _restore_schedule_refresh(monkeypatch)
+    service = _CountingService([f"60000{i}" for i in range(3)])
+    service._startup_grace_seconds = 0.3        # 缩短宽限，便于测"之后会跑"
+
+    async def _run():
+        service._schedule_watchlist_refresh()
+        await asyncio.sleep(0.1)
+        early = len(service.started)
+        await asyncio.sleep(0.5)
+        return early, len(service.started)
+
+    early, later = asyncio_run(_run())
+    assert early == 0                   # 宽限期内没跑
+    assert later >= 1                   # 宽限结束后自动补算（不能丢排）
+
+
+def test_scheduled_refresh_still_works_after_grace(monkeypatch) -> None:
+    """宽限期过后，读请求触发的后台重算照常工作（自愈路径不能被砍掉）。"""
+    _restore_schedule_refresh(monkeypatch)
+    service = _no_startup_grace(_CountingService([f"60000{i}" for i in range(3)]))
+
+    async def _run():
+        service._schedule_watchlist_refresh()
+        for _ in range(50):
+            if service._watch_cache is not None:
+                break
+            await asyncio.sleep(0.02)
+        return service._watch_cache
+
+    cache = asyncio_run(_run())
+    assert cache is not None
+    assert len(cache[1]) == 3
+
+
+def test_scheduled_refresh_skipped_while_full_recompute_in_flight(
+        monkeypatch) -> None:
+    """循环正在跑整表重算时，读请求不再叠一个（两份 = 白白多付两分钟 CPU）。"""
+    _restore_schedule_refresh(monkeypatch)
+    service = _no_startup_grace(_CountingService([f"60000{i}" for i in range(3)]))
+    service._full_recompute_inflight = True
+
+    async def _run():
+        service._schedule_watchlist_refresh()
+        await asyncio.sleep(0.05)
+        return len(service._watch_refresh_tasks)
+
+    assert asyncio_run(_run()) == 0
+
+
+def test_explicit_force_always_really_recomputes() -> None:
+    """去重**只**作用于后台自动重算：显式 force 必须真算，不能拿缓存假装刷过。
+
+    前端「↻ 立即刷新」与 `/intraday/scan` 都走 `force=True`；返回缓存冒充刚刷新的
+    结果是最容易被用户抓到的那种谎。
+    """
+    service = _no_startup_grace(_CountingService([f"60000{i}" for i in range(3)]))
+
+    async def _run():
+        await service.watchlist(limit=50)
+        await service.watchlist(limit=50, force=True)
+        return service.started
+
+    started = asyncio_run(_run())
+    assert len(started) == 6          # 3 只 × 2 轮，第二轮没有被去重跳过
 
 
 # ==================== 接口契约 ====================

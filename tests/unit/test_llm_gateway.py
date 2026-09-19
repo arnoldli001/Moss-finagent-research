@@ -1,4 +1,4 @@
-﻿"""LLM网关测试（FakeProvider注入，不联网）。"""
+"""LLM网关测试（FakeProvider注入，不联网）。"""
 
 import pytest
 
@@ -14,9 +14,11 @@ class FakeProvider:
         self._error = error
         self._fail_first = fail_first
         self.calls: list[str] = []
+        self.prompts: list[str] = []
 
     async def chat(self, spec, system, prompt, *, json_mode=False):
         self.calls.append(spec.model_name)
+        self.prompts.append(prompt)
         if self._fail_first > 0:
             self._fail_first -= 1
             raise LLMGatewayError("模拟主模型故障")
@@ -86,6 +88,45 @@ async def test_all_providers_fail_raises(gateway_env):
 
     with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
         await gw.complete("light", "系统", "任务")
+
+
+async def test_same_prompt_different_tier_is_not_a_cache_hit(gateway_env):
+    """**作用域回归**：同 prompt 跨层级不复用缓存。
+
+    `light` 跑本地 1.5B、`decision` 跑云端 pro，system/prompt 可能一字不差；
+    若缓存不按层级分区，1.5B 的粗糙结论会被决策层直接拿去当结论。
+    """
+    settings, _ = gateway_env
+    providers = {"ollama": FakeProvider(), "deepseek": FakeProvider()}
+    gw = LLMGateway(settings=settings, providers=providers)
+
+    await gw.complete("light", "系统", "同一段文字")
+    second = await gw.complete("decision", "系统", "同一段文字")
+    assert not second.cache_hit, "跨层级串用了缓存"
+    assert len(providers["deepseek"].calls) == 1
+
+
+@pytest.mark.parametrize("cap", [200, 501, 1000])
+async def test_truncation_keeps_head_and_tail(gateway_env, cap):
+    """截断必须**保住尾部** —— JSON schema 在 prompt 末尾。
+
+    分析类 prompt 的段序是 `[数据正文] … ## 任务要求(schema) ## 技能指引`。
+    一刀切尾部会让模型拿不到输出格式，进而走 repair 重试（成本翻倍）。
+    """
+    settings, _ = gateway_env
+    settings.llm_input_char_hard_cap = cap
+    providers = {"ollama": FakeProvider(), "deepseek": FakeProvider()}
+    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+
+    prompt = "数据行\n" * 500 + "## 任务要求\n{\"stance\": \"string\"}"
+    await gw.complete("light", "系统", prompt)
+
+    sent = providers["ollama"].prompts[-1]
+    assert len(sent) <= cap + 40, "截断后仍超出上限"
+    assert "## 任务要求" in sent, "尾部指令段被切掉了"
+    assert sent.startswith("数据行"), "头部数据段被切掉了"
+    assert "已省略" in sent, "中段省略标记缺失，截断不可见"
+
 
 
 async def test_unknown_tier_raises(gateway_env):

@@ -22,13 +22,27 @@ import logging
 import sys
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 # 子进程里先注入的引导代码：保证 packages 可导入、统一 UTF-8、异常转成 JSON 错误。
 # body 会被**整体再缩进一级**放进 try 里（否则多行 body 只有首行有缩进 → IndentationError）。
+#
+# 第 4 行装「东财直连回退」：akshare 的东财接口都跑在这个子进程里，而本机网络
+# 对 `push2*.eastmoney.com` 做了 TLS SNI 阻断（详见 `src/core/eastmoney_direct.py`），
+# 主进程装了也管不到子进程 —— 必须在这里再装一次。
 _BOOTSTRAP_HEAD = """
 import json, sys
 sys.path.insert(0, ".")
+try:
+    from src.core.eastmoney_direct import install as _install_em_direct
+    _install_em_direct()
+except Exception:
+    pass
 def __emit(payload):
     sys.stdout.write(json.dumps(payload, ensure_ascii=False, default=str))
     sys.stdout.flush()
@@ -62,7 +76,7 @@ async def run_json_subprocess(
             stderr=asyncio.subprocess.PIPE,
         )
     except Exception as exc:  # noqa: BLE001 连进程都起不来（极少见）
-        logger.warning("%s 子进程启动失败: %s", label, str(exc)[:150])
+        logger.warning("%s 子进程启动失败: %s", label, brief(exc, BRIEF_DEFAULT))
         return None
     try:
         stdout, stderr = await asyncio.wait_for(

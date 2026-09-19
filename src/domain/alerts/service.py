@@ -14,6 +14,11 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from src.core.config import Settings, get_settings
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.domain.alerts.analyzer import EventAnalyzer
 from src.domain.alerts.dedup import _parse_dt, dedupe_events, is_in_cooldown
 from src.domain.alerts.models import DEFAULT_TENANT, Alert, ScanResult
@@ -106,9 +111,9 @@ class AlertScanService:
             except Exception as exc:  # noqa: BLE001 单采集器故障隔离
                 logger.warning("采集器%s失败: %s",
                                getattr(collector, "source_name", "?"),
-                               str(exc)[:150])
+                               brief(exc, BRIEF_DEFAULT))
                 errors.append(f"{getattr(collector, 'source_name', 'collector')}"
-                              f"采集异常: {str(exc)[:120]}")
+                              f"采集异常: {brief(exc, BRIEF_TIGHT)}")
                 continue
             raw_items.extend(items)
             errors.extend(source_errors)
@@ -193,7 +198,7 @@ class AlertScanService:
         try:
             await self._hub.broadcast(alert, alert.tenant_id)
         except Exception as exc:  # noqa: BLE001 推送失败不影响落库/邮件
-            logger.warning("WebSocket广播失败: %s", str(exc)[:120])
+            logger.warning("WebSocket广播失败: %s", brief(exc, BRIEF_TIGHT))
         email_result = await self._emailer.send(alert)
         if email_result.status != "suppressed":
             result.email_results.append(email_result)

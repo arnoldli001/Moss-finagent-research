@@ -14,6 +14,7 @@
 | 本地开发调试（看实时日志） | `python manage.py start --reload` |
 | 后台挂着跑（前后端一起） | `python manage.py start --daemon --with-frontend` |
 | 看所有服务/依赖状态 | `python manage.py status` |
+| 本地 SQLite 打不开（`disk I/O error`） | `python manage.py doctor` |
 | 重启后端（部署新版本） | `python manage.py start --replace` |
 | 跑测试（**不会影响线上数据**） | `python manage.py test -q` |
 | 停掉本项目所有服务 | `python manage.py stop` |
@@ -62,10 +63,61 @@ python manage.py stop
 
 一次停止：后端（8100）、前端 dev（5173）、Celery worker（如存在）。
 
-- 只按 **PID 精确树杀**（`taskkill /T /F /PID`，连带 uvicorn reload/npm 派生子进程）；
+- **先优雅、后硬杀**：先给每个后端实例发 `CTRL_BREAK_EVENT` 请它自己退出
+  （uvicorn 会正常走 lifespan 关停 → SQLite checkpoint + 关闭连接），等端口释放；
+  到点仍存活的才 `taskkill /T /F`。**顺序不能反** —— 硬杀会让 SQLite 来不及
+  checkpoint，留下 0 字节的 `-wal` 与陈旧的 `-shm`，下次启动每次打开该库都
+  `disk I/O error`（实测重启后首个前端请求 182.9 秒）；
+- **按命令行枚举所有后端实例，不只按端口**：原先只杀"端口监听者"，端口之外的
+  历史实例会变成孤儿进程一直占着 `-wal`/`-shm`（实测有个 12:28 启动的实例活到
+  16:51，CPU 累计 0.0s，纯占位）。只匹配 `is_our_cmdline`（含 `src.api.main:app`），
+  **不会误杀同机其他 Python/Node 服务**；
 - PID 文件丢失时按端口兜底，但必须先通过 `/health` 服务签名或命令行
-  证实是"本项目实例"才会停止，**不会误杀同机其他 Node/Python 服务**；
+  证实是"本项目实例"才会停止；
 - 严禁使用 `taskkill /F /IM python.exe` / `node.exe` 这类进程名通杀。
+
+`start --replace` 走同一条停止路径：端口外的孤儿实例也会被一并清理，并打印出来。
+
+---
+
+## 2.5 `doctor` —— 本地 SQLite 体检与自愈
+
+```
+python manage.py doctor
+```
+
+检查 `data/moss_finagent.db`（可写库，会自愈）与 `data/quant/warehouse.db`
+（只读检查），并列出后端实例（含端口外孤儿）。
+
+**什么时候用**：日志里反复出现
+
+```
+路由DB查询异常，穿透网络: stock_close:300750 -> disk I/O error
+```
+
+或"重启后前端几十秒没数据"。这类故障的根因是 **`-wal` 被截断成 0 字节 +
+`-shm` 停在上一轮**（主库本身完好），处理动作是把这两个伴生文件**改名备份**到
+`data/recovery/<库名>-<时间戳>/`，再从主库重建。判据与完整证据见
+[TROUBLESHOOTING.md §二](./TROUBLESHOOTING.md)。
+
+输出示例：
+
+```
+● data/moss_finagent.db
+    主库大小 : 729.2MB
+    -wal/-shm: 0B / 65536B
+    表数量   : 打不开（disk I/O error）
+    结论     : ❌ 不可用（…伴生文件挪不动：仍有进程占用，请先停掉重复实例）
+```
+
+| 结论 | 含义 | 动作 |
+|---|---|---|
+| ✅ 正常 | 库可正常打开 | 无需处理 |
+| 🔧 已自愈 | 陈旧伴生文件已备份、库已恢复 | 重启服务即可；备份在 `data/recovery/` |
+| ❌ 不可用 | 挪不动 / 隔离后仍打不开 | 按提示 `python manage.py stop` 后重试；仍不行则人工介入 |
+
+服务启动时 lifespan 会自动做同一件事，所以正常运维其实不需要手动跑这个命令 ——
+它是排查时的现场取证工具。关掉自动自愈：`MOSS_SQLITE_RECOVERY=0`。
 
 ---
 

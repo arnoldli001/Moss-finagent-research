@@ -26,10 +26,24 @@ def normalize_text(text: str) -> str:
     return _NORMALIZE_RE.sub("", text.lower())
 
 
-def cache_key(system: str, prompt: str) -> str:
-    return hashlib.sha256(
-        (normalize_text(system) + "\x00" + normalize_text(prompt)).encode("utf-8")
-    ).hexdigest()
+def cache_key(system: str, prompt: str, scope: str = "") -> str:
+    """缓存键（SHA256）。
+
+    `scope` 用于区分**同一 prompt 在不同调用条件下不应互相复用**的场景。
+    最典型的是模型层级：`light` 层用本地 1.5B 跑出来的回答，
+    不能拿去当 `decision` 层的结论复用 —— 两者对精度要求差一个量级，
+    但 system/prompt 可能一字不差。`json_mode` 同理（是否要求结构化输出）。
+
+    `scope` 由调用方生成（形如 `"reasoning|json=1"`），不走 `normalize_text`
+    —— 它是标记而不是自然语言，不该被去标点。
+
+    不传 `scope` 时退化为"只看 system+prompt"，这条路径给**审计用的
+    prompt_hash** 使用（它要标识 prompt 本身，与调用条件无关）。
+    """
+    parts = [normalize_text(system), normalize_text(prompt)]
+    if scope:
+        parts.insert(0, scope)
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
 
 def _ngram_vector(text: str, n: int = 3) -> Counter[str]:
@@ -65,27 +79,32 @@ class LLMCache:
         self._dir.mkdir(parents=True, exist_ok=True)
         return self._dir / f"{key}.json"
 
-    def get(self, system: str, prompt: str, agent_id: str = "") -> LLMResponse | None:
+    def get(self, system: str, prompt: str, agent_id: str = "",
+            scope: str = "") -> LLMResponse | None:
         """先精确后语义。返回的response已带cache_hit/cache_kind标记。
 
-        语义命中仅限同一agent_id：不同Agent（如A05核验/A06抽取）输入文本
-        大量重叠时3-gram相似度可能越界，跨Agent复用会造成结论串台。
+        两级都有作用域限制，**缺一不可**：
+
+        - 精确命中按 `scope` 分区（模型层级 / json_mode）；
+        - 语义命中仅限同一 `agent_id` —— 不同 Agent（如 A05 核验 / A06 抽取）
+          输入文本大量重叠时 3-gram 相似度可能越界，跨 Agent 复用会造成结论串台。
         """
-        key = cache_key(system, prompt)
+        key = cache_key(system, prompt, scope)
         hit = self._get_exact(key)
         if hit is not None:
             return self._mark(hit, "exact")
         return self._get_semantic(system, prompt, exclude=key, agent_id=agent_id)
 
     def put(self, system: str, prompt: str, response: LLMResponse,
-            agent_id: str = "") -> None:
+            agent_id: str = "", scope: str = "") -> None:
         expires_at = time.time() + self._ttl_seconds
         entry = {
             **response.model_dump(mode="json"),
             "vector_text": normalize_text(system + prompt),
             "agent_id": agent_id,
+            "scope": scope,
         }
-        key = cache_key(system, prompt)
+        key = cache_key(system, prompt, scope)
         self._memory[key] = (expires_at, entry)
         self._file_path(key).write_text(
             json.dumps({"expires_at": expires_at, **entry}, ensure_ascii=False),
@@ -117,9 +136,18 @@ class LLMCache:
         return self._load(key)
 
     def _get_semantic(
-        self, system: str, prompt: str, *, exclude: str, agent_id: str = ""
+        self, system: str, prompt: str, *, exclude: str, agent_id: str = "",
+        scope: str = "",
     ) -> LLMResponse | None:
-        """扫描L2文件构建向量索引，取相似度最高且≥阈值的条目（同Agent内）。"""
+        """扫描L2文件构建向量索引，取相似度最高且≥阈值的条目。
+
+        复用必须同时满足两个作用域，缺一不可：
+
+        - **同 `scope`**（模型层级 / json_mode）—— 否则 1.5B 的粗糙结论会被
+          决策层当结论用；
+        - **同 `agent_id`** —— 不同 Agent 的输入文本大量重叠时相似度会越界，
+          跨 Agent 复用会造成结论串台。无 agent_id 标记的历史条目不参与复用。
+        """
         if not self._dir.exists():
             return None
         query_vec = _ngram_vector(normalize_text(system + prompt))
@@ -131,8 +159,9 @@ class LLMCache:
             entry = self._load(key)
             if entry is None:
                 continue
-            # 无agent_id标记的历史缓存不参与语义复用，避免跨任务串台
             if not agent_id or entry.get("agent_id") != agent_id:
+                continue
+            if str(entry.get("scope") or "") != scope:
                 continue
             score = cosine_similarity(query_vec, _ngram_vector(entry.get("vector_text", "")))
             if score >= best_score:

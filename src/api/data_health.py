@@ -13,11 +13,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.intraday.source_health import SOURCE_CAPABILITIES
 
 logger = logging.getLogger(__name__)
@@ -30,18 +36,82 @@ _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _WAREHOUSE_STATS_FILE = Path("data/quant/warehouse_stats.json")
 _WAREHOUSE_TTL = 600.0
 _WAREHOUSE_REFRESHING = False
+# Tushare 分区覆盖的落盘缓存：`coverage()` 要遍历 3.5 万个分区目录做 stat，
+# 实测平时 2.9 秒，但**启动后磁盘被 akshare 子进程占满时会膨胀到 140 秒以上**，
+# 于是首个 /health 请求要等两三分钟（用户看到"运维页一直转圈"）。
+# 分区覆盖是小时级信息，没有理由让请求路径去遍历目录 —— 同一套
+# "读缓存秒回 + 后台刷新" 口径（与 _warehouse_health 一致）。
+_TUSHARE_STATS_FILE = Path("data/quant/tushare_stats.json")
+_TUSHARE_TTL = 1800.0
+_TUSHARE_REFRESHING = False
 
 
 def _tushare_health(root: str = "data/quant/tushare",
-                    universe: str = "a_share") -> dict[str, Any]:
-    """Tushare 健康度：token 可用性 + 各数据集覆盖 + 新鲜度（滞后交易日数）。"""
+                    universe: str = "a_share",
+                    *, force: bool = False) -> dict[str, Any]:
+    """Tushare 健康度：token 可用性 + 各数据集覆盖 + 新鲜度（滞后交易日数）。
+
+    ## 为什么要落盘缓存 + 后台刷新（2026-09-17 实测）
+
+    `coverage()` 会遍历 **35,711 个分区目录**逐个 `stat`。平时 2.9 秒，
+    但服务刚起来时磁盘正被 akshare 子进程（25 只票的分钟线/板块快照）占满，
+    这一步实测膨胀到 **140 秒以上** —— 首个 `/api/v1/health` 要 142.8 秒才返回，
+    而这只是"运维看一眼数据源状态"。
+
+    分区覆盖是**小时级**信息，不该由请求路径去遍历目录。改成与
+    `_warehouse_health` 同一套口径：请求读落盘缓存秒回，过期就顺手起一个
+    后台线程重算（去重），下次请求自然拿到新值。
+    """
+    if force:
+        # 显式重算（预热/降级路径）：算完写回缓存。
+        value = _build_tushare_health(root, universe)
+        _write_tushare_stats(value)
+        return value
+
+    cached = _read_tushare_stats()
+    if cached is None:
+        # 完全没有缓存（首次部署）：**不在请求路径上现算**。
+        # 遍历 3.5 万个分区在磁盘繁忙时要几十秒到一两分钟（实测 2026-09-17：
+        # 首个 /health 因此要 142.8 秒），而这份数据本来就是小时级信息。
+        # 返回"待生成"结构 + 起后台线程算，前端立刻能渲染、下次请求就有值 ——
+        # 与「诚实数据」一致：不给假数字，而是明确标注尚未生成。
+        _refresh_tushare_stats_async(root, universe)
+        return _tushare_pending()
+
+    stamp, payload = cached
+    if time.time() - stamp > _TUSHARE_TTL:
+        _refresh_tushare_stats_async(root, universe)
+    return payload
+
+
+def _tushare_pending() -> dict[str, Any]:
+    """覆盖统计尚未生成时的占位结构（前端据此显示"统计生成中"）。"""
+    return {
+        "source": "tushare",
+        "label": SOURCE_CAPABILITIES["tushare"]["label"],
+        "kind": SOURCE_CAPABILITIES["tushare"]["kind"],
+        "realtime": False,
+        "token": {"configured": False, "hint": ""},
+        "datasets": [],
+        "partitions": 0,
+        "rows": 0,
+        "latest_date": "",
+        "note": SOURCE_CAPABILITIES["tushare"]["note"],
+        "intraday_usable": False,
+        "stats_pending": True,
+        "stats_note": "分区覆盖统计正在后台生成（首次部署或缓存被清理），稍后刷新即可",
+    }
+
+
+def _build_tushare_health(root: str, universe: str) -> dict[str, Any]:
+    """真正去遍历分区的那一步（**只在后台线程/预热里调用**）。"""
     from src.quant.tushare_source import resolve_token, token_hint
 
     try:
         token = resolve_token()
         token_state = {"configured": True, "hint": token_hint(token)}
     except Exception as exc:  # noqa: BLE001 没 token 也是合法状态
-        token_state = {"configured": False, "error": str(exc)[:160]}
+        token_state = {"configured": False, "error": brief(exc, BRIEF_DEFAULT)}
 
     dataset_root = Path(root) / universe
     datasets: list[dict[str, Any]] = []
@@ -136,15 +206,83 @@ def _warehouse_health(root: str = "data/quant/tushare",
         payload = dict(cached[1])
         payload["cached_age_seconds"] = round(age, 1)
         return payload
-    try:
-        from src.quant.warehouse import warehouse_status
+    if force:
+        # 预热线程走这条（启动时把统计算出来并落盘），冷启动后第一次请求就是热的。
+        try:
+            from src.quant.warehouse import warehouse_status
 
-        status = warehouse_status(root=root)
-    except Exception as exc:  # noqa: BLE001 健康度面板不允许因此 500
-        return {"available": False, "error": f"{type(exc).__name__}: "
-                                             f"{str(exc)[:160]}"}
-    _write_warehouse_stats(status)
-    return _decorate_warehouse(status)
+            status = warehouse_status(root=root)
+        except Exception as exc:  # noqa: BLE001 健康度面板不允许因此 500
+            return {"available": False, "error": f"{type(exc).__name__}: "
+                                                 f"{brief(exc, BRIEF_DEFAULT)}"}
+        _write_warehouse_stats(status)
+        return _decorate_warehouse(status)
+    # 没有缓存（首次部署 / 缓存被清理）且不是预热：**别让请求等 14GB 的库扫描**
+    # （实测冷页缓存 28 秒，磁盘繁忙时更久）。给占位结构 + 后台算，下次请求就有值；
+    # 与 Tushare 覆盖统计同一口径，也和「诚实数据」一致：标注"生成中"而不是给假数字。
+    _refresh_warehouse_stats_async(root)
+    return {
+        "dialect": "unknown", "total_rows": 0, "tables": [],
+        "count_mode": "unknown", "dataset_count": 0,
+        "latest_date": "", "earliest_date": "",
+        "stats_pending": True,
+        "stats_note": "仓库统计正在后台生成（首次部署或缓存被清理），稍后刷新即可",
+    }
+
+
+def _read_tushare_stats() -> tuple[float, dict[str, Any]] | None:
+    """读 Tushare 分区覆盖的落盘缓存；缺失/损坏返回 None。"""
+    try:
+        raw = _TUSHARE_STATS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    stamp = float(payload.pop("_cached_at", 0) or 0)
+    return (stamp, payload) if stamp else None
+
+
+def _write_tushare_stats(status: dict[str, Any]) -> None:
+    """原子写：预热线程与请求线程可能同时写，别让读方看到半个 JSON。"""
+    tmp = _TUSHARE_STATS_FILE.with_suffix(
+        _TUSHARE_STATS_FILE.suffix + f".tmp{os.getpid()}")
+    try:
+        _TUSHARE_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(
+            json.dumps({**status, "_cached_at": time.time()},
+                       ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        os.replace(tmp, _TUSHARE_STATS_FILE)
+    except OSError as exc:  # noqa: BLE001 写不进缓存不影响返回
+        logger.debug("Tushare 统计缓存写入失败：%s", brief(exc, BRIEF_TIGHT))
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _refresh_tushare_stats_async(root: str, universe: str) -> None:
+    """后台线程重算 Tushare 覆盖（带去重标记，不阻塞任何请求）。"""
+    global _TUSHARE_REFRESHING
+    if _TUSHARE_REFRESHING:
+        return
+    _TUSHARE_REFRESHING = True
+
+    def _job() -> None:
+        global _TUSHARE_REFRESHING
+        try:
+            _write_tushare_stats(_build_tushare_health(root, universe))
+        except Exception as exc:  # noqa: BLE001 后台失败只记日志
+            logger.debug("Tushare 统计后台刷新失败：%s", brief(exc, BRIEF_TIGHT))
+        finally:
+            _TUSHARE_REFRESHING = False
+
+    threading.Thread(target=_job, name="tushare-stats-refresh",
+                     daemon=True).start()
 
 
 def _read_warehouse_stats() -> tuple[float, dict[str, Any]] | None:
@@ -165,7 +303,7 @@ def _write_warehouse_stats(status: dict[str, Any]) -> None:
                        ensure_ascii=False, indent=1),
             encoding="utf-8")
     except OSError as exc:  # noqa: BLE001 写不进缓存不影响返回
-        logger.debug("仓库统计缓存写入失败：%s", str(exc)[:100])
+        logger.debug("仓库统计缓存写入失败：%s", brief(exc, BRIEF_TIGHT))
 
 
 def _decorate_warehouse(status: dict[str, Any]) -> dict[str, Any]:
@@ -193,7 +331,7 @@ def _refresh_warehouse_stats_async(root: str) -> None:
 
             _write_warehouse_stats(warehouse_status(root=root))
         except Exception as exc:  # noqa: BLE001 后台失败只记日志
-            logger.debug("仓库统计后台刷新失败：%s", str(exc)[:120])
+            logger.debug("仓库统计后台刷新失败：%s", brief(exc, BRIEF_TIGHT))
         finally:
             _WAREHOUSE_REFRESHING = False
 
@@ -210,7 +348,7 @@ def warm(runtime: Any) -> None:
         try:
             build_data_health(runtime, force=True)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("数据健康度预热失败：%s", str(exc)[:120])
+            logger.debug("数据健康度预热失败：%s", brief(exc, BRIEF_TIGHT))
 
     threading.Thread(target=_job, name="data-health-warm", daemon=True).start()
 
@@ -230,23 +368,28 @@ def build_data_health(runtime: Any, *, force: bool = False,
     为什么缓存：这份内容要遍历 35,711 个分区清单（实测 3.5 秒）+ 查仓库九表，
     而面板每次打开都会取一次。数据健康度是**分钟级**信息，30 秒内复用完全够用。
     实测：首次 ~5 秒、命中 <1 毫秒。
+
+    `force=True` 会**一路透传**到仓库统计与 Tushare 覆盖两处：这两处都有落盘缓存，
+    不透传的话"强制重算"只会重算外壳、里面仍是旧缓存（测试实测过这个坑：
+    改了 `MOSS_QUANT_SQLITE` 后 `force=True` 仍报上一轮的 mysql 方言）。
+    启动预热走的正是 `force=True`，保证下次请求读到的是刚算出来的值。
     """
     cached = _CACHE.get("value")
     if (not force and cached is not None
             and time.monotonic() - cached[0] < cache_ttl):
         return cached[1]
-    value = _build_data_health_uncached(runtime)
+    value = _build_data_health_uncached(runtime, force=force)
     _CACHE["value"] = (time.monotonic(), value)
     return value
 
 
-def _build_data_health_uncached(runtime: Any) -> dict[str, Any]:
+def _build_data_health_uncached(runtime: Any, *, force: bool = False) -> dict[str, Any]:
     return {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "capability_matrix": _static_capability_matrix(),
         "intraday_sources": _intraday_source_health(runtime),
-        "tushare": _tushare_health(),
-        "warehouse": _warehouse_health(),
+        "tushare": _tushare_health(force=force),
+        "warehouse": _warehouse_health(force=force),
         "notes": [
             "做T实时链路按实测速度排序：QMT（本机终端，中位 0ms）优先，"
             "腾讯（54ms）为第一备用，新浪逐笔兜底；东财在本机网络被阻断。",
@@ -264,12 +407,14 @@ def _build_data_health_uncached(runtime: Any) -> dict[str, Any]:
 def invalidate_cache(*, include_disk: bool = False) -> None:
     """清空健康度缓存（测试/运维用）。
 
-    `include_disk=True` 连**落盘的仓库统计**一起删 —— 否则调用方（或测试）
-    会继续读到那份旧结果，看起来像"改了配置没生效"。
+    `include_disk=True` 连**落盘的仓库/Tushare 统计**一起删 —— 否则调用方
+    （或测试）会继续读到那份旧结果，看起来像"改了配置没生效"。
     """
     _CACHE.clear()
     if include_disk:
-        try:
-            _WAREHOUSE_STATS_FILE.unlink(missing_ok=True)
-        except OSError as exc:  # noqa: BLE001 删不掉不影响内存缓存已清空
-            logger.debug("删除仓库统计缓存失败：%s", str(exc)[:100])
+        for path, label in ((_WAREHOUSE_STATS_FILE, "仓库统计"),
+                            (_TUSHARE_STATS_FILE, "Tushare统计")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:  # noqa: BLE001 删不掉不影响内存缓存已清空
+                logger.debug("删除%s缓存失败：%s", label, brief(exc, BRIEF_TIGHT))

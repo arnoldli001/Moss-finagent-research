@@ -22,6 +22,11 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.intraday.config import FACTOR_LABELS
 from src.intraday.service import IntradayService
 
@@ -81,26 +86,95 @@ async def snapshot(
     try:
         result = await service.snapshot(target, force_refresh=refresh)
     except Exception as exc:  # noqa: BLE001 取数失败转502而非500
-        logger.warning("做T快照失败(%s): %s", target, str(exc)[:200])
+        logger.warning("做T快照失败(%s): %s", target, brief(exc, BRIEF_DEFAULT))
         raise HTTPException(
-            status_code=502, detail=f"做T快照组装失败：{str(exc)[:200]}") from exc
+            status_code=502, detail=f"做T快照组装失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return result.model_dump()
+
+
+@router.post("/intraday/auto-select")
+async def auto_select(
+    request: Request,
+    apply: bool = Query(default=False,
+                        description="true=把选出的票真正加入自选（会写 configs/intraday.yaml）"),
+    top_n: int = Query(default=6, ge=1, le=20,
+                       description="最多选几只（用户口径：6）"),
+    min_intraday: float = Query(default=40.0, ge=0, le=100,
+                                description="分时多指标合成打分门槛（用户口径：>40）"),
+    prescreen: int = Query(default=30, ge=5, le=120,
+                           description="粗筛后进入精算的票数上限（控制单轮耗时）"),
+) -> dict:
+    """**自动选股**：日K买入信号 + 分时打分 > 阈值 → 按综合分排序取前 N。
+
+    候选池 = 热门股前 50 ∪ 昨日涨停 ∪ 昨日成交额前 200（并集去重）。
+    只在交易日的 9:25–9:40 与 14:45–15:00 由后台定时触发（每分钟一次）；
+    本接口用 `apply=true` 可手动触发并直接写入自选。
+
+    为什么分两段打分：250 只票各跑一次完整评分要 8~16 分钟，
+    而要求是 1 分钟一轮 —— 所以先按分时粗筛取前 `prescreen` 只，再精算。
+    """
+    from src.intraday.auto_select import WatchlistAutoSelector
+
+    service = _service(request)
+    selector = WatchlistAutoSelector(service, top_n=top_n,
+                                     min_intraday_score=min_intraday,
+                                     prescreen_size=prescreen)
+    result = await selector.run(window="manual")
+    added: list[str] = []
+    if apply and result.selected:
+        added = await _add_selected_to_watchlist(service, result)
+    return {"ok": True, "applied": bool(apply), "added": added,
+            **result.as_dict()}
+
+
+async def _add_selected_to_watchlist(service: Any, result: Any) -> list[str]:
+    """把入选标的写入自选池（幂等：已在自选里的跳过）。
+
+    复用 `service.add_watch`（同步方法，内部走 Moss 既有写盘逻辑：
+    原子替换 + 校验 + 保留注释），**不自己拼 YAML**。
+    """
+    import asyncio
+
+    added: list[str] = []
+    existing = {item.code for item in await service.watchlist()}
+    for item in result.selected:
+        if item.code in existing:
+            result.skipped.append(item.code)
+            continue
+        try:
+            await asyncio.to_thread(service.add_watch, item.code, name=item.name)
+            item.added = True
+            added.append(item.code)
+        except Exception as exc:  # noqa: BLE001 单只失败不影响其余
+            result.notes.append(f"加入自选失败 {item.code}：{brief(exc, BRIEF_TIGHT)}")
+    return added
 
 
 @router.get("/intraday/watchlist")
 async def watchlist(
-    request: Request, limit: int = Query(default=20, ge=1, le=50),
+    request: Request, limit: int = Query(default=20, ge=1, le=200),
     force: bool = Query(
         default=False,
         description="true=绕过缓存立即重算（前端「刷新」按钮）；默认取自动刷新循环写入的缓存"),
+    active: str = Query(
+        default="",
+        description="前端当前正在查看的标的代码：force=true 时**只重算这一只**，"
+                    "其余走缓存并在后台补齐（自选 30+ 只时避免整表重算的几秒等待）"),
 ) -> dict:
     """自选标的概览（轻量快照并发，含当前总分与信号）。
 
     盘中由 `IntradayService` 的自动刷新循环每分钟重算一次，这里默认直接返回缓存，
     前端每分钟取一次即"自选股自动刷新"，不需要用户手动点。
+
+    `limit` 上限从 50 提到 200：自选池很容易超过 50 只（实测写入后已达 39 只，
+    多选几次就破 50），而前端漏传 `limit` 时只会拿到默认 20 只 ——
+    表现就是"加了自选但列表里没有"（实测踩过）。上限放宽后前端可以一次取全。
+
+    `active` 是「强制刷新不卡」的关键：见 `IntradayService.watchlist` 的说明。
     """
     service = _service(request)
-    items = await service.watchlist(limit=limit, force=force)
+    items = await service.watchlist(limit=limit, force=force,
+                                    active=active or None)
     return _watchlist_payload(items, service.watchlist_refresh_status())
 
 
@@ -134,7 +208,7 @@ async def add_watch(body: WatchRequest, request: Request) -> dict:
             quote, _, _ = await service.data_provider.fetch_quote(code)
             name = quote.name or ""
         except Exception as exc:  # noqa: BLE001 取名失败不阻断加自选
-            logger.info("加自选时取证券简称失败(%s): %s", code, str(exc)[:120])
+            logger.info("加自选时取证券简称失败(%s): %s", code, brief(exc, BRIEF_TIGHT))
     peers = [_validate_code(peer) for peer in body.peers]
     try:
         config = service.add_watch(
@@ -142,7 +216,7 @@ async def add_watch(body: WatchRequest, request: Request) -> dict:
             industry=body.industry.strip(), overseas=body.overseas)
     except Exception as exc:  # noqa: BLE001 磁盘写入/配置校验失败转400
         raise HTTPException(
-            status_code=400, detail=f"写入自选失败：{str(exc)[:200]}") from exc
+            status_code=400, detail=f"写入自选失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return {
         "ok": True, "code": code, "name": name,
         # 回显绑定结果：板块绑定决定「板块情绪/板块排行」两个维度能否计入总分
@@ -162,9 +236,39 @@ async def remove_watch(code: str, request: Request) -> dict:
         config = service.remove_watch(target)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=400, detail=f"移除自选失败：{str(exc)[:200]}") from exc
+            status_code=400, detail=f"移除自选失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return {
         "ok": True, "code": target,
+        "watchlist": [item.model_dump() for item in config.watchlist],
+    }
+
+
+@router.post("/intraday/watchlist/pin")
+async def pin_watch(
+    request: Request,
+    code: str = Query(description="要置顶/取消置顶的 6 位代码"),
+    pinned: bool = Query(default=True, description="true=置顶，false=取消置顶"),
+) -> dict:
+    """置顶 / 取消置顶一只自选（幂等）。
+
+    置顶状态写在 `configs/intraday.yaml` 的 `pinned: true` 上（不是前端 localStorage），
+    因此换浏览器/换机器一致，服务端刷新循环产出的顺序也一致。
+    置顶项在列表里**永远排最前**，其余保持配置顺序（不按分数自动排 —— 那会让列表
+    每分钟自己跳动，想点的票在手指落下时换位置）。
+    """
+    from src.core.exceptions import ConfigError
+
+    service = _service(request)
+    target = _validate_code(code)
+    try:
+        config = service.set_watch_pinned(target, pinned)
+    except ConfigError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"置顶失败：{brief(exc, BRIEF_DEFAULT)}") from exc
+    return {
+        "ok": True, "code": target, "pinned": bool(pinned),
         "watchlist": [item.model_dump() for item in config.watchlist],
     }
 
@@ -294,7 +398,7 @@ async def intraday_ws(websocket: WebSocket,
                         "type": "snapshot", "data": snapshot.model_dump()})
                 except Exception as exc:  # noqa: BLE001 单次失败不断开连接
                     await websocket.send_json({
-                        "type": "error", "detail": str(exc)[:200]})
+                        "type": "error", "detail": brief(exc, BRIEF_DEFAULT)})
             try:
                 status = service.watchlist_refresh_status()
                 fingerprint = (status.get("generation"),

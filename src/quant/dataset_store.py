@@ -20,6 +20,12 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROOT = "data/quant/tushare"
@@ -103,7 +109,7 @@ class DatasetStore:
             return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:  # noqa: BLE001
             logger.warning("%s manifest 损坏(%s)，按空处理并重建",
-                           self.dataset, str(exc)[:80])
+                           self.dataset, brief(exc, BRIEF_TIGHT))
             return {}
 
     def _write_manifest(self, manifest: dict[str, Any]) -> None:
@@ -217,7 +223,7 @@ class DatasetStore:
                     if hasattr(frame, "__await__"):
                         frame = await frame
                 except Exception as exc:  # noqa: BLE001 单分区失败不中断整批
-                    result.failed[key] = f"{type(exc).__name__}: {str(exc)[:140]}"
+                    result.failed[key] = f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}"
                     return
             if frame is None or len(frame) == 0:
                 result.failed[key] = "返回空表"

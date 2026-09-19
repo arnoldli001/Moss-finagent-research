@@ -76,7 +76,7 @@ uv run python scripts/quant_stocks.py enrich 588170 510300
 ## 5. 前端
 
 `web/src/components/StockPicker.tsx` 是统一的选择器组件，已接入三处：
-做T辅助（切换标的）、单股票策略回测、宏观择时回测。
+量化交易（做T辅助，切换标的）、单股票策略回测、多因子回测。
 
 行为要点：
 

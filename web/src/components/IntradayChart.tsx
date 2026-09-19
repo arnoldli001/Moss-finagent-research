@@ -78,7 +78,21 @@ function boardEquivPrice(
   return points.map((p) => ({ ts: p.ts, price: prevClose * (p.price / base) }));
 }
 
-type Hover = { minute: number; price: number; ts: string; avg: number | null } | null;
+type Hover = {
+  minute: number; price: number; ts: string; avg: number | null;
+  /** 十字光标横线对应的价格（鼠标 Y 位置）——与吸附到数据点的 price 不同。 */
+  cursorPrice: number;
+} | null;
+
+/** 档位线的键（用于显示开关与图例）。 */
+type LevelKey = "high_sell" | "low_buy" | "stop_loss" | "boll";
+
+const LEVEL_META: Record<LevelKey, { label: string; color: string; cls: string }> = {
+  high_sell: { label: "高抛", color: "#d95c4a", cls: "lv-sell" },
+  low_buy: { label: "低吸", color: "#2ea86e", cls: "lv-buy" },
+  stop_loss: { label: "止损", color: "#e0b020", cls: "lv-stop" },
+  boll: { label: "布林", color: "#4a9eff", cls: "lv-boll" },
+};
 
 function IntradayChart({
   quote, trend, levels, markers, boards, boardSeries, levelSeries,
@@ -97,6 +111,15 @@ function IntradayChart({
     { start: 0, end: MINUTES_TOTAL });
   // 是否把箱体等远档位也纳入Y轴（默认否，避免压扁价格线）
   const [fitLevels, setFitLevels] = useState(false);
+  /**
+   * 档位线的显示开关：默认全开。
+   *
+   * 为什么给开关：Y轴是按"可执行档位"伸缩的（见 domain 里的自适应护栏），
+   * 止损线有时离现价很远（高波动股 ATR 口径下 4~5%），纳入定标会把分时线压扁。
+   * 给用户一个「只看低吸高抛 / 连止损一起看」的选择，比替他决定更诚实。
+   */
+  const [showLevels, setShowLevels] = useState<Record<LevelKey, boolean>>(
+    { high_sell: true, low_buy: true, stop_loss: true, boll: true });
   const svgRef = useRef<SVGSVGElement | null>(null);
   const dragRef = useRef<{ minute: number; start: number; end: number } | null>(null);
 
@@ -122,7 +145,49 @@ function IntradayChart({
     return { points, boardLines };
   }, [trend, boardSeries, prevClose]);
 
-  // 可见窗口内的数据点（Y轴与成交量都只按可见区间定标）
+  /**
+   * 关键价位的**当前值** + 每条线的显示开关。
+   *
+   * ⚠️ 这里刻意用 `levels`（快照当前值）而不是 `levelSeries` 的末值：
+   * `levels` 与分时点来自同一次快照，两者**同一时刻**；而 `level_series` 是
+   * 5 分钟粒度、在 `pre_open`/`lunch_break`/`closed` 时可能整段缺失或停在上一根 bar，
+   * 用它的末值会在图上画出一条"与价格线不同时刻"的档位线（用户看到的就是错位）。
+   */
+  const allLevels: { key: LevelKey; price: number; label: string; cls: string;
+                     color: string }[] = [];
+  if (levels) {
+    const push = (key: LevelKey, value: number | null | undefined) => {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        const meta = LEVEL_META[key];
+        allLevels.push({ key, price: value, label: meta.label,
+                         cls: meta.cls, color: meta.color });
+      }
+    };
+    push("high_sell", levels.high_sell);
+    push("low_buy", levels.low_buy);
+    push("stop_loss", levels.stop_loss);
+    push("boll", levels.boll_lower ?? null);
+    push("boll", levels.boll_upper ?? null);
+  }
+  const visibleLevelLines = allLevels.filter((line) => showLevels[line.key]);
+
+  // 漂移曲线在可见窗口内的价格范围（用于把档位线纳入Y轴定标）
+  const driftRange = useMemo(() => {
+    if (!levelSeries || !levelSeries.length) return null;
+    let min = Infinity;
+    let max = -Infinity;
+    levelSeries.forEach((row) => {
+      const minute = sessionMinute(row.ts);
+      if (minute === null || minute < view.start || minute > view.end) return;
+      [row.low_buy, row.high_sell, row.stop_loss].forEach((value) => {
+        if (!Number.isFinite(value)) return;
+        min = Math.min(min, value);
+        max = Math.max(max, value);
+      });
+    });
+    return min <= max ? { min, max } : null;
+  }, [levelSeries, view]);
+
   const visible = useMemo(
     () => series.points.filter(
       (p) => p.minute >= view.start && p.minute <= view.end),
@@ -158,18 +223,32 @@ function IntradayChart({
         Math.abs(prevClose - min), Math.abs(max - prevClose),
         prevClose * 0.002, // 极窄幅时给个下限，避免"一条直线"没有刻度
       );
-      // 三个**可执行**档位（高抛/低吸/止损）若离得不远，就把它们纳进可见范围：
-      // 止损线是最该看见的一条线，不能因为"按分时波动定标"而被裁掉。
-      // 但只允许拉伸有限倍数（默认1.6×），否则箱体那种远档位又会把图压扁。
-      if (levels) {
-        [levels.high_sell, levels.low_buy, levels.stop_loss].forEach((value) => {
-          if (typeof value !== "number" || !Number.isFinite(value)) return;
-          const distance = Math.abs(value - prevClose);
-          if (distance > reach && distance <= reach * MAX_LEVEL_STRETCH) {
-            reach = distance;
-          }
-        });
-      }
+      // 把**可执行档位**纳入可见范围：止损线是最该看见的一条线，
+      // 不能因为"按分时波动定标"而被裁到图外（用户报的"没有画出低吸/高抛/止损"
+      // 就是它被裁掉导致的 —— 数据在，只是落在 y 轴范围之外 30~40 元）。
+      //
+      // 但不能无条件纳入：300308 的箱体 804~950 若全部纳入，分时线会被压成一条直线。
+      // 折中：
+      //   · 取「当前档位」与「逐bar档位曲线在可见窗口内的极值」两者中更近的一个
+      //     （曲线会漂移到离现价很远的地方，用它会把图压扁）；
+      //   · 允许的拉伸倍数随**时间窗变窄**而放宽（放到 10 分钟窗口时，本来就该
+      //     看清这一小段里的档位，而不是死守 1.6×）；
+      //   · 实在超出范围时右边的档位清单会标「（图外）」并说明原因。
+      const windowRatio = spanMinutes / MINUTES_TOTAL;
+      const stretchLimit = Math.max(
+        MAX_LEVEL_STRETCH, 1 + (3.2 - 1) * Math.max(0, 1 - windowRatio));
+      // 够得着就纳入；够不着（例如高波动股 ATR 口径的止损离现价 5%+）就交给
+      // 下面的"贴边指示线"—— 那时若强行纳入，全天分时会被压成中间一条细带。
+      const NEAR_MISS = 1.15;
+      const candidates: number[] = [];
+      visibleLevelLines.forEach((line) => candidates.push(line.price));
+      if (driftRange) candidates.push(driftRange.min, driftRange.max);
+      candidates.forEach((value) => {
+        const distance = Math.abs(value - prevClose);
+        if (distance > reach && distance <= reach * Math.min(stretchLimit, NEAR_MISS)) {
+          reach = distance;
+        }
+      });
       reach *= 1.08;
       return { min: prevClose - reach, max: prevClose + reach,
                span: reach * 2, centered: true as const };
@@ -177,7 +256,8 @@ function IntradayChart({
     const pad = (span || (prevClose ?? max) * 0.01) * 0.12;
     return { min: min - pad, max: max + pad, span: (max - min) + pad * 2,
              centered: false as const };
-  }, [visible, series.boardLines, view, prevClose, levels, fitLevels]);
+  }, [visible, series.boardLines, view, prevClose, levels, fitLevels,
+      visibleLevelLines, driftRange, spanMinutes]);
 
   const x = useCallback((minute: number) =>
     PAD.left + ((minute - view.start) / spanMinutes) * (W - PAD.left - PAD.right),
@@ -203,51 +283,51 @@ function IntradayChart({
 
   const volumeMax = Math.max(1, ...visible.map((p) => p.volume || 0));
 
-  // 档位线：只画落在可见Y范围内的；范围外的转到右侧清单提示
-  // （API 里这些字段可空，这里统一收窄成 number，避免后续到处判空）
-  type LevelLine = { key: string; price: number; label: string; cls: string };
-  const allLevels: LevelLine[] = [];
-  if (levels) {
-    const push = (key: string, value: number | null | undefined,
-                  label: string, cls: string) => {
-      if (typeof value === "number" && Number.isFinite(value)) {
-        allLevels.push({ key, price: value, label, cls });
-      }
+  /**
+   * 逐bar档位**漂移曲线**：把 low_buy / high_sell / stop_loss 画成随时间变化的线。
+   *
+   * 档位是**时刻量**（每分钟随 VWAP/布林重算）：实测 300308 当日低吸线从 862 抬到
+   * 898、603083 从 215.42 抬到 221.91。画成横贯全天的直线会让人误以为"开盘就在
+   * 低吸线以下"（那只是当前值的错觉），也会把后来的高位止损误读成早盘就该止损。
+   *
+   * `minute` 与 `price` 都必须过滤成有限数字：`x(null)` → NaN 会让整条 `d`
+   * 变成 `MNaN,NaN`，浏览器会**静默丢弃**该 path —— 表现出来就是"档位线根本不画"。
+   */
+  const driftPaths = useMemo(() => {
+    const result: Partial<Record<LevelKey, string>> = {};
+    if (!levelSeries || levelSeries.length < 2) return result;
+    const build = (pick: (row: IntradayLevelPoint) => number) => {
+      const pts = levelSeries
+        .map((row) => ({ minute: sessionMinute(row.ts), price: pick(row) }))
+        .filter((p): p is { minute: number; price: number } =>
+          p.minute !== null && Number.isFinite(p.price));
+      return pts.length > 1 ? path(pts) : "";
     };
-    push("high_sell", levels.high_sell, "高抛", "lv-sell");
-    push("low_buy", levels.low_buy, "低吸", "lv-buy");
-    push("stop_loss", levels.stop_loss, "止损", "lv-stop");
-    push("box_high", levels.box_high, "箱体上沿", "lv-box");
-    push("box_low", levels.box_low, "箱体下沿", "lv-box");
-    push("boll_upper", levels.boll_upper, "布林上轨", "lv-boll");
-    push("boll_lower", levels.boll_lower, "布林下轨", "lv-boll");
-  }
+    const pickers: Record<string, (row: IntradayLevelPoint) => number> = {
+      high_sell: (row) => row.high_sell,
+      low_buy: (row) => row.low_buy,
+      stop_loss: (row) => row.stop_loss,
+    };
+    Object.keys(pickers).forEach((key) => {
+      const built = build(pickers[key]);
+      if (built) result[key as LevelKey] = built;
+    });
+    return result;
+    // path() 每次渲染都是新引用，但它的取值只由 view/domain 决定 ——
+    // 依赖里显式写出 view/domain，语义等价且不会漏重算。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [levelSeries, view, domain]);
+
+  /** 落在可见 Y 范围内 / 范围外的档位（范围外的转到下方清单并标注原因）。 */
   const inViewLevels = domain
-    ? allLevels.filter((l) => l.price >= domain.min && l.price <= domain.max)
+    ? visibleLevelLines.filter((l) => l.price >= domain.min && l.price <= domain.max)
     : [];
   const outViewLevels = domain
-    ? allLevels.filter((l) => l.price < domain.min || l.price > domain.max)
+    ? visibleLevelLines.filter((l) => l.price < domain.min || l.price > domain.max)
     : [];
   const lastPrice = visible.length ? visible[visible.length - 1].price
     : (quote?.price ?? null);
 
-  /**
-   * 逐bar档位曲线：把 low_buy / high_sell / stop_loss 画成随时间变化的细线。
-   * 数据是 5 分钟粒度、分时点是 1 分钟粒度，两边用同一个 `sessionMinute(ts)` 映射。
-   */
-  const levelDrift = (() => {
-    if (!levelSeries || levelSeries.length < 2) return null;
-    const build = (pick: (row: IntradayLevelPoint) => number) => {
-      const pts = levelSeries
-        .map((row) => ({ minute: sessionMinute(row.ts), price: pick(row) }))
-        .filter((p): p is { minute: number; price: number } => p.minute !== null);
-      return pts.length > 1 ? path(pts) : "";
-    };
-    const high = build((row) => row.high_sell);
-    const low = build((row) => row.low_buy);
-    const stop = build((row) => row.stop_loss);
-    return high && low && stop ? { high, low, stop } : null;
-  })();
 
   // 刻度：按整齐步长铺满可见范围
   const yTicks = useMemo(() => {
@@ -320,6 +400,22 @@ function IntradayChart({
     return view.start + Math.min(1, Math.max(0, plotRatio)) * spanMinutes;
   };
 
+  /**
+   * 鼠标 Y 位置 → 价格（供十字光标的**横线**用）。
+   *
+   * 为什么横线要跟鼠标而不是吸附到数据点：用户要的是"我指的这个价位是多少、
+   * 它离低吸/高抛线差多少"，横线粘在 1 分钟数据点上就失去这个能力。
+   * 纵线仍吸附到最近的分钟点（读时间与均价用），两者各司其职。
+   */
+  const priceAt = (clientY: number): number | null => {
+    const node = svgRef.current;
+    if (!node || !domain) return null;
+    const rect = node.getBoundingClientRect();
+    const viewY = (clientY - rect.top) / rect.height * H;
+    const ratio = (H - PAD.bottom - viewY) / HEIGHT;
+    return domain.min + Math.min(1, Math.max(0, ratio)) * domain.span;
+  };
+
   const handleMove = (event: React.MouseEvent<SVGSVGElement>) => {
     const drag = dragRef.current;
     if (drag && domain) {
@@ -344,9 +440,11 @@ function IntradayChart({
       const distance = Math.abs(point.minute - minute);
       if (distance < best) { best = distance; nearest = point; }
     }
+    const cursorPrice = priceAt(event.clientY);
     setHover({
       minute: nearest.minute, price: nearest.price, ts: nearest.ts,
       avg: nearest.avg_price,
+      cursorPrice: cursorPrice === null ? nearest.price : cursorPrice,
     });
   };
 
@@ -463,42 +561,72 @@ function IntradayChart({
                 strokeWidth="1.3" strokeDasharray="6 4" opacity={0.75} />
         ))}
 
-        {/* 关键价位线（仅画可见范围内的）。
+        {/* 关键价位线（**只画可见范围内的**）。
             有逐bar档位序列时画**随时间漂移的曲线**，而不是一条横贯全天的直线 ——
             档位（低吸/高抛/止损）是每分钟随 VWAP/布林重算的时刻量：
             实测 300308 当日低吸线从 862 抬到 898、603083 从 215.42 抬到 221.91。
             画成横线会让人以为"开盘就在低吸线以下"（那只是当前值的错觉），
-            也会让人把后来的高位止损误读成早盘就该止损。 */}
-        {levelDrift && (
-          <>
-            <path d={levelDrift.high} fill="none" className="lv-sell"
-                  strokeWidth="1.3" strokeDasharray="7 3" opacity={0.9} />
-            <path d={levelDrift.low} fill="none" className="lv-buy"
-                  strokeWidth="1.3" strokeDasharray="7 3" opacity={0.9} />
-            <path d={levelDrift.stop} fill="none" className="lv-stop"
-                  strokeWidth="1.3" strokeDasharray="4 3" opacity={0.9} />
-          </>
-        )}
-        {!levelDrift && inViewLevels.map((line) => (
-          <g key={line.key} className={line.cls}>
-            <line x1={PAD.left} x2={W - PAD.right} y1={y(line.price)}
-                  y2={y(line.price)} strokeWidth="1.4" strokeDasharray="7 3" />
-            <text x={PAD.left + 4} y={y(line.price) - 4} fontSize="10"
-                  className="lv-text">
-              {line.label} {line.price.toFixed(2)}
-            </text>
-          </g>
-        ))}
-        {/* 档位曲线模式下，只在右端标当前值（曲线自然收束到那里） */}
-        {levelDrift && inViewLevels.map((line) => (
-          <g key={`tag-${line.key}`} className={line.cls}>
-            <text x={W - PAD.right + 4} y={y(line.price) + 4} fontSize="10"
-                  className="lv-text">
-              {line.label} {line.price.toFixed(2)}
-            </text>
-          </g>
-        ))}
+            也会让人把后来的高位止损误读成早盘就该止损。
 
+            ⚠️ stroke 必须**显式内联**：早期版本只给了 className，
+            而 CSS 里只有 `.lv-sell line {}`（元素选择器）—— 对 `<path>` 无效，
+            于是三条档位曲线全部按 SVG 默认的 `stroke:none` 渲染 = 图上看不见。
+            这正是"低吸/高抛/止损虚线没画出来"的直接原因之一。 */}
+        {(["high_sell", "low_buy", "stop_loss"] as LevelKey[]).map((key) => {
+          const d = driftPaths[key];
+          if (!d || !showLevels[key]) return null;
+          const meta = LEVEL_META[key];
+          return (
+            <path key={`drift-${key}`} d={d} fill="none" stroke={meta.color}
+                  strokeWidth="1.5" strokeDasharray="7 3" opacity={0.95}>
+              <title>{`${meta.label}线（随时间漂移）`}</title>
+            </path>
+          );
+        })}
+        {/* 档位**当前值**参考线（低吸/高抛/止损）。
+            与上面的漂移曲线并存：曲线回答"这条线今天怎么走的"，参考线回答
+            "此刻它在哪" —— 交易软件（同花顺/东财）也是这两个一起给的。
+
+            ⚠️ stroke 必须**显式给**：早期版本只写了 className，
+            而 CSS 里只有 `.lv-sell line {}`（元素选择器）—— 对 `<path>` 无效，
+            于是档位线全部按 SVG 默认 `stroke:none` 渲染，图上一个点都看不到。
+            「低吸/高抛/止损虚线没画出来」就是这个原因。 */}
+        {inViewLevels.map((line) => (
+          <g key={`flat-${line.key}-${line.price}`}>
+            <line x1={PAD.left} x2={W - PAD.right} y1={y(line.price)}
+                  y2={y(line.price)} stroke={line.color} strokeWidth="1.5"
+                  strokeDasharray="7 3" opacity={0.95}>
+              <title>{`${line.label}线 ${line.price.toFixed(2)}（当前值）`}</title>
+            </line>
+            <text x={PAD.left + 4} y={y(line.price) - 4} fontSize="10"
+                  fill={line.color}>
+              {line.label} {line.price.toFixed(2)}
+            </text>
+          </g>
+        ))}
+        {/* 档位线**图外**时的贴边指示：一条贴在上下边缘的箭头线 + 数值。
+            这比"什么都不画"诚实得多 —— 用户至少知道止损位在哪一侧、离多远，
+            点一下档位清单里的开关就能把它真正画进来。 */}
+        {outViewLevels.map((line) => {
+          const above = line.price > domain.max;
+          const edgeY = above ? PAD.top + 3 : H - PAD.bottom - 3;
+          const gapPct = lastPrice ? ((line.price / lastPrice) - 1) * 100 : null;
+          return (
+            <g key={`edge-${line.key}-${line.price}`}>
+              <line x1={PAD.left} x2={W - PAD.right} y1={edgeY} y2={edgeY}
+                    stroke={line.color} strokeWidth="1.2"
+                    strokeDasharray="2 4" opacity={0.6} />
+              <text x={W - PAD.right - 4} y={above ? edgeY + 11 : edgeY - 4}
+                    fontSize="10" textAnchor="end" fill={line.color}>
+                {line.label} {line.price.toFixed(2)}
+                {gapPct === null ? "" : `（${gapPct >= 0 ? "+" : ""}${gapPct.toFixed(2)}%）`}
+                {above ? " ↑在图上方" : " ↓在图下方"}
+              </text>
+            </g>
+          );
+        })}
+        {/* 档位曲线模式下，右端标当前值（曲线自然收束到那里）；
+            同一个 y 上有多条时依次错开 11px，避免标签叠在一起看不清 */}
         {/* 分时线 + 均价线 + 现价点 */}
         <path d={averagePath} fill="none" stroke="var(--medium)" strokeWidth="1.6" />
         <path d={path(visible)} fill="none" stroke="var(--accent)" strokeWidth="2" />
@@ -536,15 +664,75 @@ function IntradayChart({
           );
         })}
 
-        {/* 悬浮十字光标 */}
-        {hover && (
-          <g>
-            <line x1={x(hover.minute)} x2={x(hover.minute)} y1={PAD.top}
-                  y2={H - PAD.bottom} stroke="var(--muted)" strokeDasharray="2 3" />
-            <circle cx={x(hover.minute)} cy={y(hover.price)} r="3.5"
-                    fill="var(--accent)" />
-          </g>
-        )}
+        {/* 档位线右端标当前值 —— 放在**最后**绘制：它是压在右轴上的小标签，
+            必须盖在所有曲线之上，否则会被分时线/十字光标划断。
+            同一 y 附近有多条时依次错开 11px，避免标签叠在一起看不清。 */}
+        {(() => {
+          const tags = inViewLevels
+            .map((line) => ({ line, y: y(line.price) }))
+            .sort((a, b) => a.y - b.y);
+          let lastY = -Infinity;
+          return tags.map(({ line, y: rawY }) => {
+            const textY = Math.max(rawY + 4, lastY + 11);
+            lastY = textY;
+            return (
+              <g key={`tag-${line.key}-${line.price}`}>
+                <circle cx={W - PAD.right + 2} cy={rawY} r="2.4" fill={line.color} />
+                <text x={W - PAD.right + 10} y={textY} fontSize="10"
+                      fill={line.color}>
+                  {line.label} {line.price.toFixed(2)}
+                </text>
+              </g>
+            );
+          });
+        })()}
+
+        {/* 悬浮十字光标：**纵线吸附到分钟点 + 横线跟随鼠标**。
+            两条线各带一个"轴标"（左边价格、下边时间），并在读数条给出"光标"价格，
+            这样"指到哪读到哪"，不用去右轴上一格格对。 */}
+        {hover && (() => {
+          const hx = x(hover.minute);
+          const hy = y(hover.cursorPrice);
+          const cursorPct = pctOf(hover.cursorPrice);
+          return (
+            <g className="crosshair">
+              <line x1={hx} x2={hx} y1={PAD.top} y2={H - PAD.bottom}
+                    stroke="var(--muted)" strokeDasharray="3 3" opacity="0.85" />
+              <line x1={PAD.left} x2={W - PAD.right} y1={hy} y2={hy}
+                    stroke="var(--muted)" strokeDasharray="3 3" opacity="0.85" />
+              {/* 左轴价格标 */}
+              <rect x={PAD.left - 60} y={hy - 8} width={58} height={16} rx={3}
+                    fill="var(--accent)" opacity="0.92" />
+              <text x={PAD.left - 6} y={hy + 4} fontSize="10" textAnchor="end"
+                    fill="#0f1419" className="crosshair-label">
+                {hover.cursorPrice.toFixed(2)}
+              </text>
+              {/* 右轴涨跌幅标 */}
+              {cursorPct !== null && (
+                <>
+                  <rect x={W - PAD.right + 2} y={hy - 8} width={52} height={16} rx={3}
+                        fill={cursorPct >= 0 ? "var(--low)" : "var(--high)"}
+                        opacity="0.92" />
+                  <text x={W - PAD.right + 6} y={hy + 4} fontSize="10"
+                        fill="#0f1419" className="crosshair-label">
+                    {cursorPct >= 0 ? "+" : ""}{cursorPct.toFixed(2)}%
+                  </text>
+                </>
+              )}
+              {/* 下轴时间标 */}
+              <rect x={hx - 22} y={H - PAD.bottom + 2} width={44} height={15} rx={3}
+                    fill="var(--accent)" opacity="0.92" />
+              <text x={hx} y={H - PAD.bottom + 13} fontSize="10"
+                    textAnchor="middle" fill="#0f1419" className="crosshair-label">
+                {timeLabel(hover.minute)}
+              </text>
+              {/* 数据点 + 交点数值 */}
+              <circle cx={hx} cy={y(hover.price)} r="3.5" fill="var(--accent)" />
+              <circle cx={hx} cy={hy} r="2.5" fill="none"
+                      stroke="var(--muted)" strokeWidth="1.2" />
+            </g>
+          );
+        })()}
       </svg>
 
       <div className="chart-readout">
@@ -567,6 +755,28 @@ function IntradayChart({
                 偏离 {(((hover.price / hover.avg) - 1) * 100).toFixed(2)}%
               </span>
             )}
+            {/* 十字光标横线那一点：用户指到哪就报哪 */}
+            <span className="crosshair-readout">
+              光标 <b className="mono">{hover.cursorPrice.toFixed(2)}</b>
+              {prevClose && (
+                <b className="mono" style={{
+                  color: hover.cursorPrice >= prevClose ? "var(--low)" : "var(--high)",
+                }}>
+                  {" "}{(((hover.cursorPrice / prevClose) - 1) * 100).toFixed(2)}%
+                </b>
+              )}
+            </span>
+            {/* 距三条档位线多远：做T时最常问的一句话 */}
+            {inViewLevels.length > 0 && (
+              <span className="muted-text crosshair-levels">
+                {inViewLevels.slice(0, 4).map((line) => (
+                  <span key={`hv-${line.key}-${line.price}`} style={{ color: line.color }}>
+                    {" "}{line.label}
+                    {" "}{(((line.price / hover.cursorPrice) - 1) * 100).toFixed(2)}%
+                  </span>
+                ))}
+              </span>
+            )}
           </>
         ) : (
           <>
@@ -584,16 +794,26 @@ function IntradayChart({
         )}
       </div>
 
-      {/* 档位清单：范围外的档位在这里显示，避免为看档位而把Y轴拉大 */}
+      {/* 档位清单：**所有**档位都列出来（含未显示的），并给出显示开关与"图外"提示。
+          为什么把开关放这里而不是藏进设置：止损线有时离现价 4~5%（ATR 口径），
+          纳入定标会把分时线压扁；给用户一个"只看低吸高抛 / 连止损一起看"的选择，
+          比替他决定更诚实。 */}
       <div className="level-strip">
-        {allLevels.map((line) => {
+        {allLevels.map((line, index) => {
           const outside = line.price < domain.min || line.price > domain.max;
           const pct = lastPrice ? ((line.price / lastPrice) - 1) * 100 : null;
+          const shown = showLevels[line.key];
           return (
-            <span key={line.key}
-                  className={`level-chip ${line.cls}${outside ? " outside" : ""}`}
-                  title={outside ? "该档位在当前Y轴范围外（避免压扁价格线，故不入图）"
-                    : "已在图中标注"}>
+            <label key={`${line.key}-${line.price}-${index}`}
+                   className={`level-chip ${line.cls}${outside ? " outside" : ""}${
+                     shown ? "" : " hidden-line"}`}
+                   title={outside
+                     ? "该档位在当前Y轴范围外（避免压扁分时线，故不动Y轴）—— "
+                       + "勾选下方「图外档位也纳入Y轴」即可把它画进来"
+                     : "已在图中标注；取消勾选可临时隐藏这条线"}>
+              <input type="checkbox" checked={shown}
+                     onChange={(e) => setShowLevels((prev) => ({
+                       ...prev, [line.key]: e.target.checked }))} />
               {line.label} <b className="mono">{line.price.toFixed(2)}</b>
               {pct !== null && (
                 <em className="muted-text">
@@ -601,14 +821,14 @@ function IntradayChart({
                 </em>
               )}
               {outside && <span className="muted-text">（图外）</span>}
-            </span>
+            </label>
           );
         })}
         {outViewLevels.length > 0 && (
           <label className="muted-text chart-toggle">
             <input type="checkbox" checked={fitLevels}
                    onChange={(e) => setFitLevels(e.target.checked)} />
-            把图外档位也纳入Y轴
+            图外档位也纳入Y轴
           </label>
         )}
       </div>

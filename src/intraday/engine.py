@@ -173,6 +173,127 @@ def compute_levels(
     )
 
 
+def apply_level_fit(
+    base: LevelSet, fit: Any, ctx: Any, *,
+    adjustment_scale: dict[str, float] | None = None,
+    blend: float = 1.0,
+) -> LevelSet:
+    """把**拟合出的档位**套到现价上，并用「调整项」做后置微调（用户口径）。
+
+    分工（与用户给的两段口径一一对应）：
+
+    | 阶段 | 输入 | 产物 |
+    |---|---|---|
+    | 拟合（主） | 7 个客观维度（筹码/箱体/缠论/VWAP/布林/MACD/KDJ·RSI） | 低吸/高抛/止损三条线的**尺度**（相对当日均价%） |
+    | 调整（后置） | 其余 7 个维度（指数量能/消息面/市场情绪/情绪周期/海外映射/板块排行/股性） | 对上述尺度的**±50% 以内**微调 |
+
+    实现要点：
+
+    1. 拟合结果里记的是**相对当日均价的百分比**（见 `level_fit.fit_levels`），
+       这里换成绝对价格：`均价 ×(1 ± pct)`。用均价而不是箱体，是因为拟合就是在
+       "相对当日成本中枢"这个参照系里学的，换参照物会让训练与推理口径不一致。
+    2. `adjustment_scale` 由 `level_fit.adjustment_factors` 给出（结构侧 + 环境侧 +
+       微观侧三个乘数）。它只**缩放线的远近**，不会把线翻到另一侧。
+    3. 拟合与调整后仍要过**三条硬约束**（低吸<高抛、止损在低吸下方、与现价留出
+       最小间距）—— 拟合是统计结论，约束是风控底线，后者优先。
+    4. `blend` 是"拟合占比"：<1 时与规则口径的档位按比例混合，便于灰度对比。
+    """
+    if fit is None or not getattr(fit, "metrics", None) or not fit.metrics.available:
+        return base
+    if not fit.metrics.gate_passed:
+        # 闸门没过：不启用拟合档位（回退规则口径）。这是本模块最重要的安全阀。
+        return base
+    low_pct = _fit_pct(fit, "low")
+    high_pct = _fit_pct(fit, "high")
+    stop_pct = _fit_pct(fit, "stop")
+    if low_pct is None or high_pct is None or stop_pct is None:
+        return base
+
+    scale = adjustment_scale or {}
+    structure = max(0.5, min(1.5, float(scale.get("structure", 1.0))))
+    environment = max(0.5, min(1.5, float(scale.get("environment", 1.0))))
+    micro = max(0.5, min(1.5, float(scale.get("micro", 1.0))))
+    # 低吸距离：负向环境 → 跌得更深才接（更谨慎）；正向环境 → 适度提前接
+    width_scale = structure * (1.0 + 0.25 * (environment - 1.0))
+    low_pct = low_pct * width_scale * micro
+    high_pct = high_pct * structure * micro
+    stop_pct = stop_pct * max(1.0, structure)
+
+    # 三条线的次序与间距：低吸<高抛、止损<低吸，且价差不为负
+    if high_pct <= low_pct:
+        high_pct = low_pct * 1.05 + 0.05
+    if stop_pct <= low_pct:
+        stop_pct = low_pct * 1.05 + 0.05
+
+    day_mean = _fit_reference_price(ctx, base)
+    if day_mean is None or day_mean <= 0:
+        return base
+    price = float(ctx.price) if getattr(ctx, "price", None) else base.price
+    fitted_low = day_mean * (1.0 - low_pct / 100.0)
+    fitted_high = day_mean * (1.0 + high_pct / 100.0)
+    fitted_stop = day_mean * (1.0 - stop_pct / 100.0)
+
+    # 与规则口径混合（blend=1 时完全用拟合线）
+    ratio = max(0.0, min(1.0, float(blend)))
+    low_buy = base.low_buy * (1.0 - ratio) + fitted_low * ratio
+    high_sell = base.high_sell * (1.0 - ratio) + fitted_high * ratio
+    stop_loss = base.stop_loss * (1.0 - ratio) + fitted_stop * ratio
+
+    # ---- 风控底线（与 compute_levels 的护栏同口径）----
+    low_buy = min(low_buy, high_sell * (1.0 - _MIN_LEVEL_GAP))
+    if low_buy >= price * (1.0 - _MIN_LEVEL_GAP):
+        low_buy = price * (1.0 - max(0.01, low_pct / 100.0))
+    stop_loss = min(stop_loss, low_buy - max(1e-6, low_buy * 0.002))
+    if stop_loss <= 0:
+        return base
+
+    note = (f"档位：神经网络拟合（留一日成功率 "
+            f"{_pct_text(fit.metrics.walk_forward_rate)}）"
+            f"+ 调整项 ×{width_scale:.2f}/×{structure:.2f}/×{micro:.2f}")
+    return base.model_copy(update={
+        "low_buy": round(low_buy, 4),
+        "high_sell": round(high_sell, 4),
+        "stop_loss": round(stop_loss, 4),
+        "low_source": (f"神经网络拟合：低吸 −{low_pct:.2f}%（相对当日均价）"
+                       f"；底座 {base.low_source or '规则档位'}"),
+        "high_source": (f"神经网络拟合：高抛 +{high_pct:.2f}%（相对当日均价）"
+                        f"；底座 {base.high_source or '规则档位'}"),
+        "stop_basis": (f"神经网络拟合：止损 −{stop_pct:.2f}%"
+                       f"；低吸线下方 {stop_pct - low_pct:.2f}%（原口径 "
+                       f"{base.stop_basis or '百分比/ATR'}）"),
+        "level_fit_note": note,
+    })
+
+
+def _fit_pct(fit: Any, key: str) -> float | None:
+    """从拟合结果里取"相对当日均价的百分比"（每条线取混合权重最大的那个锚点）。"""
+    mix = getattr(fit, f"{key}_mix", None) or []
+    anchors = getattr(fit, f"{key}_anchors", None) or []
+    if not mix or not anchors or len(mix) != len(anchors):
+        return None
+    index = max(range(len(mix)), key=lambda i: mix[i])
+    try:
+        value = float(anchors[index])
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _fit_reference_price(ctx: Any, base: LevelSet) -> float | None:
+    """拟合线的参照价：当日均价（VWAP）优先，缺失时退回现价。"""
+    vwap = getattr(ctx, "vwap", None)
+    if vwap is not None and math.isfinite(float(vwap)) and float(vwap) > 0:
+        return float(vwap)
+    price = getattr(ctx, "price", None)
+    if price is not None and math.isfinite(float(price)) and float(price) > 0:
+        return float(price)
+    return base.price if base.price and base.price > 0 else None
+
+
+def _pct_text(value: float | None) -> str:
+    return "—" if value is None else f"{value * 100:.0f}%"
+
+
 def _enforce_band_width(    low_buy: float, high_sell: float, price: float, params: Any,
 ) -> tuple[float, float]:
     """把低吸~高抛档位差夹到 [min_band_pct, max_band_pct]×现价 区间内。

@@ -34,6 +34,11 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 _ENV_KEYS = ("TUSHARE_TOKEN", "tushare_token", "TS_TOKEN")
@@ -281,10 +286,10 @@ class TushareClient:
                                "params": params}
             except TusharePermissionError as exc:
                 report[api] = {"ok": False, "kind": "permission",
-                               "detail": str(exc)[:200], "params": params}
+                               "detail": brief(exc, BRIEF_DEFAULT), "params": params}
             except Exception as exc:  # noqa: BLE001
                 report[api] = {"ok": False, "kind": type(exc).__name__,
-                               "detail": str(exc)[:200], "params": params}
+                               "detail": brief(exc, BRIEF_DEFAULT), "params": params}
         return report
 
 

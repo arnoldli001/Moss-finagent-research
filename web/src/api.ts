@@ -409,9 +409,30 @@ export type IntradayLevels = {
   box_span_days: number;
   low_buy: number; high_sell: number; stop_loss: number;
   stop_loss_pct: number;
+  /** 止损位是怎么定出来的（百分比口径 / ATR 口径 / 当日最低）。 */
+  stop_basis?: string;
   boll_upper: number | null; boll_mid: number | null; boll_lower: number | null;
   pct_b: number | null; bandwidth: number | null;
   vwap: number | null; atr: number | null;
+  // ---- 解释字段（服务端 annotate_level_basis 补，仅当前档位对象上有）----
+  /** 低吸线由谁决定（箱体下沿/布林下轨/ATR 兜底）。 */
+  low_source?: string;
+  /** 高抛线由谁决定（箱体上沿/布林上轨/高抛缓冲）。 */
+  high_source?: string;
+  /** 实际档位差占现价%。 */
+  band_width_pct?: number | null;
+  /** 档位差是否被 min/max 护栏夹过（空串=没夹）。 */
+  band_clamped?: string;
+  /** 档位差护栏前的低吸线/高抛线候选位置。 */
+  pre_clamp_low?: number | null;
+  pre_clamp_high?: number | null;
+  /** 低吸触发的最高价 = 低吸线×(1+贴线带宽)。 */
+  low_trigger_price?: number | null;
+  /** 高抛触发的最低价 = 高抛线×(1−贴线带宽)。 */
+  high_trigger_price?: number | null;
+  take_profit_buffer_pct?: number | null;
+  dip_fallback_atr?: number | null;
+  atr_stop_mult?: number | null;
 };
 
 export type IntradaySignal = {
@@ -576,6 +597,8 @@ export type IntradaySnapshot = {  code: string; name: string; trade_date: string
   news: IntradayNews | null;
   index_volume: IntradayIndexVolume | null;
   overseas: IntradayOverseas | null;
+  /** 档位拟合摘要（规则口径 / 拟合口径、两个成功率、调整项乘数）。 */
+  level_fit: IntradayLevelFit | null;
   health: IntradayHealth;
   config_snapshot: Record<string, unknown>;
   notifier: Record<string, unknown>;
@@ -588,6 +611,10 @@ export type IntradayWatchItem = {
   signal_strength: "solid" | "hollow" | "forced_exit" | "none";
   signal_kind: "low_buy" | "high_sell" | "stop_loss" | "none";
   price: number | null; change_pct: number | null;
+  /** 价格的取数时刻（报价快车道，每几秒更新） */
+  quote_ts?: string;
+  /** 是否置顶：置顶项永远排最前（状态存在配置文件里） */
+  pinned?: boolean;
 };
 
 /** 自选池自动刷新的运行状态（服务端每分钟重算一次，前端据此展示刷新时间/暂停原因）。 */
@@ -598,6 +625,13 @@ export type IntradayWatchRefresh = {
   window_reason: string;
   running: boolean;
   generation: number;
+  /**
+   * true = 服务端此刻**没有任何缓存**（首次部署 / 热缓存超过 24 小时 /
+   * 自选池改动较大），返回的是只有代码·名称·板块的**占位列表**：
+   * 现价由报价快车道几秒内贴上，分数/信号要等后台整表重算（冷启动实测约 200 秒）。
+   * 前端据此显示"首次重算中"，而不是把 "—" 当成数据坏了。
+   */
+  warming?: boolean;
   cache_age_seconds: number | null;
   cached_count: number;
   last_run_at: string;
@@ -802,6 +836,264 @@ export type CharacterProfile = {
   templates: WeightTemplate[];
 };
 
+/** 档位神经网络拟合：成功率、可达上限、闸门与拟合线（服务端口径，见 level_fit.py）。 */
+export type IntradayLevelFitMetrics = {
+  available: boolean;
+  reason: string;
+  sessions: number;
+  bars: number;
+  horizon_bars: number;
+  touch_samples: number;
+  /** 训练窗口（过去 N 个交易日）内的成功率 —— 用户口径的那个数。 */
+  in_sample_rate: number | null;
+  in_sample_touches: number;
+  /** 留一日交叉验证成功率 —— 决定能不能启用拟合档位。 */
+  walk_forward_rate: number | null;
+  walk_forward_touches: number;
+  avg_round_trip_pct: number | null;
+  /** 放宽搜索能达到的上限：用来区分"没搜到"与"到不了"。 */
+  best_achievable_rate: number | null;
+  best_achievable_lines: number[];
+  target_hit_rate: number;
+  gate_passed: boolean;
+  gate_reason: string;
+  elapsed_ms: number;
+};
+
+export type IntradayLevelFit = {
+  code: string;
+  trade_date: string;
+  fitted_at: string;
+  metrics: IntradayLevelFitMetrics;
+  low_mix: number[];
+  high_mix: number[];
+  stop_mix: number[];
+  low_anchors: number[];
+  high_anchors: number[];
+  stop_anchors: number[];
+  feature_means: number[];
+  feature_stds: number[];
+  features: { key: string; label: string }[];
+  notes: string[];
+  /** 快照里额外带的：调整项乘数（其余 7 个维度）与"是否已用于档位"。 */
+  adjustment?: Record<string, number>;
+  applied?: boolean;
+  notice?: string;
+};
+
+/** 资金流监控：一天的一条资金流（单位统一为元）。 */
+export type FlowPoint = {
+  date: string;
+  net: number | null;
+  buy_lg: number | null;
+  sell_lg: number | null;
+  buy_elg: number | null;
+  sell_elg: number | null;
+  /**
+   * 日线 OHLCV：走势图叠加 K 线与成交量柱用（**只有个股有**，板块这几项为 null）。
+   * 单位：价格=元，volume=股，amount=元，pct_chg=%。
+   */
+  close: number | null;
+  open?: number | null;
+  high?: number | null;
+  low?: number | null;
+  volume?: number | null;
+  amount?: number | null;
+  pct_chg?: number | null;
+};
+
+/** 资金流监控：一个被监控实体（板块或个股）及其近 N 日资金流。 */
+export type FlowEntity = {
+  kind: "sector" | "stock";
+  code: string;
+  name: string;
+  source: "manual" | "default" | string;
+  available: boolean;
+  unit: string;
+  data_source: string;
+  series: FlowPoint[];
+  /** 近 N 日净额均值（元）。 */
+  net_avg: number | null;
+  /** 个股：净额均值 / 流通市值（越小越"轻"，用于跨大小盘排序）。 */
+  net_to_mv: number | null;
+  circ_mv: number | null;
+  /** 板块：当日盘中净额（元，同花顺即时口径）。 */
+  today_net: number | null;
+  change_pct: number | null;
+  latest_net: number | null;
+  latest_date: string;
+  gap: string | null;
+  notes: string[];
+  /**
+   * 个股榜的类别（2026-09-17 口径）：昨日涨停 / 净流入前10 / 净流出前10 / 自选 / 其他。
+   * 板块实体没有这个字段。
+   */
+  rank_group?: string;
+  /** 涨停原因（东财涨停池的行业/题材归类，含连板数）；非涨停股为空串 */
+  limitup_reason?: string;
+  /** 涨停原因对应的交易日（避免把昨天的池子标成今天） */
+  limitup_date?: string;
+  /** 涨幅来源（腾讯盘中快照 / 本地仓库日频），用于判断数据新旧 */
+  change_source?: string;
+};
+
+export type FlowBoard = {
+  generated_at: string;
+  window_days: number;
+  trade_date: string;
+  session_state: string;
+  session_label: string;
+  sector_rank: FlowEntity[];
+  stock_rank: FlowEntity[];
+  sectors: FlowEntity[];
+  stocks: FlowEntity[];
+  source_notes: string[];
+  gaps: string[];
+  refresh_hint: string;
+  notice?: string;
+};
+
+export type FlowWatchItem = {
+  kind: "sector" | "stock";
+  code: string;
+  name: string;
+  source: string;
+  added_at: string;
+};
+
+// ---------------- 量化选股（3 档模型 + 自定义板块） ----------------
+
+/** 量化选股模块状态。 */
+export type QuantSelectStatus = {
+  available: boolean;
+  reason: string;
+  /** 模型文件名（如 core_v1_20-150亿_20260917-160502.joblib）。 */
+  model_version: string;
+  /** 三档模型名（20-150亿 / 150-500亿 / 500亿+）。 */
+  model_buckets: string[];
+  model_trained_at: string;
+  last_run_at: string;
+  last_trade_date: string;
+  last_selected: number;
+  last_seconds: number;
+  last_error: string;
+  running: boolean;
+  /** 模型缺失时是否正在**自动训练**（后端后台跑，前端据此提示"训练中"）。 */
+  training: boolean;
+  sectors: number;
+};
+
+/** 选股结果里的单只票。 */
+export type QuantSelectionItem = {
+  code: string;
+  name: string;
+  score: number;
+  rank: number;
+  /** 该票打分时实际使用的市值档（三档模型里的哪一档）。 */
+  cap_bucket: string;
+  circ_mv: number | null;
+  /**
+   * 当日涨跌幅（%）：**已实现的收盘涨跌**，不是预测值。
+   * 算不出来时为 null（老记录没这列 / 新股首日无前收）—— 界面显示 `—`。
+   */
+  pct_chg: number | null;
+  /** 命中的自定义板块名（既是归类标签，也是选股范围的回执）。 */
+  sectors: string[];
+  factors: Record<string, number | null>;
+  /** 是否已加进做T自选（后端在加入时统一打标）。 */
+  added: boolean;
+};
+
+/** 选股结果用的个股消息面（新闻/公告）单条。 */
+export type QuantStockNewsItem = {
+  title: string;
+  /** 发布时间（形如 `2026-09-18 10:31:30`）。 */
+  publish_time: string;
+  /** 媒体名（财联社 / 证券时报网 …）。 */
+  media: string;
+  url: string;
+  summary: string;
+};
+
+/** 一只票的消息面；取不到时 `items` 为空且 `reason` 说明原因（不编造新闻）。 */
+export type QuantStockNews = {
+  code: string;
+  items: QuantStockNewsItem[];
+  source: string;
+  reason: string;
+};
+
+/** 批量加入做T自选池的结果（「一键全部加自选」）。 */
+export type QuantBatchWatchResult = {
+  /** 是否真的写了配置（全部都已在池中且无需补名时为 false）。 */
+  saved: boolean;
+  requested: number;
+  /** 本次新增进自选池的代码。 */
+  added: string[];
+  /** 本来就在池中、但名字是空的，本次顺手补上了名字（其余字段未动）。 */
+  repaired: string[];
+  /** 本来就在池中、本次**未改动**的（避免覆盖手配的板块/海外映射）。 */
+  existing: string[];
+  /** 代码格式不合法、没写进去的。 */
+  failed: { code: string; reason: string }[];
+  /** 写进去了但本地字典查不到中文名（配置里名字为空，不拿代码冒充）。 */
+  missing_name: string[];
+  /** 写入后自选池总只数。 */
+  total: number;
+  /** 被回标成「已加」的历史选股明细行数。 */
+  marked_runs: number;
+};
+
+/** 一次选股运行。 */
+export type QuantSelectionRun = {
+  id: number;
+  trade_date: string;
+  /** open=开盘窗口(9:25-9:45) / close=尾盘(14:45) / manual=手动。 */
+  window: "open" | "close" | "manual";
+  ran_at: string;
+  model_version: string;
+  model_detail: string;
+  threshold: number;
+  scored: number;
+  top_n: number;
+  selected: number;
+  sector_filter: string[];
+  seconds: number;
+  gaps: string[];
+  error: string;
+  triggered_by: string;
+  /**
+   * 数据新鲜度（服务端**读时计算**，不落库：老记录也能被正确重判）。
+   *
+   * `data_stale=true` 表示这一轮用的行情不是最近一个已收盘交易日的 ——
+   * 分数、阈值、排名全都算得出来、界面上看不出异常，但它描述的是旧市场。
+   * 起因是本地行情仓库没同步（`quant_data_sync` 作业负责推进）。
+   */
+  data_stale?: boolean;
+  expected_trade_date?: string;
+  /** 滞后时给人看的说明（含"实际用的"与"应该用的"两个日期）。 */
+  note?: string;
+  /** false = 交易日历不可用、**没做判断**（不能读成"确认新鲜"）。 */
+  checked?: boolean;
+  items?: QuantSelectionItem[];
+};
+
+/** 自定义板块（既是选股范围也是归类标签）。 */
+export type QuantSector = {
+  id: number;
+  name: string;
+  /** manual=手工成分股；dynamic=按规则由服务端求值。 */
+  kind: "manual" | "dynamic";
+  note: string;
+  rule: Record<string, unknown>;
+  color: string;
+  sort_order: number;
+  members: { code: string; name: string }[];
+  member_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
 /** 市场情绪周期（涨停家数 / 炸板率 / 最高连板 → 阶段与做T环境温度）。 */
 export type MarketCycle = {
   available: boolean;
@@ -887,6 +1179,91 @@ export type IntradayWeightPreviewRequest = {
   weights?: Record<string, number>;
   thresholds?: Record<string, number>;
   levels?: Record<string, number>;
+  /**
+   * 可选：「面板此刻」的档位（low_buy/high_sell/stop_loss/vwap）。
+   * 服务端用它当「改动前」那一列 —— 传了它，"变动"就只反映参数改动，
+   * 不会把这几秒内 VWAP 的自然漂移算成你改出来的。
+   */
+  current_levels?: Record<string, number>;
+};
+
+/** 一条档位线：现在是多少 + 离现价多远 + 谁定的 + 触发价。 */
+export type IntradayTriggerLevel = {
+  key: string;
+  label: string;
+  price: number;
+  /** (线 - 现价)/现价×100，负=在现价下方。 */
+  distance_pct: number;
+  source: string;
+  trigger_price: number | null;
+  trigger_note: string;
+  note: string;
+};
+
+/** 「差多少分 / 差多少价才出信号」一行。 */
+export type IntradayTriggerGate = {
+  key: string;
+  label: string;
+  ready: boolean;
+  /** 总分还差多少（正=还差这么多）。 */
+  score_need: number;
+  /** 价格还要走多少%（负=还要往下跌）。 */
+  price_need_pct: number | null;
+  blocked_by: string;
+  note: string;
+};
+
+/** 单因子对总分的**影响度**（权重口径，与档位线无关）。 */
+export type IntradayFactorImpact = {
+  key: string;
+  label: string;
+  weight: number;
+  score: number;
+  contribution: number;
+  /** = 得分：权重每 +1 分对总分的推动（负=拉低总分）。 */
+  unit_impact: number;
+  /** 把这一项权重置 0 时总分的变化。 */
+  zero_impact: number;
+  /** 该权重占**有效权重**的比例%。 */
+  weight_share_pct: number;
+  available: boolean;
+  gap: string | null;
+  note: string;
+};
+
+/** 「改动前 → 改动后」一条价格线的变动（服务端算，前端只做展示）。 */
+export type IntradayLevelDelta = {
+  key: string;
+  label: string;
+  /** 该票**当前生效口径**下这条线的位置（无基准时为空）。 */
+  current: number | null;
+  preview: number;
+  delta: number | null;
+  delta_pct: number | null;
+};
+
+/** 「参数 → 价格线 / 触发门槛」的可解释推导（服务端与图上那条线同源）。 */
+export type IntradayTriggerImpact = {
+  available: boolean;
+  reason: string;
+  price: number;
+  low_trigger_price: number | null;
+  high_trigger_price: number | null;
+  stop_price: number | null;
+  total: number;
+  threshold_action: number;
+  threshold_hint: number;
+  available_weight: number;
+  coverage_blocked: boolean;
+  cycle_blocked: boolean;
+  cycle_stage: string;
+  level_rows: IntradayTriggerLevel[];
+  /** 「改动前 → 改动后」逐线对照（服务端按当前口径算好）。 */
+  level_deltas: IntradayLevelDelta[];
+  gates: IntradayTriggerGate[];
+  factor_impact: IntradayFactorImpact[];
+  examples: string[];
+  notes: string[];
 };
 
 /**
@@ -903,6 +1280,10 @@ export type IntradayWeightPreview = {
   weights: Record<string, number>;
   thresholds: { action: number; hint: number };
   levels: Record<string, number>;
+  /** 预览口径下的**真实档位对象**（含各线的来源与触发价）。 */
+  level_set?: IntradayLevels | null;
+  /** 「价格线 / 触发门槛 / 因子影响度」的展开（保存前就能看到会变成多少）。 */
+  impact?: IntradayTriggerImpact | null;
   signal: Record<string, unknown> | null;
 };
 
@@ -989,6 +1370,48 @@ export type IntradayDailySignalMark = {
   stop_loss: number | null;
 };
 
+/** 擒牛线在某一根日线上的五个档位值（null = 该线暖机未完成）。 */
+export type NiuLinePoint = {
+  date: string;
+  nml: number | null;
+  qrl: number | null;
+  cbx20: number | null;
+  cbx60: number | null;
+  smx: number | null;
+};
+
+/**
+ * 擒牛线档位线体系（日K做T 主图）。
+ *
+ * 两套同花顺公式按标的类别自动选：
+ *  - `variant="stock"`：个股版，CBX = SUM(AMOUNT,N)/SUM(V,N)（真实成交额均价）
+ *  - `variant="index"`：指数/ETF/板块版，CBX = SUM(C*V,N)/SUM(V,N)（收盘价加权）
+ *
+ * NML/QRL/SMX 两套完全相同，**只有 CBX 分叉**。
+ */
+export type NiuLineSet = {
+  available: boolean;
+  variant: "stock" | "index";
+  /** 为什么选了这个变体（可追溯，不猜） */
+  reason: string;
+  /** 实际用的均价口径 */
+  price_basis: "amount" | "close_volume";
+  /**
+   * CBX 换算系数：个股口径下把"每手价"换成"每股"。
+   * 本项目 volume 单位是手，故实测 ~100；不换算 CBX 会比股价高两个数量级，
+   * "站稳/跌破"判据会整体反过来。指数口径恒为 1。
+   */
+  cbx_scale: number;
+  n: number;
+  m: number;
+  latest: Record<string, number | null>;
+  /** 线的展示元数据（label/note），由后端给出，前端不硬编码线名 */
+  lines: { key: string; label: string; note: string }[];
+  points: NiuLinePoint[];
+  /** 口径说明与降级原因（如"成交额缺失 → 退回指数口径"） */
+  notes: string[];
+};
+
 export type IntradayDailySnapshot = {
   available: boolean;
   code: string; name: string;
@@ -1007,6 +1430,8 @@ export type IntradayDailySnapshot = {
   ma: Record<string, number | null>;
   discipline: string[];
   verdict: string;
+  /** 擒牛线档位线（日K做T 主图；原蜡烛K线已按用户要求下线） */
+  niuline: NiuLineSet | null;
   health: IntradayHealth;
   config_snapshot: Record<string, unknown>;
   disclaimer: string;
@@ -1148,9 +1573,29 @@ export const api = {
     request<IntradaySnapshot>(
       `/api/v1/intraday/snapshot?code=${encodeURIComponent(code)}` +
       (refresh ? "&refresh=true" : "")),
-  intradayWatchlist: (force = false) =>
+  /**
+   * 自选标的概览。
+   *
+   * 必须显式传 `limit`：后端默认值是 **20**，省略时自选超过 20 只就会出现
+   * "新加的股票不在列表里"（实测：自选已 39 只，界面只显示前 20 只，
+   * 用户以为没写入成功）。
+   *
+   * `active`（当前查看的标的）**只在 force=true 时有意义**：后端会把整表重算
+   * 收敛成"只重算这一只 + 其余走缓存 + 后台补齐"。自选 30+ 只时这是
+   * "强制刷新要等 6~7 秒"的根治手段（实测每只票的板块概念快照要 3.2~6.5s，
+   * 39 只就是几十个子进程抢 CPU）。
+   */
+  intradayWatchlist: (force = false, limit = 50, active = "") =>
     request<IntradayWatchPayload>(
-      `/api/v1/intraday/watchlist${force ? "?force=true" : ""}`),
+      `/api/v1/intraday/watchlist?limit=${limit}`
+      + (force ? "&force=true" : "")
+      + (force && active ? `&active=${encodeURIComponent(active)}` : "")),
+  /** 置顶/取消置顶一只自选（状态写入 configs/intraday.yaml，跨浏览器一致）。 */
+  intradayPinWatch: (code: string, pinned = true) =>
+    request<{ ok: boolean; code: string; pinned: boolean;
+              watchlist: Record<string, unknown>[] }>(
+      `/api/v1/intraday/watchlist/pin?code=${encodeURIComponent(code)}`
+      + `&pinned=${pinned ? "true" : "false"}`, { method: "POST" }),
   intradayAddWatch: (body: {
     code: string; name?: string; boards?: string[];
     peers?: string[]; industry?: string; overseas?: string[];
@@ -1185,6 +1630,131 @@ export const api = {
   intradayMarketCycle: (force = false) =>
     request<MarketCycle>(
       `/api/v1/intraday/market-cycle${force ? "?force=true" : ""}`),
+  /** 档位神经网络拟合（refresh=true 忽略缓存重训一次，约 1~5 秒）。 */
+  intradayLevelFit: (code: string, refresh = false) =>
+    request<IntradayLevelFit>(
+      `/api/v1/intraday/level-fit?code=${encodeURIComponent(code)}`
+      + (refresh ? "&refresh=true" : "")),
+  /** 资金流监控快照（榜单 + 已选实体走势；盘中 60 秒缓存，refresh 穿透）。 */
+  fundflowSnapshot: (refresh = false, window = 10, top = 20) =>
+    request<FlowBoard>(
+      `/api/v1/fundflow/snapshot?refresh=${refresh ? "true" : "false"}`
+      + `&window=${window}&top=${top}`),
+  /** 资金流监控：已加入监控的板块/个股。 */
+  fundflowWatch: (kind: "sector" | "stock") =>
+    request<{ kind: string; count: number; items: FlowWatchItem[] }>(
+      `/api/v1/fundflow/watch?kind=${kind}`),
+  /** 加入监控（幂等）。 */
+  fundflowAddWatch: (kind: "sector" | "stock", code: string, name = "") =>
+    request<{ ok: true; kind: string; code: string; count: number;
+              items: FlowWatchItem[]; notice: string }>(
+      "/api/v1/fundflow/watch",
+      { method: "POST", body: JSON.stringify({ kind, code, name }) }),
+  /** 移除监控（幂等）。 */
+  fundflowRemoveWatch: (kind: "sector" | "stock", code: string) =>
+    request<{ ok: true; removed: boolean; count: number;
+              items: FlowWatchItem[]; notice: string }>(
+      `/api/v1/fundflow/watch/${kind}/${encodeURIComponent(code)}`,
+      { method: "DELETE" }),
+  /** 搜索可加入监控的板块（数据源官方名）或个股（仓库名录）。 */
+  fundflowSearch: (kind: "sector" | "stock", q = "", limit = 20) =>
+    request<{ kind: string; query: string; items: Record<string, unknown>[] }>(
+      `/api/v1/fundflow/search?kind=${kind}&q=${encodeURIComponent(q)}`
+      + `&limit=${limit}`),
+
+  // ---------------- 量化选股（3 档模型 + 自定义板块） ----------------
+  // 选股结果**不自动写自选池**：只落在模块里，用户点「加自选」才写
+  // configs/intraday.yaml（`quantSelectAddToWatchlist`）。
+  /** 模块状态：模型档位/训练时间、上一轮选股、是否正在跑、板块数。 */
+  quantSelectStatus: () =>
+    request<QuantSelectStatus>("/api/v1/quant/select/status"),
+  /**
+   * 手动补训模型（前端「立即训练模型」）。
+   *
+   * 正常路径不需要它：模型缺失时 `/status` 会**自动**起一次训练；
+   * 这个接口是"自动那次失败/等不及"时的重试入口。
+   */
+  quantSelectTrain: () =>
+    request<{ started: boolean; training: boolean; message: string }>(
+      "/api/v1/quant/select/train", { method: "POST" }),
+  /**
+   * 手动跑一轮选股（同步等待；一轮几十秒到几分钟）。
+   *
+   * `sectorFilter` 是**选股范围**（自定义板块名）：给了就把候选池换成这些板块的
+   * 成分，阈值也在板块内部取 —— 而不是"全市场选完再筛"（后者板块一小就选不出票）。
+   */
+  quantSelectRun: (body: {
+    sector_filter?: string[]; top_n?: number | null;
+    trade_date?: string | null; max_stocks?: number | null;
+  }) =>
+    request<QuantSelectionRun>("/api/v1/quant/select/run", {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  /**
+   * 选股结果用的**个股消息面**（新闻/公告）。
+   *
+   * 增强信息：取不到时后端返回空 items + reason，**不会**让选股结果接口失败。
+   * 服务端有 TTL 缓存，前端可以放心在结果刷新后调用。
+   */
+  quantSelectNews: (codes: string[], limit = 3) =>
+    request<{ news: Record<string, QuantStockNews>; count: number; reason: string }>(
+      `/api/v1/quant/select/news?codes=${encodeURIComponent(codes.join(","))}`
+      + `&limit=${limit}`),
+  /** 历史选股记录（含明细）。 */
+  quantSelectRuns: (limit = 20, window = "") =>
+    request<{ runs: QuantSelectionRun[]; count: number }>(
+      `/api/v1/quant/select/runs?limit=${limit}`
+      + (window ? `&window=${encodeURIComponent(window)}` : "")),
+  /** 最新一轮选股结果（没有记录时 `available=false`）。 */
+  quantSelectLatest: (window = "") =>
+    request<QuantSelectionRun & { available?: boolean; reason?: string }>(
+      `/api/v1/quant/select/latest`
+      + (window ? `?window=${encodeURIComponent(window)}` : "")),
+  /** 把选出的票加进做T自选（人工确认）。 */
+  quantSelectAddToWatchlist: (code: string, name = "") =>
+    request<{ code: string; added: boolean; marked_runs: number }>(
+      "/api/v1/quant/select/add-to-watchlist", {
+        method: "POST", body: JSON.stringify({ code, name }),
+      }),
+  /**
+   * 整批加进做T自选（「＋ 全部加自选」）。
+   *
+   * 与逐只调用 `quantSelectAddToWatchlist` 的区别只在**落盘次数**：
+   * 服务端一次写完配置、一次重建做T子组件（逐只循环会让自选概览缓存
+   * 被反复作废，随后那次整表重算是整个动作里最贵的一步）。
+   */
+  quantSelectAddManyToWatchlist: (items: { code: string; name?: string }[]) =>
+    request<QuantBatchWatchResult>(
+      "/api/v1/quant/select/add-to-watchlist-batch", {
+        method: "POST", body: JSON.stringify({ items }),
+      }),
+  /** 自定义板块列表（含成分股）。 */
+  quantSectors: (withMembers = true) =>
+    request<{ sectors: QuantSector[]; count: number }>(
+      `/api/v1/quant/sectors?with_members=${withMembers ? "true" : "false"}`),
+  /** 新建/更新自定义板块（同名即更新，幂等）。 */
+  quantSaveSector: (body: {
+    name: string; kind?: "manual" | "dynamic"; note?: string;
+    rule?: Record<string, unknown>; color?: string; sort_order?: number;
+    members?: { code: string; name?: string }[];
+  }) =>
+    request<QuantSector>("/api/v1/quant/sectors", {
+      method: "POST", body: JSON.stringify(body),
+    }),
+  quantDeleteSector: (sectorId: number) =>
+    request<{ deleted: boolean; sector_id: number }>(
+      `/api/v1/quant/sectors/${sectorId}`, { method: "DELETE" }),
+  /** 增量加成分股（幂等：已在板块里的不算新增，返回实际新增数）。 */
+  quantAddSectorMembers: (sectorId: number,
+                          members: { code: string; name?: string }[]) =>
+    request<{ sector_id: number; added: number }>(
+      `/api/v1/quant/sectors/${sectorId}/members`, {
+        method: "POST", body: JSON.stringify({ members }),
+      }),
+  quantRemoveSectorMember: (sectorId: number, code: string) =>
+    request<{ removed: boolean; sector_id: number; code: string }>(
+      `/api/v1/quant/sectors/${sectorId}/members/${encodeURIComponent(code)}`,
+      { method: "DELETE" }),
   /** 权重档案列表（按更新时间倒序）。 */
   intradayWeightProfiles: (limit = 200) =>
     request<IntradayWeightProfileList>(
@@ -1265,6 +1835,22 @@ export const api = {
   stockSearch: (q: string, limit = 20) =>
     request<StockSearchResult>(
       `/api/v1/quant/stocks/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+
+  /**
+   * 某只票的**关联概念板块**（按相关性降序）。
+   *
+   * `auto_default` 是相关性最高的概念名，用于"选中个股后自动关联最相关概念"。
+   * 相关性 = 窄度(55%) + 人均主力净额(28%) + 板块涨幅(17%)，
+   * 已剔除"同花顺全A""百元股"这类市场级/量化标签概念。
+   */
+  stockBoards: (code: string, limit = 12) =>
+    request<StockBoardsResult>(
+      `/api/v1/quant/stocks/${encodeURIComponent(code)}/boards?limit=${limit}`),
+
+  /** 概念板块名联想（「关联板块」输入框用）。 */
+  conceptSuggest: (q: string, limit = 12) =>
+    request<{ query: string; count: number; items: ConceptSuggestion[]; hint: string }>(
+      `/api/v1/quant/concepts/suggest?q=${encodeURIComponent(q)}&limit=${limit}`),
 
   /** 单个代码的名称与拼音（输入框旁的名称补全） */
   stockDetail: (code: string, autoEnrich = true) =>
@@ -1606,6 +2192,34 @@ export type StockSearchResult = {
   total_in_directory: number;
   stocks: StockEntry[];
   hint: string;
+};
+
+/** 一个概念板块与某只个股的相关性（`/quant/stocks/{code}/boards`）。 */
+export type ConceptBoard = {
+  code: string;
+  name: string;
+  /** 概念内成员数：越少说明概念越"窄"、越能刻画这只票 */
+  members: number;
+  relevance: number;
+  /** 板块当日主力净额（亿元） */
+  net_yi: number | null;
+  change_pct: number | null;
+  reasons: string[];
+};
+
+export type StockBoardsResult = {
+  code: string; name: string; count: number;
+  boards: ConceptBoard[];
+  /** 相关性最高的概念名（前端"自动关联最相关概念"用它） */
+  auto_default: string;
+  /** true=在线取数失败，用的是落库结果 */
+  stale: boolean;
+  note: string;
+};
+
+/** 概念名联想项（`/quant/concepts/suggest`）。 */
+export type ConceptSuggestion = {
+  code: string; name: string; members: number;
 };
 
 /** 同源WebSocket地址（vite代理已开启ws升级；生产同源直连）。 */

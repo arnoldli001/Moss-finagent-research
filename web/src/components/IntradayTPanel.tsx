@@ -4,12 +4,15 @@ import {
   IntradayWatchRefresh, MarketCycle,
 } from "../api";
 import IntradayChart from "./IntradayChart";
+import BoardPicker from "./BoardPicker";
 import IntradayDailyPanel from "./IntradayDailyPanel";
+import IntradayLevelFitPanel from "./IntradayLevelFit";
 import DataSourceHealth from "./DataSourceHealth";
 import IntradayScore from "./IntradayScore";
 import IntradaySentimentPanel from "./IntradaySentiment";
 import IntradayValuation from "./IntradayValuation";
 import MarketContextStrip from "./MarketContextStrip";
+import PrivateFeatureNotice from "./PrivateFeatureNotice";
 import { StockPicker } from "./StockPicker";
 import WeightProfileEditor from "./WeightProfileEditor";
 
@@ -33,6 +36,31 @@ const POLL_FALLBACK_MS = 20000;
 // 取的是服务端缓存（60 秒才重算一次打分），所以即使 15 秒轮询也不会放大取数成本。
 const WATCH_POLL_MS = 15000;
 
+/** 提示条自动消失时间（毫秒）：通知类信息不该一直占着屏幕。 */
+const NOTICE_TTL_MS = 9000;
+
+/**
+ * 自选侧边栏的展开状态（localStorage 键）。
+ *
+ * 为什么记住：自选列表是"左侧滑动窗口"（参考同花顺持仓栏），用户收起它多半是为了
+ * 给图让出宽度 —— 下次进来又被强行展开会很烦。窄屏默认收起。
+ */
+const DRAWER_KEY = "moss.intraday.watchDrawer";
+
+function initialDrawerOpen(): boolean {
+  try {
+    const saved = window.localStorage.getItem(DRAWER_KEY);
+    if (saved === "0") return false;
+    if (saved === "1") return true;
+  } catch {
+    /* 隐私模式禁用 localStorage：按屏幕宽度决定 */
+  }
+  return window.innerWidth >= 1180;
+}
+
+/** 顶部提示条：带自增 id，用于「同一条消息再次出现也要重新计时」。 */
+type Notice = { id: number; text: string; level: "info" | "warn" };
+
 const SIGNAL_TEXT: Record<string, string> = {
   low_buy: "低吸做T",
   high_sell: "高抛做T",
@@ -54,7 +82,18 @@ function SignalBadge({ item }: { item: IntradayWatchItem }) {
   return <span className={`sig-badge ${cls}`}>{text}</span>;
 }
 
-export default function IntradayTPanel() {
+export default function IntradayTPanel({ onOpenAuction }: {
+  /**
+   * 「竞价选股」页签回调。
+   *
+   * 为什么用**回调**而不是在组件内部直接切页面：竞价选股是**组合级**子模块，
+   * 它不需要也不可能针对当前这只票；而本组件内部已有 9 处
+   * `mode === "intraday" | "daily" | "select"` 分支，再塞一个 mode 值要动
+   * 全部 9 处、回归风险大。改成"父级换页"后，本组件**一行逻辑都不用改**，
+   * 切走时整块做T面板被卸载（不会继续轮询）。
+   */
+  onOpenAuction?: () => void;
+} = {}) {
   const [code, setCode] = useState(DEFAULT_CODE);
   const [inputCode, setInputCode] = useState(DEFAULT_CODE);
   const [snapshot, setSnapshot] = useState<IntradaySnapshot | null>(null);
@@ -63,7 +102,7 @@ export default function IntradayTPanel() {
   const [watchAt, setWatchAt] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [wsState, setWsState] = useState<"connecting" | "live" | "fallback">("connecting");
   const [updatedAt, setUpdatedAt] = useState<string>("");
   const [showBacktest, setShowBacktest] = useState(false);
@@ -71,12 +110,18 @@ export default function IntradayTPanel() {
   const [backtestRunning, setBacktestRunning] = useState(false);
   const [horizon, setHorizon] = useState(6);
   const [watchBusy, setWatchBusy] = useState(false);
+  // 刚加入自选（1.6 秒内把按钮文案变成"已加入"）—— 这是**替代提示气泡**的
+  // 非打扰反馈：用户要求去掉"已加入自选……"的提示语，但成功后总得有个回执，
+  // 否则就成了"点了不知道有没有生效"。
+  const [justAdded, setJustAdded] = useState(false);
   // 海外映射输入（usNVDA,kr000660…）；留空则按板块默认映射回落
   const [overseasInput, setOverseasInput] = useState("");
   // 关联板块输入（PCB概念,PET铜箔…）；绑定后板块情绪/板块排行维度才会计入总分
   const [boardInput, setBoardInput] = useState("");
-  // 模式：日内分时做T / 日K级别做T（量价体系）
-  const [mode, setMode] = useState<"intraday" | "daily">("intraday");
+  /** 由当前个股自动推导出的"最相关概念"（**按相关性降序，默认关联前 3 个**） */
+  const [autoBoard, setAutoBoard] = useState<string[]>([]);
+  // 模式：日内分时做T / 日K（量价体系 + 擒牛线）
+  const [mode, setMode] = useState<"intraday" | "daily" | "select">("intraday");
   // 权重编辑弹窗（做T权重自定义 + 写入个股权重档案）
   const [weightOpen, setWeightOpen] = useState(false);
   // 这只票当前生效的口径来源（"全局口径" / "权重档案（…）"）
@@ -88,6 +133,8 @@ export default function IntradayTPanel() {
   // 请求竞态守卫：快速连点「切换标的」时，只接受最后一次请求的结果，
   // 避免慢的旧响应覆盖新标的的快照。
   const requestSeq = useRef(0);
+  /** 当前查看的标的（供 `loadWatch` 这种"空依赖"回调读取，避免闭包过期） */
+  const codeRef = useRef("");
 
   /**
    * 取快照。**先渲染缓存、再后台刷新**（stale-while-revalidate）：
@@ -100,6 +147,30 @@ export default function IntradayTPanel() {
    * 没有缓存的票（首次查看）才清空显示 loading，避免把上一只票的图当成本票的图。
    */
   const snapshotCache = useRef(new Map<string, IntradaySnapshot>());
+
+  // 选中/切换个股时，取这只票的"最相关概念"，供关联板块输入框自动填入。
+  // 概念库来自 Tushare 同花顺指数名录（已剔除市场级/量化标签概念），
+  // 相关性 = 窄度(55%) + 人均主力净额(28%) + 板块涨幅(17%)。
+  // **默认关联前 3 个**（用户口径）：只填 1 个覆盖面太窄，
+  // 而板块情绪/板块涨幅排行两个维度靠它绑定。
+  useEffect(() => {
+    let alive = true;
+    if (!code) {
+      setAutoBoard([]);
+      return () => { alive = false; };
+    }
+    // 取 6 个候选、只用前 3 个：留点余量以便将来调数量，不必改接口
+    api.stockBoards(code, 6)
+      .then((data) => {
+        if (!alive) return;
+        setAutoBoard((data.boards ?? [])
+          .map((board) => board.name)
+          .filter(Boolean)
+          .slice(0, 3));
+      })
+      .catch(() => { if (alive) setAutoBoard([]); });
+    return () => { alive = false; };
+  }, [code]);
 
   const load = useCallback(async (target: string, refresh = false) => {
     const seq = ++requestSeq.current;
@@ -128,9 +199,14 @@ export default function IntradayTPanel() {
     }
   }, []);
 
-  const loadWatch = useCallback(async (force = false) => {
+  const loadWatch = useCallback(async (force = false, focus?: string) => {
     try {
-      const data = await api.intradayWatchlist(force);
+      codeRef.current = focus ?? codeRef.current;
+      // 把"当前正在看的标的"告诉后端：force 时它只重算这一只，其余走缓存 +
+      // 后台补齐。自选 30+ 只时这是"强制刷新等 6~7 秒"的根治手段。
+      // 用 ref 读当前代码而不是闭包变量：loadWatch 的依赖是 []（让轮询
+      // 定时器不被重建），直接引用 `code` 会永远拿到首次渲染时的那个值。
+      const data = await api.intradayWatchlist(force, 50, codeRef.current);
       setWatch(data.items);
       setWatchRefresh(data.auto_refresh);
       setWatchAt(new Date().toLocaleTimeString("zh-CN"));
@@ -275,6 +351,33 @@ export default function IntradayTPanel() {
     return () => { alive = false; };
   }, [mode]);
 
+  /**
+   * 自选侧边栏（左侧滑动窗口）。默认展开与否见 `initialDrawerOpen`；
+   * 窄屏（<1180px）自动收起，避免刚进页面就把图挤成一条。
+   */
+  const [drawerOpen, setDrawerOpen] = useState<boolean>(initialDrawerOpen);
+
+  const toggleDrawer = useCallback(() => {
+    setDrawerOpen((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem(DRAWER_KEY, next ? "1" : "0");
+      } catch {
+        /* 记不住也不影响本次使用 */
+      }
+      return next;
+    });
+  }, []);
+
+  // 窗口变窄时自动收起（用户手动收起的记忆保留，所以只在变窄这一侧强制）
+  useEffect(() => {
+    const onResize = () => {
+      if (window.innerWidth < 1180) setDrawerOpen(false);
+    };
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
   const submit = () => {
     const value = inputCode.trim();
     if (!/^\d{6}$/.test(value)) {
@@ -318,23 +421,24 @@ export default function IntradayTPanel() {
         .split(/[,，\s]+/)
         .map((s) => s.trim())
         .filter(Boolean);
-      const result = await api.intradayAddWatch({
+      await api.intradayAddWatch({
         code: target,
         name: current?.name ?? "",
         boards,
         overseas,
       });
-      setNotice(
-        `已加入自选：${target} ${result.name || ""}` +
-        (result.boards?.length
-          ? `（关联板块 ${result.boards.join("/")}）` : "") +
-        (result.overseas?.length
-          ? `（海外映射 ${result.overseas.join("/")}）` : "") +
-        `，共 ${result.watchlist.length} 只，已写入 configs/intraday.yaml`);
+      // 加入成功**不再弹提示**（用户要求去掉"已加入自选……"那类提示语）。
+      // 反馈改走非打扰路径：自选列表本来就会立刻刷新（loadWatch），
+      // 按钮也会短暂变成"已加入"，够用且不挡视线。
       setOverseasInput("");
       setBoardInput("");
+      setJustAdded(true);
+      // 侧栏是**追加**顺序，新票在末尾；不滚过去的话用户要自己找（报障过）
+      revealAdded([target]);
       await loadWatch();
+      window.setTimeout(() => setJustAdded(false), 1600);
     } catch (exc) {
+      // 失败仍然必须报错：静默失败比弹提示更糟
       setError(`加自选失败：${String(exc)}`);
     } finally {
       setWatchBusy(false);
@@ -343,21 +447,127 @@ export default function IntradayTPanel() {
 
   /** 从自选移除。 */
   const removeFromWatch = async (target: string) => {
-    setWatchBusy(true);
     setError(null);
+    // ---- 乐观删除：先动界面，再等后端 ----
+    // 用户点「移出自选」就该**立刻**看到它从列表消失。原实现是
+    // "等接口 → 再回读整个列表"，而后端那次回读若撞上整表重算就会卡几秒
+    // （实测 28 只票冷启动 ~114 秒），体验上就是"点删除没反应"。
+    // 这里先本地移除并记住原位置，失败再**原样回滚**（不静默丢数据）。
+    const previous = watch;
+    setWatch((current) => current.filter((item) => item.code !== target));
+    setWatchBusy(true);
     setNotice(null);
     try {
       const result = await api.intradayRemoveWatch(target);
-      setNotice(`已移除自选：${target}（剩余 ${result.watchlist.length} 只）`);
-      await loadWatch();
+      showNotice(`已移除自选：${target}（剩余 ${result.watchlist.length} 只）`);
+      // 后端已经把数据准备好了，这里只是**对齐权威列表**（不再触发重算）
+      void loadWatch();
     } catch (exc) {
-      setError(`移除自选失败：${String(exc)}`);
+      // 回滚到删除前的**完整列表**（顺序也还原），并把失败说清楚
+      setWatch(previous);
+      setError(`移除自选失败（已恢复原列表）：${String(exc)}`);
     } finally {
       setWatchBusy(false);
     }
   };
 
   const inWatchlist = watch.some((item) => item.code === inputCode);
+
+  /** 自选列表的**展示排序**（只影响当前视图，不改配置里的顺序）。
+   *
+   * 为什么排序放在前端、且默认是"配置顺序"：盘中分数每分钟都变，若服务端按分数
+   * 自动排，列表会自己跳动 —— 想点的那只票会在手指落下时换位置。所以默认不动，
+   * 用户显式选了某个排序才按它显示；置顶项任何排序下都在最前。 */
+  const [watchSort, setWatchSort] = useState<
+    "config" | "chg_desc" | "chg_asc" | "score_desc" | "signal">("config");
+
+  const SIGNAL_WEIGHT: Record<string, number> = {
+    forced_exit: 4, solid: 3, hollow: 2, none: 1,
+  };
+
+  /** 刚加入自选、需要**在左侧列表里露脸**的代码（4 秒后清除高亮）。 */
+  const [revealCodes, setRevealCodes] = useState<string[]>([]);
+  const revealTimer = useRef<number | null>(null);
+  const watchListRef = useRef<HTMLUListElement | null>(null);
+
+  useEffect(() => () => {
+    if (revealTimer.current) window.clearTimeout(revealTimer.current);
+  }, []);
+
+  /**
+   * 「加自选」成功后的**定位反馈**：展开侧栏 → 刷新列表 → 滚到新票并高亮 4 秒。
+   *
+   * ## 为什么必须有这一步（用户报障）
+   *
+   * 自选池是**追加**语义（`upsert_watch` 把新票放到末尾）。用户从
+   * 「量化选股」一键加了 20 只之后，它们在 43 只里的第 24~43 位 ——
+   * 侧栏默认按配置顺序显示，那一段正好在可视区之外。
+   * 结果就是"加了自选但列表里没有"，用户以为加错了地方（实测报障）。
+   *
+   * 这里**不去改配置顺序**（用户的排列是有意义的），而是把刚加的那几只
+   * 滚进视野并短暂高亮 —— 加完就能看见它在哪。
+   */
+  const revealAdded = useCallback((codes: string[]) => {
+    const cleaned = codes.filter(Boolean);
+    if (cleaned.length === 0) return;
+    // 收起状态下什么都不显示，等于没有反馈 —— 用户刚做完"加"这个动作，
+    // 这正是需要把列表露出来的时刻。
+    setDrawerOpen(true);
+    setRevealCodes(cleaned);
+    if (revealTimer.current) window.clearTimeout(revealTimer.current);
+    revealTimer.current = window.setTimeout(() => setRevealCodes([]), 4000);
+    void loadWatch();
+  }, [loadWatch]);
+
+  // 新票要等 `loadWatch()` 回来才在 DOM 里，所以滚动依赖 watch 一起触发
+  useEffect(() => {
+    if (revealCodes.length === 0) return;
+    const list = watchListRef.current;
+    if (list === null) return;
+    for (const target of revealCodes) {
+      const row = list.querySelector<HTMLElement>(`[data-code="${target}"]`);
+      if (row !== null) {
+        row.scrollIntoView({ block: "center", behavior: "smooth" });
+        return;
+      }
+    }
+  }, [revealCodes, watch]);
+
+  /** 排序后的自选列表：置顶优先，其余按所选字段。 */
+  const sortedWatch = useMemo(() => {    if (watchSort === "config") return watch;
+    const value = (item: IntradayWatchItem): number => {
+      if (watchSort === "signal") return SIGNAL_WEIGHT[item.signal_strength] ?? 0;
+      if (watchSort === "score_desc") return item.total_score ?? -Infinity;
+      return item.change_pct ?? -Infinity;
+    };
+    const sorted = [...watch].sort((left, right) => {
+      const diff = value(right) - value(left);
+      return watchSort === "chg_asc" ? -diff : diff;
+    });
+    // 置顶项永远在最前（排序只在组内生效）
+    return [...sorted.filter((i) => i.pinned), ...sorted.filter((i) => !i.pinned)];
+  }, [watch, watchSort]);
+
+  /** 置顶/取消置顶（乐观更新：先动界面，失败回滚）。 */
+  const togglePin = async (target: string, pinned: boolean) => {
+    const previous = watch;
+    // 乐观更新 + 本地重排，避免等接口回来列表才动
+    setWatch((current) => {
+      const next = current.map((item) =>
+        item.code === target ? { ...item, pinned } : item);
+      return [...next.filter((i) => i.pinned), ...next.filter((i) => !i.pinned)];
+    });
+    setWatchBusy(true);
+    try {
+      await api.intradayPinWatch(target, pinned);
+      showNotice(pinned ? `已置顶：${target}` : `已取消置顶：${target}`);
+    } catch (exc) {
+      setWatch(previous);
+      setError(`置顶失败（已恢复）：${String(exc)}`);
+    } finally {
+      setWatchBusy(false);
+    }
+  };
 
   const runBacktest = async () => {
     setBacktestRunning(true);
@@ -457,25 +667,76 @@ export default function IntradayTPanel() {
     return { level: blocked && fired === 0 ? "warn" : "info", text: parts.join("；") };
   }, [snapshot]);
 
+  /**
+   * 提示条（notice）的唯一入口：自增 id + 自动消失计时。
+   *
+   * 为什么要 id：连续两次触发同一条消息时，纯文本 state 值相同，
+   * React 不会重渲染、计时器也不会重置；带上自增 id 就每次都是"新消息"。
+   */
+  const noticeSeq = useRef(0);
+  const showNotice = useCallback((text: string, level: "info" | "warn" = "info") => {
+    noticeSeq.current += 1;
+    setNotice({ id: noticeSeq.current, text, level });
+  }, []);
+
+  /**
+   * 提示条自动消失。
+   *
+   * 旧实现把 notice 当永久状态：保存权重后那句「已保存权重档案并生效：…」
+   * 会**一直挂在页面上**（用户实测报障）。通知类信息没有理由常驻 ——
+   * 需要留住的信息（权重口径、拟合依据、数据健康度）都已经在各自面板里，
+   * 顶部这条只负责"刚才那一下成功了"，看到就该走。
+   */
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(null), NOTICE_TTL_MS);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  // 切换标的时清掉上一条提示：它说的是上一只票的事，留着只会误导
+  useEffect(() => { setNotice(null); }, [code]);
+
+  /**
+   * 重新拟合成功后的强刷。
+   *
+   * 必须用 `useCallback` 固定身份：这个回调会作为 prop 传进拟合面板，
+   * 若每次渲染都新建，面板里依赖它的 `useCallback` 就会跟着变 ——
+   * 一旦形成「快照更新 → 回调变 → 重新拟合 → 快照更新」就是死循环
+   * （实测：页面每秒重渲染一次）。依赖里的 `load` 本身是稳定的 useCallback。
+   */
+  const handleFitted = useCallback(async () => {
+    snapshotCache.current.delete(code);
+    await load(code, true);
+  }, [code, load]);
+
   return (
     <div className="intraday-root">
       <div className="intraday-toolbar">
+        {/* 自选侧边栏开合：不必先进设置，一个图标按钮直接切 */}
+        <button className={`btn-ghost drawer-toggle${drawerOpen ? " active" : ""}`}
+                onClick={toggleDrawer}
+                title={drawerOpen ? "收起自选列表（给图让出宽度）" : "展开自选列表（左侧滑动窗口）"}
+                aria-expanded={drawerOpen}>
+          <span className="drawer-icon" aria-hidden="true">☰</span>
+          自选
+          <span className="mono">{watch.length}</span>
+        </button>
         <span className="intraday-title">股票做T辅助</span>
-        <div className="mode-switch">
-          <button className={mode === "intraday" ? "mode-btn active" : "mode-btn"}
-                  onClick={() => setMode("intraday")}
-                  title="日内分时做T：分钟级多因子打分 + ±20/±30 阈值信号">
-            日内分时
-          </button>
-          <button className={mode === "daily" ? "mode-btn active" : "mode-btn"}
-                  onClick={() => setMode("daily")}
-                  title="日K级别做T：量柱体系 + 高量柱攻防 + B1-B15/S1-S6 战法">
-            日K做T
-          </button>
-        </div>
+        {/* 「量化选股」是**组合级**子模块：它不针对某一只票，因此这里把整排
+            个股级操作（选股/自选增删/板块/强制刷新/阈值回测/权重编辑/推送状态）
+            全部收起来 —— 留着会让用户以为"选股结果会跟着这只票走"。
+            自选侧边栏仍保留：既能看到自选池，量化选股的结果也是往它里面加。 */}
+        {mode !== "select" && (
+          <>
         <StockPicker
           value={inputCode}
-          onChange={(next) => setInputCode(next.replace(/[^\d]/g, ""))}
+          // ⚠️ 这里**不能**写成 `next.replace(/[^\d]/g, "")`：那个过滤器会把
+          // 拼音与中文全删掉，于是"输拼音时输入框永远是空的"（实测用户报障：
+          // 联想列表能出「301013 利和兴 LHX」，但输入框里看不到自己打的字）。
+          // 现在只在"纯数字超长"时截到 6 位（防粘贴一串数字），其余原样保留，
+          // 让拼音首字母 / 全拼 / 中文名都能正常显示与联想。
+          onChange={(next) => setInputCode(
+            /^\d+$/.test(next) ? next.slice(0, 6) : next)}
           onPick={(entry) => {
             // 点候选即切换标的：这是最常用的动作，不该再要求点一次「切换标的」
             setInputCode(entry.code);
@@ -497,16 +758,19 @@ export default function IntradayTPanel() {
             {watchBusy ? "处理中…" : "− 移出自选"}
           </button>
         ) : (
-          <button className="btn-ghost" disabled={watchBusy}
+          <button className={`btn-ghost${justAdded ? " done" : ""}`}
+                  disabled={watchBusy || justAdded}
                   onClick={() => void addToWatch(inputCode)}
                   title="加入自选池并写回 configs/intraday.yaml">
-            {watchBusy ? "处理中…" : "＋ 加自选"}
+            {watchBusy ? "处理中…" : justAdded ? "✓ 已加入" : "＋ 加自选"}
           </button>
         )}
-        <input className="board-input" value={boardInput}
-               onChange={(e) => setBoardInput(e.target.value)}
-               placeholder="关联板块(可选) PCB概念,PET铜箔"
-               title="加自选时一并写入关联板块：板块情绪与板块涨幅排行维度要靠它绑定；不填则该两维度不计入总分" />
+        <BoardPicker
+          value={boardInput}
+          onChange={setBoardInput}
+          autoValue={autoBoard}
+          disabled={watchBusy}
+        />
         <input className="overseas-input" value={overseasInput}
                onChange={(e) => setOverseasInput(e.target.value)}
                placeholder="海外映射(可选) usNVDA,kr000660"
@@ -538,106 +802,213 @@ export default function IntradayTPanel() {
             {snapshot.health.stale && " · 非当日"}
           </span>
         )}
+          </>
+        )}
       </div>
 
       {error && <div className="error-box">{error}</div>}
-      {notice && <div className="info-box">{notice}</div>}
-
-      {snapshot && (
-        <div className="intraday-headline">
-          <span className="hl-name">{snapshot.name || snapshot.code}</span>
-          <span className="mono">{snapshot.code}</span>
-          <span className="hl-price mono" style={{ color: changeTone }}>
-            {quote?.price?.toFixed(2) ?? "—"}
-          </span>
-          <span className="mono" style={{ color: changeTone }}>
-            {quote?.change !== null && quote?.change !== undefined
-              ? `${quote.change >= 0 ? "+" : ""}${quote.change.toFixed(2)}` : "—"}
-            {" "}
-            {quote?.change_pct !== null && quote?.change_pct !== undefined
-              ? `(${quote.change_pct >= 0 ? "+" : ""}${quote.change_pct.toFixed(2)}%)` : ""}
-          </span>
-          {snapshot.levels && (
-            <span className="hl-levels mono muted-text">
-              低吸 {snapshot.levels.low_buy.toFixed(2)} ·
-              高抛 {snapshot.levels.high_sell.toFixed(2)} ·
-              止损 {snapshot.levels.stop_loss.toFixed(2)}
-            </span>
-          )}
-          {quote?.turnover_rate !== null && quote?.turnover_rate !== undefined && (
-            <span className="muted-text">换手 {quote.turnover_rate.toFixed(2)}%</span>
-          )}
+      {/* 提示：**悬浮 toast**（fixed 定位），不占文档流。
+          原来它是插在面板里的一个 info-box，出现时会把下方所有面板整体下移 ——
+          用户明确反馈"体验不好"。现在浮在右下角，最多覆盖一点空白，
+          9 秒自动消失，也可手动关闭（用户口径：最多悬浮提示）。 */}
+      {notice && (
+        <div className={`notice-toast ${notice.level === "warn" ? "warn" : "info"}`}
+             role="status" aria-live="polite">
+          <span className="notice-text">{notice.text}</span>
+          <button className="notice-close" onClick={() => setNotice(null)}
+                  title="关闭提示（也会在 9 秒后自动消失）"
+                  aria-label="关闭提示">×</button>
         </div>
       )}
 
-      <div className="intraday-watch">
-        <span className="muted-text">自选（{watch.length}）：</span>
-        {/* 自选池刷新状态：盘中由**服务端**每分钟重算全部自选，前端每分钟取缓存 +
-            WS 推送新版。以前只有进页面时取一次，所以价格/信号一直不动、必须手动刷新。 */}
-        <span className={`watch-refresh ${
-          watchRefresh?.window_open && watchRefresh.running ? "live" : ""}`}
-              title={watchRefresh
-                ? (watchRefresh.last_error || watchRefresh.quote_last_error
-                    ? `上次刷新失败：${watchRefresh.last_error
-                        || watchRefresh.quote_last_error}`
-                    : `现价 ${watchRefresh.quote_last_run_at || "—"}`
-                      + `（${watchRefresh.quote_last_seconds}s / `
-                      + `${watchRefresh.quote_last_count}只，覆盖`
-                      + `${watchRefresh.quote_covered}只）`
-                      + `；打分重算 ${watchRefresh.last_run_at || "—"}`
-                      + `（${watchRefresh.last_seconds}s / ${watchRefresh.last_count}只）`)
-                : "自动刷新状态未知"}>
-          {watchRefresh
-            ? (watchRefresh.enabled && watchRefresh.window_open && watchRefresh.running
-                // 报价与打分是两条节奏，必须分开写：否则用户会把 60 秒前的信号
-                // 当成此刻的信号
-                ? `⟳ 报价 ${watchRefresh.quote_interval_seconds}s`
-                  + ` · 打分 ${watchRefresh.interval_seconds}s`
-                  + `${watchRefresh.quote_last_run_at
-                      ? ` · ${watchRefresh.quote_last_run_at}` : ""}`
-                : `⏸ ${watchRefresh.window_reason}${watchAt ? ` · 数据 ${watchAt}` : ""}`)
-            : ""}
-          {watchRefresh?.last_error || watchRefresh?.quote_last_error
-            ? " ⚠刷新异常" : ""}
-        </span>
-        <button className="btn-ghost" disabled={watchBusy}
-                onClick={() => void loadWatch(true)}
-                title="忽略缓存立即重算全部自选（盘中本来每分钟自动刷新，这里用于盘中临时催一次）">
-          ↻ 立即刷新
-        </button>
-        {watch.length === 0 && (
-          <span className="muted-text">
-            暂无自选 —— 在上方输入6位代码后点「＋ 加自选」即可
-          </span>
-        )}
-        {watch.map((item) => (
-          <div key={item.code}
-               className={`watch-chip ${item.code === code ? "active" : ""}`}>
-            <button className="chip-main"
-                    title={`切换到 ${item.name || item.code}`}
-                    onClick={() => { setInputCode(item.code); setCode(item.code); }}>
-              <b>{item.name || item.code}</b>
-              <span className="mono" style={{
-                color: (item.change_pct ?? 0) >= 0 ? "var(--low)" : "var(--high)",
-              }}>
-                {item.change_pct === null || item.change_pct === undefined
-                  ? "—" : `${item.change_pct >= 0 ? "+" : ""}${item.change_pct.toFixed(2)}%`}
+      {/* 两栏：左=自选滑动窗口（可收起）／右=个股工作面。
+          自选不再横向平铺 —— 十几只票会占掉 2~3 行，把图挤到下面去（用户报障）。 */}
+      <div className={`intraday-body${drawerOpen ? " drawer-open" : ""}`}>
+        <aside className="intraday-drawer" aria-hidden={!drawerOpen}>
+          <div className="drawer-head">
+            <b>自选</b>
+            <span className="muted-text">（{watch.length}）</span>
+            <select className="watch-sort mono" value={watchSort}
+                    onChange={(event) => setWatchSort(event.target.value as
+                      "config" | "chg_desc" | "chg_asc" | "score_desc" | "signal")}
+                    title="列表排序（只改显示顺序，不改配置顺序；置顶项永远在最前）">
+              <option value="config">配置顺序</option>
+              <option value="chg_desc">涨幅↓</option>
+              <option value="chg_asc">涨幅↑</option>
+              <option value="score_desc">分数↓</option>
+              <option value="signal">信号优先</option>
+            </select>
+            <button className="btn-ghost tiny" disabled={watchBusy}
+                    onClick={() => void loadWatch(true, code)}
+                    title="忽略缓存立即重算全部自选（盘中本来每分钟自动刷新，这里用于临时催一次）">
+              ↻ 刷新
+            </button>
+            <button className="btn-ghost tiny drawer-hide" onClick={toggleDrawer}
+                    title="收起自选列表">‹</button>
+          </div>
+          {/* 报价与打分是两条节奏，必须分开写：否则用户会把 60 秒前的信号当成此刻的信号 */}
+          <div className={`watch-refresh drawer-status ${
+            watchRefresh?.window_open && watchRefresh.running ? "live" : ""}`}
+               title={watchRefresh
+                 ? (watchRefresh.last_error || watchRefresh.quote_last_error
+                     ? `上次刷新失败：${watchRefresh.last_error
+                         || watchRefresh.quote_last_error}`
+                     : `现价 ${watchRefresh.quote_last_run_at || "—"}`
+                       + `（${watchRefresh.quote_last_seconds}s / `
+                       + `${watchRefresh.quote_last_count}只，覆盖`
+                       + `${watchRefresh.quote_covered}只）`
+                       + `；打分重算 ${watchRefresh.last_run_at || "—"}`
+                       + `（${watchRefresh.last_seconds}s / ${watchRefresh.last_count}只）`)
+                 : "自动刷新状态未知"}>
+            {watchRefresh
+              ? (watchRefresh.warming
+                  // 服务端还没有任何缓存（首次部署 / 热缓存过期 / 自选池大改）：
+                  // 这份列表只有代码·名称·板块，价格由报价快车道几秒内贴上，
+                  // 分数与信号要等后台整表重算。不说清楚的话，用户会把 "—" 当成数据坏了。
+                  ? "⟳ 首次重算中：先给自选清单与现价，分数稍后补上"
+                  : watchRefresh.enabled && watchRefresh.window_open && watchRefresh.running
+                  ? `⟳ 报价 ${watchRefresh.quote_interval_seconds}s`
+                    + ` · 打分 ${watchRefresh.interval_seconds}s`
+                    + `${watchRefresh.quote_last_run_at
+                        ? ` · ${watchRefresh.quote_last_run_at}` : ""}`
+                  : `⏸ ${watchRefresh.window_reason}${watchAt ? ` · 数据 ${watchAt}` : ""}`)
+              : ""}
+            {watchRefresh?.last_error || watchRefresh?.quote_last_error
+              ? " ⚠刷新异常" : ""}
+          </div>
+          <ul className="watch-list" ref={watchListRef}>
+            {watch.length === 0 && (
+              <li className="muted-text watch-empty">
+                暂无自选 —— 在上方输入 6 位代码后点「＋ 加自选」即可
+              </li>
+            )}
+            {sortedWatch.map((item) => (
+              <li key={item.code}
+                  data-code={item.code}
+                  className={`watch-row ${item.code === code ? "active" : ""}` +
+                             (item.pinned ? " pinned" : "") +
+                             (revealCodes.includes(item.code) ? " just-added" : "")}>
+                <button className="watch-pick"
+                        title={`切换到 ${item.name || item.code}`}
+                        onClick={() => {
+                          setInputCode(item.code);
+                          setCode(item.code);
+                          setShowBacktest(false);
+                          setBacktest(null);
+                          // 窄屏下选完就把列表收起来，避免它一直盖着图
+                          if (window.innerWidth < 1180) setDrawerOpen(false);
+                        }}>
+                  <span className="watch-name">{item.name || item.code}</span>
+                  <span className="watch-code mono muted-text">{item.code}</span>
+                  <span className="watch-chg mono" style={{
+                    color: (item.change_pct ?? 0) >= 0 ? "var(--low)" : "var(--high)",
+                  }}>
+                    {item.change_pct === null || item.change_pct === undefined
+                      ? "—" : `${item.change_pct >= 0 ? "+" : ""}${item.change_pct.toFixed(2)}%`}
+                  </span>
+                  <span className="watch-score mono muted-text">
+                    {item.total_score === null || item.total_score === undefined
+                      ? "" : `分 ${item.total_score >= 0 ? "+" : ""}${item.total_score.toFixed(0)}`}
+                  </span>
+                  <SignalBadge item={item} />
+                </button>
+                <button className={`watch-pin ${item.pinned ? "on" : ""}`}
+                        disabled={watchBusy}
+                        title={item.pinned ? "取消置顶" : "置顶（永远排在最前）"}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void togglePin(item.code, !item.pinned);
+                        }}>
+                  {item.pinned ? "📌" : "📍"}
+                </button>
+                <button className="watch-remove" disabled={watchBusy}
+                        title={`从自选移除 ${item.code}`}
+                        onClick={() => void removeFromWatch(item.code)}>×</button>
+              </li>
+            ))}
+          </ul>
+        </aside>
+        {/* 窄屏时的点击遮罩：点一下就把抽屉收起来 */}
+        <button className="drawer-backdrop" aria-label="收起自选列表"
+                onClick={() => setDrawerOpen(false)} />
+
+        <div className="intraday-main">
+          {snapshot && (
+            <div className="intraday-headline">
+              <span className="hl-name">{snapshot.name || snapshot.code}</span>
+              <span className="mono">{snapshot.code}</span>
+              <span className="hl-price mono" style={{ color: changeTone }}>
+                {quote?.price?.toFixed(2) ?? "—"}
               </span>
-              {item.total_score !== null && item.total_score !== undefined && (
-                <span className="mono muted-text">
-                  {item.total_score >= 0 ? "+" : ""}{item.total_score.toFixed(0)}
+              <span className="mono" style={{ color: changeTone }}>
+                {quote?.change !== null && quote?.change !== undefined
+                  ? `${quote.change >= 0 ? "+" : ""}${quote.change.toFixed(2)}` : "—"}
+                {" "}
+                {quote?.change_pct !== null && quote?.change_pct !== undefined
+                  ? `(${quote.change_pct >= 0 ? "+" : ""}${quote.change_pct.toFixed(2)}%)` : ""}
+              </span>
+              {snapshot.levels && (
+                <span className="hl-levels mono muted-text">
+                  低吸 {snapshot.levels.low_buy.toFixed(2)} ·
+                  高抛 {snapshot.levels.high_sell.toFixed(2)} ·
+                  止损 {snapshot.levels.stop_loss.toFixed(2)}
                 </span>
               )}
-              <SignalBadge item={item} />
-            </button>
-            <button className="chip-remove" disabled={watchBusy}
-                    title={`从自选移除 ${item.code}`}
-                    onClick={() => void removeFromWatch(item.code)}>×</button>
-          </div>
-        ))}
-      </div>
+              {quote?.turnover_rate !== null && quote?.turnover_rate !== undefined && (
+                <span className="muted-text">换手 {quote.turnover_rate.toFixed(2)}%</span>
+              )}
+            </div>
+          )}
 
-      {mode === "daily" ? (
+          {/* 日内分时 / 日K / 竞价选股 / 量化选股 的口径切换：紧贴走势图上方（用户要求的位置），
+              它决定下面整块图与打分是"分钟级"、"日线级"，还是"组合级选股"。
+              标签用「周期」而不是「走势图口径」：这是用户的原话口径，
+              而且它切换的其实是整个面板的计算周期（含档位与信号），不只是图。
+              「量化选股」是**组合级**子模块（不针对当前那一只票），
+              所以切过去时整块个股图与打分会被替换掉，见下方 mode === "select" 分支。 */}
+          <div className="mode-bar">
+            <span className="muted-text">周期</span>
+            <div className="mode-switch">
+              <button className={mode === "intraday" ? "mode-btn active" : "mode-btn"}
+                      onClick={() => setMode("intraday")}
+                      title="日内分时做T：分钟级多因子打分 + ±提示线/动手线 阈值信号">
+                日内分时
+              </button>
+              <button className={mode === "daily" ? "mode-btn active" : "mode-btn"}
+                      onClick={() => setMode("daily")}
+                      title="日K：蜡烛柱状图 + 擒牛线（NML/QRL/CBX20/CBX60/SMX）+ 量柱体系 + 高量柱攻防 + B1-B15/S1-S6 战法；均线已去掉">
+                日K
+              </button>
+              <button className={mode === "select" ? "mode-btn active" : "mode-btn"}
+                      onClick={() => setMode("select")}
+                      title="量化选股：开市日 9:25–9:45 与 14:45 用 3 档模型自动选股；支持自定义板块">
+                量化选股
+              </button>
+              {/* 「竞价选股」紧挨在「量化选股」右侧；它是独立的组合级页面，
+                  所以由父级换页而不是加进本组件的 mode（见组件签名处的说明）。 */}
+              {onOpenAuction && (
+                <button className="mode-btn"
+                        onClick={onOpenAuction}
+                        title="竞价选股：开市日 9:25:00 自动跑，只选昨日涨停且 30~110 亿的票，9:27 前出池">
+                  竞价选股
+                </button>
+              )}
+            </div>
+            {mode === "daily" && (
+              <span className="muted-text">
+                （日K模式的档位由量价体系自算，止损/保护线不走分时档位）
+              </span>
+            )}
+            {mode === "select" && (
+              <span className="muted-text">
+                （组合级选股：不针对当前这一只票，结果需手动点「＋加自选」）
+              </span>
+            )}
+          </div>
+
+          {mode === "select" ? (
+        <PrivateFeatureNotice feature="量化选股（3档模型定时选股）" />
+      ) : mode === "daily" ? (
         <IntradayDailyPanel code={code} />
       ) : (
         <>
@@ -712,6 +1083,13 @@ export default function IntradayTPanel() {
                   {signalDiag.text}
                 </div>
               )}
+              {/* 档位口径与拟合依据：用户必须知道现在用的是规则线还是拟合线 */}
+              <IntradayLevelFitPanel
+                code={code}
+                fit={snapshot?.level_fit ?? null}
+                levels={snapshot?.levels ?? null}
+                onFitted={handleFitted}
+              />
             </section>
           </div>
 
@@ -724,6 +1102,8 @@ export default function IntradayTPanel() {
                                   news={snapshot?.news ?? null} />
         </>
       )}
+        </div>
+      </div>
 
       {showBacktest && (
         <section className="panel intraday-panel">
@@ -943,13 +1323,16 @@ export default function IntradayTPanel() {
         <WeightProfileEditor
           code={code}
           name={snapshot?.name}
-          mode={mode}
+          // 权重档案只有"日内分时 / 日K"两套口径；`select` 是组合级模块，
+          // 权重编辑按钮在它下面本来就被收起来了（见工具栏的 mode !== "select"）。
+          mode={mode === "daily" ? "daily" : "intraday"}
+          levels={snapshot?.levels ?? null}
           onClose={() => setWeightOpen(false)}
           onSaved={async ({ code: savedCode, describe }) => {
             // 权重档案保存后服务端立即换成新口径，但前端这份快照还是旧权重算出来的：
             // 必须清缓存 + 强刷，否则用户会看到「保存成功但分数没变」而反复保存。
             snapshotCache.current.delete(savedCode);
-            setNotice(`已保存权重档案并生效：${describe}`);
+            showNotice(`已保存权重档案并生效：${describe}`);
             await load(savedCode, true);
             await loadOverrideSource(savedCode);
           }}

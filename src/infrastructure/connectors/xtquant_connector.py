@@ -19,6 +19,11 @@ import logging
 from datetime import datetime
 from typing import Any
 
+from src.core import symbols
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
 from src.core.exceptions import DataFetchError
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
 from src.infrastructure.connectors.base import BaseConnector
@@ -42,7 +47,7 @@ def to_qmt_code(code: str) -> str:
         raise DataFetchError(f"QMT连接器仅支持6位数字代码: {code}")
     if code.startswith(("8", "4", "920")):
         raise DataFetchError(f"北交所标的暂不支持: {code}")
-    if code.startswith(("6", "9")):
+    if symbols.market_of(code) == "sh":
         return f"{code}.SH"
     return f"{code}.SZ"
 
@@ -184,7 +189,7 @@ class XtQuantConnector(BaseConnector):
         try:
             subscribe_once(qmt_code, "1d", client=xtdata)
         except Exception as exc:  # noqa: BLE001 订阅失败不影响既有读取路径
-            logger.warning("QMT日线订阅失败(%s): %s", qmt_code, str(exc)[:120])
+            logger.warning("QMT日线订阅失败(%s): %s", qmt_code, brief(exc, BRIEF_TIGHT))
         try:
             # 所有 xtquant 调用都在进程级锁内：并发访问 QMT（多线程 + 补下载）
             # 曾让服务进程无 traceback 猝死，详见 src/core/qmt_guard.py

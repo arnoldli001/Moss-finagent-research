@@ -293,7 +293,7 @@ python scripts/quant_sync.py status
 ### 7.3 前端接入（策略回测页 · 多因子模式）
 
 `web/src/components/BacktestPanel.tsx` 顶部新增模式切换：
-**「宏观择时」（原有）/「多因子（35 个因子）」**。多因子面板 `QuantFactorPanel.tsx` 提供：
+**「多因子（35 个因子）」**。多因子面板 `QuantFactorPanel.tsx` 提供：
 
 - **因子库**：七大类 × 35 个因子，带中文标签/英文键/公式提示，方向自动取反的因子标 `↺`；
   支持按类别全选；

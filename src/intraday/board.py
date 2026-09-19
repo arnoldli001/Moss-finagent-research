@@ -25,6 +25,11 @@ from typing import Any
 
 import pandas as pd
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.core.exceptions import DataFetchError
 from src.intraday.config import IntradayConfig
 from src.intraday.features import safe_float
@@ -250,7 +255,7 @@ class BoardContextProvider:
                 else:
                     await self._concept_snapshot(name, _force=True)
             except Exception as exc:  # noqa: BLE001 后台失败只记日志
-                logger.debug("后台刷新板块 %s 失败：%s", name, str(exc)[:100])
+                logger.debug("后台刷新板块 %s 失败：%s", name, brief(exc, BRIEF_TIGHT))
             finally:
                 self._refresh_inflight.discard(name)
 
@@ -332,20 +337,126 @@ __emit({"names": [str(v) for v in frame["name"].tolist()]})
             logger.info("同花顺概念板块名列表已加载：%d 个", len(names))
             return names
         self._ths_names_cooldown_until = now + 300.0
-        logger.warning("同花顺概念板块名列表不可用，300s 内不再重试（板块名按原样使用）")
+        logger.warning("同花顺概念板块名列表不可用，300s 内不再重试"
+                       "（这期间板块名不做官方名校验，按原名直达子进程）")
         return []
 
     async def _resolve_concept_name(self, name: str) -> str:
-        """用户写的板块名 → 同花顺官方板块名（解析不到就原样返回，交由失败冷却兜住）。"""
+        """用户写的板块名 → 同花顺官方板块名；**解析不到返回 ""**。
+
+        ## 为什么"解析不到"不能原样返回
+
+        原实现是 `match_board_name(name, names) or name`，解析不到就把用户原名
+        交给 akshare。但 `ak.stock_board_concept_info_ths(symbol=...)` 内部是
+        `map_df[map_df["name"] == symbol]["code"].values[0]` —— 名字不在官方列表里
+        时 `.values[0]` 直接抛 `IndexError: index out of bounds`（实测 2026-09-17，
+        `覆铜板 / 印制电路板 / 锂电铜箔 / 电子铜箔` 都不在同花顺 375 个概念里），
+        子进程崩掉 → 白等一次子进程启动 → 回退新浪 → 这两个板块永远不可用。
+
+        现在先判"查得到"，查不到就直接返回空串让上层走新浪回退并给出明确原因，
+        **不再无谓地起一个注定崩溃的子进程**（自选池预热时每次启动都要报 4 条
+        `子进程内报错: IndexError`，就是这四个名字）。
+
+        ⚠️ 只有"官方列表确实拿到了"才算权威判据。列表因冷却/网络失败为空时
+        回落成**原名**（旧行为）—— 否则一次列表拉取失败会让所有板块在 300 秒内
+        全部跳过同花顺，那是比多起一个子进程严重得多的退化。
+        """
         cached = self._concept_name_cache.get(name)
         if cached is not None:
             return cached
         names = await self._ths_concept_names()
-        resolved = match_board_name(name, names) or name
+        if not names:
+            self._concept_name_cache[name] = name      # 不缓存空串判定，列表可用后再解析
+            return name
+        resolved = match_board_name(name, names) or ""
         self._concept_name_cache[name] = resolved
-        if resolved != name:
+        if resolved and resolved != name:
             logger.info("板块名自动解析：%s → %s", name, resolved)
+        elif not resolved:
+            logger.info("板块名 %s 不在同花顺概念列表中（官方共 %d 个），"
+                        "跳过同花顺快照、改用回退源", name, len(names))
         return resolved
+
+    async def warm_concept_snapshots(self, names: list[str], *,
+                                     limit: int = 14) -> dict[str, int]:
+        """**一次子进程**把多个概念板块的快照全拿回来并写入缓存（自选池预热用）。
+
+        ## 为什么必须有这个批量入口（2026-09-17 实测）
+
+        原来每个板块各起一个子进程，而子进程的**固定成本**是 `import akshare`
+        约 **0.99s**（实测：空进程 0.03s）。自选 26 只票 × 每只 2~4 个板块
+        = 几十次子进程 → 整表重算 **110 秒**。
+
+        批量版把 N 个板块放进**同一个**子进程里循环，那 0.99s 只付一次。
+        口径完全不变（同一个 `stock_board_concept_info_ths`、同一套 `parse_concept_info`），
+        只是把"N 次进程启动"压成"1 次"。
+
+        Args:
+            names: 配置里的板块名（内部先解析成同花顺官方名）。
+            limit: 单批上限（子进程有超时，太多会被打断）。
+
+        Returns:
+            `{板块名: 1/0}` 表示各板块是否成功，仅用于日志与排障。
+        """
+        wanted = [str(name).strip() for name in names if str(name).strip()][:limit]
+        if not wanted:
+            return {}
+        resolved: dict[str, str] = {}
+        for name in wanted:
+            try:
+                official = await self._resolve_concept_name(name)
+            except Exception:  # noqa: BLE001 解析失败就跳过这个板块
+                continue
+            # 空串 = 官方概念列表里没有这个名字：**不要**把它放进批量目标，
+            # 否则 akshare 的 `.values[0]` 会 IndexError 崩掉整个批量子进程，
+            # 连带把同批其它正常板块的结果也一起丢掉。
+            if official:
+                resolved[name] = official
+        if not resolved:
+            return {}
+        from src.intraday.subproc import run_json_subprocess
+
+        payload = await run_json_subprocess(
+            f"""
+import akshare as ak
+targets = {list(resolved.values())!r}
+out = {{"frames": {{}}}}
+for name in targets:
+    try:
+        frame = ak.stock_board_concept_info_ths(symbol=name)
+    except Exception as exc:
+        out["frames"][name] = {{"error": f"{{type(exc).__name__}}: {{exc}}"}}
+        continue
+    out["frames"][name] = {{"rows": frame.to_dict("records")}}
+__emit(out)
+""",
+            timeout=min(90.0, 8.0 + 6.0 * len(resolved)),
+            label=f"同花顺概念快照批量({len(resolved)}个)")
+        frames = (payload or {}).get("frames") or {}
+        result: dict[str, int] = {}
+        now = time.monotonic()
+        for name, official in resolved.items():
+            rows = (frames.get(official) or {}).get("rows") or []
+            parsed = parse_concept_info(pd.DataFrame(rows)) if rows else {}
+            if not parsed:
+                result[name] = 0
+                continue
+            self._snapshot_cache[name] = (now, BoardSnapshot(
+                name=name, kind="concept", available=True,
+                change_pct=parsed.get("change_pct"),
+                up_count=parsed.get("up_count"), down_count=parsed.get("down_count"),
+                breadth=parsed.get("breadth"), amount=parsed.get("amount"),
+                net_inflow=parsed.get("net_inflow"), rank=parsed.get("rank"),
+                open_price=parsed.get("open_price"),
+                prev_close=parsed.get("prev_close"), high=parsed.get("high"),
+                low=parsed.get("low"), source_name="同花顺概念板块"))
+            self._fail_cooldown.pop(official, None)
+            self._cold_retry_after.pop(name, None)
+            result[name] = 1
+        logger.info("板块快照批量预热：%d 个板块成功 %d 个（**1 次**子进程；"
+                    "原来的逐板块做法要 %d 次）",
+                    len(result), sum(result.values()), len(result))
+        return result
 
     async def _concept_snapshot(self, name: str,
                                 *, _force: bool = False) -> BoardSnapshot:
@@ -386,6 +497,13 @@ __emit({"names": [str(v) for v in frame["name"].tolist()]})
             return pre
 
         resolved = await self._resolve_concept_name(name)
+        if not resolved:
+            # 不在同花顺官方概念列表里：不起那个注定 IndexError 的子进程，
+            # 直接给出可取证的缺口说明（上层会走新浪概念回退）。
+            return BoardSnapshot(
+                name=name, kind="concept", available=False,
+                source_name=SOURCE_LABELS["router"],
+                gap=f"「{name}」不在同花顺概念板块列表中，同花顺快照不可用")
         cooldown = self._fail_cooldown.get(resolved)
         if cooldown is not None:
             remaining = int(cooldown[0] - time.monotonic())
@@ -454,7 +572,7 @@ __emit({{"rows": frame.to_dict("records")}})
         except Exception as exc:  # noqa: BLE001
             return BoardSnapshot(
                 name=name, available=False,
-                gap=f"新浪概念板块快照失败：{str(exc)[:100]}")
+                gap=f"新浪概念板块快照失败：{brief(exc, BRIEF_TIGHT)}")
         if frame is None or len(frame) == 0:
             return BoardSnapshot(
                 name=name, available=False, gap="新浪概念板块快照为空")
@@ -645,7 +763,7 @@ __emit({"rows": frame.to_dict("records")})
                 if series.available:
                     self._series_cache[name] = (time.monotonic(), series)
             except Exception as exc:  # noqa: BLE001 后台失败只记日志
-                logger.debug("后台刷新板块分时 %s 失败：%s", name, str(exc)[:100])
+                logger.debug("后台刷新板块分时 %s 失败：%s", name, brief(exc, BRIEF_TIGHT))
             finally:
                 self._series_inflight.discard(name)
 
@@ -688,7 +806,7 @@ __emit({"rows": frame.to_dict("records")})
         except Exception as exc:  # noqa: BLE001 东财接口常被阻断
             return BoardSeries(
                 name=name, available=False,
-                gap=f"东财概念分钟接口失败：{str(exc)[:100]}")
+                gap=f"东财概念分钟接口失败：{brief(exc, BRIEF_TIGHT)}")
         return _frame_to_board_series(frame, name, "东方财富概念分钟", "concept")
 
     @staticmethod
@@ -714,7 +832,7 @@ __emit({"rows": frame.to_dict("records")})
         except Exception as exc:  # noqa: BLE001
             return BoardSeries(
                 name=name, available=False,
-                gap=f"东财行业分钟接口失败：{str(exc)[:100]}")
+                gap=f"东财行业分钟接口失败：{brief(exc, BRIEF_TIGHT)}")
         return _frame_to_board_series(frame, name, "东方财富行业分钟", "industry")
 
     async def _synthetic_peer_series(self, name: str,
@@ -774,7 +892,7 @@ __emit({"rows": frame.to_dict("records")})
         except DataFetchError as exc:
             return {
                 "index_code": index_code, "index_name": label, "available": False,
-                "gap": str(exc)[:160], "attempts": [],
+                "gap": brief(exc, BRIEF_DEFAULT), "attempts": [],
             }
         change_pct = quote.change_pct
         if change_pct is None:

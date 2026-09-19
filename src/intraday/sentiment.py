@@ -22,6 +22,11 @@ import logging
 import time
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.core.exceptions import AgentExecutionError
 from src.domain.agents.analysis.base import parse_llm_json
 from src.intraday.models import NewsItem, NewsSentiment
@@ -245,7 +250,7 @@ class NewsSentimentAnalyzer:
         try:
             raw_items = await self._news_fetcher.fetch_news(code, limit=limit)
         except Exception as exc:  # noqa: BLE001 新闻是增强链路，失败不阻断
-            logger.debug("消息面指纹抓取失败(%s): %s", code, str(exc)[:100])
+            logger.debug("消息面指纹抓取失败(%s): %s", code, brief(exc, BRIEF_TIGHT))
             return ""
         return _fingerprint_of_raw(raw_items)
 
@@ -259,7 +264,7 @@ class NewsSentimentAnalyzer:
         try:
             raw_items = await self._news_fetcher.fetch_news(code, limit=limit)
         except Exception as exc:  # noqa: BLE001 新闻是增强链路，失败不阻断
-            logger.warning("个股新闻抓取异常(%s): %s", code, str(exc)[:150])
+            logger.warning("个股新闻抓取异常(%s): %s", code, brief(exc, BRIEF_DEFAULT))
             raw_items = []
         if not raw_items:
             return NewsSentiment(
@@ -304,8 +309,8 @@ class NewsSentimentAnalyzer:
                     agent_id=AGENT_ID, trace_id=f"intraday_{code}",
                     json_mode=True, use_cache=self._use_gateway_cache)
             except Exception as exc:  # noqa: BLE001 模型不可用 → 计数口径
-                logger.warning("消息面LLM调用失败(%s): %s", code, str(exc)[:150])
-                base.gap = f"LLM调用失败（{str(exc)[:80]}），降级为关键词计数口径"
+                logger.warning("消息面LLM调用失败(%s): %s", code, brief(exc, BRIEF_DEFAULT))
+                base.gap = f"LLM调用失败（{brief(exc, BRIEF_TIGHT)}），降级为关键词计数口径"
                 return self._fallback_counts(base, raw_items)
             content = getattr(response, "content", "") or ""
             if not content.strip():
@@ -320,9 +325,9 @@ class NewsSentimentAnalyzer:
                 payload = parse_llm_json(AGENT_ID, content)
                 break
             except AgentExecutionError as exc:
-                failure = f"LLM输出非合法JSON（{str(exc)[:80]}）"
+                failure = f"LLM输出非合法JSON（{brief(exc, BRIEF_TIGHT)}）"
                 logger.warning("消息面LLM输出解析失败(%s) 第%d次: %s",
-                               code, attempt + 1, str(exc)[:150])
+                               code, attempt + 1, brief(exc, BRIEF_DEFAULT))
                 payload = None
                 continue
         if payload is None or response is None:

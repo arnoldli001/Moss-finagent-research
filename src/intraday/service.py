@@ -28,7 +28,21 @@ from typing import Any
 
 import pandas as pd
 
-from src.core.exceptions import DataFetchError
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
+from src.core.exceptions import ConfigError, DataFetchError
+from src.core.trading_session import (
+    MORNING_OPEN,
+    SESSION_LABELS,
+    WATCH_WINDOWS,
+)
+from src.core.trading_session import (
+    session_state as _session_state,
+)
+from src.intraday import hot_cache
 from src.intraday import indicators as ind
 from src.intraday.backtest import DISCLAIMER as BACKTEST_DISCLAIMER
 from src.intraday.backtest import run_threshold_backtest
@@ -40,7 +54,12 @@ from src.intraday.config import (
     WatchConfig,
     load_intraday_config,
 )
-from src.intraday.engine import compute_levels, replay_levels, run_engine
+from src.intraday.engine import (
+    apply_level_fit,
+    compute_levels,
+    replay_levels,
+    run_engine,
+)
 from src.intraday.factors import (
     FactorContext,
     cross_bonus_for,
@@ -54,6 +73,13 @@ from src.intraday.features import (
     day_level_constants,
     replay_totals,
     resample_bars,
+)
+from src.intraday.impact import annotate_level_basis
+from src.intraday.level_fit import (
+    LevelFitResult,
+    adjustment_factors,
+    build_dataset,
+    fit_levels,
 )
 from src.intraday.market_cycle import MarketCycle, MarketCycleProvider
 from src.intraday.models import (
@@ -85,34 +111,20 @@ from src.intraday.valuation import ValuationProvider
 logger = logging.getLogger(__name__)
 
 DEFAULT_INDEX = "000001"
-_INTRADAY_DAYS = 6  # 5分钟上下文天数（腾讯单次接口上限约320根）
+# 5分钟上下文天数（腾讯单次接口上限约320根 ≈ 6.6 个交易日）。
+# 档位拟合还想要更长窗口（用户口径是"过去 10 个交易日"），见 `_intraday_days`：
+# 数据源能吃多少就取多少，拟合侧按**实际拿到的天数**如实标注。
+_INTRADAY_DAYS = 6
 # 权重档案的进程内缓存秒数：档案是低频变更的用户数据，
 # 但自选池每分钟会给每只票各跑一次快照，不缓存就是 N 次 SQLite 读。
 _PROFILE_CACHE_TTL = 5.0
 
-_SESSION_LABELS = {
-    "pre_open": "盘前", "call_auction": "集合竞价", "trading": "交易中",
-    "lunch_break": "午间休市", "closed": "已收盘",
-}
+_SESSION_LABELS = SESSION_LABELS
 
 
 def session_state(now: datetime | None = None) -> tuple[str, str]:
     """当前交易时段（北京时间口径）→ (状态码, 中文标签)。"""
-    moment = now or datetime.now()
-    if moment.weekday() >= 5:
-        return "closed", "周末休市"
-    minutes = moment.hour * 60 + moment.minute
-    if minutes < 9 * 60 + 15:
-        return "pre_open", _SESSION_LABELS["pre_open"]
-    if minutes < 9 * 60 + 30:
-        return "call_auction", _SESSION_LABELS["call_auction"]
-    if minutes <= 11 * 60 + 30:
-        return "trading", _SESSION_LABELS["trading"]
-    if minutes < 13 * 60:
-        return "lunch_break", _SESSION_LABELS["lunch_break"]
-    if minutes <= 15 * 60:
-        return "trading", _SESSION_LABELS["trading"]
-    return "closed", _SESSION_LABELS["closed"]
+    return _session_state(now)
 
 
 # ==================== 自选池自动刷新窗口 ====================
@@ -120,10 +132,30 @@ def session_state(now: datetime | None = None) -> tuple[str, str]:
 # 用户口径：集合竞价 09:15 开始，到 11:30；下午 13:00 到 15:00。
 # 非盘中（盘前/午休/收盘后/周末/节假日）完全不取数 —— 那些时段行情不会变，
 # 每分钟重算 N 只标的只是白白消耗数据源配额与 CPU。
-_WATCH_REFRESH_WINDOWS = ((9 * 60 + 15, 11 * 60 + 30), (13 * 60, 15 * 60))
+_WATCH_REFRESH_WINDOWS = WATCH_WINDOWS
 # 集合竞价开始到开盘之间，市场时钟（当天第一笔成交前 tick 的 timetag）可能还停在
 # 上一交易日，此时**不能**据此判定"今天休市"，否则 09:15~09:30 会被整段跳过。
-_MORNING_OPEN_MINUTE = 9 * 60 + 30
+_MORNING_OPEN_MINUTE = MORNING_OPEN
+
+
+def sort_watch_items(items: list[Any]) -> list[Any]:
+    """自选列表排序：**置顶优先**，其余保持配置顺序（用户要求的排序/置顶）。
+
+    排序规则刻意做得保守：
+
+      - 置顶项永远在最前（组内仍按配置顺序，符合"我把它们钉在这里"的直觉）；
+      - 非置顶项**保持 `configs/intraday.yaml` 里的顺序** —— 不按涨跌幅/分数自动排。
+
+    为什么不做"按分数自动排序"：盘中分数每分钟都在变，列表会**自己跳动**，
+    用户想点的那只票会在手指落下的瞬间换位置（交易软件里公认的糟糕体验）。
+    要给用户灵活排序，正确做法是让他显式置顶，而不是让系统自动重排
+    （前端另有只影响当前视图的排序下拉，属于展示层，不改配置）。
+    """
+    if not items:
+        return []
+    pinned = [item for item in items if getattr(item, "pinned", False)]
+    others = [item for item in items if not getattr(item, "pinned", False)]
+    return pinned + others
 
 
 def watchlist_refresh_window(now: datetime | None = None) -> tuple[bool, str]:
@@ -173,8 +205,41 @@ def _seconds_until_next_tick(interval: float,
     return max(1.0, (target - moment).total_seconds() + 2.0)
 
 
+#: 启动后多久**才允许自动整表重算**（秒）。见 `IntradayService._startup_grace_left`。
+#:
+#: 2026-09-18 实测：冷启动整表重算是 50 只票 × 3~5 秒的 CPU 活儿。即使用户首屏
+#: 已经有热缓存（`hot_cache`），首屏那次**完整快照**（默认标的，冷取实测 7.5s）
+#: 仍要和它抢同一个 GIL —— 实测首屏要 220~231 秒。推迟十几秒对任何信号都没有
+#: 影响（自选分数本来就是分钟级），但能把首屏从"几分钟"压回"一次快照的时间"。
+_WATCHLIST_STARTUP_GRACE = 20.0
+
+#: 整表重算的最短间隔（秒）：避免"刷新循环"与"读请求触发的后台重算"在同一轮里
+#: 各跑一遍（实测冷启动时是双份工作，每份 50 只 × 3~5 秒）。
+_FULL_RECOMPUTE_MIN_INTERVAL = 30.0
+
+#: 完全没有缓存时，首屏那次 `/watchlist` **最多等多久**（秒）。
+#: 等到了给真数据；等不到就先给占位列表，重算在后台继续 ——
+#: 冷启动 50 只实测 199 秒，绝不能让它挂住首屏（用户目标：10 秒内可用）。
+_COLD_WATCHLIST_WAIT = 3.0
+
+
 class IntradayService:
     """做T辅助服务（进程内单例，挂在 Runtime 上）。"""
+
+    #: 整表重算的并发上限（只数）。理由与实测见 `_gather_light_snapshots`。
+    #: 取 1：实测事件循环最长只被占用 0.4s（50 只并发时是 36.5s），
+    #: 而整表总耗时不变（那本来就是跑不掉的 CPU 时间）。
+    _WATCH_COMPUTE_BATCH = 1
+
+    #: 批间让路时长（秒）：把事件循环还给 HTTP 请求 / WebSocket 推送。
+    _WATCH_COMPUTE_YIELD = 0.05
+
+    #: 启动宽限期（秒）。实例属性而不是只读常量：测试要能置 0，
+    #: 才能单独验证"盘中启动时循环第一轮就刷"这个窗口语义。
+    _startup_grace_seconds = _WATCHLIST_STARTUP_GRACE
+
+    #: 无缓存时首屏最多等整表重算多久（秒）。同样是实例属性，便于测试缩短。
+    _cold_watchlist_wait = _COLD_WATCHLIST_WAIT
 
     def __init__(
         self,
@@ -207,17 +272,37 @@ class IntradayService:
         self._profile_cache: dict[str, Any] | None = None
         # 股性画像缓存：日线级特征，同一交易日内不必重算（键=代码，值=(时间戳, 画像)）
         self._character_cache: dict[str, tuple[float, CharacterProfile]] = {}
+        # 档位拟合缓存：键=代码，值=(交易日, 单调时钟, 拟合结果)。
+        # 拟合是 CPU 密集的（网格搜索 + 小网络，实测 0.3~2 秒/票），
+        # 因此**整天只算一次**：盘中每 15 秒推一次快照，不能每次都重训。
+        self._fit_cache: dict[str, tuple[str, float, Any]] = {}
+        # 筹码量能快照缓存（供拟合的 7 个客观维度取 volume_ratio）
+        self._chip_cache: dict[str, Any] = {}
         # 自选池概览缓存 + 盘中自动刷新循环。
         # 缓存的意义：全表重算要为每只票各跑一次轻量快照（实测整表 ~1.1s 且每只票
         # 都要打一次数据源），前端每分钟取一次若都重算，就会和刷新循环重复取数。
         self._watch_cache: tuple[float, list[WatchItem]] | None = None
         self._watch_lock = asyncio.Lock()
+        # 创建时刻与"上次整表重算完成时刻"（都取单调钟）：
+        # - `_boot_at` 用于启动宽限期（见 `_WATCHLIST_STARTUP_GRACE`）；
+        # - `_full_recompute_at` 用于去重（见 `_FULL_RECOMPUTE_MIN_INTERVAL`）。
+        self._boot_at = time.monotonic()
+        self._full_recompute_at = 0.0
+        # 冷启动（无缓存）时那次整表重算的任务句柄：多个请求共享同一次计算。
+        self._cold_task: asyncio.Task[list[WatchItem]] | None = None
         # 版本号：每写一次概览缓存 +1（增删自选也 +1）。WS 推送据此判断"有没有新版"，
         # 否则每 15 秒都会把同一份列表重复推给前端。
         self._watch_generation = 0
         self._refresh_task: asyncio.Task[None] | None = None
+        # 自动选股循环 + 最近一轮结果（窗口 9:25-9:40 / 14:45-15:00 + 盘后一次）
+        self._auto_select_task: asyncio.Task[None] | None = None
+        self._auto_select_state: dict[str, Any] = {}
         # 后台重算（stale-while-revalidate）的进行中标记与任务强引用
         self._watch_refresh_inflight = False
+        # "整表重算正在进行中"：区别于上面的"已排了一个后台重算任务"。
+        # 刷新循环直接调 `watchlist(force=True)`，不设 `_watch_refresh_inflight`，
+        # 只有这个标记能让"读请求触发的后台重算"看出循环正在跑、别叠加。
+        self._full_recompute_inflight = False
         self._watch_refresh_tasks: set[Any] = set()
         self._refresh_state: dict[str, Any] = {
             "last_run_at": "", "last_seconds": 0.0,
@@ -235,11 +320,100 @@ class IntradayService:
         }
         # 日K快照的进程内缓存（键=标的）：前端按「数据源周期×3」轮询时避免重复计算
         self._daily_cache: dict[str, tuple[float, Any]] = {}
+        # 上次关停前的自选概览快照（热加载）：文件路径 + 已加载标记。
+        # 冷启动首个 /watchlist 要 59.8 秒（26~39 只票全量取数），热加载让首屏
+        # 0 秒出数据、新鲜度交给后台重算 —— 详见 src/intraday/hot_cache.py。
+        self._snapshot_dir = str(
+            getattr(getattr(self._config, "data", None), "hot_cache_dir", "")
+            or hot_cache.DEFAULT_CACHE_DIR)
+        self._snapshot_loaded = False
+        self._snapshot_state: dict[str, Any] = {
+            "loaded": False, "reason": "", "count": 0, "saved_at": 0.0,
+            "age_seconds": 0.0,
+        }
 
     @property
     def config(self) -> IntradayConfig:
         return self._config
 
+    # ----------------------------------------------------------------
+    # 上次关停前缓存的热加载（重启后首屏立刻有数据）
+    # ----------------------------------------------------------------
+
+    def load_cached_watchlist(self, *, max_age_seconds: float | None = None) -> dict[str, Any]:
+        """把上一轮落盘的自选概览塞进缓存（**标为过期**），返回加载状态。
+
+        为什么标成过期：`watchlist()` 里已有这条分支 ——
+
+            if not force and cached is not None:
+                if ttl <= 0 or time.monotonic() - cached[0] >= ttl:
+                    self._schedule_watchlist_refresh()      # 后台重算
+                return self._apply_quote_overlay(cached[1][:limit])
+
+        把时间戳设成"很久以前"就自动命中它：**首请求立刻返回旧列表，
+        同时后台起一次真实重算**。不需要为热加载新增返回路径，
+        也就不会和既有的 stale-while-revalidate 逻辑分叉。
+
+        幂等：同一进程重复调用只在第一次真正读盘。
+        """
+        if self._snapshot_loaded:
+            return dict(self._snapshot_state)
+        self._snapshot_loaded = True
+        try:
+            config = self._reload_config()
+            codes = [item.code for item in config.watchlist]
+        except Exception as exc:  # noqa: BLE001 配置读不到就别加载
+            self._snapshot_state = {
+                "loaded": False, "reason": f"自选配置不可读：{brief(exc, BRIEF_TIGHT)}",
+                "count": 0, "saved_at": 0.0, "age_seconds": 0.0,
+            }
+            return dict(self._snapshot_state)
+
+        kwargs: dict[str, Any] = {"cache_dir": self._snapshot_dir}
+        if max_age_seconds is not None:
+            kwargs["max_age_seconds"] = max_age_seconds
+        outcome = hot_cache.load_snapshot(known_codes=codes or None, **kwargs)
+        if not outcome.loaded:
+            self._snapshot_state = {
+                "loaded": False, "reason": outcome.reason, "count": 0,
+                "saved_at": outcome.saved_at, "age_seconds": outcome.age_seconds,
+            }
+            logger.info("自选概览热加载未生效：%s", outcome.reason)
+            return dict(self._snapshot_state)
+
+        items: list[WatchItem] = []
+        for raw in outcome.items:
+            try:
+                items.append(WatchItem(**raw))
+            except Exception:  # noqa: BLE001 单条坏了就丢这条，不影响其它
+                continue
+        if not items:
+            self._snapshot_state = {
+                "loaded": False, "reason": "快照条目无法反序列化", "count": 0,
+                "saved_at": outcome.saved_at, "age_seconds": outcome.age_seconds,
+            }
+            return dict(self._snapshot_state)
+
+        # 时间戳取"很久以前" → 下一次 `watchlist()` 立即返回它并触发后台重算
+        self._watch_cache = (time.monotonic() - 1e6, sort_watch_items(items))
+        self._watch_generation += 1
+        self._snapshot_state = {
+            "loaded": True, "reason": outcome.reason, "count": len(items),
+            "saved_at": outcome.saved_at, "age_seconds": outcome.age_seconds,
+            "dropped": list(outcome.dropped_codes),
+        }
+        logger.info(
+            "自选概览热加载成功：%d 条（%.1f 分钟前的数据，已标记为过期 → "
+            "首请求立即可用并自动触发后台重算）%s",
+            len(items), outcome.age_seconds / 60,
+            f"，丢弃已不在自选池的 {outcome.dropped_codes}" if outcome.dropped_codes else "")
+        return dict(self._snapshot_state)
+
+    def _persist_watch_snapshot(self, items: list[WatchItem]) -> None:
+        """把当前概览落盘（供下次启动热加载）。失败只记日志。"""
+        if not items:
+            return
+        hot_cache.save_snapshot(items, cache_dir=self._snapshot_dir)
     @property
     def notifier(self) -> SignalNotifier:
         return self._notifier
@@ -313,7 +487,7 @@ class IntradayService:
 
             return stock_directory().name_of(code)
         except Exception as exc:  # noqa: BLE001 字典不可用不影响加自选
-            logger.debug("解析 %s 的名称失败：%s", code, str(exc)[:80])
+            logger.debug("解析 %s 的名称失败：%s", code, brief(exc, BRIEF_TIGHT))
             return ""
 
     def add_watch(
@@ -345,14 +519,179 @@ class IntradayService:
         self._reset_components(saved)
         return saved
 
+    def add_watch_many(self, items: list[dict[str, str]]) -> dict[str, Any]:
+        """批量加入自选池：**一次落盘、一次重建子组件**。
+
+        ## 为什么不循环调 `add_watch`
+
+        `add_watch` 每次都走 `upsert_watch` → `save_watchlist`（写文件 + 校验 +
+        全量 reload）再 `_reset_components`（重建 5 个子组件 + 作废自选概览缓存）。
+        「一键全部加自选」有 20 只票就是 20 次落盘、20 次重建 ——
+        实测这一类重复重建最贵的部分是随后的自选概览**整表重算**（冷启动约 114 秒），
+        前端表现就是点完按钮卡住一段时间。合并成一次后只有一次重建。
+
+        ## 已经在自选池里的票**不动**
+
+        `upsert_watch` 是**整条替换**（`WatchConfig` 含 `boards/peers/industry/overseas`），
+        重复加入会把用户手工配过的板块/海外映射清空。所以这里：
+        已有票**原样保留**；只有当它的名字是空的（历史事故留下的 `name: "603083"` 那类）
+        才顺手把名字补上，其余字段仍然不动。
+
+        返回按结果分类，**不谎报成功**：写不进去的（代码格式错）进 `failed`，
+        名称解析不出来的进 `missing_name`。
+        """
+        from src.intraday.config import WatchConfig, load_intraday_config, save_watchlist
+
+        config = load_intraday_config(self._config_path)
+        merged = list(config.watchlist)
+        position = {item.code: index for index, item in enumerate(merged)}
+        added: list[str] = []
+        repaired: list[str] = []
+        existing: list[str] = []
+        failed: list[dict[str, str]] = []
+        missing_name: list[str] = []
+        seen: set[str] = set()
+
+        for raw in items or []:
+            code = str((raw or {}).get("code") or "").strip().split(".")[0]
+            if not code.isdigit() or len(code) != 6:
+                failed.append({"code": str((raw or {}).get("code") or ""),
+                               "reason": "代码格式不对（要 6 位数字）"})
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            name = str((raw or {}).get("name") or "").strip()
+            if not name or name == code:
+                name = self._lookup_name(code)
+            if code in position:
+                current = merged[position[code]]
+                if not current.name and name:
+                    merged[position[code]] = current.model_copy(update={"name": name})
+                    repaired.append(code)
+                else:
+                    existing.append(code)
+                continue
+            if not name:
+                # ⚠️ 名称解析不出来时**仍然加进去**（票是该在池子里的），
+                # 但要把代码报给前端：`dump_watchlist_block` 写盘时用的是
+                # `item.name or item.code`，所以这种条目在配置文件里会显示成代码
+                # （历史事故里那种"界面上认不出是什么公司、还不报错"的状态）。
+                # 用 `missing_name` 把它显式说出来，用户才有机会手工补名。
+                missing_name.append(code)
+            position[code] = len(merged)
+            merged.append(WatchConfig(code=code, name=name))
+            added.append(code)
+
+        if not added and not repaired:
+            return {"saved": False, "requested": len(items or []),
+                    "added": [], "repaired": [], "existing": existing,
+                    "failed": failed, "missing_name": missing_name,
+                    "total": len(config.watchlist)}
+
+        saved = save_watchlist(merged, self._config_path)
+        self._reset_components(saved)
+        logger.info("批量加自选：新增 %d、补名 %d、已在池中 %d、失败 %d",
+                    len(added), len(repaired), len(existing), len(failed))
+        return {"saved": True, "requested": len(items or []),
+                "added": added, "repaired": repaired, "existing": existing,
+                "failed": failed, "missing_name": missing_name,
+                "total": len(saved.watchlist)}
+
     def remove_watch(self, code: str) -> IntradayConfig:
-        """从自选池移除标的并写回 configs/intraday.yaml（幂等）。"""
+        """从自选池移除标的并写回 configs/intraday.yaml（幂等）。
+
+        ## 为什么删除后要"精确更新缓存"而不是整个作废
+
+        原实现走 `_reset_components()` → `invalidate_watchlist_cache()`，
+        把概览缓存**置空**。置空的后果是下一次 `/watchlist` 请求要**整表重算**
+        （实测 28 只票冷启动约 114 秒），而前端删完立刻回读列表 ——
+        正好撞上这次重算，用户看到的就是"删一只票要等好几秒"。
+
+        现在：配置与子组件照常重置，但概览缓存**按代码精确剔除** ——
+        列表其余部分完全有效，没必要重算。
+        """
         from src.intraday.config import remove_watch as remove_from_yaml
 
+        cached = self._watch_cache
         saved = remove_from_yaml(code, self._config_path)
         self._config = saved
         self._reset_components(saved)
+        if cached is not None:
+            target = str(code).strip().split(".")[0].zfill(6)
+            remaining = [item for item in cached[1] if item.code != target]
+            if len(remaining) != len(cached[1]):
+                self._watch_cache = (time.monotonic(), remaining)
+                self._watch_generation += 1
+                logger.info("自选概览缓存已精确剔除 %s（剩 %d 只，无需重算）",
+                            target, len(remaining))
         return saved
+
+    def set_watch_pinned(self, code: str, pinned: bool) -> IntradayConfig:
+        """置顶/取消置顶一只自选（写回配置文件；幂等）。
+
+        置顶状态**存在配置里**而不是前端 localStorage：换浏览器、换机器应该一致，
+        而且服务端的自动刷新循环也要按同样顺序产出列表（否则前端每次轮询回来
+        顺序又变回去）。
+        """
+        from src.intraday.config import WatchConfig, upsert_watch
+
+        target = str(code).strip().split(".")[0].zfill(6)
+        config = self._reload_config()
+        current = config.watch(target)
+        if current is None:
+            raise ConfigError(f"自选池里没有 {target}，无法置顶")
+        if bool(current.pinned) == bool(pinned):
+            return config                       # 幂等：状态没变就不写盘
+        item = WatchConfig(
+            code=current.code, name=current.name, boards=list(current.boards),
+            industry=current.industry, peers=list(current.peers),
+            overseas=list(current.overseas), pinned=bool(pinned))
+        saved = upsert_watch(item, self._config_path)
+        self._config = saved
+        # ⚠️ **不调 `_reset_components()`**：置顶只改一个展示顺序字段，
+        # 数据源/板块/估值 provider 完全不关心它；而 `_reset_components` 会
+        # `invalidate_watchlist_cache()` 把概览缓存**置空** → 下次读取整表重算
+        # （实测"取消置顶"因此要 13.31s）。只更新配置与缓存里的那一条即可。
+        cached = self._watch_cache
+        if cached is not None:
+            for entry in cached[1]:
+                if entry.code == target:
+                    entry.pinned = bool(pinned)
+            self._watch_cache = (time.monotonic(), sort_watch_items(list(cached[1])))
+            self._watch_generation += 1
+        logger.info("自选置顶%s：%s", "已设置" if pinned else "已取消", target)
+        return saved
+
+    async def warm_board_snapshots(self) -> dict[str, int]:
+        """**一次子进程**把自选池涉及的所有板块快照预热进缓存（启动后调用）。
+
+        为什么要预热：自选 26 只票涉及几十个板块，逐个取要几十次子进程
+        （每次约 1s 固定成本）→ 整表重算 110 秒。启动后先用**一个**子进程
+        把它们全取回来，之后每只票的快照都命中缓存，整表重算的板块部分
+        从"几十次进程启动"降到"零"。
+
+        在后台线程池里跑（`asyncio.to_thread` 不需要，子进程本身是异步等待），
+        失败只记日志 —— 预热是**优化**，不该影响任何请求。
+        """
+        try:
+            config = self._reload_config()
+            names: list[str] = []
+            for item in config.watchlist:
+                for name in item.boards:
+                    if name not in names:
+                        names.append(name)
+            if not names:
+                logger.info("板块快照预热：自选池没有配置板块，跳过")
+                return {}
+            started = time.perf_counter()
+            result = await self._board.warm_concept_snapshots(names)
+            logger.info("板块快照预热完成：%d 个板块（%.1fs）",
+                        len(result), time.perf_counter() - started)
+            return result
+        except Exception as exc:  # noqa: BLE001 预热失败不影响主链路
+            logger.info("板块快照预热失败（不影响功能）：%s", brief(exc, BRIEF_DEFAULT))
+            return {}
 
     def _reset_components(self, config: IntradayConfig) -> None:
         """自选池变更后重建依赖配置的子组件（保住数据源连接池与缓存）。"""
@@ -426,7 +765,7 @@ class IntradayService:
         peer_codes = [c for c in (watch.peers if watch else []) if c != code]
 
         tasks: list[Any] = [
-            self._data.fetch_bars(code, days=_INTRADAY_DAYS),
+            self._data.fetch_bars(code, days=self._intraday_days),
             self._data.fetch_trend(code),
             self._data.fetch_quote(code),
             self._fetch_daily_bars(code),
@@ -560,6 +899,8 @@ class IntradayService:
                           quote=quote, config=config)
             if config.weights.chip > 0
             else ChipSnapshot(available=False, gap="该票权重把筹码量能设为0"))
+        # 供档位拟合取"筹码量能结构"这一维（拟合的 7 个客观维度之一）
+        self._chip_cache[code] = chip_snapshot
 
         state, state_label = session_state()
         stale = bool(trade_date) and trade_date != datetime.now().strftime("%Y-%m-%d")
@@ -580,20 +921,43 @@ class IntradayService:
         levels = None
         scorecard = None
         signal = None
+        # 档位拟合结果与调整项乘数：即使本次没进打分分支（数据缺口）也要有定义，
+        # 否则快照组装处会 UnboundLocalError（实测：无数据源时整条链路 500）。
+        fit: LevelFitResult | None = None
+        adjustment: dict[str, float] = {}
         markers: list[SignalMarker] = []
         score_series: list[ScorePoint] = []
         level_series: list[LevelPoint] = []
         if (today_features is not None and len(today_features)
                 and quote is not None):
-            levels = self._compute_levels(
+            raw_levels = self._compute_levels(
                 quote=quote, today_features=today_features,
                 daily_bars=daily_bars, config=config)
+            # 只给**当前**这一份档位补来源标注（低吸线由箱体还是布林下轨决定、
+            # 触发价在哪、档位差被护栏动过没有）：面板上那条横线要说得出出处，
+            # 否则用户只能对着一个数字猜。逐bar的 levels_series 刻意不标 ——
+            # 那是 240 个对象，标注字段会让 WS 每 15 秒推的载荷无谓变大。
+            levels = annotate_level_basis(raw_levels, config)
             ctx = self._build_context(
                 quote=quote, features=features, today_features=today_features,
                 daily_bars=daily_bars, boards=scored_boards, news=news_obj,
                 config=config, index_volume=index_volume, overseas=overseas,
                 chan=chan_snapshot, chip=chip_snapshot, cycle=market_cycle,
                 character=character)
+            # ---- 神经网络拟合档位（7 个客观维度拟合 + 7 个调整项微调）----
+            # 必须在算 levels_series 之前：图上那条漂移曲线与"此刻档位"必须同源，
+            # 否则用户会看到曲线在 892、而右上角标签写 898（两个口径打架）。
+            fit = await self._fit_levels_for(
+                code=code, features=features, ctx=ctx,
+                trade_date=trade_date, config=config, daily_bars=daily_bars)
+            # 调整项乘数：其余 7 个维度按"作用面"归并成三个有界乘数（≤±50%）。
+            # 打分核与打分卡**同一批函数**，因此这里不需要等打分卡算完；
+            # 面板上改权重会经由 ctx 的因子参数一并生效（同源，不存在两套口径）。
+            adjustment = (adjustment_factors(ctx, None, config.factors)
+                          if fit is not None else {})
+            levels = apply_level_fit(
+                levels, fit, ctx, adjustment_scale=adjustment,
+                blend=config.factors.level_fit.blend)
             # 逐bar档位：回放与画图都要按"当时那一刻"的档位，而不是当前值
             # （实测 300308 低吸线当日从 862 抬到 898、603083 从 215 抬到 222；
             #  拿当前值横贯全天会把早盘正常回踩误判成破位/误读成"开盘在低吸线下"）
@@ -602,6 +966,11 @@ class IntradayService:
                 box_high=levels.box_high, box_low=levels.box_low,
                 box_span_days=levels.box_span_days, atr=levels.atr,
                 config=config)
+            if fit is not None and fit.metrics.available and adjustment:
+                levels_series = [
+                    apply_level_fit(item, fit, ctx, adjustment_scale=adjustment,
+                                    blend=config.factors.level_fit.blend)
+                    for item in levels_series]
             replay = replay_totals(
                 intraday_features=today_features,
                 oscillator_features=build_oscillator_features(
@@ -671,6 +1040,31 @@ class IntradayService:
                     "图上三角标记为「以当前日级因子（箱体/情绪/消息面）对当日逐bar的近似重放」；"
                     "分钟级因子随bar变化，日级因子按最新值恒定")
 
+        # ---- 分时卖点（量价关系）----
+        #
+        # 与日线 S 系列分工：S 系列判"这一段该不该持有"（日K），
+        # 这里判"**此刻盘中该不该卖**"（分钟级 trend + VWAP）。
+        #
+        # 量能基数（"放天量"的分母）取近 N 日日均成交量；拿不到就不给
+        # 放量判据（`sell_points` 会如实记 gap），不用当日量自我比较冒充。
+        sell_verdict: dict[str, Any] | None = None
+        try:
+            from src.intraday import sell_points as _sell_points
+
+            _avg_volume = await self._average_volume(code, trade_date, days=5)
+            _verdict = _sell_points.detect_all(
+                trend, prev_close=(quote.prev_close if quote else None),
+                limit_up=(quote.limit_up if quote else None),
+                avg_volume=_avg_volume,
+                volume_ratio=None)
+            sell_verdict = _verdict.to_dict()
+            gaps.extend(_verdict.gaps)
+        except ImportError:  # 公开版不含分时卖点模块，属预期
+            logger.info("分时卖点模块未包含（商业版功能）")
+        except Exception as exc:  # noqa: BLE001 卖点算不出来不该拖垮整个面板
+            logger.warning("分时卖点计算失败（降级）：%s", exc)
+            gaps.append(f"分时卖点不可用：{type(exc).__name__}: {exc}")
+
         snapshot = IntradaySnapshot(
             code=code, name=name, trade_date=trade_date,
             session_state=state, session_label=state_label,
@@ -689,6 +1083,14 @@ class IntradayService:
                 index_volume.to_dict() if hasattr(index_volume, "to_dict") else None),
             overseas=(
                 _overseas_to_dict(overseas) if overseas is not None else None),
+            level_fit=(
+                None if fit is None else {
+                    **fit.to_dict(),
+                    "adjustment": adjustment,
+                    "applied": bool(
+                        fit.metrics.available and fit.metrics.gate_passed),
+                }),
+            sell_points=sell_verdict,
             health=DataHealth(
                 chosen_intraday_source=intraday_source,
                 chosen_daily_source=daily_source,
@@ -713,8 +1115,8 @@ class IntradayService:
             signal.pushed = pushed
             snapshot.notifier["last_push"] = [r.model_dump() for r in results]
         except Exception as exc:  # noqa: BLE001
-            logger.warning("做T推送异常(%s): %s", snapshot.code, str(exc)[:150])
-            snapshot.notifier["last_push_error"] = str(exc)[:200]
+            logger.warning("做T推送异常(%s): %s", snapshot.code, brief(exc, BRIEF_DEFAULT))
+            snapshot.notifier["last_push_error"] = brief(exc, BRIEF_DEFAULT)
 
     # ==================== 数据装配 ====================
 
@@ -747,7 +1149,7 @@ class IntradayService:
         try:
             items = await self._profile_repo.list(limit=500)
         except Exception as exc:  # noqa: BLE001 档案库故障不该让做T面板整体不可用
-            logger.warning("读取做T权重档案失败（按无档案继续）：%s", str(exc)[:160])
+            logger.warning("读取做T权重档案失败（按无档案继续）：%s", brief(exc, BRIEF_DEFAULT))
             self._profile_cache = (now, {})
             return {}
         mapping = {item.code: item for item in items}
@@ -782,6 +1184,200 @@ class IntradayService:
         if override is not None and not override.is_empty():
             return override, f"YAML 个股微调（configs/intraday.yaml 的 overrides.{code}）"
         return None, ""
+
+    async def level_fit(
+        self, code: str, *, refresh: bool = False,
+        features: pd.DataFrame | None = None, daily_bars: pd.DataFrame | None = None,
+        quote: Quote | None = None,
+    ) -> LevelFitResult | None:
+        """取这只票的档位拟合结果（按交易日缓存；`refresh=True` 强制重算）。
+
+        为什么单独开一个入口而不是内联在快照里：拟合是 CPU 密集的（网格搜索 +
+        小网络），必须能被"面板要求时才跑一次、之后整天复用"地调用。
+        数据由调用方给（快照里本来就有），避免这里再取一次盘。
+        """
+        config = self._reload_config()
+        moment = datetime.now()
+        trade_date = moment.strftime("%Y-%m-%d")
+        cached = self._fit_cache.get(code)
+        if (not refresh and cached is not None
+                and cached[0] == trade_date
+                and (time.monotonic() - cached[1]) < config.factors.level_fit.cache_seconds):
+            return cached[2]
+        if features is None or daily_bars is None or quote is None:
+            # 没有现成数据就不在这里重新取数（避免把慢取数引进工具链）
+            return cached[2] if cached is not None else None
+        try:
+            fit = await asyncio.to_thread(
+                self._fit_levels_sync, code=code, features=features,
+                daily_bars=daily_bars, quote=quote, config=config,
+                trade_date=trade_date)
+        except Exception as exc:  # noqa: BLE001 拟合失败不该让整个接口 500
+            logger.warning("档位拟合失败(%s): %s", code, brief(exc, BRIEF_DEFAULT))
+            return None
+        self._fit_cache[code] = (trade_date, time.monotonic(), fit)
+        return fit
+
+    def _fit_levels_sync(
+        self, *, code: str, features: pd.DataFrame, daily_bars: pd.DataFrame,
+        quote: Quote, config: IntradayConfig, trade_date: str,
+    ) -> LevelFitResult:
+        """同步拟合（在 `asyncio.to_thread` 里跑，不阻塞事件循环）。"""
+        cfg = config.factors.level_fit
+        atr_pct = None
+        if daily_bars is not None and len(daily_bars) >= 15:
+            atr_series = ind.atr(daily_bars)
+            atr_value = ind.last_value(atr_series)
+            if atr_value is not None and quote.price:
+                atr_pct = float(atr_value) / float(quote.price) * 100.0
+        bars = _bars_frame(features)
+        frame = bars.copy()
+        if "ts" not in frame.columns and len(features):
+            frame["ts"] = features["ts"].astype(str).to_numpy()
+        box_high = box_low = None
+        if daily_bars is not None and len(daily_bars) >= 5:
+            box_high, box_low, _span = ind.box_levels(
+                daily_bars, lookback=config.factors.box.lookback_days)
+        last = features.iloc[-1] if len(features) else None
+        dataset = build_dataset(
+            bars=frame,
+            day_low=None if last is None else _finite(last.get("low")),
+            day_high=None if last is None else _finite(last.get("high")),
+            pct_b=None if last is None else _finite(last.get("pct_b")),
+            bandwidth=None if last is None else _finite(last.get("bandwidth")),
+            dev_z=None if last is None else _finite(last.get("dev_z")),
+            chip_volume_ratio=self._last_chip_ratio(code),
+            box_position=(None if None in (box_high, box_low) or quote.price is None
+                          else ind.box_position(quote.price, box_high, box_low)),
+            chan_position=None,
+            macd_atr=self._macd_atr(last, quote.price, atr_pct),
+            kdj_rsi=self._kdj_rsi(features, config),
+            atr_pct=atr_pct, cfg=cfg)
+        return fit_levels(code=code, dataset=dataset, cfg=cfg,
+                          trade_date=trade_date)
+
+    def _last_chip_ratio(self, code: str) -> float | None:
+        snapshot = self._chip_cache.get(code)
+        return None if snapshot is None else snapshot.volume_ratio
+
+    @staticmethod
+    def _macd_atr(last: Any, price: float | None, atr_pct: float | None) -> float:
+        """MACD 的 DIF-DEA 用日ATR% 归一化（跨票可比）。"""
+        if last is None or not price or not atr_pct:
+            return 0.0
+        dif = _finite(last.get("dif"))
+        dea = _finite(last.get("dea"))
+        if dif is None or dea is None:
+            return 0.0
+        return float((dif - dea) / max(1e-9, price * atr_pct / 100.0))
+
+    @staticmethod
+    def _kdj_rsi(features: pd.DataFrame, config: IntradayConfig) -> float:
+        """KDJ/RSI 合成到 [-1,1]（与打分因子同口径：30 分钟 KDJ + RSI 各半）。"""
+        parts: list[float] = []
+        try:
+            osc = build_oscillator_features(
+                resample_bars(_bars_frame(features), 30), config)
+        except Exception:  # noqa: BLE001 缺数据不该让拟合失败
+            return 0.0
+        if osc is not None and len(osc):
+            last = osc.iloc[-1]
+            value = _finite(last.get("kdj_j"))
+            if value is not None:
+                parts.append(max(-1.0, min(1.0, (50.0 - value) / 50.0)))
+            rsi = _finite(last.get("rsi"))
+            if rsi is not None:
+                parts.append(max(-1.0, min(1.0, (50.0 - rsi) / 40.0)))
+        return float(sum(parts) / len(parts)) if parts else 0.0
+
+    @property
+    def _intraday_days(self) -> int:
+        """5 分钟 bars 的取数窗口（天）。
+
+        为什么不是一个常数：档位拟合需要"过去 10 个交易日"，但**上下文**（分时图、
+        打分的分钟特征）只需要最近几天。两者共用同一次取数，于是取
+        `max(上下文天数, 拟合窗口)` —— 拿得到就多拟合几天，拿不到（数据源上限）
+        拟合侧会按实际天数如实标注，绝不假装有 10 天。
+        """
+        fit_days = int(self._reload_config().factors.level_fit.sessions)
+        return max(_INTRADAY_DAYS, min(12, fit_days))
+
+    async def _fit_levels_for(
+        self, *, code: str, features: pd.DataFrame | None,
+        ctx: Any, trade_date: str, config: IntradayConfig,
+        daily_bars: pd.DataFrame | None = None,
+    ) -> LevelFitResult | None:
+        """快照路径用的拟合入口：按交易日缓存，**整天只算一次**。
+
+        为什么要缓存：拟合是 CPU 密集的（网格搜索 75 组合 × 留一日 10 折 +
+        小网络训练，实测 0.3~2 秒/票），而盘中每 15 秒就要推一次快照。
+        没有缓存的话每次推送都要重训，面板会直接卡住。
+
+        `daily_bars` 由调用方传（快照里刚取过同一份）：不传时才自己去取，
+        且**取不到就放弃拟合**而不是抛错 —— 拟合是增强项，绝不能把主链路带崩。
+        """
+        cfg = config.factors.level_fit
+        if not cfg.enabled or not cfg.fit_on_snapshot:
+            return None
+        cached = self._fit_cache.get(code)
+        if cached is not None and cached[0] == trade_date:
+            age = time.monotonic() - cached[1]
+            if cfg.cache_seconds <= 0 or age < cfg.cache_seconds:
+                return cached[2]
+        if features is None or not len(features):
+            return None
+        if daily_bars is None:
+            try:
+                daily = await self._fetch_daily_bars(code)
+                daily_bars = daily[0] if isinstance(daily, tuple) else daily
+            except Exception as exc:  # noqa: BLE001 拟合是增强项，取不到就算了
+                logger.info("档位拟合跳过(%s)：日线不可用 %s", code, brief(exc, BRIEF_TIGHT))
+                return None
+        # 现价直接取上下文里的（快照路径本来就在用同一份），不再多打一次行情：
+        # `fetch_quote` 在不同数据源上返回形态不一（Quote / tuple），
+        # 在拟合路径上多做一次取数既慢又容易踩到"熔断冷却"。
+        quote = ctx if hasattr(ctx, "price") else None
+        if quote is None or not getattr(quote, "price", None):
+            return None
+        try:
+            fit = await asyncio.to_thread(
+                self._fit_levels_sync, code=code, features=features,
+                daily_bars=daily_bars, quote=quote, config=config,
+                trade_date=trade_date)
+        except Exception as exc:  # noqa: BLE001 拟合失败不影响做T主链路
+            logger.warning("档位拟合失败(%s): %s", code, brief(exc, BRIEF_DEFAULT))
+            return None
+        self._fit_cache[code] = (trade_date, time.monotonic(), fit)
+        return fit
+
+    async def effective_config(self, code: str) -> IntradayConfig:
+        """该票**当前实际生效**的口径（权重档案 > YAML 覆盖 > 全局配置）。
+
+        与 `snapshot` 内部解析覆盖的那段逻辑同源，抽出来是为了让「改动前」有
+        一个可比较的基准：权重预览要显示"这条线改完会变成多少"，就必须先知道
+        它现在是多少 —— 而"现在"用的是这只票自己的档案口径，不是全局默认值。
+        """
+        config = self._reload_config()
+        override, _source = await self._resolve_override(code, config)
+        if override is not None and not override.is_empty():
+            return config.with_override(code, override)
+        return config
+
+    async def current_levels(
+        self, code: str, *, force_refresh: bool = False,
+    ) -> Any:
+        """该票**当前口径**下的关键价位（低吸/高抛/止损），命中快照缓存时几乎零成本。
+
+        用途：权重预览的「改动前」那一列。为什么不另算一遍档位：
+        `compute_levels` 需要当日分钟特征 + 日线箱体 + 布林 + ATR，
+        在预览路径上重取这些等于把 1~3 秒的预览再翻一倍；而档位**价格**
+        只由行情与"箱体/布林/VWAP/ATR"这些非档位参数决定 ——
+        档位参数（止损%、ATR倍数、兜底距离）只影响止损距离与护栏，
+        拿当前这一份做基准已经足够回答"这条线原来在哪"。
+        """
+        snapshot = await self.snapshot(
+            code, force_refresh=force_refresh, light=True)
+        return snapshot.levels
 
     async def profiles(self, *, limit: int = 200) -> list[Any]:
         """列出全部权重档案（前端「档案库」列表）。"""
@@ -1064,6 +1660,46 @@ class IntradayService:
             character_gap=None if character is None else character.gap,
         )
 
+    async def _average_volume(self, code: str, trade_date: str,
+                              *, days: int = 5) -> float | None:
+        """近 N 日日均成交量（"放天量"判据的分母）。
+
+        为什么不用当日自身的量做基数：那就变成"自己跟自己比"，
+        永远得不出"天量"的结论。必须拿**历史同期**做基数才叫放量。
+
+        取不到就返回 None —— `sell_points` 会据此**去掉**放量判据并记 gap，
+        而不是塞一个编造的基数进去（那会让"天量"判据永远成立或永远不成立）。
+
+        ⚠️ 复用既有的 `_fetch_daily_bars`（QMT→本地CSV→AkShare 采集链），
+        **不要**去访问 `self._warehouse` —— 那个属性在原实现里根本不存在
+        （只知道用 `self._warehouse.load(...)` 取数，类里从未赋值），
+        调用时必然抛异常、被下面的 except 吞掉，表现为"放量判据永远缺席"。
+        """
+        try:
+            frame, _source = await self._fetch_daily_bars(code)
+            if frame is None or frame.empty:
+                return None
+            # 兼容不同的日期列名（`date` / `trade_date`）
+            date_col = "date" if "date" in frame.columns else "trade_date"
+            if date_col not in frame.columns:
+                return None
+            # 排除当日（当日量正是要比较的对象）
+            history = frame[frame[date_col].astype(str) < str(trade_date)]
+            tail = history.tail(int(days))
+            if not len(tail):
+                return None
+            vol_col = "volume" if "volume" in tail.columns else "volume_lot"
+            if vol_col not in tail.columns:
+                return None
+            values = [float(v) for v in tail[vol_col].tolist()
+                      if v == v and float(v) > 0]
+            if not values:
+                return None
+            return sum(values) / len(values)
+        except Exception as exc:  # noqa: BLE001 拿不到就不判放量
+            logger.debug("取日均成交量失败（不判放量）：%s", exc)
+            return None
+
     @staticmethod
     def _build_sentiment_panel(
         *, quote: Quote | None, boards: list[Any], series: list[Any],
@@ -1129,18 +1765,57 @@ class IntradayService:
     # ==================== 自选列表 ====================
 
     async def watchlist(self, *, limit: int = 20,
-                        force: bool = False) -> list[WatchItem]:
+                        force: bool = False,
+                        active: str | None = None) -> list[WatchItem]:
         """自选标的概览（轻量快照并发，含当前总分与信号）。
 
         **默认走进程内缓存**：盘中由 `_watchlist_refresh_loop` 每分钟重算一次并写入，
-        前端每分钟取一次直接命中缓存 —— 用户要的"自选股每分钟自动刷新"就是这条链路；
-        `force=True`（前端「刷新」按钮）绕过缓存立即重算。
+        前端每分钟取一次直接命中缓存 —— 用户要的"自选股每分钟自动刷新"就是这条链路。
 
-        用 light=True 重算：列表页只需「哪只票现在触发信号」，不必为每只标的各跑一次
-        LLM 消息面打分与同业批量快照（否则 N 只票会互相抢数据源，整体变慢）。
+        ## 强制刷新为什么要"按优先级"（2026-09-17 用户报障）
+
+        用户反馈：自选 30+ 只时点「强制刷新」要 6~7 秒。实测确认了两个成本来源：
+
+        | 环节 | 单只耗时 | 说明 |
+        |---|---|---|
+        | `fetch_quote` 报价 | 2.1s（冷）/ ~0ms（热） | QMT/腾讯快照 |
+        | 板块概念快照子进程 | 3.2~6.5s/板块 | 一只票 2~4 个板块，**且每只票都要重付** |
+
+        39 只 × 每只 2~4 个板块 = 几十个子进程抢 CPU，于是"整表重算"变成几秒起步。
+        但**用户真正在看的只有一只票** —— 没必要为了刷新 39 只列表而阻塞他看的那只。
+
+        因此 `active`（前端当前查看的标的）给定时：
+
+        - **只有 active 这一只重新取数**（它必须是新鲜的：用户正盯着它）；
+        - 其余标的**直接用缓存值返回**（1 分钟前的分数/信号仍然有用，
+          价格还有报价快车道单独贴），并把整表重算丢到后台去（去重）。
+
+        这样强制刷新的响应时间从"随自选数量增长"变成"基本恒定（≈1 只票）"。
+        不传 `active` 时保持旧语义（整表重算），供刷新循环/后台任务复用。
         """
         ttl = self._watch_cache_ttl()
         cached = self._watch_cache
+
+        # ---- 优先路径：强制刷新 + 指定了当前标的 ----
+        # 刻意不走 `_watch_lock`：后台整表重算可能正持有它（实测 28 只约 109 秒冷启动），
+        # 用户点「强制刷新」若排在那后面，就会又变成"等好几秒"（实测 6.3s）。
+        # 单只快照自己有 60 秒缓存与数据源层缓存，重复触发不会放大成本。
+        if force and active:
+            fresh = await self._refresh_one_watch(active)
+            if fresh is not None:
+                base_items = list(cached[1]) if cached is not None else []
+                merged = [fresh if item.code == active else item
+                          for item in base_items]
+                if not any(item.code == active for item in merged):
+                    merged.insert(0, fresh)
+                self._watch_cache = (time.monotonic(), merged)
+                self._watch_generation += 1
+                # ⚠️ 这里**不**再调 `_schedule_watchlist_refresh()`：
+                # 实测那样会和"当前这只票的同步重算"叠在一起变成**双份工作**
+                # （第一只票时 5.2s → 冷缓存下 66.7s），而且盘中每分钟的刷新循环
+                # 本来就会把整表补齐。宁可让其余标的短暂用旧值，也不要抢 CPU。
+                return self._apply_quote_overlay(merged[:limit])
+
         if not force and cached is not None:
             # **有缓存就直接给，绝不让请求排队等重算**。
             # 过期时改为后台重算（stale-while-revalidate）：盘中刷新循环每 60 秒
@@ -1151,24 +1826,156 @@ class IntradayService:
             if ttl <= 0 or time.monotonic() - cached[0] >= ttl:
                 self._schedule_watchlist_refresh()
             return self._apply_quote_overlay(cached[1][:limit])
-        # 单飞：刷新循环与前端请求（多个标签页）可能同时进来，只真正算一次
+        if not force:
+            # ---- 完全没有缓存，且不是用户显式要求刷新 ----
+            #
+            # 为什么不能像以前那样"就地同步算一遍"（2026-09-18 实测）：
+            # 冷启动整表重算是 **50 只 × 3~5 秒 ≈ 200 秒**。以前这条分支会让
+            # 首屏的 `GET /intraday/watchlist` 直接挂 200 秒 —— 而这正是用户
+            # 报障"每次重启前端加载要一分钟"的主因之一（实测冷进程里
+            # `/watchlist` 219.8s，而其它请求 1~2 秒）。
+            #
+            # 触发这条分支的现实场景并不罕见：
+            #   - 首次部署（还没有快照文件）；
+            #   - 快照超过 24 小时（周一早上开机，上一份是上周五收盘写的）；
+            #   - 自选池改动较大（快照条目与当前池无交集，`hot_cache` 会整体丢弃）；
+            #   - 快照格式版本升级。
+            #
+            # 口径与项目里其它"慢链路"一致 —— **先给能立刻给的东西，重算放后台**：
+            # 配置里的代码/名称/板块立刻铺出来（价格由报价快车道 5 秒内贴上），
+            # 分数与信号**留空**（前端显示 "—" 与"观望"，绝不伪造数字）。
+            if self._startup_grace_left() > 0:
+                # 启动宽限期内连后台重算都先不跑（把 CPU 让给首屏那次完整快照），
+                # 但**要排上**：宽限一到自动补算，否则列表会永远停在占位值。
+                self._schedule_watchlist_refresh()
+                return self._apply_quote_overlay(self._placeholder_watchlist(limit))
+            # 过了宽限期：起一次重算，最多等 `_COLD_WATCHLIST_WAIT` 秒 ——
+            # 自选少 / 数据源热时这点时间足够拿到真数据；50 只冷取则等不到，
+            # 那就先给占位值，让重算在后台继续（结果会写回缓存并由 WS 推送）。
+            try:
+                items = await asyncio.wait_for(
+                    asyncio.shield(self._cold_recompute_task()),
+                    timeout=self._cold_watchlist_wait)
+            except asyncio.TimeoutError:
+                return self._apply_quote_overlay(self._placeholder_watchlist(limit))
+            except Exception as exc:  # noqa: BLE001 重算失败也不能让首屏 500
+                # 没有缓存 + 重算失败（数据源全挂/配置写坏）时，给占位列表比给 500
+                # 好得多：用户至少能看到自选清单，`last_error` 也会说明原因。
+                logger.warning("冷启动整表重算失败，先返回占位列表：%s", brief(exc, BRIEF_DEFAULT))
+                return self._apply_quote_overlay(self._placeholder_watchlist(limit))
+            return self._apply_quote_overlay(items[:limit])
+
+        # 显式 `force=True`（前端「立即刷新」/`/scan`）走到这里：**必须真的算**，
+        # 调用方要的就是"现在这一刻"的结果。
+        items = await self._recompute_into_cache()
+        return self._apply_quote_overlay(items[:limit])
+
+    def _cold_recompute_task(self) -> asyncio.Task[list[WatchItem]]:
+        """冷启动（无缓存）时的那次整表重算 —— 进程内单飞。
+
+        单飞的必要性：多个标签页 / WS 首帧 / 轮询会**同时**打进来，
+        不共享同一个任务就会排在 `_watch_lock` 上各算一遍（实测 50 只 × 3 遍）。
+        """
+        task = self._cold_task
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(
+                self._recompute_into_cache(), name="intraday-watchlist-cold")
+            self._cold_task = task
+            # 强引用 + 异常兜底：超时返回占位值后这个任务仍在后台跑，
+            # 若它抛异常而没人取结果，asyncio 会在 GC 时打 "never retrieved" 噪声。
+            self._watch_refresh_tasks.add(task)
+
+            def _done(finished: asyncio.Task[list[WatchItem]]) -> None:
+                self._watch_refresh_tasks.discard(finished)
+                if finished.cancelled():
+                    return
+                error = finished.exception()
+                if error is not None:
+                    logger.warning("冷启动整表重算失败：%s", brief(error, BRIEF_DEFAULT))
+
+            task.add_done_callback(_done)
+        return task
+
+    async def _recompute_into_cache(self) -> list[WatchItem]:
+        """真正算一次整表并写回缓存（`_watch_lock` 单飞）。调用方决定"等不等"。"""
         async with self._watch_lock:
-            cached = self._watch_cache
-            if not force and cached is not None and ttl > 0:
-                return self._apply_quote_overlay(cached[1][:limit])
-            items = await self._compute_watchlist(limit=self._watch_cache_size)
+            self._full_recompute_inflight = True
+            try:
+                items = await self._compute_watchlist(limit=self._watch_cache_size)
+            finally:
+                self._full_recompute_inflight = False
             self._watch_cache = (time.monotonic(), items)
+            self._full_recompute_at = time.monotonic()
             self._watch_generation += 1
             self._refresh_state["last_count"] = len(items)
-            return self._apply_quote_overlay(items[:limit])
+            self._persist_watch_snapshot(items)          # 供下次启动热加载
+            return items
+
+    def _placeholder_watchlist(self, limit: int) -> list[WatchItem]:
+        """没有任何缓存时的**占位自选列表**（只有身份字段，没有任何数字）。
+
+        为什么只给身份字段：分数/信号/价格要真算才有，编一个"看起来像"的值
+        比空着更糟（用户会拿它做交易决定）。空值在前端显示为 "—"，
+        而 `warming=True` 会告诉用户"首次重算中"。
+
+        为什么需要它：见 `watchlist()` 里"完全没有缓存"分支的说明 ——
+        没有它，冷启动首屏要等 200 秒的整表重算。
+        """
+        config = self._reload_config()
+        items = [
+            WatchItem(
+                code=item.code,
+                name=item.name or self._lookup_name(item.code),
+                boards=list(item.boards),
+                pinned=bool(getattr(item, "pinned", False)),
+            )
+            for item in config.watchlist[:max(0, limit)]
+        ]
+        return sort_watch_items(items)
+
+    def _startup_grace_left(self) -> float:
+        """启动宽限期还剩几秒（0 = 已过）。
+
+        见 `_WATCHLIST_STARTUP_GRACE`：冷启动的整表重算要与首屏那次完整快照抢
+        CPU/GIL，把首屏从 8 秒拖到几分钟。宽限期内**自动**重算一律不启动
+        （用户显式点「刷新」仍立即生效 —— 那是人在等结果）。
+
+        `_startup_grace_seconds` 做成实例属性而不是只读常量：测试要把它置 0
+        才能验证"循环第一轮就刷"这个窗口语义（见
+        `tests/unit/test_intraday_watchlist_refresh.py`）。
+        """
+        return max(0.0, float(self._startup_grace_seconds)
+                   - (time.monotonic() - self._boot_at))
+
+    async def _refresh_one_watch(self, code: str) -> WatchItem | None:
+        """只重算**一只**标的的概览行（强制刷新时给当前查看的那只走快车道）。
+
+        复用 `_compute_watchlist` 的组装逻辑，但把范围缩到一只：
+        这样耗时与自选数量无关（实测单只 light 快照 2~4s，而整表 39 只是 6~7s+，
+        且不会再触发几十个板块子进程）。
+        """
+        try:
+            items = await self._compute_watchlist(limit=0, only=[code])
+        except Exception as exc:  # noqa: BLE001 单只失败不该让整次刷新报错
+            logger.info("单只自选快照失败(%s)：%s", code, brief(exc, BRIEF_TIGHT))
+            return None
+        return items[0] if items else None
 
     def _schedule_watchlist_refresh(self) -> None:
         """后台重算自选概览（去重，不阻塞调用方）。
 
         与刷新循环共用同一条重算路径；即使循环被关掉（配置 0）或正在等下一分钟
         刻度，一次读请求也能顺手把数据刷新起来 —— 自愈而不是让用户等。
+
+        **启动宽限期内延后、但一定会跑**：首屏（含当前标的的完整快照）优先占用
+        CPU；宽限期一到就自动补算。注意不能直接"丢掉不排" —— 冷启动且没有热缓存
+        时，占位列表要人把它算出来，丢排会让首屏永远停在 "—"。
         """
         if self._watch_refresh_inflight:
+            return
+        # 刷新循环正在跑整表重算（或刚跑完）时不再叠一个：两边都是 50 只 × 3~5 秒，
+        # 叠起来就是白白多付两分钟 CPU，而且第二个还要先排队等锁。
+        if self._recompute_already_running():
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1178,9 +1985,13 @@ class IntradayService:
 
         async def _refresh() -> None:
             try:
+                grace = self._startup_grace_left()
+                if grace > 0:
+                    logger.info("后台整表重算延后 %.0f 秒启动（先让出首屏）", grace)
+                    await asyncio.sleep(grace)
                 await self.watchlist(force=True)
             except Exception as exc:  # noqa: BLE001 后台失败只记日志
-                logger.warning("后台重算自选概览失败：%s", str(exc)[:160])
+                logger.warning("后台重算自选概览失败：%s", brief(exc, BRIEF_DEFAULT))
             finally:
                 self._watch_refresh_inflight = False
 
@@ -1232,14 +2043,18 @@ class IntradayService:
         self._watch_cache = None
         self._watch_generation += 1
 
-    async def _compute_watchlist(self, *, limit: int = 20) -> list[WatchItem]:
+    async def _compute_watchlist(self, *, limit: int = 20,
+                                 only: list[str] | None = None) -> list[WatchItem]:
         config = self._reload_config()
         codes = [item.code for item in config.watchlist][:limit]
+        if only:
+            # 优先刷新：只算指定的这几只（顺序按配置里的顺序，保证列表稳定）
+            wanted = {str(code) for code in only}
+            codes = [item.code for item in config.watchlist
+                     if str(item.code) in wanted]
         if not codes:
             return []
-        snapshots = await asyncio.gather(
-            *(self.snapshot(code, light=True) for code in codes),
-            return_exceptions=True)
+        snapshots = await self._gather_light_snapshots(codes)
         items: list[WatchItem] = []
         for code, result in zip(codes, snapshots, strict=True):
             watch = config.watch(code)
@@ -1251,7 +2066,8 @@ class IntradayService:
                     code=code,
                     name=(watch.name if watch and watch.name != code else "")
                          or self._lookup_name(code),
-                    boards=boards))
+                    boards=boards,
+                    pinned=bool(getattr(watch, "pinned", False))))
                 continue
             resolved = result.name or (
                 watch.name if watch and watch.name != code else "")
@@ -1263,8 +2079,56 @@ class IntradayService:
                     result.signal.strength if result.signal else "none"),
                 signal_kind=result.signal.kind if result.signal else "none",
                 price=result.quote.price if result.quote else None,
-                change_pct=result.quote.change_pct if result.quote else None))
-        return items
+                change_pct=result.quote.change_pct if result.quote else None,
+                pinned=bool(getattr(watch, "pinned", False))))
+        return sort_watch_items(items)
+
+    async def _gather_light_snapshots(self, codes: list[str]) -> list[Any]:
+        """并发跑一批「轻量快照」，但**限制同时进行的只数**并把事件循环让出去。
+
+        ## 为什么不能一把 `asyncio.gather(50 只)`（2026-09-18 实测，冷启动）
+
+        用户报障："每次重启服务，前端加载数据都要一分钟。" 实测（冷进程 + 浏览器
+        首屏的真实请求序列）：
+
+        | 请求 | 冷启动 | 事件循环空闲后 |
+        |---|---|---|
+        | `agents/meta`（纯静态字典） | **25.5s** | 0.7s |
+        | `intraday/watchlist`（**有热缓存**） | **22.0s** | 0.8s |
+        | `health` / `intraday/weight-profiles` | **210s / 208s** | 1.0s |
+        | `intraday/snapshot?code=300308` | **231s** | 1.1s |
+
+        即：**任何**请求（哪怕只返回一个静态字典）都要等几分钟。原因是启动后
+        `_watchlist_refresh_loop` 立刻做整表重算，把 50 只票的轻量快照
+        `gather` 到一起 —— 每只票 3~5 秒的同步 pandas 计算（特征/指标/逐bar回放）
+        全部压在事件循环上，同时还有几十个档位拟合线程在抢 GIL。
+        事件循环被连续占用最长 **36.5s**（采样定位到 `features.py`/`indicators.py`
+        的 DataFrame 计算），整表 198s 期间进程几乎不响应。
+
+        ## 做法：限并发 + 批间让路
+
+        每批只跑 `_WATCH_COMPUTE_BATCH` 只，批间 `await asyncio.sleep(YIELD)`。
+        实测（50 只冷启动）：
+
+        | 并发 | 整表耗时 | 事件循环最长被占用 |
+        |---|---|---|
+        | 50（原） | 198s | **36.5s** |
+        | 2 | 193s | 4.2s |
+        | **1（现在）** | 200s | **0.4s** |
+
+        总耗时不变（那本来就是 CPU 时间，单核跑不掉），但事件循环再也不被饿死：
+        首屏、`/health`、WebSocket 推送都能插空被服务。
+        """
+        batch = max(1, int(self._WATCH_COMPUTE_BATCH))
+        results: list[Any] = []
+        for start in range(0, len(codes), batch):
+            chunk = codes[start:start + batch]
+            results.extend(await asyncio.gather(
+                *(self.snapshot(code, light=True) for code in chunk),
+                return_exceptions=True))
+            if start + batch < len(codes):
+                await asyncio.sleep(self._WATCH_COMPUTE_YIELD)
+        return results
 
     # ==================== 自选池盘中自动刷新 ====================
 
@@ -1295,12 +2159,26 @@ class IntradayService:
 
         循环本身**不会**因为单次失败而死：数据源抖动、某只票停牌、配置被写坏都
         只影响这一轮，下一分钟照常继续。非盘中只做窗口判断、不取数。
+
+        首轮延后 `_WATCHLIST_STARTUP_GRACE` 秒：见该常量的实测说明 —— 首屏要的是
+        "热缓存 + 当前这一只的完整快照"，而整表重算是 50 只 × 3~5 秒的 CPU 活儿。
         """
         interval = max(15, self._config.data.watchlist_refresh_seconds)
+        grace = self._startup_grace_left()
+        if grace > 0:
+            logger.info("自选池整表重算延后 %.0f 秒启动（先把 CPU 让给首屏）", grace)
+            await asyncio.sleep(grace)
         while True:
             try:
                 allowed, reason = watchlist_refresh_window()
                 if allowed:
+                    if self._recompute_already_running():
+                        # 已有一次整表重算在进行 / 刚完成：这一轮**跳过**。
+                        # 冷启动（无热缓存）时它有两条触发源会撞在一起 ——
+                        # 读请求排下的后台重算 + 本循环的首轮，不跳过就是
+                        # 一前一后各算 50 只（白白多付约 200 秒 CPU）。
+                        await asyncio.sleep(_seconds_until_next_tick(interval))
+                        continue
                     started = time.perf_counter()
                     try:
                         items = await self.watchlist(force=True)
@@ -1309,14 +2187,175 @@ class IntradayService:
                             last_seconds=round(time.perf_counter() - started, 2),
                             last_count=len(items), last_error="")
                     except Exception as exc:  # noqa: BLE001 单轮失败不影响下一轮
-                        self._refresh_state["last_error"] = str(exc)[:200]
-                        logger.warning("自选池自动刷新失败：%s", str(exc)[:200])
+                        self._refresh_state["last_error"] = brief(exc, BRIEF_DEFAULT)
+                        logger.warning("自选池自动刷新失败：%s", brief(exc, BRIEF_DEFAULT))
                 await asyncio.sleep(_seconds_until_next_tick(interval))
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 循环必须活着
                 logger.exception("自选池自动刷新循环异常，5 秒后继续")
                 await asyncio.sleep(5)
+
+    def _recompute_already_running(self) -> bool:
+        """是否已有整表重算在进行 / 排着队 / 刚刚完成。
+
+        三个来源都要算上，否则冷启动时会撞出**双份整表重算**（每份 50 只 × 3~5 秒）：
+        1. `_full_recompute_inflight`：正拿着 `_watch_lock` 算；
+        2. `_watch_refresh_inflight`：读请求排下的那次后台重算（可能还在等启动宽限）；
+        3. 最近 `_FULL_RECOMPUTE_MIN_INTERVAL` 内刚算完。
+        """
+        if self._full_recompute_inflight or self._watch_refresh_inflight:
+            return True
+        return (time.monotonic() - self._full_recompute_at
+                < _FULL_RECOMPUTE_MIN_INTERVAL)
+
+    async def start_auto_select(self) -> None:
+        """启动「自动选股」循环（幂等；只在交易日的规定窗口内真正跑）。
+
+        用户口径（2026-09-17）：
+          - 触发时段：**9:25–9:40**（开盘定方向）与 **14:45–15:00**（尾盘定隔夜）；
+          - 频率：**1 分钟一次**；
+          - 盘后：日K触发买入信号的票也自动加自选（15:05 后一次）。
+
+        为什么只在窗口内跑：一轮要精算几十只票（每只 2~4 秒），全天跑既没人看，
+        又会持续抢数据源 —— 这两个窗口才是低吸决策真正发生的时候。
+        """
+        if not bool(getattr(self._config.data, "auto_select_enabled", True)):
+            logger.info("自动选股未启用（auto_select_enabled=false）")
+            return
+        if self._auto_select_task is not None and not self._auto_select_task.done():
+            return
+        self._auto_select_task = asyncio.create_task(
+            self._auto_select_loop(), name="intraday-auto-select")
+        logger.info("自动选股已启动：窗口 09:25~09:40 / 14:45~15:00，每分钟一次；"
+                    "盘后 15:05 再按日K信号补一次")
+
+    async def stop_auto_select(self) -> None:
+        """停止自动选股循环（关停时调用；可重复调用）。"""
+        task, self._auto_select_task = self._auto_select_task, None
+        if task is None:
+            return
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    async def _auto_select_loop(self) -> None:
+        """自动选股主循环：**每个窗口每轮只跑一次**（用窗口标签去重）。
+
+        去重是必要的：窗口有 15 分钟、循环每分钟醒一次，不做去重就会在同一窗口里
+        连跑 15 轮，每轮几十只票 —— 既浪费又会把自选写满。
+        """
+        from src.intraday.auto_select import in_trigger_window, is_post_close, is_trading_day
+
+        interval = 60.0
+        last_window = ""
+        post_close_done_for = ""
+        # 启动后先让出 90 秒再进第一轮：盘后启动时 `is_post_close(now)` 立刻为真，
+        # 原先会在启动瞬间就开跑一轮几十只票的选股（每只 2~4 秒 + 可能触发 QMT
+        # 历史补下载子进程），把磁盘/CPU 与首屏请求、`/health` 抢在一起 ——
+        # 实测 `/health` 因此从 3.7 秒退化成 111.8~142.8 秒。
+        # 延后不影响窗口语义：15:05 之后任意时刻跑一次即可；而盘中窗口
+        # （9:25~9:40 / 14:45~15:00）本来也不在启动瞬间。
+        await asyncio.sleep(90.0)
+        while True:
+            try:
+                now = datetime.now()
+                if is_trading_day(now):
+                    window = in_trigger_window(now)
+                    if window and window != last_window:
+                        last_window = window
+                        await self._run_auto_select(window, apply=True)
+                    elif not window:
+                        last_window = ""      # 离开窗口 → 下次进入同一窗口可再跑
+                    # 盘后一次（每天只跑一次）
+                    stamp = now.strftime("%Y%m%d")
+                    if is_post_close(now) and post_close_done_for != stamp:
+                        post_close_done_for = stamp
+                        await self._run_auto_select("post_close", apply=True)
+                await asyncio.sleep(_seconds_until_next_tick(interval))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 循环必须活着
+                logger.exception("自动选股循环异常，5 秒后继续")
+                await asyncio.sleep(5)
+
+    async def _run_auto_select(self, window: str, *, apply: bool = True) -> Any:
+        """跑一轮自动选股并（可选）写入自选；失败只记日志，不打断循环。"""
+        from src.intraday.auto_select import (
+            DEFAULT_MIN_INTRADAY_SCORE,
+            DEFAULT_PRESCREEN_SIZE,
+            DEFAULT_TOP_N,
+            WatchlistAutoSelector,
+        )
+
+        data_cfg = self._config.data
+        selector = WatchlistAutoSelector(
+            self,
+            top_n=int(getattr(data_cfg, "auto_select_top_n", DEFAULT_TOP_N)),
+            min_intraday_score=float(getattr(
+                data_cfg, "auto_select_min_intraday", DEFAULT_MIN_INTRADAY_SCORE)),
+            prescreen_size=int(getattr(
+                data_cfg, "auto_select_prescreen", DEFAULT_PRESCREEN_SIZE)))
+        started = time.perf_counter()
+        try:
+            result = await selector.run(window=window)
+            if apply and result.selected:
+                existing = {item.code for item in await self.watchlist()}
+                for item in result.selected:
+                    if item.code in existing:
+                        result.skipped.append(item.code)
+                        continue
+                    try:
+                        await asyncio.to_thread(self.add_watch, item.code,
+                                                name=item.name)
+                        item.added = True
+                        result.added.append(item.code)
+                        logger.info("自动选股加入自选：%s %s（综合 %.1f，"
+                                    "日K %.0f / 分时 %.0f，窗口 %s）",
+                                    item.code, item.name, item.combined,
+                                    item.daily_score or 0,
+                                    item.intraday_score or 0, window)
+                    except Exception as exc:  # noqa: BLE001
+                        result.notes.append(
+                            f"加入自选失败 {item.code}：{brief(exc, BRIEF_TIGHT)}")
+            self._auto_select_state = {
+                "last_run_at": datetime.now().strftime("%H:%M:%S"),
+                "last_window": window,
+                "last_seconds": round(time.perf_counter() - started, 2),
+                "candidates": result.candidates, "scored": result.scored,
+                "selected": [item.as_dict() for item in result.selected],
+                "added": list(result.added),
+            }
+            return result
+        except Exception as exc:  # noqa: BLE001 单轮失败不影响下一轮
+            self._auto_select_state = {
+                "last_run_at": datetime.now().strftime("%H:%M:%S"),
+                "last_window": window, "last_error": brief(exc, BRIEF_DEFAULT)}
+            logger.warning("自动选股失败(%s)：%s", window, brief(exc, BRIEF_DEFAULT))
+            return None
+
+    def auto_select_status(self) -> dict[str, Any]:
+        """自动选股的运行状态（前端/排障用）。"""
+        from src.intraday.auto_select import (
+            DEFAULT_MIN_INTRADAY_SCORE,
+            DEFAULT_TOP_N,
+            in_trigger_window,
+            is_trading_day,
+        )
+
+        data_cfg = self._config.data
+        task = self._auto_select_task
+        return {
+            "enabled": bool(getattr(data_cfg, "auto_select_enabled", True)),
+            "running": bool(task is not None and not task.done()),
+            "trading_day": is_trading_day(),
+            "current_window": in_trigger_window(),
+            "windows": ["09:25-09:40", "14:45-15:00", "15:05 盘后一次"],
+            "top_n": int(getattr(data_cfg, "auto_select_top_n", DEFAULT_TOP_N)),
+            "min_intraday_score": float(getattr(
+                data_cfg, "auto_select_min_intraday", DEFAULT_MIN_INTRADAY_SCORE)),
+            **(self._auto_select_state or {}),
+        }
 
     def watchlist_refresh_status(self) -> dict[str, Any]:
         """自动刷新的运行状态（前端展示"上次刷新/为什么没在刷"）。"""
@@ -1331,6 +2370,10 @@ class IntradayService:
             "window_reason": reason,
             "running": task is not None and not task.done(),
             "generation": self._watch_generation,
+            # 还没有任何缓存（首次部署 / 快照过期 / 自选池大改）：此刻返回的是
+            # 只有代码/名称的**占位列表**，分数与价格要等后台重算。
+            # 前端据此显示"首次重算中"，而不是把 "—" 当成数据坏了。
+            "warming": cached is None,
             "cache_age_seconds": (
                 None if cached is None else round(time.monotonic() - cached[0], 1)),
             "cached_count": 0 if cached is None else len(cached[1]),
@@ -1397,8 +2440,8 @@ class IntradayService:
                                     time.perf_counter() - started, 3),
                                 quote_last_count=len(quotes), quote_last_error="")
                         except Exception as exc:  # noqa: BLE001 单轮失败不影响下一轮
-                            self._quote_state["quote_last_error"] = str(exc)[:200]
-                            logger.warning("报价快车道刷新失败：%s", str(exc)[:200])
+                            self._quote_state["quote_last_error"] = brief(exc, BRIEF_DEFAULT)
+                            logger.warning("报价快车道刷新失败：%s", brief(exc, BRIEF_DEFAULT))
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 raise
@@ -1438,7 +2481,7 @@ class IntradayService:
         try:
             cycle = await self._market_cycle()
         except Exception as exc:  # noqa: BLE001
-            logger.info("日K做T取情绪周期失败(%s): %s", code, str(exc)[:120])
+            logger.info("日K做T取情绪周期失败(%s): %s", code, brief(exc, BRIEF_TIGHT))
             cycle = None
         snapshot = await fetch_daily_snapshot(
             code, watch.name if watch else "", config, self._backend,
@@ -1467,14 +2510,14 @@ class IntradayService:
         except DataFetchError as exc:
             return BacktestResult(
                 available=False, code=code, name=name,
-                gaps=[str(exc)[:200]], disclaimer=BACKTEST_DISCLAIMER)
+                gaps=[brief(exc, BRIEF_DEFAULT)], disclaimer=BACKTEST_DISCLAIMER)
         daily_bars = None
         if self._backend is not None:
             try:
                 points = await self._backend.fetch(close_indicator(code))
                 daily_bars = daily_bars_from_points(points or [])
             except Exception as exc:  # noqa: BLE001 日线缺失时用分钟合成日线
-                logger.warning("回测日线取数失败(%s): %s", code, str(exc)[:120])
+                logger.warning("回测日线取数失败(%s): %s", code, brief(exc, BRIEF_TIGHT))
         result = run_threshold_backtest(
             code=code, name=name, bars_5m=bars, bars_daily=daily_bars,
             config=config, horizon=horizon)

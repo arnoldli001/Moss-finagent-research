@@ -41,6 +41,11 @@ import threading
 import time
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 # 进程内唯一：两个模块共用同一把锁才有意义（各自一把等于没锁）。
@@ -65,6 +70,11 @@ def download_history_isolated(
 
     返回 `(是否成功, 失败原因)`；**任何情况下都不抛异常**。
     子进程的原生崩溃会表现为非零退出码，被转成失败原因而不是带走服务进程。
+
+    ⚠️ 这是**阻塞**函数（`subprocess.run`，最长 `timeout` 秒）。在 async 代码里
+    必须用 `download_history_awaited()`，否则会按住整个事件循环 —— 实测
+    2026-09-17：盘后自动选股在启动后立刻跑，每次补下载最长阻塞 45 秒，
+    前端 `/health` 排队 **111.8 秒**才返回（服务其实早已启动完成）。
     """
     script = (
         "from xtquant import xtdata\n"
@@ -85,8 +95,8 @@ def download_history_isolated(
             logger.warning("QMT补下载超时(%.0fs): %s %s", timeout, qmt_code, period)
             return False, f"补下载超时({timeout:.0f}s)"
         except Exception as exc:  # noqa: BLE001 连子进程都起不来
-            logger.warning("QMT补下载子进程启动失败(%s): %s", qmt_code, str(exc)[:120])
-            return False, f"补下载子进程启动失败：{str(exc)[:120]}"
+            logger.warning("QMT补下载子进程启动失败(%s): %s", qmt_code, brief(exc, BRIEF_TIGHT))
+            return False, f"补下载子进程启动失败：{brief(exc, BRIEF_TIGHT)}"
     if completed.returncode != 0:
         tail = (completed.stderr or b"").decode("utf-8", "replace").strip()[-200:]
         logger.warning(
@@ -95,6 +105,27 @@ def download_history_isolated(
         return False, (f"补下载子进程异常退出(code={completed.returncode})"
                        f"{'：' + tail if tail else ''}")
     return True, ""
+
+
+async def download_history_awaited(
+    qmt_code: str, period: str, *,
+    start_time: str = "", end_time: str = "",
+    timeout: float = DEFAULT_DOWNLOAD_TIMEOUT,
+) -> tuple[bool, str]:
+    """`download_history_isolated` 的**不阻塞事件循环**版本（async 代码用它）。
+
+    为什么必须单独有一个：`download_history_isolated` 里是 `subprocess.run`，
+    在协程里直接调用会按住整个事件循环最长 `timeout` 秒。实测 2026-09-17：
+    服务启动后盘后自动选股立刻开跑，`sources._load()` 的补下载把循环按住，
+    期间连 `/health` 都 111.8 秒不返回 —— 用户看到的就是"重启后前端好久没数据"。
+
+    语义与同步版完全一致（同样永不抛异常），只是丢到线程池里等。
+    """
+    import asyncio
+
+    return await asyncio.to_thread(
+        download_history_isolated, qmt_code, period,
+        start_time=start_time, end_time=end_time, timeout=timeout)
 
 
 def isolated_download_supported() -> bool:

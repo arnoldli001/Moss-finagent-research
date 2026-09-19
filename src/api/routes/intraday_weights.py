@@ -21,17 +21,25 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
 from src.domain.intraday.models import (
     SOURCE_AUTO_CHARACTER,
     SOURCE_MANUAL,
     IntradayProfile,
 )
 from src.intraday.config import DAILY_FACTOR_LABELS, FACTOR_LABELS
+from src.intraday.features import build_intraday_features
+from src.intraday.impact import annotate_level_basis, build_trigger_impact
+from src.intraday.level_fit import FEATURE_KEYS
 from src.intraday.service import IntradayService
 from src.intraday.weight_profiles import (
     FACTOR_GROUPS,
@@ -180,9 +188,9 @@ async def character(
     try:
         profile = await service.character(target, mode=mode, refresh=refresh)
     except Exception as exc:  # noqa: BLE001 取数失败转502
-        logger.warning("股性画像失败(%s): %s", target, str(exc)[:200])
+        logger.warning("股性画像失败(%s): %s", target, brief(exc, BRIEF_DEFAULT))
         raise HTTPException(
-            status_code=502, detail=f"股性画像失败：{str(exc)[:200]}") from exc
+            status_code=502, detail=f"股性画像失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     payload = profile.to_dict()
     payload["mode"] = mode
     # 推荐权重的模板说明（前端展示"为什么推荐这套"）
@@ -222,6 +230,16 @@ class PreviewRequest(BaseModel):
     weights: dict[str, float] = Field(default_factory=dict)
     thresholds: dict[str, float] = Field(default_factory=dict)
     levels: dict[str, float] = Field(default_factory=dict)
+    # 「改动前」那一列的价格线：前端把**面板上此刻**的档位传回来。
+    #
+    # 为什么不让服务端自己再算一遍基准：预览本身要 1~3 秒，而低吸/高抛/止损是
+    # 时刻量（随 VWAP/布林每分钟重算）。服务端自己再取一次，前后两次的 VWAP 会差
+    # 0.1% 量级，于是在"变动"列里凭空冒出一行 `VWAP −0.93（−0.10%）` ——
+    # 用户会以为调某个参数动到了 VWAP，而那根本不是他改出来的。
+    # 用前端当下看到的那份做基准，才能保证「变动」只反映参数改动本身。
+    current_levels: dict[str, float] = Field(
+        default_factory=dict,
+        description="可选：面板当前档位 low_buy/high_sell/stop_loss/vwap")
 
 
 class ProfileRequest(BaseModel):
@@ -251,6 +269,106 @@ class ProfileRequest(BaseModel):
     # 前端「按股性一键推荐」按钮走这条路
     apply_character: bool = Field(default=False)
 
+
+
+def _baseline_levels(
+    payload: dict[str, float], level_set: Any,
+) -> Any:
+    """把前端回传的「面板此刻档位」拼成对照用的基准 LevelSet。
+
+    只取四个价格字段（低吸/高抛/止损/VWAP）：它们是用户眼睛看到的、也是"变动"
+    这一列需要比较的量。基准的来源说明沿用**该票当前生效口径**的标注
+    （即用 `baseline` 那一份的参数去 annotate 同一批价格），因此"由谁决定"
+    这一列讲的仍是"改动前这条线是怎么来的"，不会张冠李戴。
+
+    四个键一个都没给（或全不是数字）→ 返回 None，让调用方走服务端兜底基准。
+    """
+    picked = {
+        key: float(value) for key, value in payload.items()
+        if key in ("low_buy", "high_sell", "stop_loss", "vwap")
+        and isinstance(value, (int, float)) and math.isfinite(float(value))
+    }
+    if not picked:
+        return None
+    return level_set.model_copy(update=picked)
+
+
+@router.get("/intraday/level-fit")
+async def level_fit(
+    request: Request,
+    code: Annotated[str, Query(description="6位证券代码")] = "300308",
+    refresh: Annotated[bool, Query(description="true=忽略缓存重新拟合")] = False,
+) -> dict:
+    """关键价位**神经网络拟合**：用 7 个客观维度拟合低吸/高抛/止损三条线。
+
+    返回三个必须一起看的东西（少一个都会误导）：
+
+      1. `metrics.in_sample_rate` —— **过去 N 个交易日**的成功率（用户口径）；
+      2. `metrics.walk_forward_rate` —— **留一天**交叉验证的成功率（能不能信它）；
+      3. `metrics.gate_passed` —— 是否允许启用拟合档位（不达标就回退规则口径）。
+
+    拟合口径与「成功」的定义见 `src/intraday/level_fit.py` 模块 docstring：
+    触及低吸后、在 H 根 bar 内**先**到高抛且不破止损 = 成功；只统计"触及过"的样本。
+    """
+    service = _service(request)
+    target = _validate_code(code)
+    config = service.config
+    # 数据直接取 5 分钟 bars（多日）自己走一遍特征工程。
+    #
+    # 为什么不用"轻量快照"里的 bars：快照的 `bars` 字段只有**当日**（前端画图用），
+    # 而拟合要的是过去 N 个交易日 —— 实测那样只会拿到 1 天 / 48 根，
+    # 拟合会一直报"样本不足"。多日 bars 在快照内部是有的（`features`），
+    # 但那条路只在快照调用栈里可见，独立接口只能自己取一次。
+    try:
+        bars, bars_source, _attempts = await service.data_provider.fetch_bars(
+            target, days=service._intraday_days)  # noqa: SLF001
+        quote = await service.data_provider.fetch_quote(target)
+        daily = await service._fetch_daily_bars(target)  # noqa: SLF001
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502,
+            detail=("拟合所需数据获取失败（数据源不可用时如实报错，不猜测）："
+                    + brief(exc, BRIEF_DEFAULT))
+        ) from exc
+    daily_bars = daily[0] if isinstance(daily, tuple) else daily
+    if bars is None or len(bars) == 0:
+        raise HTTPException(
+            status_code=502,
+            detail="拟合需要多日 5 分钟K线，但数据源未返回（缺口时不拟合、不猜测）")
+    try:
+        features = build_intraday_features(bars, config=config)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"分钟特征构建失败：{brief(exc, BRIEF_DEFAULT)}") from exc
+    fit = await service.level_fit(
+        target, refresh=refresh, features=features,
+        daily_bars=daily_bars, quote=quote)
+    if fit is None:
+        raise HTTPException(status_code=503, detail="档位拟合结果不可用")
+    payload = fit.to_dict()
+    payload["bars_input"] = int(len(bars))
+    payload["bars_source"] = bars_source
+    payload["feature_keys"] = list(FEATURE_KEYS)
+    payload["config"] = {
+        "sessions": config.factors.level_fit.sessions,
+        "horizon_bars": config.factors.level_fit.horizon_bars,
+        "target_hit_rate": config.factors.level_fit.target_hit_rate,
+        "min_touch_samples": config.factors.level_fit.min_touch_samples,
+        "round_trip_cost_pct": config.factors.level_fit.round_trip_cost_pct,
+    }
+    payload["notice"] = (
+        f"拟合线：低吸 −{_mix_pct(fit, 'low'):.2f}% / 高抛 +{_mix_pct(fit, 'high'):.2f}% "
+        f"/ 止损 −{_mix_pct(fit, 'stop'):.2f}%（相对当日均价）"
+        if fit.metrics.available else f"拟合不可用：{fit.metrics.reason}")
+    return payload
+
+
+def _mix_pct(fit: Any, key: str) -> float:
+    mix = getattr(fit, f"{key}_mix", None) or []
+    anchors = getattr(fit, f"{key}_anchors", None) or []
+    if not mix or not anchors or len(mix) != len(anchors):
+        return 0.0
+    return float(anchors[max(range(len(mix)), key=lambda i: mix[i])])
 
 
 def _check_weight_sum(weights: dict[str, float], mode: Mode) -> float:
@@ -305,7 +423,7 @@ async def list_profiles(request: Request,
         items = await repo.list(limit=limit)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=500, detail=f"读取权重档案失败：{str(exc)[:200]}") from exc
+            status_code=500, detail=f"读取权重档案失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return {
         "count": len(items),
         "profiles": [_profile_payload(item) for item in items],
@@ -323,7 +441,7 @@ async def get_profile(code: str, request: Request) -> dict:
         profile = await repo.get(target)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=500, detail=f"读取权重档案失败：{str(exc)[:200]}") from exc
+            status_code=500, detail=f"读取权重档案失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     config = service.config
     override, source = await service._resolve_override(target, config)  # noqa: SLF001
     if override is not None and not override.is_empty():
@@ -385,7 +503,9 @@ async def save_profile(code: str, body: ProfileRequest, request: Request) -> dic
             character = await service.character(target)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
-                status_code=502, detail=f"取股性画像失败（无法按股性推荐）：{str(exc)[:200]}"
+                status_code=502,
+                detail=("取股性画像失败（无法按股性推荐）："
+                        + brief(exc, BRIEF_DEFAULT)),
             ) from exc
         if not character.available:
             raise HTTPException(
@@ -437,7 +557,7 @@ async def save_profile(code: str, body: ProfileRequest, request: Request) -> dic
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=400, detail=f"保存权重档案失败：{str(exc)[:200]}") from exc
+            status_code=400, detail=f"保存权重档案失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return {
         "ok": True, "code": target,
         "profile": _profile_payload(saved),
@@ -456,7 +576,7 @@ async def delete_profile(code: str, request: Request) -> dict:
         removed = await service.delete_profile(target)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=400, detail=f"删除权重档案失败：{str(exc)[:200]}") from exc
+            status_code=400, detail=f"删除权重档案失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return {
         "ok": True, "code": target, "removed": removed,
         "notice": (f"已删除 {target} 的权重档案，该票回到全局口径"
@@ -485,6 +605,14 @@ async def preview(body: PreviewRequest, request: Request) -> dict:
         raise HTTPException(status_code=400, detail="预览至少要给出一项改动（权重/阈值/档位）")
 
     base = service.config
+    # 「改动前」的基准口径：这只票**当前实际生效**的那一套（档案 > YAML 覆盖 > 全局）。
+    # 只用来给对照表提供"改动前"那一列，任何失败都不阻断预览
+    # （那时对照列留空，面板只显示"改动后"，绝不编造基准）。
+    try:
+        baseline_config = await service.effective_config(target)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("预览基准口径获取失败(%s): %s", target, brief(exc, BRIEF_DEFAULT))
+        baseline_config = None
     try:
         # 预览以**全局口径**为基准（不叠加该票已有档案）：
         # 否则用户看到的是"档案 + 我的改动"的叠加结果，看不出改动本身的效果。
@@ -492,18 +620,49 @@ async def preview(body: PreviewRequest, request: Request) -> dict:
             body.mode, weights=weights, thresholds=thresholds, levels=levels)
     except Exception as exc:  # noqa: BLE001 参数非法转400
         raise HTTPException(
-            status_code=400, detail=f"预览参数非法：{str(exc)[:200]}") from exc
+            status_code=400, detail=f"预览参数非法：{brief(exc, BRIEF_DEFAULT)}") from exc
 
     try:
         if body.mode == "intraday":
             snapshot = await service.snapshot(
                 target, force_refresh=False, light=False, config_patch=scoped)
             card = snapshot.scorecard
+            # 「改动后到底会变成什么样」——档位线、触发价、还差多少分/多少价。
+            # 这里返回的档位是**这次预览口径**下的真实档位（含档位参数改动的影响），
+            # 与面板上那条线同源，因此可以直接用来做「改动前/改动后」对照。
+            #
+            # 先 annotate 再算 impact：`impact.level_rows` 用的就是这一份带来源
+            # 标注的档位，前面板"改动前/改动后"两列与"由谁决定"那一列才会一致 ——
+            # 若这里仍返回未标注的 snapshot.levels，前端拿到的来源会是空的。
+            level_set = (None if snapshot.levels is None
+                         else annotate_level_basis(snapshot.levels, scoped))
+            # 「改动前」那一列：
+            #   1) 优先用前端回传的「面板此刻档位」—— 它与用户眼睛看到的一致，
+            #      "变动"列就只反映参数改动（见 PreviewRequest.current_levels 说明）；
+            #   2) 没传就退回服务端自己取的当前口径档位（可能已漂移几百毫秒）。
+            baseline = dict(body.current_levels)
+            current_levels = None
+            if level_set is not None:
+                current_levels = _baseline_levels(baseline, level_set)
+            if current_levels is None:
+                raw_current = None
+                try:
+                    raw_current = await service.current_levels(target)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("预览基准档位获取失败(%s): %s", target, brief(exc, BRIEF_DEFAULT))
+                current_levels = (None if raw_current is None
+                                  else annotate_level_basis(
+                                      raw_current, baseline_config or base))
+            impact = build_trigger_impact(
+                scorecard=card, levels=level_set, config=scoped,
+                current_levels=current_levels)
             effective = {
                 "weights": scoped.weights.as_dict(),
                 "thresholds": {"action": scoped.thresholds.action,
                                "hint": scoped.thresholds.hint},
                 "levels": scoped.levels.model_dump(),
+                "level_set": None if level_set is None else level_set.model_dump(),
+                "impact": impact.model_dump(),
                 "signal": None if snapshot.signal is None
                 else snapshot.signal.model_dump(),
             }
@@ -515,14 +674,19 @@ async def preview(body: PreviewRequest, request: Request) -> dict:
                 "thresholds": {"action": scoped.daily_thresholds.action,
                                "hint": scoped.daily_thresholds.hint},
                 "levels": {},
+                "level_set": None,
+                # 日K模式没有「低吸档位」这套线（止损/保护线由量价体系自算），
+                # 只给权重影响度，别硬套分时的解释。
+                "impact": build_trigger_impact(
+                    scorecard=card, levels=None, config=scoped).model_dump(),
                 "signal": None,
             }
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.warning("权重预览失败(%s): %s", target, str(exc)[:200])
+        logger.warning("权重预览失败(%s): %s", target, brief(exc, BRIEF_DEFAULT))
         raise HTTPException(
-            status_code=502, detail=f"权重预览失败：{str(exc)[:200]}") from exc
+            status_code=502, detail=f"权重预览失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     if card is None:
         raise HTTPException(status_code=502, detail="预览失败：该标的当天打分卡未生成")
     return {

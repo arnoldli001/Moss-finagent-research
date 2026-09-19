@@ -14,6 +14,11 @@ from src.api.runtime import Runtime, agent_health
 from src.api.tasks import TaskStore, new_task_id
 from src.core.cancel import CancellationToken, TaskCancelledError
 from src.core.config import get_settings
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    brief,
+)
+from src.core.executors import run_infra
 from src.infrastructure.connectors.security_resolver import resolve_stock
 from src.orchestration.supervisor import plan_run
 
@@ -287,7 +292,7 @@ async def health(request: Request) -> dict:
         try:
             return build_data_health(runtime_obj)
         except Exception as exc:  # noqa: BLE001 健康检查本身不能崩
-            return {"available": False, "error": str(exc)[:200]}
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
     runtime = _runtime(request)
     settings = get_settings()
     agents = agent_health(runtime.agents)
@@ -362,7 +367,11 @@ async def health(request: Request) -> dict:
             # 而这是 CPU/IO 密集的同步代码 —— 直接在事件循环里跑会阻塞**所有**并发请求
             # （实测旧实现对 14GB 库做 COUNT(*) 时 /health 卡到 300 秒超时，
             #  同一时间做T面板也跟着卡）。
-            "health": await asyncio.to_thread(_data_health, runtime),
+            #
+            # 用**关键路径专用线程池**而不是 `asyncio.to_thread`：后者与自选池首屏
+            # （26 只票并发取数）共用默认执行器，实测被占满时 /health 要排队
+            # **144.5 秒**才返回，而它自己只要 3.74 秒。详见 src/core/executors.py。
+            "health": await run_infra(_data_health, runtime),
         },
         "model_gateway": {
             "ollama": ollama_status,

@@ -1,8 +1,8 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  api, CharacterProfile, FactorMetaItem, IntradayFactorCatalog, IntradayMode,
+  api, CharacterProfile, FactorMetaItem, IntradayFactorCatalog, IntradayLevels,
+  IntradayMode, MarketCycle, WeightProfile, WeightTemplate,
   IntradayWeightPreview, IntradayWeightProfileDetail, IntradayWeightProfileRequest,
-  WeightProfile, WeightTemplate,
 } from "../api";
 
 /**
@@ -135,6 +135,39 @@ function num(value: number | null | undefined, digits = 2): string {
   return value.toFixed(digits);
 }
 
+/** 带符号的百分比（用于「离现价多远」这类有方向的数）。 */
+function signedPct(value: number | null | undefined, digits = 2): string {
+  if (value === null || value === undefined) return "—";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(digits)}%`;
+}
+
+/** 带符号的数（贡献分/影响度）。 */
+function signed(value: number | null | undefined, digits: number): string {
+  if (value === null || value === undefined) return "—";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(digits)}`;
+}
+
+/**
+ * 把一组档位映射到「相对现价」的 0~100 刻度上（50 = 现价）。
+ *
+ * 刻度跨度按最远的那个档位定，并留 15% 余量；只用当前档位集合就够 ——
+ * 「现在 vs 改动后」两个数值是在同一行文字里对照的，不需要两套标记。
+ */
+function levelScalePositions(
+  levels: { key: string; price: number }[], price: number,
+): { key: string; pos: number }[] {
+  const values = levels.map((item) => item.price)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (!values.length || !(price > 0)) return [];
+  const span = Math.max(2.0, ...values.map((value) => Math.abs(value - price) / price * 100));
+  const extent = span * 1.15;
+  return levels.map((item) => ({
+    key: item.key,
+    pos: Math.max(0, Math.min(100,
+      50 + (item.price - price) / price * 100 / extent * 50)),
+  }));
+}
+
 const REGIME_TEXT: Record<string, string> = {
   swing: "震荡回归",
   mixed: "混合",
@@ -150,12 +183,29 @@ const ZONE_TEXT: Record<string, string> = {
   strong_sell_zone: "偏空高抛区",
 };
 
+/** 档位刻度上的短标签。 */
+const LEVEL_TEXT: Record<string, string> = {
+  low_buy: "低吸线",
+  high_sell: "高抛线",
+  stop_loss: "止损位",
+  vwap: "当日均价VWAP",
+  boll: "布林轨",
+};
+
 export default function WeightProfileEditor({
-  code, name, mode, onClose, onSaved,
+  code, name, mode, levels: liveLevels, onClose, onSaved,
 }: {
   code: string;
   name?: string;
   mode: IntradayMode;
+  /**
+   * 面板上**此刻**显示的关键价位（低吸/高抛/止损/VWAP）。
+   *
+   * 传进来的唯一用途是当「改动前」那一列：档位是时刻量（每分钟随 VWAP/布林重算），
+   * 预览又要 1~3 秒，若让服务端自己再取一次基准，前后两次的 VWAP 会差 0.1% 量级，
+   * 「变动」列里就会凭空出现一行 VWAP 位移 —— 用户会以为是自己改出来的。
+   */
+  levels?: IntradayLevels | null;
   onClose: () => void;
   onSaved: (info: { code: string; describe: string }) => void;
 }) {
@@ -201,6 +251,10 @@ export default function WeightProfileEditor({
   const [preview, setPreview] = useState<IntradayWeightPreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  /** 预览提交时的表单指纹：之后任何一个数字被改动，预览结果就标为"已过期"。 */
+  const [previewStamp, setPreviewStamp] = useState("");
+  /** 市场情绪周期（做T环境温度）：涨停家数/炸板率/最高连板是**实时**取的。 */
+  const [cycle, setCycle] = useState<MarketCycle | null>(null);
 
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -276,6 +330,29 @@ export default function WeightProfileEditor({
       .catch(() => { if (alive) setProfiles([]); });
     return () => { alive = false; };
   }, []);
+
+  /**
+   * 市场情绪周期：涨停家数 / 炸板率 / 最高连板 → 阶段与做T环境温度。
+   *
+   * 这三项是**实时**从东财涨停池/炸板池取的（服务端 60 秒 TTL 缓存），不是写死的
+   * 常量。把它摆在权重表旁边是有必要的：「市场情绪周期」这个因子的得分完全由
+   * 温度映射而来（温度 100→+1、50→0、0→−1），不看到原始计数就无法判断这个分数
+   * 是否合理；退潮/冰点期还会一票否决低吸。
+   */
+  const loadCycle = useCallback(async (force = false) => {
+    try {
+      setCycle(await api.intradayMarketCycle(force));
+    } catch {
+      setCycle(null);   // 情绪周期取不到不影响权重编辑主流程
+    }
+  }, []);
+
+  useEffect(() => {
+    if (tab !== "intraday") return;
+    void loadCycle();
+    const timer = window.setInterval(() => void loadCycle(), 60000);
+    return () => window.clearInterval(timer);
+  }, [tab, loadCycle]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -485,25 +562,55 @@ export default function WeightProfileEditor({
     }
   }
 
+  /** 档位表单的**当前**数值（发给服务端的口径；布尔开关不进请求体）。 */
+  const numericLevels = useMemo(() => {
+    const payload: Record<string, number> = {};
+    Object.keys(levels).forEach((key) => {
+      if (BOOLEAN_LEVEL_KEYS.has(key)) return;
+      payload[key] = Number(levels[key]);
+    });
+    return payload;
+  }, [levels]);
+
+  /** 表单指纹：预览结果与它绑定，改过任何一个数字就说明结果已过期。 */
+  const formStamp = useMemo(() => JSON.stringify({
+    weights: factors.map((item) => [item.key, weights[item.key] || 0]),
+    thresholds: [thresholds.action, thresholds.hint],
+    levels: Object.keys(numericLevels).sort().map((key) => [key, numericLevels[key]]),
+  }), [factors, weights, thresholds, numericLevels]);
+
+  const previewStale = !!preview && previewStamp !== formStamp;
+
   async function runPreview() {
     if (!sumOk) {
       setPreviewError(`预览失败：权重合计 ${weightSum} ≠ 100，`
         + "总分刻度依赖它（先点「一键归一化」）");
       return;
     }
-    // 布尔开关不进预览请求体：`levels` 在后端是 dict[str, float]
-    const numericLevels: Record<string, number> = {};
-    Object.keys(levels).forEach((key) => {
-      if (BOOLEAN_LEVEL_KEYS.has(key)) return;
-      numericLevels[key] = Number(levels[key]);
-    });
+    // 预览必须提交**全量权重**（合计恰好 100）：服务端的预览是按「总分=Σ(得分×权重)」
+    // 的口径校验的，只发改动项（稀疏差分）会被判成"合计=8"直接 400 ——
+    // 那是保存接口的增量语义，预览是"想看看这一套口径算出来多少分"，两者不同。
+    const fullWeights: Record<string, number> = {};
+    factors.forEach((item) => { fullWeights[item.key] = weights[item.key] || 0; });
+    // 「面板此刻」的档位原样回传（服务端拿它当"改动前"那一列）
+    const baselineLevels: Record<string, number> = {};
+    if (liveLevels) {
+      (["low_buy", "high_sell", "stop_loss", "vwap"] as const).forEach((key) => {
+        const value = liveLevels[key];
+        if (typeof value === "number" && Number.isFinite(value)) {
+          baselineLevels[key] = value;
+        }
+      });
+    }
     setPreviewLoading(true);
     setPreviewError(null);
     try {
       const data = await api.intradayPreviewWeights({
-        code, mode: tab, weights, thresholds, levels: numericLevels,
+        code, mode: tab, weights: fullWeights, thresholds, levels: numericLevels,
+        current_levels: baselineLevels,
       });
       setPreview(data);
+      setPreviewStamp(formStamp);
     } catch (exc) {
       setPreview(null);
       setPreviewError(`预览失败：${humanizeError(exc)}`);
@@ -511,6 +618,30 @@ export default function WeightProfileEditor({
       setPreviewLoading(false);
     }
   }
+
+  /**
+   * 表单一变就自动重算（防抖 800ms）。
+   *
+   * 为什么不像原来那样只留手动按钮：用户拖滑杆问的是「**现在**低吸线是多少、
+   * 还差多少分」，手动预览永远慢一拍 —— 拖完看到的是上一版数字，很容易据此
+   * 得出反向结论。代价是每次预览走一遍服务端完整快照（1~3 秒），因此：
+   *   - 权重合计不等于 100 时**不自动预览**（那种口径本来就不合法）；
+   *   - 首次挂载故意不自动跑（用户可能只是进来看看，不必立刻付这次取数成本）。
+   */
+  const autoPreviewArmed = useRef(false);
+  useEffect(() => {
+    if (!sumOk || loading) {
+      autoPreviewArmed.current = false;
+      return;
+    }
+    if (!autoPreviewArmed.current) {
+      autoPreviewArmed.current = true;
+      return;
+    }
+    const timer = window.setTimeout(() => { void runPreview(); }, 800);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [formStamp, sumOk, loading]);
 
   async function save() {
     if (!sumOk) {
@@ -618,6 +749,41 @@ export default function WeightProfileEditor({
   const previewSum = previewCard
     ? round1(previewCard.factors.reduce((acc, f) => acc + f.contribution, 0))
     : 0;
+  const impact = preview?.impact ?? null;
+  const levelSet = preview?.level_set ?? null;
+
+  /**
+   * 「现在 vs 改动后」逐线对照。
+   *
+   * 「改动前」那一列由**服务端**给出（`impact.level_deltas`）：它在
+   * 「这只票当前生效口径」下把同一条线再算了一遍，因此差异只来自你改的参数与阈值。
+   * 前端不自己减 —— 两份档位的口径差异只该由服务端定义一处（见 impact.level_deltas）。
+   */
+  const levelCompare = useMemo(() => {
+    if (!impact || !impact.available) return [];
+    const byKey = new Map(impact.level_deltas.map((row) => [row.key, row]));
+    return impact.level_rows.map((row) => {
+      const delta = byKey.get(row.key);
+      return {
+        ...row,
+        before: delta?.current ?? null,
+        delta: delta?.delta ?? null,
+        deltaPct: delta?.delta_pct ?? null,
+      };
+    });
+  }, [impact]);
+
+  /** 档位刻度：把三条线（与改动后）画在同一条相对现价的轴上。 */
+  const levelScale = useMemo(() => {
+    if (!impact || !impact.available || !(impact.price > 0)) return [];
+    return levelScalePositions(
+      levelCompare
+        .filter((row) => ["high_sell", "low_buy", "stop_loss"].includes(row.key))
+        .map((row) => ({ key: row.key, price: row.price })),
+      impact.price);
+  }, [impact, levelCompare]);
+
+  const hitCount = impact ? impact.factor_impact.filter((row) => row.available).length : 0;
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -626,7 +792,7 @@ export default function WeightProfileEditor({
           <h2>
             权重编辑 · {name ? `${name} ` : ""}
             <span className="mono">{code}</span>
-            <span className="muted-text">（{tab === "intraday" ? "日内分时" : "日K做T"}口径）</span>
+            <span className="muted-text">（{tab === "intraday" ? "日内分时" : "日K"}口径）</span>
           </h2>
           <button className="btn-ghost tiny" onClick={onClose}>关闭 (Esc)</button>
         </div>
@@ -706,6 +872,39 @@ export default function WeightProfileEditor({
               </p>
             )}
 
+            {tab === "intraday" && cycle && (
+              <div className={cycle.available && !cycle.t_allowed
+                ? "warn-box cycle-strip" : "info-box cycle-strip"}>
+                {cycle.available ? (
+                  <>
+                    <b>市场情绪周期：{cycle.stage}</b>
+                    <span className="mono">温度 {cycle.temperature}/100</span>
+                    <span className="mono">
+                      涨停 {cycle.limit_up_count} · 跌停 {cycle.limit_down_count}
+                      {" · 炸板 "}{cycle.broken_count}
+                      {cycle.broken_rate !== null
+                        && `（${(cycle.broken_rate * 100).toFixed(0)}%）`}
+                      {" · 最高 "}{cycle.max_streak} 板
+                    </span>
+                    <span className="muted-text">
+                      实时取自涨停池/炸板池（{cycle.fetched_at.slice(11, 19)} 取数，
+                      60 秒缓存）——「市场情绪周期」因子的得分就是由温度映射而来
+                      （100→+1 / 50→0 / 0→−1），不是写死的常量。
+                      {cycle.t_allowed ? "" : "⛔ 当前阶段禁止正式低吸做T。"}
+                    </span>
+                    <button className="btn-ghost tiny" onClick={() => void loadCycle(true)}>
+                      刷新
+                    </button>
+                  </>
+                ) : (
+                  <span className="muted-text">
+                    市场情绪周期不可用：{cycle.gap ?? "数据缺口"}
+                    ——该维度会记为缺口并从有效权重中扣除
+                  </span>
+                )}
+              </div>
+            )}
+
             <div className="weight-editor-table-wrap">
               <table className="audit-table compact-table weight-editor-table">
                 <thead>
@@ -737,6 +936,17 @@ export default function WeightProfileEditor({
                                 <span className="badge-tag"
                                       title={`来自交易技能库：${item.source}`}>
                                   技能
+                                </span>
+                              )}
+                              {item.key === "cycle" && tab === "intraday" && (
+                                <span className="badge-tag live-badge"
+                                      title={cycle?.available
+                                        ? `实时取自东财涨停池/炸板池（${cycle.trade_date}，`
+                                          + `60秒缓存）：涨停 ${cycle.limit_up_count} 家 / `
+                                          + `炸板 ${cycle.broken_count} 家 / 最高 ${cycle.max_streak} 板 `
+                                          + `→ 温度 ${cycle.temperature}/100`
+                                        : "实时情绪周期数据当前不可用（该维度会记为缺口）"}>
+                                  实时
                                 </span>
                               )}
                               <span className="mono muted-text weight-editor-key">
@@ -944,6 +1154,225 @@ export default function WeightProfileEditor({
             </div>
 
             <div className="weight-editor-block">
+              <h3>
+                实时价格线影响
+                <span className="muted-text">
+                  （改动会怎么影响低吸/高抛/止损与触发门槛）
+                </span>
+              </h3>
+              <div className="weight-editor-inline">
+                <button className="btn-ghost tiny" disabled={previewLoading}
+                        onClick={() => void runPreview()}
+                        title="用当前表单的权重/阈值/档位走服务端同一条打分链路重算一次（需1~3秒）">
+                  {previewLoading ? "重算中…" : "立即重算"}
+                </button>
+                <span className="muted-text">
+                  改完数字会自动重算（防抖 0.8 秒）；这里的结果与「保存后」同源同口径
+                </span>
+                {previewStale && <span className="badge-tag warn-badge">表单已改动，待重算</span>}
+              </div>
+
+              {impact && impact.available ? (
+                <>
+                  <div className="weight-editor-chips">
+                    <span className="stat-chip">
+                      <em>现价</em>{num(impact.price, 2)}
+                    </span>
+                    <span className="stat-chip">
+                      <em>总分</em>{signed(impact.total, 1)}
+                    </span>
+                    <span className="stat-chip">
+                      <em>动手线</em>±{num(impact.threshold_action, 0)}
+                    </span>
+                    <span className="stat-chip">
+                      <em>提示线</em>±{num(impact.threshold_hint, 0)}
+                    </span>
+                    <span className="stat-chip">
+                      <em>有效权重</em>{num(impact.available_weight, 0)}/100
+                    </span>
+                  </div>
+
+                  {levelScale.length > 0 && (
+                    <div className="level-scale">
+                      <span className="level-scale-label muted-text mono">
+                        相对现价 {num(impact.price, 2)}（左=低 右=高）
+                      </span>
+                      <div className="level-scale-track">
+                        <div className="level-scale-zero" />
+                        {levelScale.map((item) => (
+                          <div key={item.key}
+                               className={`level-scale-mark mark-${item.key}`}
+                               style={{ left: `${item.pos}%` }}
+                               title={`${LEVEL_TEXT[item.key] ?? item.key}`} />
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <table className="audit-table compact-table">
+                    <thead>
+                      <tr>
+                        <th>价格线</th>
+                        <th className="num">改动前</th>
+                        <th className="num">改动后</th>
+                        <th className="num">变动</th>
+                        <th className="num">离现价</th>
+                        <th className="num">触发价（触及）</th>
+                        <th>由谁决定 / 说明</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {levelCompare.map((row) => (
+                        <tr key={row.key} className={row.key === "stop_loss" ? "row-stop" : ""}>
+                          <td className="factor-name">{row.label}</td>
+                          <td className="num mono muted-text">
+                            {row.before === null ? "—" : num(row.before, 2)}
+                          </td>
+                          <td className="num mono"><b>{num(row.price, 2)}</b></td>
+                          <td className="num mono" style={{
+                            color: row.delta === null || row.delta === 0 ? "var(--muted)"
+                              : row.delta > 0 ? "var(--high)" : "var(--low)",
+                          }}>
+                            {row.delta === null ? "—"
+                              : Math.abs(row.delta) < 0.005 ? "0.00 未变"
+                              : `${signed(row.delta, 2)}`
+                                + (row.deltaPct === null ? "" : `（${signedPct(row.deltaPct)}）`)}
+                          </td>
+                          <td className="num mono" style={{
+                            color: row.distance_pct > 0 ? "var(--high)" : "var(--low)",
+                          }}>
+                            {signedPct(row.distance_pct)}
+                          </td>
+                          <td className="num mono">
+                            {row.trigger_price === null ? "—"
+                              : `${num(row.trigger_price, 2)}`}
+                          </td>
+                          <td className="muted-text">
+                            {row.source}
+                            <br />{row.note}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  <p className="muted-text">
+                    ⚠️ 口径提醒：这三条线是**时刻量**，随 VWAP / 布林 / 现价每分钟重算，
+                    因此「改动前」取的是你打开面板那一刻面板上的值；盘中它会随时间小幅漂移，
+                    与你的参数改动无关。另：**因子权重不在这条链路里** ——
+                    调权重只会改上面的总分与「还差分」，不会移动这三条线。
+                  </p>
+
+                  <table className="audit-table compact-table">
+                    <thead>
+                      <tr>
+                        <th>触发门槛</th>
+                        <th>可否动手</th>
+                        <th className="num">还差分</th>
+                        <th className="num">还差价</th>
+                        <th>推导</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {impact.gates.map((gate) => (
+                        <tr key={gate.key}>
+                          <td className="factor-name">{gate.label}</td>
+                          <td>
+                            <span className={gate.ready ? "gate-ok" : "gate-no"}>
+                              {gate.ready ? "✓ 条件已满足" : "✗ 未满足"}
+                            </span>
+                            {gate.blocked_by && (
+                              <span className="muted-text"> ⛔{gate.blocked_by}</span>
+                            )}
+                          </td>
+                          <td className="num mono">
+                            {gate.score_need > 0 ? gate.score_need.toFixed(1) : "0"}
+                          </td>
+                          <td className="num mono">
+                            {gate.price_need_pct === null ? "—"
+                              : signedPct(gate.price_need_pct)}
+                          </td>
+                          <td className="muted-text">{gate.note}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  <details className="weight-editor-levels" open>
+                    <summary>
+                      因子影响度（权重 → 总分；{hitCount} 项可用）
+                    </summary>
+                    <p className="muted-text">
+                      「每 +1 分权重」= 该因子得分：得分正 → 加权**推高**总分；
+                      得分负 → 加权**拉低**总分（不是所有维度都加分）。
+                      「权重置0」= 关掉这一项后总分的变化。
+                      这些数字只影响总分，**不会移动价格线**。
+                    </p>
+                    <table className="audit-table compact-table">
+                      <thead>
+                        <tr>
+                          <th>因子</th>
+                          <th className="num">权重</th>
+                          <th className="num">得分</th>
+                          <th className="num">贡献分</th>
+                          <th className="num">每+1分权重</th>
+                          <th className="num">权重置0</th>
+                          <th className="num">占有效权重</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {impact.factor_impact.map((row) => (
+                          <tr key={row.key} className={row.available ? "" : "factor-gap"}>
+                            <td className="factor-name">
+                              {row.label}
+                              <span className="muted-text"> {row.note}</span>
+                            </td>
+                            <td className="num mono">{row.weight}</td>
+                            <td className="num mono">{signed(row.score, 2)}</td>
+                            <td className="num mono" style={{
+                              color: row.contribution > 0 ? "var(--high)"
+                                : row.contribution < 0 ? "var(--low)" : "var(--muted)",
+                            }}>
+                              {signed(row.contribution, 1)}
+                            </td>
+                            <td className="num mono" style={{
+                              color: row.unit_impact > 0 ? "var(--high)"
+                                : row.unit_impact < 0 ? "var(--low)" : "var(--muted)",
+                            }}>
+                              {signed(row.unit_impact, 2)}
+                            </td>
+                            <td className="num mono">{signed(row.zero_impact, 1)}</td>
+                            <td className="num mono">{pct(row.weight_share_pct, 1)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </details>
+
+                  {impact.notes.length > 0 && (
+                    <ul className="weight-editor-notes">
+                      {impact.notes.map((note, index) => <li key={index}>{note}</li>)}
+                    </ul>
+                  )}
+                  {impact.examples.length > 0 && (
+                    <p className="muted-text">
+                      {impact.examples.map((item, index) => (
+                        <span key={index}>{index > 0 ? " " : ""}{item}</span>
+                      ))}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <p className="muted-text">
+                  {impact && !impact.available
+                    ? `暂不可用：${impact.reason}`
+                    : "改动后低吸/高抛/止损会落在哪个价位、还差多少分多少价才出信号 —— "
+                      + "这里会直接算给你看（改完自动重算，也可点「立即重算」）。"}
+                </p>
+              )}
+            </div>
+
+            <div className="weight-editor-block">
               <h3>预览分数（不保存、不落库）</h3>
               <div className="weight-editor-inline">
                 <button className="btn-ghost" disabled={previewLoading}
@@ -973,6 +1402,15 @@ export default function WeightProfileEditor({
                   </div>
                   <p className="muted-text">{previewCard.verdict}</p>
                   <p className="muted-text">{preview.notice}</p>
+                  {levelSet && (
+                    <p className="mono muted-text">
+                      本次口径的档位：低吸 {num(levelSet.low_buy, 2)}
+                      （触发 {num(levelSet.low_trigger_price, 2)}）· 高抛 {num(levelSet.high_sell, 2)}
+                      （触发 {num(levelSet.high_trigger_price, 2)}）· 止损 {num(levelSet.stop_loss, 2)}
+                      {levelSet.band_width_pct !== null && levelSet.band_width_pct !== undefined
+                        && ` · 档位差 ${num(levelSet.band_width_pct, 2)}%`}
+                    </p>
+                  )}
                   {previewCard.available_weight < 70 && (
                     <div className="warn-box">
                       有效权重只有 {previewCard.available_weight}/100（&lt;70）：
@@ -1030,7 +1468,8 @@ export default function WeightProfileEditor({
               )}
               {!preview && !previewLoading && !previewError && (
                 <p className="muted-text">
-                  预览走完整快照链路，因此要比对「改动前/改动后」时请把两边各预览一次。
+                  预览走完整快照链路（服务端重算），因此要比对「改动前/改动后」
+                  直接看上面的「实时价格线影响」表即可 —— 它已经给出逐线对照。
                 </p>
               )}
             </div>
@@ -1087,6 +1526,11 @@ export default function WeightProfileEditor({
           权重合计必须=100（总分刻度依赖它）；档案是「这只票相对全局口径的差异」，
           因此只提交改动项；预览不落库。因子清单、中文名、分组与公式均由服务端目录提供，
           前端不写死任何一项。
+          <br />
+          ⚠️ 两条链路要分开读：**因子权重只影响总分**（够不够格动手），
+          **档位参数只影响低吸/高抛/止损三条线**（在哪个价位动手）——
+          调权重不会让价格线移动一分钱。操作细节见
+          <span className="mono"> docs/INTRADAY_T_OPERATION_GUIDE.md</span>。
         </div>
       </div>
     </div>

@@ -653,6 +653,171 @@ def test_add_watch_does_not_store_code_as_name(tmp_dir, monkeypatch) -> None:
     assert service.config.watch("601999").name in ("", "601999")
 
 
+# ==================== 批量加自选（「一键全部加自选」） ====================
+
+
+def _batch_service(tmp_dir, monkeypatch, names: dict[str, str] | None = None):
+    """建一个只有自选池功能的 IntradayService（不碰网络）。"""
+    from src.intraday.service import IntradayService
+
+    path = os.path.join(tmp_dir, "intraday.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(SAMPLE_YAML)
+    reset_config_cache()
+    service = IntradayService(backend=None, config_path=path)
+    table = dict(names or {})
+    monkeypatch.setattr(service, "_lookup_name", lambda code: table.get(code, ""))
+    return service, path
+
+
+def test_add_watch_many_appends_and_keeps_order(tmp_dir, monkeypatch) -> None:
+    """批量加自选：一次性写进配置，顺序按入参，已有的 300308 仍在最前。"""
+    service, path = _batch_service(
+        tmp_dir, monkeypatch,
+        {"600110": "诺德股份", "603083": "剑桥科技"})
+
+    result = service.add_watch_many([
+        {"code": "600110", "name": "诺德股份"},
+        {"code": "603083", "name": ""},
+    ])
+
+    assert result["saved"] is True
+    assert result["added"] == ["600110", "603083"]
+    assert result["failed"] == []
+    assert [item.code for item in service.config.watchlist] == [
+        "300308", "600110", "603083"]
+    assert service.config.watch("603083").name == "剑桥科技"
+    # 注释必须活下来（批量写盘走的还是同一套段落替换）
+    assert "# 做T辅助配置（这行注释必须活下来）" in open(
+        path, encoding="utf-8").read()
+
+
+def test_add_watch_many_writes_config_only_once(tmp_dir, monkeypatch) -> None:
+    """**性能契约**：批量加 20 只只能落盘一次。
+
+    这是「一键全部加自选」不做成循环调 `add_watch` 的唯一理由 ——
+    每次落盘都会作废做T自选概览缓存，随后的整表重算是主要卡顿来源。
+    """
+    from src.intraday import config as config_mod
+
+    service, _path = _batch_service(tmp_dir, monkeypatch)
+    calls: list[int] = []
+    original = config_mod.save_watchlist
+
+    def counting_save(items, path=None):
+        calls.append(len(items))
+        return original(items, path)
+
+    monkeypatch.setattr(config_mod, "save_watchlist", counting_save)
+    items = [{"code": f"60{i:04d}", "name": f"票{i}"} for i in range(20)]
+    result = service.add_watch_many(items)
+
+    assert result["added"] == [item["code"] for item in items]
+    assert len(calls) == 1, f"落盘 {len(calls)} 次，应为 1 次"
+    assert calls[0] == 21          # 原有 1 只 + 新增 20 只
+
+
+def test_add_watch_many_does_not_touch_existing_stocks(
+        tmp_dir, monkeypatch) -> None:
+    """已在池中的票**原样保留** —— 不能把用户手配的板块/同业/海外映射覆盖掉。"""
+    service, _path = _batch_service(tmp_dir, monkeypatch,
+                                    {"300308": "别的名字"})
+
+    result = service.add_watch_many([{"code": "300308", "name": "中际旭创"}])
+
+    assert result["existing"] == ["300308"]
+    assert result["added"] == []
+    assert result["saved"] is False          # 什么都没改 → 不该落盘
+    watch = service.config.watch("300308")
+    assert watch.name == "中际旭创"           # 名字保持原样，没有被入参改写
+    assert watch.boards == ["PCB概念"]        # 板块配置完好
+    assert watch.peers == ["002463", "603228"]
+
+
+def test_add_watch_many_repairs_blank_name_without_touching_the_rest(
+        tmp_dir, monkeypatch) -> None:
+    """历史事故留下的空名字顺手补上，但**其余字段一个都不动**。"""
+    import os
+
+    from src.intraday.service import IntradayService
+
+    yaml_with_blank = SAMPLE_YAML.replace('    name: 中际旭创\n', '    name: ""\n')
+    path = os.path.join(tmp_dir, "intraday.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(yaml_with_blank)
+    reset_config_cache()
+    service = IntradayService(backend=None, config_path=path)
+    monkeypatch.setattr(service, "_lookup_name",
+                        lambda code: "中际旭创" if code == "300308" else "")
+
+    result = service.add_watch_many([{"code": "300308", "name": "中际旭创"}])
+
+    assert result["repaired"] == ["300308"]
+    assert result["added"] == []
+    assert result["saved"] is True
+    watch = service.config.watch("300308")
+    assert watch.name == "中际旭创"
+    assert watch.boards == ["PCB概念"]        # 补名的同时没顺手清空板块
+    assert watch.industry != ""
+
+
+def test_add_watch_many_reports_bad_codes_instead_of_swallowing_them(
+        tmp_dir, monkeypatch) -> None:
+    """代码格式不对的要**单独报出来**，不能静默丢掉（前端要能说清少加了哪只）。"""
+    service, _path = _batch_service(tmp_dir, monkeypatch)
+
+    result = service.add_watch_many([
+        {"code": "600110", "name": "诺德股份"},
+        {"code": "12345", "name": "五位"},
+        {"code": "ABCDEF", "name": "非数字"},
+        {"code": "", "name": "空"},
+    ])
+
+    assert result["added"] == ["600110"]
+    assert sorted(row["code"] for row in result["failed"]) == ["", "12345", "ABCDEF"]
+    assert all(row["reason"] for row in result["failed"])
+
+
+def test_add_watch_many_dedupes_and_flags_unresolved_names(
+        tmp_dir, monkeypatch) -> None:
+    """重复代码只加一次；名称解析不出来的进 `missing_name`（不拿代码冒充名称）。"""
+    service, path = _batch_service(tmp_dir, monkeypatch, {"600110": "诺德股份"})
+
+    result = service.add_watch_many([
+        {"code": "600110", "name": ""},
+        {"code": "600110", "name": "诺德股份"},
+        {"code": "601999", "name": ""},
+    ])
+
+    assert result["added"] == ["600110", "601999"]
+    assert result["missing_name"] == ["601999"]
+    assert [item.code for item in service.config.watchlist].count("600110") == 1
+    # 名称解析不出来时，`dump_watchlist_block` 的既有约定是 `name or code`，
+    # 所以配置文件里看到的就是代码本身。这里**断言这个已知行为**（而不是
+    # 假装它是空），同时 `missing_name` 已经把它显式报给前端 ——
+    # 历史事故的教训是"认不出名字的条目不能悄悄存在"，不是"不许存在"。
+    assert service.config.watch("601999").name == "601999"
+    assert 'name: "601999"' in open(path, encoding="utf-8").read()
+
+
+def test_add_watch_many_normalises_suffixed_codes(tmp_dir, monkeypatch) -> None:
+    """带交易所后缀的代码（600110.SH）要归一成 6 位数字。"""
+    service, _path = _batch_service(tmp_dir, monkeypatch)
+
+    result = service.add_watch_many([{"code": "600110.SH", "name": "诺德股份"}])
+
+    assert result["added"] == ["600110"]
+    assert service.config.watch("600110") is not None
+
+
+def test_add_watch_many_empty_input_is_a_noop(tmp_dir, monkeypatch) -> None:
+    service, _path = _batch_service(tmp_dir, monkeypatch)
+    result = service.add_watch_many([])
+    assert result["saved"] is False
+    assert result["added"] == []
+    assert result["total"] == 1
+
+
 def test_configs_default_boards_used_for_new_watch() -> None:
     """未在自选中声明板块的标的：不打分用板块，只给「参考板块」展示。"""
     config = IntradayConfig()

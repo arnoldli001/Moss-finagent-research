@@ -21,6 +21,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from src.core.errors import BRIEF_DEFAULT
 
 LOG_DIR = Path("data/qmt")
 INDEX_CODES = [
@@ -111,7 +112,7 @@ def batch_download(xtdata, codes: list[str], logger, *, tag: str) -> list[str]:
             xtdata.download_history_data(code, "1d", "", "", incrementally=True)
         except Exception as exc:  # noqa: BLE001
             failed.append(code)
-            logger.warning("[%s] %s 下载失败: %s", tag, code, str(exc)[:120])
+            logger.warning("[%s] %s 下载失败: %s", tag, code, brief(exc, BRIEF_DEFAULT))
         if i % 200 == 0:
             logger.info("[%s] 逐只补漏进度 %d/%d，累计失败 %d",
                         tag, i, total, len(failed))

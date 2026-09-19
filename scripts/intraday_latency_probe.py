@@ -33,6 +33,7 @@ import httpx  # noqa: E402
 
 from src.intraday.config import load_intraday_config  # noqa: E402
 from src.intraday.sources import IntradayDataProvider  # noqa: E402
+from src.core.errors import BRIEF_DEFAULT
 
 SAMPLES = 20
 CODES = ["600519", "000001", "300750"]
@@ -55,7 +56,7 @@ async def sample(call, rounds: int = SAMPLES) -> dict:
                 continue
             latencies.append(elapsed)
         except Exception as exc:  # noqa: BLE001 测速要把失败如实记下来
-            errors.append(f"{type(exc).__name__}: {str(exc)[:70]}")
+            errors.append(f"{type(exc).__name__}: {brief(exc, BRIEF_DEFAULT)}")
     if not latencies:
         return {"ok": 0, "fail": len(errors), "error": errors[:2]}
     ordered = sorted(latencies)

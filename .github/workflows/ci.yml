@@ -38,6 +38,43 @@ jobs:
         # 全部单测/集测离线运行（连接器走Fake，无需Ollama/PG/Redis/外网）
         run: uv run python -m pytest tests/ -q
 
+  compliance:
+    name: 合规门禁
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      # 独立 job：这条挂了**不允许合并**，与普通单测失败的处置不同。
+      # 每条用例都对应一条监管/内控要求，出处写在 tests/unit/test_compliance_gate.py。
+      - name: 安全与合规检查
+        run: |
+          uv run python -m pytest tests/unit/test_compliance_gate.py \
+            tests/unit/test_tenancy.py -q
+
+      - name: 敏感信息扫描（.env.example 与仓库根）
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+          from src.core.redaction import assert_no_secret
+          for path in [Path(".env.example")] + sorted(Path(".").glob("*.yaml")):
+              if path.exists():
+                  assert_no_secret(path.read_text(encoding="utf-8"),
+                                   context=str(path))
+          print("敏感信息扫描通过")
+          PY
+
+      - name: 黄金回归 + 性能门禁
+        # 冻结行情录像带缺失时用例会自动 skip，不会因数据未提交而失败
+        run: uv run python -m pytest tests/unit/test_auction_golden.py -q
+
   frontend:
     name: Frontend build
     runs-on: ubuntu-latest

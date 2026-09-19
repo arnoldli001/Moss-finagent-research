@@ -43,6 +43,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.core.errors import (
+    BRIEF_TIGHT,
+    brief,
+)
+
 logger = logging.getLogger(__name__)
 
 DIRECTORY_TABLE = "quant_stock_directory"
@@ -297,7 +302,7 @@ class StockDirectory:
                     for name in StockEntry.__dataclass_fields__})
                 self.cache[entry.code] = entry
         except Exception as exc:  # noqa: BLE001 字典坏了不该让业务崩
-            logger.warning("股票字典加载失败：%s", str(exc)[:120])
+            logger.warning("股票字典加载失败：%s", brief(exc, BRIEF_TIGHT))
         self.loaded = True
 
     def count(self) -> int:
@@ -394,7 +399,7 @@ def _fetch_eastmoney(code: str, *, timeout: int = 12) -> StockEntry | None:
         with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             payload = json.loads(response.read().decode("utf-8", "replace"))
     except Exception as exc:  # noqa: BLE001 补录失败不影响已有条目
-        logger.debug("东财补录 %s 失败：%s", code, str(exc)[:80])
+        logger.debug("东财补录 %s 失败：%s", code, brief(exc, BRIEF_TIGHT))
         return None
     rows = ((payload.get("QuotationCodeTable") or {}).get("Data")) or []
     for row in rows:

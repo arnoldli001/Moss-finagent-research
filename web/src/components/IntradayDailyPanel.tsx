@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { api, IntradayDailySignal, IntradayDailySnapshot } from "../api";
-import DailyCandleChart from "./DailyCandleChart";
+import PrivateFeatureNotice from "./PrivateFeatureNotice";
 import WeightProfileEditor from "./WeightProfileEditor";
 
 /**
@@ -128,6 +128,8 @@ function IntradayDailyPanel({ code }: { code: string }) {
       setSnapshot(data);
       setUpdatedAt(new Date().toLocaleTimeString("zh-CN"));
     } catch (exc) {
+      // 失败时**不要**继续用旧 snapshot：那会让"图是旧的"看起来像"图没数据"。
+      setSnapshot(null);
       setError(`日K分析失败：${String(exc)}`);
     } finally {
       setLoading(false);
@@ -176,7 +178,7 @@ function IntradayDailyPanel({ code }: { code: string }) {
   if (loading && !snapshot) {
     return (
       <section className="panel intraday-panel">
-        <h2>日K做T（量价体系）</h2>
+        <h2>日K（量价体系 + 擒牛线）</h2>
         <div className="empty-tip muted-text"><span className="spinner" /> 正在取日线并跑量价规则…</div>
       </section>
     );
@@ -186,7 +188,7 @@ function IntradayDailyPanel({ code }: { code: string }) {
   if (!snapshot.available) {
     return (
       <section className="panel intraday-panel">
-        <h2>日K做T（量价体系）</h2>
+        <h2>日K（量价体系 + 擒牛线）</h2>
         <div className="warn-box">
           日K分析不可用：{snapshot.health.gaps.join("；") || "日线数据缺失"}
         </div>
@@ -211,7 +213,7 @@ function IntradayDailyPanel({ code }: { code: string }) {
     <div className="daily-root">
       <section className="panel intraday-panel">
         <div className="panel-head">
-          <h2>日K做T（量价体系）</h2>
+          <h2>日K（量价体系 + 擒牛线）</h2>
           <span className={`watch-refresh ${live ? "live" : ""}`}
                 title="日线bar盘中由逐笔驱动、按分钟更新；这里取「数据源更新周期的 3 倍」自动刷新">
             {live
@@ -241,7 +243,8 @@ function IntradayDailyPanel({ code }: { code: string }) {
           </div>
         )}
         <p className="score-verdict">{snapshot.verdict}</p>
-        <DailyCandleChart snapshot={snapshot} />
+        {/* 擒牛线（同花顺公式档位线体系）为商业版功能，开源版不含公式与图表 */}
+        <PrivateFeatureNotice feature="擒牛线主图档位线" />
       </section>
 
       {/* 最近30个交易日的买卖标记（逐bar因果回放） */}
@@ -249,8 +252,14 @@ function IntradayDailyPanel({ code }: { code: string }) {
         <div className="panel-head">
           <h3>最近 30 个交易日买卖标记</h3>
           <span className="muted-text">
-            ▲ 买点（K线下方红三角） ｜ ▼ 卖点/风控（K线上方绿/橙三角）
-            —— 每根bar只用该日及之前的数据重算，无未来函数；同一信号连续触发只记首次
+            ▲ 买点 ｜ ▼ 卖点 / 风控 —— 每根bar只用该日及之前的数据重算，无未来函数；
+            同一信号连续触发只记首次。「离场参考」对**卖点**是止损价、
+            对**风控**是「跌破就走」的参考价（不是买入建议）。
+            图上标记固定在**蜡烛带外侧**（买点在下方、卖点/风控在上方），
+            同一根bar同侧只画一个三角 —— 三角旁的数字是信号代码，
+            逐个信号的价位见下方表格。本图 Y 轴按**五条擒牛线**取值
+            （NML/QRL 是突破线，下跌途中会明显高于股价，属正常），
+            想放大线附近的细节可取消勾选某条线，轴会按剩余线重新定标。
           </span>
         </div>
         {marks.length === 0 ? (
@@ -261,7 +270,12 @@ function IntradayDailyPanel({ code }: { code: string }) {
               <tr>
                 <th>日期</th><th>方向</th><th>信号</th>
                 <th>说明</th><th className="num">当日收盘</th>
-                <th className="num">建议买点</th><th className="num">止损</th>
+                <th className="num" title="买点=建议买入价；风控=参考价（非买入建议）">
+                  参考价
+                </th>
+                <th className="num" title="卖点=止损价；风控/买点若规则不产出该价则为 —">
+                  离场参考
+                </th>
               </tr>
             </thead>
             <tbody>

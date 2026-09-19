@@ -201,3 +201,76 @@ def test_profile_repo_unavailable_degrades_to_503(tmp_dir: str) -> None:
         # 但因子目录不依赖仓储，照常可用
         assert test_client.get(
             "/api/v1/intraday/factors").status_code == 200
+
+
+# ==================== 预览：基准档位 ====================
+
+
+def test_baseline_levels_uses_only_known_price_keys() -> None:
+    """前端回传的「面板此刻档位」只取四个价格键，其余一律忽略。
+
+    这条防线是必要的：`current_levels` 会被直接 model_copy 进档位对象，
+    若把 `price`/`box_low`/`stop_loss_pct` 之类的键也放进去，用户就能用
+    一个预览请求把基准篡改成任意数字（对照表会说"你的止损之前是 1 块钱"）。
+    """
+    from src.api.routes.intraday_weights import _baseline_levels
+    from src.intraday.config import IntradayConfig
+    from src.intraday.engine import compute_levels
+
+    config = IntradayConfig()
+    levels = compute_levels(
+        price=10.0, box_high=10.3, box_low=9.7, box_span_days=20, config=config)
+    baseline = _baseline_levels(
+        {
+            "low_buy": 9.5, "high_sell": "纳尼", "stop_loss": 9.2,
+            "vwap": 9.9, "stop_loss_pct": 99.0, "price": 1.0,
+        },
+        levels)
+    assert baseline is not None
+    assert baseline.low_buy == pytest.approx(9.5)
+    assert baseline.stop_loss == pytest.approx(9.2)
+    assert baseline.vwap == pytest.approx(9.9)
+    # 非数值 / 未在白名单里的键都不能生效
+    assert baseline.high_sell == pytest.approx(levels.high_sell)
+    assert baseline.stop_loss_pct == pytest.approx(levels.stop_loss_pct)
+    assert baseline.price == pytest.approx(levels.price)
+
+
+def test_baseline_levels_returns_none_without_usable_input() -> None:
+    from src.api.routes.intraday_weights import _baseline_levels
+    from src.intraday.config import IntradayConfig
+    from src.intraday.engine import compute_levels
+
+    levels = compute_levels(
+        price=10.0, box_high=10.3, box_low=9.7, box_span_days=20,
+        config=IntradayConfig())
+    assert _baseline_levels({}, levels) is None
+    assert _baseline_levels({"low_buy": "x"}, levels) is None
+
+
+def test_preview_rejects_unknown_factor_names(client) -> None:
+    """预览的权重也走同一套因子校验（坏口径不允许进打分链路）。"""
+    resp = client.post("/api/v1/intraday/weight-profiles/preview",
+                       json={"code": CODE, "mode": "intraday",
+                             "weights": {"boll_band": 100.0}})
+    assert resp.status_code == 400
+    assert "未知因子" in resp.json()["detail"]
+
+
+def test_preview_requires_at_least_one_change(client) -> None:
+    resp = client.post("/api/v1/intraday/weight-profiles/preview",
+                       json={"code": CODE, "mode": "intraday"})
+    assert resp.status_code == 400
+    assert "至少要给出一项改动" in resp.json()["detail"]
+
+
+def test_preview_declares_current_levels_field() -> None:
+    """`current_levels` 必须存在于请求契约里 —— 面板的「改动前」那一列靠它。"""
+    from src.api.routes.intraday_weights import PreviewRequest
+
+    assert "current_levels" in PreviewRequest.model_fields
+    body = PreviewRequest.model_validate({
+        "code": CODE, "mode": "intraday", "levels": {"stop_loss_pct": 2.0},
+        "current_levels": {"low_buy": 9.5},
+    })
+    assert body.current_levels == {"low_buy": 9.5}

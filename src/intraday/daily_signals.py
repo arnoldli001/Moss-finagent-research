@@ -1,7 +1,25 @@
-"""日K级别做T信号库（B1–B15 买入 / S1–S6 卖出风控）。
+"""日K级别做T信号库（B1–B15 买入 / S1–S7 卖出风控）。
 
 逐条对应需求给出的信号库，每条规则都输出 **逐条件明细**（SignalCondition），
 前端可以展示「哪几条满足、差在哪」，而不是只有一个黑盒结论。
+
+## 卖出侧的实际覆盖（2026-09-17 补齐）
+
+实测发现卖出侧原本只有 S2（唯一真卖点）+ S3/S6（风控）：10 只票 × 30 个交易日里
+**真卖点触发 0 次**（S2 要"爆量 1.5 倍"或"跌破 20 日平台"，震荡市不具备这两个条件）。
+因此补了两条能在常规行情下触发的真卖点：
+
+| 信号 | 类型 | 触发场景 |
+|---|---|---|
+| S2 日线级别卖点 | sell | **下跌侧**：爆量离场 / 平台跌破（锁筹跳水） |
+| S5 拉升达标止盈 | sell | **上涨侧**：当日大涨 ≥5% 或 高位滞涨收阴 |
+| S7 量价背离 | sell | 创新高但量能未跟、且冲高回落 |
+| S3 缩量阴线风控 | risk | 当天不抄底（**不是卖点**） |
+| S6 高量纪律 | risk | 高量破 / 遇顶不过等纪律命中 |
+| S4 缩量阳线持股 | watch | 当天不卖（**也不是卖点**） |
+
+**S1 刻意不实现**：「S1 分时三类卖点」依赖分时/盘口数据，日线无法复现；
+硬做只会是另一个规则冒充分时卖点，所以留在缺口说明里，而不是假装有。
 
 实现取舍（诚实标注，不假装能做到）：
 - 依赖 Level-2 / 竞价数据的规则（B3 竞价确认、B15 打板买点、S1 分时三类卖点、
@@ -155,15 +173,18 @@ def signal_b2(ctx: DailyContext) -> DailySignalItem | None:
 
 
 def signal_b3(ctx: DailyContext) -> DailySignalItem | None:
-    """B3 阴线反包法：涨停无明显放量后，阴线量≥涨停日2倍。"""
+    """B3 阴线反包法：涨停无明显放量后，阴线量≥近5日最大量且<其1.7倍。"""
     params = ctx.params
     offset = _recent_limit_up(ctx, params.limit_up_tolerance)
-    if offset is None or offset == 0 or ctx.index < offset + 1:
+    if offset is None or offset == 0 or ctx.index < max(offset + 1, 5):
         return None
     limit_index = ctx.index - offset
     limit_volume = vol._vol(ctx.frame, limit_index)
     limit_shrink = limit_volume <= vol._vol(ctx.frame, max(0, limit_index - 1))
-    big_shadow = ctx.volume(0) >= limit_volume * 2
+    # 近5日（不含当日）最大单日成交量
+    recent_max_vol = max(ctx.volume(i) for i in range(1, 6))
+    big_shadow = ctx.volume(0) >= recent_max_vol
+    not_extreme = ctx.volume(0) < recent_max_vol * 1.7
     return _finish(
         "B3", "阴线反包法", "buy",
         [
@@ -171,9 +192,14 @@ def signal_b3(ctx: DailyContext) -> DailySignalItem | None:
             _cond("涨停日无明显放量（主力高度控盘）", limit_shrink,
                   f"涨停日量 {limit_volume:.0f} vs 前日 "
                   f"{vol._vol(ctx.frame, max(0, limit_index - 1)):.0f}"),
-            _cond("阴线当日量 ≥ 涨停日量 × 2", big_shadow,
-                  f"当日量 {ctx.volume(0):.0f} vs 涨停日×2 "
-                  f"{limit_volume * 2:.0f}"),
+            _cond("阴线量 ≥ 近5日最大单日成交量", big_shadow,
+                  f"当日量 {ctx.volume(0):.0f} vs 近5日最大 "
+                  f"{recent_max_vol:.0f}",
+                  "≥近5日最大量"),
+            _cond("阴线量 < 近5日最大量 × 1.7", not_extreme,
+                  f"当日量 {ctx.volume(0):.0f} vs 上限 "
+                  f"{recent_max_vol * 1.7:.0f}",
+                  "<近5日最大量×1.7"),
         ],
         reason="阴线反包：放量阴线洗盘，次日竞价/分时确认后低吸",
         stop_loss=ctx.low(),
@@ -307,22 +333,47 @@ def signal_b7(ctx: DailyContext) -> DailySignalItem | None:
         entry=None, stop_loss=float(long.iloc[ctx.index]) if today_long == today_long else None,
         require_all=False)
 
-
 def signal_b8(ctx: DailyContext) -> DailySignalItem | None:
     """B8 飞龙在天：第一波有力上涨后箱体内出现长下影K线。"""
     if ctx.index < 25:
         return None
+
     frame = ctx.frame
+
+    # 新增过滤1：近10个交易日涨幅 > 50%，且收盘价下跌次数 >= 3，则放弃
+    recent_10 = frame.iloc[max(0, ctx.index - 10):ctx.index + 1]  # 含当前，共11行，形成10个日涨跌
+    if len(recent_10) >= 2:
+        rise_10 = (ctx.close() / float(recent_10["close"].iloc[0]) - 1) * 100
+        down_count = int((recent_10["close"].diff() < 0).sum())
+        if rise_10 > 50 and down_count >= 3:
+            return None
+
+    # 新增过滤2：昨日收盘 < 截至昨日的5日均价，且今日当前价 < 5日均价，且今日下跌，则放弃
+    if ctx.index >= 1:
+        yesterday_close = float(frame["close"].iloc[ctx.index - 1])
+        ma5_yesterday = float(
+            frame["close"].iloc[max(0, ctx.index - 5):ctx.index].mean()
+        )
+        today_close = ctx.close()
+        if (
+            yesterday_close < ma5_yesterday
+            and today_close < ma5_yesterday
+            and today_close < yesterday_close
+        ):
+            return None
+
+    # 原有逻辑
     window = frame.iloc[max(0, ctx.index - 20):ctx.index]
     box_high = float(window["high"].max())
     box_low = float(window["low"].min())
     in_box = box_low * 1.01 <= ctx.close() <= box_high * 0.99
-    # 第一波力度：≥2连板 或 累计涨幅≈30%
+
     rally = (ctx.close()
              / float(frame["close"].iloc[max(0, ctx.index - 25)]) - 1) * 100
     has_board = _recent_limit_up(
         ctx, ctx.params.limit_up_tolerance) is not None
     strong_first_wave = rally >= 20 or has_board
+
     return _finish(
         "B8", "飞龙在天（箱体突破）", "buy",
         [
@@ -651,13 +702,106 @@ def signal_s6(ctx: DailyContext) -> DailySignalItem | None:
     return item
 
 
+def signal_s5(ctx: DailyContext) -> DailySignalItem | None:
+    """S5 拉升达标止盈：当日大涨或触及区间上沿 → 做T仓位兑现离场。
+
+    ## 为什么卖点库必须有这一条（实测数据支撑）
+
+    2026-09-17 实测：10 只票各 30 个交易日里，卖出侧只触发了 S3(73 条) 与 S6(50 条)
+    共 123 条**风控**，**真卖点（S2）0 条**。原因是 S2 要求「爆量 1.5 倍」或
+    「跌破 20 日平台」——震荡市里这两个条件几乎不可能同时具备。
+    而做T的本质是**赚波动的钱**：涨到目标就该兑现，不必等到破位。
+    S5 补的正是这条：**上涨侧的离场依据**（S2 只管下跌侧）。
+
+    判据（满足任一即触发，两条权重相同）：
+      1. 当日涨幅 ≥ 5%（`big_yang` 量价形态）：一根大阳线之后短线容易回吐；
+      2. 现价处于区间**高位**（位置分位 ≥ 0.85）且收阴：
+         高位滞涨/上影说明上方抛压重，先落袋。
+    """
+    if ctx.index < 2:
+        return None
+    change = ctx.change()
+    threshold = 5.0
+    big_up = change >= threshold
+    position = ctx.position
+    at_high = bool(position and position.percentile >= 0.85)
+    stall = at_high and not ctx.is_yang()
+    conditions = [
+        _cond(f"当日大涨（≥{threshold:.0f}%）→ 短线易回吐", big_up,
+              f"{change:+.2f}%"),
+        _cond("高位滞涨（区间分位≥85% 且收阴）→ 上方抛压重", stall,
+              f"分位 {position.percentile * 100:.0f}%" if position else "无位置数据"),
+    ]
+    item = _finish(
+        "S5", "拉升达标止盈（做T兑现）", "sell", conditions,
+        reason="做T赚的是波动：涨到目标先兑现，不等破位；高位收阴说明抛压转强",
+        require_all=False)
+    # 只要任一条件成立就算触发（`require_all=False` 的默认门槛是 0.8，
+    # 两条条件里命中一条只有 0.5，达不到）→ 这里显式收紧/放宽判定。
+    if big_up or stall:
+        item.triggered = True
+        item.score = 1.0 if (big_up and stall) else 0.75
+    if item.triggered:
+        # 止盈参考位：当日收盘（次日开盘附近兑现），风控线给近 5 日低点
+        item.entry = ctx.close()
+        recent_low = float(ctx.frame["low"].iloc[max(0, ctx.index - 4):ctx.index + 1].min())
+        item.stop_loss = round(recent_low, 2)
+    return item
+
+
+def signal_s7(ctx: DailyContext) -> DailySignalItem | None:
+    """S7 量价背离（价新高、量不跟）→ 卖点。
+
+    判据（**全部满足**，避免把正常缩量上涨误判成背离）：
+      1. 现价创近 20 日新高；
+      2. 当日量 **低于**近 20 日最大量的 70%（价涨量缩 = 上攻乏力）；
+      3. 当日收阴或留长上影（冲高回落才算背离确认，继续涨停不算）。
+    """
+    if ctx.index < 21:
+        return None
+    window = ctx.frame.iloc[ctx.index - 20:ctx.index + 1]
+    price_new_high = ctx.close() >= float(window["close"].max()) - 1e-9
+    peak = float(window["volume"].max())
+    shrink = peak > 0 and ctx.volume() < peak * 0.7
+    reversal = (not ctx.is_yang()) or bool(ctx.flags()["long_lower_shadow"])
+    conditions = [
+        _cond("价格创近 20 日新高", price_new_high, f"收盘 {ctx.close():.2f}"),
+        _cond("量能未跟（< 20 日峰量 70%）", shrink,
+              f"量/峰量 {ctx.volume() / peak:.2f}" if peak > 0 else "无峰量"),
+        # 每条条件都必须带 actual（项目契约：前端要显示"差在哪"，
+        # 空字符串会让 test_signals_expose_condition_actuals 直接失败）
+        _cond("冲高回落（收阴或长上影）", reversal,
+              ("收阴" if not ctx.is_yang() else "长上影")
+              + f"｜涨跌 {ctx.change():+.2f}%"),
+    ]
+    item = _finish(
+        "S7", "量价背离（新高无量）", "sell", conditions,
+        reason="价创新高而量跟不上，且当日冲高回落 → 上攻动能衰竭，先减仓",
+        require_all=True)
+    if item.triggered:
+        item.entry = ctx.close()
+        item.stop_loss = round(float(window["low"].min()), 2)
+    return item
+
+
 ALL_BUY_SIGNALS: list[SignalFn] = [
     signal_b1, signal_b2, signal_b3, signal_b4, signal_b5, signal_b6,
     signal_b7, signal_b8, signal_b9, signal_b10, signal_b11, signal_b12,
     signal_b13, signal_b14, signal_b15,
 ]
 
-ALL_SELL_SIGNALS: list[SignalFn] = [signal_s2, signal_s3, signal_s6]
+#: 卖出/风控信号库。
+#:
+#: `kind` 决定前端"方向"列的语义：
+#:   - `sell`：真卖点（该走）—— S2 下跌侧、S5 上涨侧、S7 量价背离；
+#:   - `risk`：风控提示（别买/别抄底/守纪律）—— S3、S6；
+#:   - `watch`：不卖提示 —— S4。
+#:
+#: **S1 刻意不实现**：「S1 分时三类卖点」依赖分时/盘口数据，日线无法复现，
+#: 硬做出来只会是另一个规则冒充分时卖点（见模块 docstring 的取舍说明）。
+ALL_SELL_SIGNALS: list[SignalFn] = [
+    signal_s2, signal_s3, signal_s5, signal_s6, signal_s7,
+]
 
 
 def run_daily_signals(ctx: DailyContext) -> dict[str, list[DailySignalItem]]:

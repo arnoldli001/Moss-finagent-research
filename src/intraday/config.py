@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Any, Literal
@@ -16,6 +17,10 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
+from src.core.errors import (
+    BRIEF_LOG,
+    brief,
+)
 from src.core.exceptions import ConfigError
 from src.intraday.weight_profiles import (
     DAILY_FACTOR_ORDER,
@@ -24,7 +29,16 @@ from src.intraday.weight_profiles import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_CONFIG_PATH = "configs/intraday.yaml"
+#: 做T模块配置路径。
+#:
+#: ⚠️ **必须是绝对路径**：早期写成 `Path("configs/intraday.yaml")`（CWD 相对），
+#: 服务/脚本一旦不在仓库根启动，`target.exists()` 为假 → 只打一条 WARNING
+#: 就回退内置默认值，**用户改的权重与阈值静默失效**（这类问题极难排查）。
+#: 同时支持 `INTRADAY_CONFIG` 环境变量覆盖（与 auction_select / sector_crowding
+#: 两个模块的约定保持一致）。
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH: str = os.environ.get(
+    "INTRADAY_CONFIG", str(_PROJECT_ROOT / "configs" / "intraday.yaml"))
 
 # 因子键 → 中文标签（前端表格与明细统一口径）
 FACTOR_LABELS: dict[str, str] = {
@@ -337,9 +351,65 @@ class CycleParams(BaseModel):
     neutral_temperature: float = Field(default=50.0, ge=0.0, le=100.0)
 
 
+class LevelFitConfig(BaseModel):
+    """关键价位**神经网络拟合**参数（做T档位从规则口径升级为"按这只票自己拟合"）。
+
+    设计口径（与 `level_fit.py` 的实现一一对应）：
+
+      - **输入 = 7 个客观维度**（用户点名的那 7 个）：筹码量能结构、箱体/压力位、
+        缠论结构、VWAP偏离、布林带、MACD、KDJ/RSI；
+      - **输出 = 三条价位线**（低吸/高抛/止损），以「ATR 倍数」为尺度；
+      - **训练目标**：过去 `sessions`（默认 10）个交易日中，先触及**低吸线**、
+        且在 `horizon_bars`（默认24根=2小时）内先到**高抛线**、且**全程不破止损**的
+        比例（`target_hit_rate`，默认 0.80）；同时要求**够得着**（触及样本数下限）。
+      - **一票一拟合**：每只票用自己的历史拟合，参数按 (代码, 交易日) 缓存。
+
+    ⚠️ **80% 是"目标"而不是"承诺"**：它写成 `target_hit_rate` 是**闸门阈值**，
+    只有留一日交叉验证（walk-forward）也达标才允许启用拟合档位；否则回退规则口径
+    并把实测值如实报出来。样本不足时同样不启用 —— 480 根 5 分钟 bar 上把成功率
+    做到 100% 太容易了，那是过拟合而不是能力。
+    """
+
+    # 总开关
+    enabled: bool = True
+    # 训练窗口（交易日）。取不到这么多时用实际可得的，并在结果里如实标注
+    sessions: int = Field(default=10, ge=3, le=60)
+    # 训练最少需要的交易日与 bar 数（不足则不做拟合，回退规则口径）
+    min_sessions: int = Field(default=5, ge=2, le=30)
+    min_bars: int = Field(default=200, ge=60, le=5000)
+    # 前瞻窗口（bar 数）：24 根 5 分钟 bar = 2 小时（当日做T的合理持有上限）
+    horizon_bars: int = Field(default=24, ge=2, le=96)
+    # 目标成功率：既是优化目标，也是**启用闸门**（walk-forward 不达标就不启用）
+    target_hit_rate: float = Field(default=0.80, ge=0.3, le=1.0)
+    # 判定"够得着"的最少触及样本数：样本太少时成功率没有统计意义
+    min_touch_samples: int = Field(default=20, ge=5, le=2000)
+    # 一轮做T的双边摩擦成本（%）：低吸~高抛的价差至少要覆盖它，否则拟合会
+    # 收敛到"线挨着线、天天触发但全是手续费"
+    round_trip_cost_pct: float = Field(default=0.20, ge=0.0, le=2.0)
+    # 三条线的搜索网格（分位数，基于该票自己的 |波动| 经验分布）
+    low_quantiles: list[float] = Field(default_factory=lambda: [0.05, 0.10, 0.15, 0.20, 0.30])
+    high_quantiles: list[float] = Field(default_factory=lambda: [0.70, 0.80, 0.85, 0.90, 0.95])
+    stop_quantiles: list[float] = Field(default_factory=lambda: [0.97, 0.985, 0.995])
+    # 神经网络本身（刻意小：单票样本量只有几百根 bar）
+    hidden: int = Field(default=16, ge=2, le=64)
+    epochs: int = Field(default=300, ge=10, le=3000)
+    learning_rate: float = Field(default=0.02, gt=0, le=1.0)
+    l2: float = Field(default=0.01, ge=0.0, le=1.0)
+    seed: int = Field(default=20260917, ge=0, le=2**31 - 1)
+    # 拟合档位的权重（0=完全不用，1=完全替换规则线）：默认 1.0 = 拟合为主
+    blend: float = Field(default=1.0, ge=0.0, le=1.0)
+    # 单次拟合的墙钟上限（秒）：超时就放弃本次拟合（回退规则口径），不拖慢面板
+    timeout_seconds: float = Field(default=20.0, gt=0, le=300)
+    # 结果缓存秒数（拟合结果按交易日有效，盘中不必重算）
+    cache_seconds: float = Field(default=1800.0, ge=0, le=86400)
+    # 快照接口是否在**缓存未命中**时同步拟合一次。
+    # 默认 True（用户要求"默认参数值，每个个股都要拟合"）；若面板首屏想更快，
+    # 可置 False —— 那时只有 `/intraday/level-fit` 接口会触发拟合。
+    fit_on_snapshot: bool = True
+
+
 class CharacterParams(BaseModel):
     """股性适配因子参数。"""
-
     # 股性画像取样的日线根数
     sample_days: int = Field(default=250, ge=60, le=1000)
     # 画像所需的最少根数（不足即记为不可用）
@@ -366,6 +436,7 @@ class FactorParams(BaseModel):
     chip: ChipParams = Field(default_factory=ChipParams)
     cycle: CycleParams = Field(default_factory=CycleParams)
     character: CharacterParams = Field(default_factory=CharacterParams)
+    level_fit: LevelFitConfig = Field(default_factory=LevelFitConfig)
 
 
 
@@ -535,6 +606,9 @@ class WatchConfig(BaseModel):
     # 海外映射：与该股涨跌最相关的海外标的（腾讯代码，如 usNVDA / kr000660）
     # us*=美股（隔夜映射，驱动跳空）；kr*=韩股（与A股同时开市，盘中同步信号）
     overseas: list[str] = Field(default_factory=list)
+    # 置顶：置顶的自选永远排在最前（用户要求，2026-09-17）。
+    # 存在配置里而不是前端 localStorage：换浏览器/换机器应当保持一致。
+    pinned: bool = False
 
     @field_validator("code")
     @classmethod
@@ -892,7 +966,7 @@ def load_intraday_config(
             logger.error(
                 "做T配置解析失败(%s)，**已回退内置默认参数**（你配置的权重/自选池"
                 "在当前进程中不生效），请修正后重试: %s", target, exc)
-            config = IntradayConfig(load_error=f"{target} 解析失败：{str(exc)[:300]}")
+            config = IntradayConfig(load_error=f"{target} 解析失败：{brief(exc, BRIEF_LOG)}")
         _cache[str(target)] = (mtime, config)
         logger.info(
             "做T配置已加载: %s（权重合计=%g，动手线=±%g，提示线=±%g，自选%d只）",
@@ -969,6 +1043,10 @@ def dump_watchlist_block(items: list[WatchConfig]) -> list[str]:
             if item.overseas:
                 overseas = ", ".join(_yaml_scalar(o) for o in item.overseas)
                 lines.append(f"    overseas: [{overseas}]")
+            # 只在置顶时写这一行：不给所有条目都加 `pinned: false`，
+            # 免得每次前端增删都重写一遍整段（diff 噪声大、也容易看出"没改却变了"）
+            if item.pinned:
+                lines.append("    pinned: true")
     lines.append(_END_LINE)
     return lines
 

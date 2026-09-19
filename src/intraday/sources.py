@@ -34,6 +34,12 @@ from typing import Any
 import httpx
 import pandas as pd
 
+from src.core import symbols
+from src.core.errors import (
+    BRIEF_DEFAULT,
+    BRIEF_TIGHT,
+    brief,
+)
 from src.core.exceptions import DataFetchError
 from src.intraday.config import IntradayConfig
 from src.intraday.features import safe_float
@@ -79,22 +85,15 @@ def exchange_symbol(code: str, *, style: str = "prefix") -> str:
     实测踩过的坑：早期只判断 6/9 开头，导致 588170（科创50ETF）被判成深市，
     取数全空且看不出原因。
     """
-    code = str(code).strip()
-    if not (code.isdigit() and len(code) == 6):
-        raise DataFetchError(f"证券代码须为6位数字: {code!r}")
-    if code.startswith(("8", "4", "920")):
-        raise DataFetchError(f"北交所标的暂不支持: {code}")
-    market = "sh" if code.startswith(("5", "6", "9")) else "sz"
-    if style == "qmt":
-        return f"{code}.{market.upper()}"
-    return f"{market}{code}"
+    try:
+        return symbols.exchange_symbol(code, style=style)
+    except symbols.SymbolError as exc:
+        raise DataFetchError(str(exc)) from exc
 
 
 def is_etf_code(code: str) -> bool:
     """6位代码是否为场内ETF（沪 51/56/58，深 15/16）。"""
-    code = str(code).strip()
-    return len(code) == 6 and code.isdigit() and code.startswith(
-        ("51", "56", "58", "15", "16"))
+    return symbols.is_etf_code(code)
 
 
 def close_indicator(code: str) -> str:
@@ -274,7 +273,7 @@ def _probe_qmt_session_date() -> str:
         with qmt_lock():
             ticks = xtdata.get_full_tick(["000001.SH"]) or {}
     except Exception as exc:  # noqa: BLE001 QMT终端未启动/未登录/未订阅
-        logger.debug("交易日时钟探测失败(QMT快照): %s", str(exc)[:120])
+        logger.debug("交易日时钟探测失败(QMT快照): %s", brief(exc, BRIEF_TIGHT))
         return ""
     tick = ticks.get("000001.SH") or {}
     text = _qmt_ts_text(tick.get("timetag"))
@@ -382,7 +381,7 @@ class QmtMinuteSource:
             return subscribe_once(qmt_code, period, client=self._client())
         except Exception as exc:  # noqa: BLE001 订阅失败不影响读取（旧数据仍可能可用）
             logger.warning("QMT订阅失败(%s %s): %s",
-                           qmt_code, period, str(exc)[:140])
+                           qmt_code, period, brief(exc, BRIEF_DEFAULT))
             return False
 
     def _await_today(self, frame: Any, read: Any) -> Any:
@@ -400,21 +399,43 @@ class QmtMinuteSource:
             return frame
         stamp = session.replace("-", "")
         deadline = time.monotonic() + 1.2
+
+        def _stamp_present(data: Any) -> bool:
+            # ⚠️ 这个判断**每次 read 只算一次**。原实现把它写在循环条件里，
+            # 每次重试都用 `{str(value)[:8] for value in data.index}` 重建集合 ——
+            # QMT 分钟线索引有上千个 Timestamp，`str()` 每个都要走一次 datetime
+            # 格式化，于是每 0.2 秒烧掉一次可观 CPU。
+            # 实测后果（2026-09-17）：并发加载几十只票时把这台机器的 CPU 打满
+            # （单个进程累计 1796s CPU、2.4GB 内存），整个服务失去响应 ——
+            # 表现就是"重启后前端好久没数据"。索引在同一份 DataFrame 上不会变，
+            # 没有任何理由重复构造。
+            if data is None or len(data) == 0:
+                return False
+            return stamp in {str(value)[:8] for value in data.index}
+
         while True:
-            if frame is not None and len(frame):
-                if stamp in {str(value)[:8] for value in frame.index}:
-                    return frame
+            if _stamp_present(frame):
+                return frame
             if time.monotonic() >= deadline:
                 return frame
             time.sleep(0.2)
             frame = read()
 
     def _load(self, code: str, period: str, days: int) -> pd.DataFrame:
-        """读本地分钟线；本地为空时触发**子进程隔离**的补下载（详见 qmt_guard）。
+        """读本地分钟线（**同步**）；本地为空时触发**子进程隔离**的补下载。
 
         所有 xtquant 调用都必须在 `qmt_lock()` 里：实测服务进程曾在并发访问
         QMT（快速切标的 + 补下载同时发生）时无 traceback 猝死，见
         `src/core/qmt_guard.py` 顶部的事故记录。
+
+        ## 为什么 async 调用方要用 `_load_async`
+
+        补下载是 `subprocess.run`，最长 `timeout`=45s。**在协程里直接调用会按住
+        整个事件循环** —— 实测 2026-09-17：服务启动后盘后自动选股立即开跑，
+        几十只票逐个补下载，期间 `/api/v1/health` 排队 **111.8 秒**才返回，
+        而服务其实 3.9 秒就已启动完成。用户感受就是"重启后前端好久没数据"。
+        异步路径 `await _load_async(...)`（丢线程池）不受影响；本同步版保留给
+        已经在线程里跑的调用方（`fetch_bars`/`_trend_sync` 都经 `to_thread`）。
         """
         from src.core.qmt_guard import download_history_isolated, qmt_lock
 
@@ -471,6 +492,10 @@ class QmtMinuteSource:
         if frame is None or len(frame) == 0:
             raise DataFetchError(f"QMT无分钟行情({qmt_code} period={period})")
         return frame
+
+    async def _load_async(self, code: str, period: str, days: int) -> pd.DataFrame:
+        """`_load` 的不阻塞事件循环版本（协程里用它，见 `_load` 的说明）。"""
+        return await asyncio.to_thread(self._load, code, period, days)
 
     @staticmethod
     def _covered_trading_days(frame: Any) -> int:
@@ -531,7 +556,7 @@ class QmtMinuteSource:
         return _normalize_bars(pd.DataFrame(rows))
 
     async def fetch_bars(self, code: str, period: str, days: int) -> pd.DataFrame:
-        frame = await asyncio.to_thread(self._load, code, period, days)
+        frame = await self._load_async(code, period, days)
         bars = self._frame_to_bars(frame)
         if bars.empty:
             raise DataFetchError(f"QMT分钟线为空({code} {period})")
@@ -571,6 +596,19 @@ class TencentSource:
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
+        # 批量快照的**共享缓存**：`{symbol: Quote}` + 取数时刻。
+        #
+        # 为什么必须有：`_raw_quotes` 原来**完全没有缓存**，而自选池刷新会对
+        # 每只票各调一次 `fetch_quote` → N 只票就是 N 次真实 HTTP。
+        # 实测单次 2.1 秒，28 只票就是几十秒量级的串行等待
+        # （用户报"自选 30+ 只时强制刷新要 6~7 秒"，根因就在这里）。
+        #
+        # 腾讯 qt 接口本身**支持一次请求多代码**，所以这里把最近一次批量结果
+        # 缓存下来：同一批（或其子集）的后续请求直接命中，不再发 HTTP。
+        # 5 秒窗口足够覆盖"一轮自选刷新"的全部请求，又不会让价格变旧。
+        self._quote_cache: dict[str, Quote] = {}
+        self._quote_at: float = 0.0
+        self._quote_ttl = 5.0
 
     async def fetch_bars(self, code: str, period: str, days: int) -> pd.DataFrame:
         symbol = exchange_symbol(code)
@@ -741,9 +779,18 @@ class TencentSource:
         return await self._raw_quotes([exchange_symbol(c) for c in codes])
 
     async def _raw_quotes(self, symbols: list[str]) -> dict[str, Quote]:
-        """腾讯 qt 批量接口原始调用（一次请求多代码）。"""
+        """腾讯 qt 批量接口原始调用（一次请求多代码）。
+
+        带 **5 秒共享缓存**（见 `__init__` 的说明）：同一批（或子集）在窗口内
+        直接复用上次结果。自选池刷新时 N 只票各调一次 `fetch_quote`，
+        原来会打 N 次 HTTP（每次约 2.1 秒），现在只打 1 次。
+        """
         if not symbols:
             return {}
+        now = time.monotonic()
+        if self._quote_cache and (now - self._quote_at) < self._quote_ttl:
+            if all(symbol in self._quote_cache for symbol in symbols):
+                return {symbol: self._quote_cache[symbol] for symbol in symbols}
         try:
             resp = await self._client.get(
                 f"{self.base_quote}{','.join(symbols)}", headers=_TENCENT_MIN_HEADERS)
@@ -753,12 +800,26 @@ class TencentSource:
         except Exception as exc:  # noqa: BLE001
             raise DataFetchError(f"腾讯批量快照失败: {exc}") from exc
         result: dict[str, Quote] = {}
+        parsed: dict[str, Quote] = {}
         for line in text.strip().split("\n"):
             quote = _parse_quote_line(line)
             if quote is not None:
+                parsed[quote.code] = quote
                 result[quote.code] = quote
         if not result:
             raise DataFetchError("腾讯批量快照无有效行")
+        # 合并进共享缓存（保留窗口内的其它代码，便于不同子集各自命中）
+        if (now - self._quote_at) >= self._quote_ttl:
+            self._quote_cache = {}
+        # ⚠️ 缓存键必须是**查询用的符号**（`sh600150`），不能只存 `quote.code`
+        # （那是 `600150`）—— 否则上面 `symbol in self._quote_cache` 永远不成立，
+        # 缓存形同虚设。实测被单测抓出：同一代码连打 3 次发了 3 次 HTTP。
+        by_code = {code.zfill(6): quote for code, quote in parsed.items()}
+        for symbol in symbols:
+            quote = parsed.get(symbol) or by_code.get(symbol[-6:])
+            if quote is not None:
+                self._quote_cache[symbol] = quote
+        self._quote_at = now
         return result
 
 
@@ -1265,7 +1326,7 @@ class IntradayDataProvider:
                 quote, _, _ = await self.fetch_quote(code)
                 result[code] = quote
             except Exception as exc:  # noqa: BLE001 单只兜底失败就跳过
-                logger.debug("单只快照兜底失败(%s)：%s", code, str(exc)[:100])
+                logger.debug("单只快照兜底失败(%s)：%s", code, brief(exc, BRIEF_TIGHT))
         return result
 
     async def fetch_quote(self, code: str) -> tuple[Quote, str, list[SourceAttempt]]:
@@ -1393,7 +1454,7 @@ class IntradayDataProvider:
         except Exception as exc:  # noqa: BLE001
             attempts.append(SourceAttempt(
                 source=SOURCE_LABELS["tencent"], ok=False,
-                detail=f"指数快照失败: {str(exc)[:120]}"))
+                detail=f"指数快照失败: {brief(exc, BRIEF_TIGHT)}"))
             raise DataFetchError(f"指数量能取数失败({index_code}): {exc}") from exc
         yesterday_volume = None
         try:
@@ -1402,10 +1463,10 @@ class IntradayDataProvider:
             if len(kline) >= 2:
                 yesterday_volume = _number(kline["volume"].iloc[-2])
         except Exception as exc:  # noqa: BLE001 日线缺失只影响量能比，不影响方向分
-            logger.warning("指数日线取数失败(%s): %s", index_code, str(exc)[:120])
+            logger.warning("指数日线取数失败(%s): %s", index_code, brief(exc, BRIEF_TIGHT))
             attempts.append(SourceAttempt(
                 source=SOURCE_LABELS["tencent"], ok=False,
-                detail=f"指数日线失败（量能比缺失）: {str(exc)[:100]}"))
+                detail=f"指数日线失败（量能比缺失）: {brief(exc, BRIEF_TIGHT)}"))
         ratio = elapsed_session_ratio()
         current_volume = quote.volume
         projected = None
