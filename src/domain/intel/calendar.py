@@ -371,6 +371,108 @@ def _num(v: Any) -> float | None:
 # 三、宏观发布日程
 # ======================================================================
 
+def build_expectation(*, expected: Any, previous: Any,
+                      published: Any = None) -> dict[str, Any]:
+    """构造**预期差**字段。用户口径（2026-09-25）：
+
+    > 金融数据源讲究时效性，讲究预期差，未来的预期事件才更重要。
+
+    ## 四种状态，**如实标注，不猜**
+
+    | state | 条件 | 界面该怎么显示 |
+    |---|---|---|
+    | `pending` | 均无（事件还远） | 「待公布」 |
+    | `prior_only` | 只有前值 | 显示前值 + 明确「暂无一致预期值」 |
+    | `expected` | 有预期值 | 预期 vs 前值，**算出预期差** |
+    | `released` | 已有公布值 | 公布 vs 预期，**算出兑现差** |
+
+    实测（2026-09-25，8 天 551 条）：**有前值 439 条、有预期值仅 40 条**。
+    所以 `prior_only` 是**常态而非异常** —— 界面必须能表达
+    "这个事件有日程、但市场还没形成一致预期"。
+
+    为什么不用 0 或中性值填：本项目口径是"不猜"。
+    把"没有预期"渲染成 0，会让人以为"预期是零增长" —— 那是编造数据。
+    """
+
+    def _f(v: Any) -> float | None:
+        try:
+            if v is None or str(v).strip() in ("", "nan", "None", "--"):
+                return None
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    exp, prev, pub = _f(expected), _f(previous), _f(published)
+
+    if pub is not None:
+        diff = None if exp is None else round(pub - exp, 4)
+        return {"state": "released", "published": pub, "expected": exp,
+                "previous": prev, "surprise": diff,
+                "surprise_txt": _pct_txt(diff, exp)}
+    if exp is not None:
+        gap = None if prev is None else round(exp - prev, 4)
+        return {"state": "expected", "published": None, "expected": exp,
+                "previous": prev, "surprise": None, "expect_gap": gap,
+                "expect_gap_txt": _pct_txt(gap, prev)}
+    if prev is not None:
+        return {"state": "prior_only", "published": None, "expected": None,
+                "previous": prev, "surprise": None,
+                "note": "暂无一致预期值"}
+    return {"state": "pending", "published": None, "expected": None,
+            "previous": None, "surprise": None, "note": "待公布"}
+
+
+def _pct_txt(diff: float | None, base: float | None) -> str | None:
+    """把差值渲染成可读文本。基准为 0 或缺失时只给绝对值（不除零）。"""
+    if diff is None:
+        return None
+    if base in (None, 0):
+        return f"{diff:+g}"
+    return f"{diff:+g}（{diff / abs(base) * 100:+.1f}%）"
+
+
+def _norm_name(name: str) -> str:
+    """事件名归一化，用于**跨源匹配**。
+
+    两个源的事件名写法差异很大：
+
+        YAML 侧   "规模以上工业企业利润" / "制造业PMI" / "CPI"
+        日历侧    "中国8月规模以上工业企业利润金额-年初至今(亿元)"
+                  "中国9月官方制造业PMI" / "中国9月CPI年率"
+
+    所以**不能用相等匹配**。归一化后做**双向包含**判断
+    （见 `_match_index`）：短名是长名的子串即命中。
+    """
+    import re
+
+    s = re.sub(r"^中国", "", name.strip())
+    s = re.sub(r"[\s·、（）()【】\[\]：:，,。/\\\-]+", "", s)
+    s = re.sub(r"\d+", "", s)
+    for drop in ("统计局", "年率", "月率", "金额", "年初至今", "单月",
+                 "累计", "同比", "官方", "亿元", "%"):
+        s = s.replace(drop, "")
+    return s.lower()
+
+
+def _match_index(norm: str, index: dict[str, dict[str, Any]]
+                 ) -> dict[str, Any] | None:
+    """在索引里找**最匹配**的一条。短名是长名子串即命中。
+
+    优先精确相等，其次双向包含（取命中里最长的，即最具体的那个）。
+    返回 `None` 表示没找到 —— 调用方据此保持 `pending`/`prior_only`，
+    **不编数字**。
+    """
+    if not norm:
+        return None
+    if norm in index:
+        return index[norm]
+    hits = [(k, v) for k, v in index.items() if norm in k or k in norm]
+    if not hits:
+        return None
+    hits.sort(key=lambda kv: len(kv[0]), reverse=True)
+    return hits[0][1]
+
+
 def fetch_macro_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                          ) -> tuple[list[CalendarEvent], list[str]]:
     """宏观发布日程。主源静态 YAML（官方日程表），备源全球财经日历。"""
