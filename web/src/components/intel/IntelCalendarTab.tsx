@@ -34,7 +34,8 @@
 import { useMemo, useState } from "react";
 import {
   CALENDAR_KINDS, CalendarEvent, CalendarResult, EXPECTATION_STATES,
-  daysBetween, fmtNum, fmtSigned, formatTime, todayKey,
+  UnlockStock, daysBetween, fmtMoney, fmtNum, fmtPct, fmtSigned, formatTime,
+  todayKey,
 } from "../../intelApi";
 
 /** 日历里的分组顺序（按"用户关心程度"排，不是按字母）。 */
@@ -228,6 +229,31 @@ function BulkRow({ kind, events, today }: {
     (e) => e.scope?.industries ?? []))];
   const changed = events.filter((e) => (e.changes?.length ?? 0) > 0).length;
 
+  // ── 解禁：把**市值合计**与**个股明细**都拿出来 ──
+  //
+  // 用户报障（2026-09-25）："限售股解禁 显示15家，点开却没有股票名称和
+  // 解禁市值或占流通股百分比等信息"。根因不在前端 —— 后端当时用的
+  // `stock_restricted_release_summary_em` 是**按日汇总**接口，
+  // 个股名与占比在那个接口里根本不存在。后端改用个股明细接口后，
+  // 这里才有东西可渲染。
+  const unlock = useMemo(() => {
+    const stocks: UnlockStock[] = [];
+    let cap = 0;
+    let hasCap = false;
+    for (const e of events) {
+      const c = Number(e.metrics?.unlock_market_cap);
+      if (Number.isFinite(c)) { cap += c; hasCap = true; }
+      for (const s of (e.scope?.stocks ?? []) as UnlockStock[]) {
+        stocks.push(s);
+      }
+    }
+    // 按市值倒序：解禁影响最大的是最大的那几只
+    stocks.sort((a, b) => (b.market_cap ?? 0) - (a.market_cap ?? 0));
+    return { stocks, cap: hasCap ? cap : null };
+  }, [events]);
+
+  const isUnlock = kind === "unlock";
+
   return (
     <article className={`cal-row bulk${open ? " open" : ""}`}>
       <div className="cal-date">
@@ -240,9 +266,11 @@ function BulkRow({ kind, events, today }: {
         <div className="cal-line">
           <span className={`cal-kind ${info.tone}`}>{info.label}</span>
           <span className="cal-title">
-            {events.length > 1
-              ? `${events.length} 条`
-              : (first.title || info.label)}
+            {isUnlock && unlock.cap !== null
+              ? `解禁市值 ${fmtMoney(unlock.cap)}`
+              : events.length > 1
+                ? `${events.length} 条`
+                : (first.title || info.label)}
           </span>
           {totalCount > 0 && <span className="cal-bulk-n">{totalCount} 家</span>}
           {changed > 0 && (
@@ -265,7 +293,30 @@ function BulkRow({ kind, events, today }: {
           </div>
         )}
 
-        {open && (
+        {/* ── 解禁明细：股票名 / 解禁市值 / 占流通比 / 限售股类型 ── */}
+        {open && isUnlock && unlock.stocks.length > 0 && (
+          <ul className="cal-stocks">
+            {unlock.stocks.map((s) => (
+              <li key={`${s.code}-${s.share_type}`}>
+                <span className="cal-stock-code code">{s.code}</span>
+                <span className="cal-stock-name">{s.name || "—"}</span>
+                <span className="cal-stock-cap code">{fmtMoney(s.market_cap)}</span>
+                <span
+                  className="cal-stock-pct code"
+                  title="占解禁前流通市值比例（可大于 100%：解禁量可超过原流通盘）"
+                >
+                  {fmtPct(s.pct_of_float)}
+                </span>
+                <span className="cal-stock-type muted-text">
+                  {s.share_type || ""}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {/* ── 其它批量类型（预约披露）沿用原来的清单 ── */}
+        {open && !isUnlock && (
           <ul className="cal-bulk-list">
             {events.map((e) => (
               <li key={e.event_id}>
@@ -282,6 +333,7 @@ function BulkRow({ kind, events, today }: {
             ))}
           </ul>
         )}
+
         {/* 折叠时给一句"里面有多少标的"，免得用户以为没数据 */}
         {!open && codes.length > 0 && (
           <div className="cal-scope">

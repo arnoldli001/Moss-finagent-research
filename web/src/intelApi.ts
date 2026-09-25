@@ -214,6 +214,11 @@ export interface CalendarEvent {
     company_count?: number;
     industries?: string[];
     codes?: string[];
+    /**
+     * **限售解禁的个股明细**（只有 `kind === "unlock"` 才有）。
+     * 按解禁市值倒序。
+     */
+    stocks?: UnlockStock[];
   };
   /** `rule` = 规则确定（交易所规则，不会变）｜`scheduled` = 预约（可改期） */
   certainty: string;
@@ -509,6 +514,54 @@ export function credLevelLabel(score: number): string {
  * ⚠️ 这条规则在本项目是硬约束：`—` 表示"没有这个数"，
  * `0` 表示"这个数是零"，两者不能混。
  */
+/**
+ * 金额 → 中文单位（亿 / 万）。
+ *
+ * 财经数据里"59107601989.11 元"没人读得出来，界面必须给"591.08 亿"。
+ * 阈值用 1e8/1e4 —— A 股语境下亿是最自然的量级。
+ */
+export function fmtMoney(v: unknown, digits = 2): string {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  // 去掉多余的尾随 0（"591.00 亿" → "591 亿"）
+  const trim = (x: number) => x.toFixed(digits).replace(/\.?0+$/, "");
+  if (abs >= 1e8) return `${trim(n / 1e8)} 亿`;
+  if (abs >= 1e4) return `${trim(n / 1e4)} 万`;
+  return fmtNum(n, digits);
+}
+
+/** 百分数（输入已经是 % 值，不是小数）。 */
+export function fmtPct(v: unknown, digits = 1): string {
+  if (v === null || v === undefined || v === "") return "—";
+  const n = Number(v);
+  if (!Number.isFinite(n)) return "—";
+  return `${n.toFixed(digits).replace(/\.?0+$/, "")}%`;
+}
+
+/**
+ * 限售解禁的个股明细（scope.stocks[]）。
+ *
+ * 来源是东财的**个股明细**接口（stock_restricted_release_detail_em），
+ * 按市值倒序 —— 解禁影响最大的是最大的那几只，展开先看到它们。
+ */
+export interface UnlockStock {
+  code: string;
+  name: string;
+  /** 实际解禁市值（元） */
+  market_cap: number | null;
+  /**
+   * 占**解禁前流通市值**比例（%）。
+   *
+   * ⚠️ 可能大于 100 —— 那不是错：解禁量可以超过原流通盘
+   * （次新股首发原股东解禁时常见）。界面不要做 0~100 钳制。
+   */
+  pct_of_float: number | null;
+  /** 限售股类型（首发原股东 / 股权激励 / 追加承诺…） */
+  share_type: string;
+}
+
 export function fmtNum(v: unknown, digits = 2): string {
   if (v === null || v === undefined || v === "") return "—";
   const n = Number(v);

@@ -302,9 +302,48 @@ def _quarter_label(now: datetime) -> str:
 # 二、限售解禁
 # ======================================================================
 
+def _unlock_date(raw: Any) -> str:
+    """解禁时间 → `YYYY-MM-DD`。
+
+    实测该字段在不同 akshare 版本里给过两种形态：
+      · `日期字符串`（`2026-09-28`）—— 现行
+      · `毫秒时间戳`（`1790553600000`）—— 旧版
+    两种都处理；都解析不出来返回空串（调用方据此跳过该行，不猜）。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    head = s[:10]
+    if len(head) == 10 and head[4] == "-" and head[7] == "-":
+        return head
+    # 纯数字 → 毫秒时间戳
+    if s.isdigit() and len(s) >= 10:
+        try:
+            return datetime.fromtimestamp(int(s) / 1000).strftime("%Y-%m-%d")
+        except (OverflowError, OSError, ValueError):
+            return ""
+    return ""
+
+
 def fetch_unlock_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                           ) -> tuple[list[CalendarEvent], list[str]]:
-    """限售解禁日程。主源东财（含解禁市值），备源巨潮公告。"""
+    """限售解禁日程。主源东财（**个股明细**），备源巨潮公告。
+
+    ## 为什么用明细源而不是汇总源（用户报障后改的）
+
+    原来用 `stock_restricted_release_summary_em`，它按日只给三列：
+    `解禁时间 / 当日解禁股票家数 / 实际解禁市值`。于是界面上"40 家"
+    点开**什么都没有** —— 个股名、每只的市值与占比在那个接口里
+    **根本不存在**，不是前端漏渲染。
+
+    改用 `stock_restricted_release_detail_em`：它按**个股**给
+    `股票代码 / 股票简称 / 限售股类型 / 实际解禁市值 /
+    占解禁前流通市值比例`。实测它与汇总源**完全一致**
+    （2026-09-28：两边都是 40 家、591.08 亿），是汇总源的超集。
+
+    所以：一家一个条目 → 按日聚合成一个事件 → 个股挂在
+    `scope.stocks` 里，展开才看得见。
+    """
     events: list[CalendarEvent] = []
     tried: list[str] = []
     today = datetime.now()
@@ -314,15 +353,35 @@ def fetch_unlock_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
     try:
         import akshare as ak
 
-        df = ak.stock_restricted_release_summary_em(
-            symbol="全部股票",
+        df = ak.stock_restricted_release_detail_em(
             start_date=today.strftime("%Y%m%d"),
             end_date=end.strftime("%Y%m%d"))
+
+        # 按日归堆。`解禁时间` 实测是**日期字符串**（`2026-09-28`），
+        # 不是时间戳 —— 但仍兼容毫秒时间戳（同一接口在不同版本下变过）
+        by_day: dict[str, list[dict[str, Any]]] = {}
         for _, row in df.iterrows():
-            d = str(row.get("解禁时间") or "")[:10]
+            d = _unlock_date(row.get("解禁时间"))
             if not d:
                 continue
-            market_cap = _num(row.get("实际解禁市值"))
+            code = str(row.get("股票代码") or "").strip()
+            cap = _num(row.get("实际解禁市值"))
+            # 占比：源给的是**小数**（7.88e-05），转成百分数才可读
+            ratio = _num(row.get("占解禁前流通市值比例"))
+            by_day.setdefault(d, []).append({
+                "code": code,
+                "name": str(row.get("股票简称") or "").strip(),
+                "market_cap": cap,
+                "pct_of_float": (None if ratio is None
+                                 else round(ratio * 100, 4)),
+                "share_type": str(row.get("限售股类型") or "").strip(),
+            })
+
+        for d in sorted(by_day):
+            stocks = sorted(by_day[d],
+                            key=lambda s: (s.get("market_cap") or 0),
+                            reverse=True)
+            total = sum((s.get("market_cap") or 0) for s in stocks)
             events.append(CalendarEvent(
                 event_id=f"unlock_{d}",
                 kind="unlock",
@@ -330,12 +389,16 @@ def fetch_unlock_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                 title="限售股解禁日",
                 scope={
                     "kind": "market",
-                    "company_count": int(_num(row.get("当日解禁股票家数")) or 0),
-                    "industries": [], "codes": [],
+                    "company_count": len(stocks),
+                    "industries": [],
+                    "codes": [s["code"] for s in stocks if s["code"]],
+                    # ★ 个股明细。**按市值倒序** —— 解禁影响最大的是最大的那几只，
+                    # 用户展开先看到的应该是它们。
+                    "stocks": stocks,
                 },
                 # 解禁日由**交易所规则**确定，不会改期
                 certainty="rule",
-                metrics={"unlock_market_cap": market_cap},
+                metrics={"unlock_market_cap": total},
             ))
         if events:
             return events, tried

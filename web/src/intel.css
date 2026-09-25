@@ -692,6 +692,48 @@
   white-space: nowrap;
 }
 .cal-bulk-toggle:hover { border-color: var(--accent); color: var(--accent); }
+/* --- 解禁个股明细（后端改用个股接口后才有内容可渲染）--- */
+.cal-stocks {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 0 0;
+  border-top: 1px dashed var(--table-line);
+  /* 一天可能几十只 —— 给上限并自己滚动，别把下面的日期推得很远 */
+  max-height: 280px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.cal-stocks li {
+  display: grid;
+  /* 代码 / 名称 / 市值 / 占比 / 类型 —— 手机上后两列会换行（见媒体查询） */
+  grid-template-columns: 52px minmax(64px, 1fr) 76px 60px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+  min-width: 0;
+}
+.cal-stock-code { color: var(--muted); font-size: 11.5px; }
+.cal-stock-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cal-stock-cap { text-align: right; font-variant-numeric: tabular-nums; }
+.cal-stock-pct {
+  text-align: right;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+}
+.cal-stock-type {
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .cal-bulk-list {
   list-style: none;
   margin: 6px 0 0;
@@ -988,6 +1030,15 @@
   .heat-bars li { grid-template-columns: 74px minmax(0, 1fr) 36px; font-size: 11.5px; }
 
   /* 日历：左边日期列再窄会截断 `09-27`，保持 58px */
+  /* 解禁明细：手机上 5 列排不下 —— 拆成两行
+     （第 1 行 代码+名称+市值，第 2 行 占比+类型） */
+  .cal-stocks li {
+    grid-template-columns: 52px minmax(0, 1fr) 76px;
+    row-gap: 2px;
+  }
+  .cal-stock-pct { grid-column: 1 / 2; text-align: left; }
+  .cal-stock-type { grid-column: 2 / 4; }
+
   .cal-row { grid-template-columns: 58px minmax(0, 1fr); gap: 8px; }
   .cal-sum-item { min-width: 92px; padding: 6px 10px; }
   .cal-sum-val { font-size: 17px; }
