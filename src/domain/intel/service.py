@@ -164,9 +164,17 @@ async def build_feed(*, watch_codes: list[str] | None = None,
             })
 
     # ── 3) 归一：按时间倒序 + 去重 + 截断 ──
+    #
+    # ⚠️ 排序键必须过 `sort_key()` 归一化，不能直接比 `published_at` 字符串。
+    # 三种时间戳格式（`20260924` / `2026-09-25 04:26:03` /
+    # `2026-09-25T13:15:41.340+0800`）直接按字符串排会出错：
+    # `-`(0x2D) < `0`(0x30)，于是 `'2026-09-…'` 排在 `'20260924'` **之前**，
+    # 界面按天分组后出现 `今天 / 09-24 / 今天 / 09-24` 来回跳。
+    from src.infrastructure.connectors.intel_sources import sort_key
+
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
-    for it in sorted(items, key=lambda x: str(x.get("published_at") or ""),
+    for it in sorted(items, key=lambda x: sort_key(x.get("published_at")),
                      reverse=True):
         h = str(it.get("content_hash") or "")
         if h and h in seen:
@@ -210,14 +218,17 @@ def _balanced_take(items: list[dict[str, Any]], limit: int
     """
     if limit <= 0:
         return []
+    from src.infrastructure.connectors.intel_sources import sort_key
+
     buckets: dict[str, list[dict[str, Any]]] = {}
     for it in items:            # items 已按时间倒序，分桶后桶内仍有序
         buckets.setdefault(str(it.get("kind") or "other"), []).append(it)
     # 类型顺序按「各自最新一条的时间」定 —— 谁有最新消息谁先露头，
     # 而不是固定字典序（那会让某个类型永远排第一）。
+    # 同样要过 `sort_key()`：三种时间戳格式直接比字符串会排错。
     order = sorted(
         buckets,
-        key=lambda k: str(buckets[k][0].get("published_at") or ""),
+        key=lambda k: sort_key(buckets[k][0].get("published_at")),
         reverse=True,
     )
     out: list[dict[str, Any]] = []

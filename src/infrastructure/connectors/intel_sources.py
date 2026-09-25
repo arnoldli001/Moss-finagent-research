@@ -45,10 +45,18 @@ from typing import Any, Callable, Final
 logger = logging.getLogger(__name__)
 
 #: 情报源类型 → 中文标签。**只暴露"类型"，不暴露"是哪一家"。**
+#:
+#: ⚠️ 这张表必须覆盖**所有**会被塞进 `IntelItem` 的 kind。
+#: 漏一个的后果是 `.get(kind, kind)` 兜底成**机器名**直接上屏 ——
+#: 实测知识星球的条目在界面上显示成了 `research_note`（用户看到的是
+#: 一个英文枚举值，而不是"研究笔记"）。
+#: `tests/unit/test_intel_source_privacy.py` 里有一条用例锁住这个覆盖性。
 SOURCE_KINDS: Final[dict[str, str]] = {
     "broker_report": "券商研报",
     "newswire": "财经快讯",
     "policy": "政策信号",
+    "research_note": "研究笔记",
+    "other": "其他",
 }
 
 #: 每个源最近一次调用结果（探活用，进程内）。
@@ -187,6 +195,52 @@ def _clip(text: object, limit: int) -> str:
     if limit <= 0 or len(s) <= limit:
         return s
     return s[:limit].rstrip() + "…"
+
+
+#: 各来源的时间戳格式（实测三种，互不相同）
+_TS_PATTERNS: Final[tuple[tuple[str, str], ...]] = (
+    # 紧凑日期：`20260924`（部分快讯只给日期）
+    ("compact", r"^(\d{4})(\d{2})(\d{2})$"),
+    # 带时间（可含 `T`、小数秒、无冒号时区）：`2026-09-25T13:15:41.340+0800`
+    ("iso", r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?"),
+)
+
+
+def sort_key(published_at: object) -> str:
+    """时间戳 → **可排序的归一化键** `YYYY-MM-DDTHH:MM:SS`。
+
+    ## 为什么必须归一化，不能直接比字符串
+
+    各来源的时间戳格式**互不相同**，实测三种：
+
+        `20260924`                       （快讯，只有日期）
+        `2026-09-25 04:26:03`            （快讯，带时间）
+        `2026-09-25T13:15:41.340+0800`   （知识星球，带毫秒与无冒号时区）
+
+    直接 `sorted(..., key=lambda x: x["published_at"])` 会得到**错的顺序**：
+    ASCII 里 `-`(0x2D) < `0`(0x30)，所以 `'2026-09'…` 排在 `'20260924'` **之前**，
+    于是"9 月 24 日的快讯"被排到了"9 月 25 日的笔记"后面。
+
+    症状在界面上表现为**按天分组后出现 `今天 / 09-24 / 今天 / 09-24`** 这种
+    来回跳的分组 —— 看起来像分组逻辑坏了，其实是排序键坏了。
+
+    解析不出来的原样返回（稳定排序下至少不会崩，也不会把数据丢掉）。
+    """
+    import re
+
+    s = "" if published_at is None else str(published_at).strip()
+    if not s:
+        return ""
+    for kind, pat in _TS_PATTERNS:
+        m = re.match(pat, s)
+        if not m:
+            continue
+        g = m.groups()
+        if kind == "compact":
+            return f"{g[0]}-{g[1]}-{g[2]}T00:00:00"
+        hh, mm, ss = g[3], g[4], g[5] or "00"
+        return f"{g[0]}-{g[1]}-{g[2]}T{hh}:{mm}:{ss}"
+    return s
 
 
 def _hash(*parts: object) -> str:

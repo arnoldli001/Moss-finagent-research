@@ -231,6 +231,72 @@ def test_agency_only_exposed_for_broker_reports() -> None:
     assert wire["agency"] == "", "快讯不应通过 agency 泄漏渠道名"
 
 
+def test_kind_label_table_covers_every_produced_kind() -> None:
+    """`SOURCE_KINDS` 必须覆盖**所有**会被塞进 `IntelItem` 的 kind。
+
+    ## 为什么值得一条测试
+
+    漏一个的后果是 `to_public()` 里 `.get(self.kind, self.kind)` 兜底成
+    **机器名直接上屏**。实测踩过：知识星球的条目在界面上显示成
+    `research_note` —— 用户看到的是一个英文枚举值，而不是"研究笔记"。
+    这种缺陷不报错、不影响布局，只有盯着界面看才会发现。
+    """
+    import inspect
+
+    from src.infrastructure.connectors import intel_sources
+    from src.infrastructure.connectors.intel_sources import SOURCE_KINDS
+
+    # 后端实际会产出的 kind 全集
+    expected = {"broker_report", "newswire", "policy", "research_note"}
+    missing = expected - set(SOURCE_KINDS)
+    assert not missing, (
+        f"SOURCE_KINDS 缺 {sorted(missing)} —— 这些类型在界面上会显示成机器名")
+
+    # 每个 label 都必须是中文，不能是原样的英文枚举
+    for kind, label in SOURCE_KINDS.items():
+        assert label != kind, f"{kind} 的 label 没有翻译（还是原值）"
+        assert any("\u4e00" <= ch <= "\u9fff" for ch in label), (
+            f"{kind} → {label!r} 不含中文，疑似漏配")
+
+    # 模块内部不该有别的 kind 字面量绕过这张表
+    src = inspect.getsource(intel_sources)
+    for k in expected:
+        assert f'"{k}"' in src, f"{k} 未在 intel_sources 里出现（是否改了名字？）"
+
+
+def test_sort_key_normalises_all_three_timestamp_formats() -> None:
+    """三种来源时间戳格式都要归一化成**可排序**的键。
+
+    ## 为什么必须有这条
+
+    各来源的时间戳格式互不相同：
+        `20260924`（只有日期） / `2026-09-25 04:26:03` /
+        `2026-09-25T13:15:41.340+0800`
+    直接按字符串排序会出错 —— ASCII 里 `-`(0x2D) < `0`(0x30)，于是
+    `'2026-09-…'` 排在 `'20260924'` **之前**，界面按天分组后出现
+    `今天 / 09-24 / 今天 / 09-24` 来回跳。看起来像分组坏了，其实是排序键坏了。
+    """
+    from src.infrastructure.connectors.intel_sources import sort_key
+
+    compact = sort_key("20260924")
+    iso = sort_key("2026-09-25T13:15:41.340+0800")
+    spaced = sort_key("2026-09-25 04:26:03")
+
+    # 归一化后必须同构（都是 `YYYY-MM-DDTHH:MM:SS`）
+    assert compact == "2026-09-24T00:00:00", compact
+    assert iso == "2026-09-25T13:15:41", iso
+    assert spaced == "2026-09-25T04:26:03", spaced
+
+    # 关键断言：**跨格式**排序必须与时间先后一致
+    assert sorted([compact, iso, spaced]) == [compact, spaced, iso], (
+        "跨格式排序与时间先后不一致（这就是分组来回跳的根因）")
+
+    # 解析不出来时不崩、不丢内容
+    assert sort_key("") == ""
+    assert sort_key(None) == ""
+    assert sort_key("不是时间") == "不是时间"
+
+
 def test_group_id_redacted_in_text() -> None:
     """日志/异常侧：group_id 与接口 URL 都要脱敏。"""
     from src.core.redaction import redact

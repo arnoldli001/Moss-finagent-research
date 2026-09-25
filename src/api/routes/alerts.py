@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
 from src.core.config import get_settings
 from src.core.errors import (
@@ -22,7 +22,7 @@ from src.domain.alerts.dedup import dedupe_events
 from src.domain.alerts.models import DEFAULT_TENANT, DISCLAIMER, ScanResult
 from src.domain.alerts.normalize import normalize_events, now_iso
 from src.domain.alerts.service import ScanInProgressError
-from src.scheduler.registry import JOB_REGISTRY
+from src.scheduler.registry import JOB_REGISTRY, alert_scan_schedule
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["alerts"])
@@ -51,6 +51,106 @@ def _scan_state(request: Request) -> dict:
     if getattr(state, "alert_scan_state", None) is None:
         state.alert_scan_state = {"running": False, "started_at": "", "result": None}
     return state.alert_scan_state
+
+
+# ======================================================================
+# 来源脱敏（**这是数据源保密的关键一环，别绕过它直接 model_dump**）
+# ======================================================================
+
+#: 告警/事件输出里**只对管理员**保留的字段。
+_ADMIN_ONLY_FIELDS = ("source_name", "source_url")
+#: 用户可见字段里**可能夹带上游 URL 的文本**
+_TEXT_FIELDS = ("description", "impact_path", "content")
+
+
+def _strip_urls(text: object) -> str:
+    """抹掉文本里的 URL，保留其余内容。
+
+    为什么不能只删 `source_url` 字段就算完：`description` 与 `impact_path`
+    是**分析层生成的自然语言**，实测里它们会把上游链接整段抄进来；`content`
+    更是事件原文。渗透工具只要读这几个字段就能拿到域名。
+    """
+    import re
+
+    s = "" if text is None else str(text)
+    if not s:
+        return s
+    # 只匹配 http(s):// 开头的串，遇到空白/引号/中文标点即止
+    return re.sub(r"https?://[^\s\"'<>）】，。；]+", "（链接已隐藏）", s)
+
+
+async def _viewer_is_admin(request: Request) -> bool:
+    """当前请求是不是管理员。
+
+    **fail-closed**：解析不出来时按"非管理员"处理 —— 脱敏失败只是少给
+    一点信息，反过来则是把数据源交出去。所以默认值必须是"更严的那一边"。
+    """
+    try:
+        from src.api.session_ctx import current_user
+
+        _, tier = await current_user(request, write=False)
+        return str(tier) == "admin"
+    except Exception:  # noqa: BLE001 拿不到身份就按非管理员
+        return False
+
+
+def alert_to_public(alert, *, is_admin: bool) -> dict:
+    """告警 → 可出接口的 dict。
+
+    ## 为什么必须有这一层
+
+    原来直接 `alert.model_dump()`，于是响应里带着：
+
+        "source_name": "东方财富-全球财经"
+        "source_url":  "https://finance.eastmoney.com/a/202609243883509677.html"
+
+    任何登录用户按一下 F12 就能看到**我们用了哪几个免费渠道**，
+    而"渠道组合 + 采集节奏"正是本项目的壁垒。前端**根本没用到**
+    这两个字段（`AlertsPanel` 只渲染了 `source_name` 做署名），
+    所以把它们从用户响应里去掉不损失任何功能。
+
+    ## 三层处理
+
+      · `source_name` → 用户侧换成**稳定假名** `source_alias`
+        （不是打码成 `***`：那样所有来源塌成同一个值，按源分组/去重全失效）
+      · `source_url`  → **一律不给用户**（管理员保留，他需要排查）
+      · 文本字段里的裸 URL → 抹成"（链接已隐藏）"
+    """
+    data = alert.model_dump()
+    for f in _TEXT_FIELDS:
+        if f in data:
+            data[f] = _strip_urls(data.get(f))
+
+    if is_admin:
+        # 管理员要能溯源排障：保留真名与链接
+        return data
+
+    from src.core.redaction import source_pseudonym
+
+    raw_name = str(data.get("source_name") or "")
+    data.pop("source_url", None)
+    data.pop("source_name", None)
+    data["source_alias"] = source_pseudonym(raw_name)
+    return data
+
+
+def event_to_public(event, *, is_admin: bool) -> dict:
+    """事件 → 可出接口的 dict。规则同 `alert_to_public`。"""
+    data = event.model_dump()
+    for f in _TEXT_FIELDS:
+        if f in data:
+            data[f] = _strip_urls(data.get(f))
+
+    if is_admin:
+        return data
+
+    from src.core.redaction import source_pseudonym
+
+    raw_name = str(data.get("source_name") or "")
+    data.pop("source_url", None)
+    data.pop("source_name", None)
+    data["source_alias"] = source_pseudonym(raw_name)
+    return data
 
 
 # ---------- 告警查询/操作 ----------
@@ -82,8 +182,14 @@ async def alert_settings(request: Request) -> dict:
             "opp_min_score": settings.alert_email_opp_min_score,
             "to": settings.alert_email_to,
         },
-        "schedule": {"job": "event_alert_daily",
-                     "cron": spec.cron if spec else None},
+        # 扫描时机：定时班次有三班（盘中/午盘/收盘后），时刻表从注册表的 cron
+        # 现算（`alert_scan_schedule`），前端直接展示、不再自己解析 cron。
+        # `job`/`cron` 两个旧字段保留给老前端，指向收盘后那班全量扫描。
+        "schedule": {
+            "job": "event_alert_daily",
+            "cron": spec.cron if spec else None,
+            **alert_scan_schedule(),
+        },
         "disclaimer": DISCLAIMER,
     }
 
@@ -95,8 +201,17 @@ async def unread_count(request: Request, tenant_id: str = DEFAULT_TENANT) -> dic
 
 
 @router.post("/alerts/scan", status_code=202)
-async def trigger_scan(request: Request) -> dict:
-    """手动触发扫描：后台执行，2秒内返回accepted，前端轮询scan/latest。"""
+async def trigger_scan(
+    request: Request,
+    force: bool = Query(
+        default=False,
+        description="true=强制重判（绕过 LLM 缓存），false=复用上次对同一批事件的评估"),
+) -> dict:
+    """手动触发扫描：后台执行，2秒内返回accepted，前端轮询scan/latest。
+
+    `force=true` 给"我就是要重新判一次"的场景 —— 它会把 `use_cache=False`
+    一路传到 LLM 网关。不传则复用缓存（同一批事件不会重复计费）。
+    """
     runtime = _require_stack(request)
     scan = _scan_state(request)
     if scan["running"] or runtime.event_service.is_running:
@@ -108,7 +223,7 @@ async def trigger_scan(request: Request) -> dict:
     async def _job() -> None:
         try:
             scan["result"] = (
-                await runtime.event_service.run("manual")).model_dump()
+                await runtime.event_service.run("manual", force=force)).model_dump()
         except ScanInProgressError as exc:
             # 与定时作业/调度器手动入口的共享锁冲突：跳过而非失败
             scan["result"] = ScanResult(
@@ -148,7 +263,8 @@ async def get_alert(
     alert = await runtime.event_repo.get_alert(alert_id, tenant_id)
     if alert is None:
         raise HTTPException(status_code=404, detail="告警不存在或已过期")
-    return {"alert": alert.model_dump()}
+    return {"alert": alert_to_public(alert,
+                                     is_admin=await _viewer_is_admin(request))}
 
 
 @router.post("/alerts/{alert_id}/read")
@@ -174,7 +290,8 @@ async def list_alerts(
         alert_type=type, alert_level=level, status=status,
         limit=limit, include_expired=include_expired, tenant_id=tenant_id)
     unread = await runtime.event_repo.count_unread(tenant_id)
-    return {"alerts": [a.model_dump() for a in alerts],
+    is_admin = await _viewer_is_admin(request)
+    return {"alerts": [alert_to_public(a, is_admin=is_admin) for a in alerts],
             "total": len(alerts), "unread": unread}
 
 
@@ -189,7 +306,9 @@ async def list_events(
     limit = max(1, min(limit, 200))
     events = await runtime.event_repo.list_events(
         event_type=type, limit=limit, tenant_id=tenant_id)
-    return {"events": [e.model_dump() for e in events], "total": len(events)}
+    is_admin = await _viewer_is_admin(request)
+    return {"events": [event_to_public(e, is_admin=is_admin) for e in events],
+            "total": len(events)}
 
 
 @router.post("/events/import")
@@ -238,19 +357,33 @@ async def import_events(request: Request, body: dict) -> dict:
 
 @router.websocket("/ws/alerts")
 async def alerts_ws(websocket: WebSocket, tenant_id: str = DEFAULT_TENANT) -> None:
+    # ★ 同上：WS 不走 HTTP 登录门槛，必须自己校验会话
+    from src.api.session_ctx import ws_allow
+
+    if not await ws_allow(websocket):
+        return
     runtime = websocket.app.state.runtime
     hub = runtime.alert_hub
     if hub is None or runtime.event_repo is None:
         await websocket.close(code=1013)  # 子系统不可用
         return
-    await hub.connect(websocket, tenant_id)
+
+    # 该连接是不是管理员 —— 决定它能不能看到来源真名与原文链接。
+    # 脱敏必须**按连接**（同一 vip 租户下既有管理员也有普通用户），
+    # 所以身份在这里解析一次、登记到 hub 上，由 hub 逐连接序列化。
+    from src.api.session_ctx import ws_identity
+
+    ident = await ws_identity(websocket)
+    is_admin = bool(ident and ident[1] == "admin")
+
+    await hub.connect(websocket, tenant_id, is_admin=is_admin)
     try:
         unread = await runtime.event_repo.list_alerts(
             status="active", limit=10, tenant_id=tenant_id)
         unread_count = await runtime.event_repo.count_unread(tenant_id)
         await websocket.send_json({
             "type": "snapshot", "unread": unread_count,
-            "data": [a.model_dump() for a in unread]})
+            "data": [alert_to_public(a, is_admin=is_admin) for a in unread]})
         while True:
             await websocket.receive_text()  # 仅保活/探断连
     except WebSocketDisconnect:
