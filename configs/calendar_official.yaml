@@ -28,21 +28,33 @@
 # ⚠️ 合规：本文件只列**日程**（哪天发布），不含任何方向判断。
 
 macro:
+  # ── 近期（用于验证"预期差"匹配通路）──
+  # 说明：预期值/前值会由全球财经日历**按事件名自动补**，
+  # 匹配不上时界面显示「待公布」或「暂无一致预期值」—— 不编数字。
+  - key: industrial_profit_202608
+    name: 规模以上工业企业利润
+    date: "2026-09-27"
+    kind: macro
+  - key: pmi_202609
+    name: 制造业PMI
+    date: "2026-09-30"
+    kind: macro
+
   # ── 2026 年 10 月 ──
   - key: cpi_202609
-    name: 统计局 · CPI（9 月）
+    name: CPI
     date: "2026-10-09"
     kind: macro
   - key: ppi_202609
-    name: 统计局 · PPI（9 月）
+    name: PPI
     date: "2026-10-09"
     kind: macro
   - key: gdp_2026q3
-    name: 统计局 · GDP（三季度）
+    name: GDP
     date: "2026-10-19"
     kind: macro
   - key: pmi_202610
-    name: 统计局 · PMI（10 月）
+    name: 制造业PMI
     date: "2026-10-31"
     kind: macro
 
