@@ -2,8 +2,18 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- `viewport-fit=cover`：让页面铺满 iPhone 的圆角与灵动岛区域，
+         配合 CSS 的 `env(safe-area-inset-*)` 把内容推离安全区。
+         不加这个，`env(safe-area-inset-*)` 在 iOS 上**恒为 0**，
+         横屏时左右被圆角切掉、竖屏时底部被 Home 指示条压住。 -->
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Moss-FinAgent-Research 投研工作台</title>
+    <!-- 页签图标：单一 SVG 源文件（web/public/favicon.svg，Vite 原样拷进 dist 根目录）。
+         实测浏览器以 <img>/页签方式加载该文件渲染正常，故不再维护 PNG 回退
+         —— 多一份位图就多一处会与矢量版走样的地方。 -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" content="#0f1419" />
   </head>
   <body>
     <div id="root"></div>

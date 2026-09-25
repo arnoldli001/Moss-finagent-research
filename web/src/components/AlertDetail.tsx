@@ -96,14 +96,21 @@ export default function AlertDetail({ alert, onClose }: Props) {
 
       <h3>溯源</h3>
       <div className="provenance">
-        <div>来源：{alert.source_name || "未知"}</div>
+        {/* ⚠️ 数据源保密：普通用户的响应里**没有** `source_name` /
+            `source_url`（后端在契约层就不构造它们），所以这里只有管理员
+            才看得到真名与原文链接。
+            原来这里直接 `<a href={alert.source_url}>查看原文</a>`，
+            等于把"东方财富快讯的某篇文章"作为可点链接交给任何登录用户 ——
+            点一下就知道了我们的渠道。 */}
+        <div>来源：{alert.source_name || "已隐藏（渠道信息不对用户开放）"}</div>
         <div>事件时间：{alert.event_publish_time || "未知"}</div>
         <div>触发时间：{alert.trigger_time}</div>
-        {alert.source_url
-          ? <a href={alert.source_url} target="_blank" rel="noreferrer">
-              查看原文 ↗
-            </a>
-          : <span className="muted-text">无原文链接</span>}
+        {alert.source_url && (
+          // 仅管理员走到这里（普通用户拿不到该字段）
+          <a href={alert.source_url} target="_blank" rel="noreferrer">
+            查看原文 ↗（管理员）
+          </a>
+        )}
       </div>
 
       <p className="disclaimer">{alert.disclaimer}</p>

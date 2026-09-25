@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, api, TaskDetail, TraceDetail } from "./api";
+import AccountMenu from "./components/AccountMenu";
+import AdminMonitorPanel from "./components/AdminMonitorPanel";
+import AdminPanel from "./components/AdminPanel";
+import AdminPermissionPanel from "./components/AdminPermissionPanel";
+import AdminTierPanel from "./components/AdminTierPanel";
 import AgentChatView from "./components/AgentChatView";
 import AgentTimeline from "./components/AgentTimeline";
 import AlertBell from "./components/AlertBell";
@@ -7,13 +12,44 @@ import AlertsPanel from "./components/AlertsPanel";
 import AlertToasts from "./components/AlertToasts";
 import BacktestPanel from "./components/BacktestPanel";
 import FundFlowPanel from "./components/FundFlowPanel";
+import IntelPanel from "./components/intel/IntelPanel";
+import LoginScreen from "./components/LoginScreen";
+import MainlinePanel from "./components/MainlinePanel";
 import QuantTabContainer from "./components/QuantTabContainer";
+import ErrorBoundary from "./components/ErrorBoundary";
 import MetricsPanel from "./components/MetricsPanel";
 import ReportView from "./components/ReportView";
 import SchedulerPanel from "./components/SchedulerPanel";
+import ServerStatusBanner from "./components/ServerStatusBanner";
+import StockProfilePanel from "./components/StockProfilePanel";
 import TracePanel from "./components/TracePanel";
 import { loadAgentMeta } from "./agentMeta";
 import { useAlertsWs } from "./hooks/useAlertsWs";
+import { readRoute, writeRoute } from "./route";
+import { useAuth } from "./hooks/useAuth";
+import { useFeatures } from "./hooks/useFeatures";
+
+/**
+ * 页签按钮（小工具组件）。
+ *
+ * `show=false` 时**不渲染** —— 页签清单由 `visible_views` 决定，
+ * 所以"关掉功能"在界面上就是"页签消失"，而不是"点进去 403"。
+ * 也顺手统一了 `white-space: nowrap`，避免中文标签折行。
+ */
+function TL({ label, active, onClick, show = true, tone = "" }: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+  show?: boolean;
+  tone?: "admin" | "";
+}) {
+  if (!show) return null;
+  const cls = ["tab", active ? "active" : "", tone === "admin" ? "tab-admin" : ""]
+    .filter(Boolean).join(" ");
+  return (
+    <button className={cls} onClick={onClick} title={label}>{label}</button>
+  );
+}
 
 const ANALYSIS_TYPES = [
   { value: "macro", label: "宏观" },
@@ -22,7 +58,58 @@ const ANALYSIS_TYPES = [
   { value: "full", label: "综合" },
 ];
 
+/**
+ * 可写进 URL 的页签白名单（与 `view` 的联合类型一一对应）。
+ *
+ * ## 为什么要有它（用户口径 2026-09-24）
+ *
+ * 用户："全都用 http://127.0.0.1:8100/，会导致刷新网页时总是跳到默认首页"。
+ * 本应用**没有路由**，页签只活在 React state 里 —— 一刷新就回到默认页。
+ * 正解不是"每个子界面开子域名"（那要重复部署、还要各自处理登录态与 CORS），
+ * 而是**把当前页签写进 URL 的 hash**：刷新、收藏、发链接都能回到同一页，
+ * 且**不需要后端配合**（hash 不会发给服务器，静态托管也不会 404）。
+ *
+ * 白名单的作用是**只认已知页签**：脏 hash（用户手改、旧链接）忽略掉，
+ * 不能让它直接进 `setView`（那会把界面切到不存在的分支 → 白屏）。
+ */
+const HASH_VIEWS = [
+  "research", "scheduler", "metrics", "backtest", "alerts", "intraday",
+  "mainline", "fundflow", "mypools", "intel",
+  "admin", "admin-monitor", "admin-tiers", "admin-perms",
+] as const;
+
 export default function App() {
+  const auth = useAuth();
+  // 认证状态机：checking → 显示"正在检查登录状态"，避免闪一下登录页
+  // （用户已登录时看到登录页一闪，会以为自己的登录丢了）。
+  if (auth.phase === "checking") {
+    return (
+      <div className="auth-shell">
+        <div className="auth-card auth-checking">
+          <span className="spinner" /> 正在检查登录状态…
+        </div>
+      </div>
+    );
+  }
+  if (auth.phase === "anonymous" || !auth.user) {
+    // `notice` 是"被退回登录页"的原因（如会话过期），如实显示 —— 否则用户会以为
+    // 自己点错了按钮，而实际是掉线（见 web/src/unauthorized.ts 的说明）。
+    return <LoginScreen onLogin={auth.login} notice={auth.notice} />;
+  }
+  return <Workbench auth={auth} />;
+}
+
+type AuthApi = ReturnType<typeof useAuth>;
+
+/**
+ * 主工作台（已登录后渲染）。
+ *
+ * 从 `App` 里拆出来是**必须的**：`useAuth()` 与 `useAlertsWs()` 都是 Hook，
+ * 若在同一个组件里先 `return <LoginScreen/>` 再调 `useAlertsWs()`，
+ * 就等于"条件调用 Hook" —— React 会直接报 Hooks 顺序错误。
+ * 拆成一个只在已登录时才渲染的组件，Hook 顺序天然稳定。
+ */
+function Workbench({ auth }: { auth: AuthApi }) {
   const [query, setQuery] = useState("当前宏观环境如何？对A股有什么含义？");
   const [analysisType, setAnalysisType] = useState("macro");
   const [target, setTarget] = useState("");
@@ -42,8 +129,51 @@ export default function App() {
   // （`view === "intraday"` 判高亮）。写成 `"quant"` 之类会编译不过或落空。
   const [view, setView] =
     useState<"research" | "scheduler" | "metrics" | "backtest" | "alerts"
-      | "intraday" | "fundflow">(
+      | "intraday" | "mainline" | "fundflow" | "intel" | "admin"
+      | "admin-monitor" | "admin-tiers" | "admin-perms">(
       "intraday");
+  // 管理员也可以切到"业务视图"看租户侧界面（他是平台身份，但业务功能同样开放）。
+  // 默认为 false：管理员登录后**先进系统管理**（那是他每天要做的事）。
+  const [tenantView, setTenantView] = useState(false);
+
+
+  const isAdmin = auth.user?.applied_tier === "admin";
+  // 是否按管理员导航渲染。管理员点了「业务视图」后即为 false —— 此时他看到
+  // 的是租户侧页签（且不受套餐限制，管理员本身含全部功能）。
+  const adminNav = isAdmin && !tenantView;
+
+  // ---- URL hash ⇄ 当前页签（刷新/收藏/分享都能回到同一页）----
+  // 读：初始化 + 浏览器前进/后退 + 手改地址栏
+  useEffect(() => {
+    const apply = () => {
+      const key = readRoute().view;
+      if (!key || !(HASH_VIEWS as readonly string[]).includes(key)) return;
+      const adminView = key.startsWith("admin");
+      if (adminView && !isAdmin) return;      // 非管理员不认管理页签，留在原页
+      if (isAdmin) setTenantView(!adminView); // 管理页签 ⇄ 业务视图的切换也跟着 URL
+      setView(key as Parameters<typeof setView>[0]);
+    };
+    apply();
+    window.addEventListener("hashchange", apply);
+    return () => window.removeEventListener("hashchange", apply);
+  }, [isAdmin]);
+
+  // 写：页签变化回填地址栏。用 `replaceState` 而不是直接赋值 ——
+  // 后者每个页签都塞一条历史，用户按"后退"要按十几次才能退出。
+  useEffect(() => {
+    // 保留子状态参数（code/mode/…）：切页签不该把它们清掉
+    writeRoute(view);
+  }, [view]);
+  // 页签权限：由服务端下发。管理员走系统管理导航时不需要拉这个接口。
+  const visibility = useFeatures(Boolean(auth.user) && !adminNav);
+  const featuresFailed = visibility.failed;
+  // 该用户能否看某个业务页签（管理员在业务视图下不受限）
+  const showView = (v: string) =>
+    adminNav ? false : (isAdmin ? true : visibility.isVisible(v));
+  // 个股口径编辑的对象（空串 = 不显示面板）。
+  // 做成"覆盖在任意页之上"而不是单独一个页签：口径是**从某只票出发**的动作
+  // （做T面板里点「⚙ 口径」），做成页签会要求用户先切页再输代码。
+  const [profileCode, setProfileCode] = useState("");
   const timer = useRef<number | null>(null);
 
   // 启动时拉取 agent 中文名/置信度中文映射（失败有本地兜底，不阻断渲染）
@@ -134,6 +264,19 @@ export default function App() {
     }
   };
 
+  /**
+   * 回首页（站名点击、登录后落地）。
+   *
+   * "首页"的定义与登录后的默认落地页一致：**量化交易**。
+   * 管理员若正在系统管理里，先切回业务视图再落到首页 ——
+   * 否则点了"回首页"却停在管理员控制台，与预期不符。
+   */
+  const goHome = () => {
+    setProfileCode("");
+    if (adminNav) setTenantView(true);
+    setView("intraday");
+  };
+
   const cancelTask = async () => {
     if (!task?.task_id) return;
     setCancelling(true);
@@ -148,77 +291,186 @@ export default function App() {
     }
   };
 
-  const running = task !== null && (task.status === "queued" || task.status === "running");
+  /**
+ * 站标图形（内联 SVG，不依赖网络字体或图片）。
+ *
+ * 为什么用内联 SVG 而不是 emoji 或图片：emoji 在各平台渲染差异很大
+ * （Windows 上是彩色字形、Linux 可能是黑白），而图片会多一次请求、
+ * 且在深色/浅色主题下不好适配。SVG 用 `currentColor` 自动跟随主题色。
+ */
+function BrandMark() {
+  return (
+    <svg viewBox="0 0 24 24" width="22" height="22" fill="none"
+      stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"
+      strokeLinejoin="round">
+      {/* 折线 = 行情走势；外框 = 工作台 */}
+      <rect x="2.5" y="3.5" width="19" height="17" rx="2.5" />
+      <path d="M5.5 15.5 9 11l3 2.5L18.5 7" />
+      <circle cx="18.5" cy="7" r="1.3" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
+const running = task !== null && (task.status === "queued" || task.status === "running");
 
   return (
-    <div className={view === "intraday" || view === "fundflow" ? "app app-wide" : "app"}>
+    <div className={view === "intraday" || view === "fundflow"
+      || view === "mainline" || view === "intel" ? "app app-wide" : "app"}>
       <header className="header">
-        <h1>Moss-FinAgent-Research</h1>
-        <span className="subtitle">多Agent投研工作台 · 全链路可溯源</span>
-        <nav className="tabs">
-          <button
-            className={view === "research" ? "tab active" : "tab"}
-            onClick={() => setView("research")}
-          >
-            投研分析
-          </button>
-          <button
-            className={view === "scheduler" ? "tab active" : "tab"}
-            onClick={() => setView("scheduler")}
-          >
-            调度管理
-          </button>
-          <button
-            className={view === "metrics" ? "tab active" : "tab"}
-            onClick={() => setView("metrics")}
-          >
-            运行指标
-          </button>
-          <button
-            className={view === "backtest" ? "tab active" : "tab"}
-            onClick={() => setView("backtest")}
-          >
-            策略回测
-          </button>
-          <button
-            className={view === "intraday" ? "tab active" : "tab"}
-            onClick={() => setView("intraday")}
-          >
-            量化交易
-          </button>
-          <button
-            className={view === "fundflow" ? "tab active" : "tab"}
-            onClick={() => setView("fundflow")}
-          >
-            资金流监控
-          </button>
-          <button
-            className={view === "alerts" ? "tab active" : "tab"}
-            onClick={() => setView("alerts")}
-          >
-            事件告警
-          </button>
-        </nav>
+        {/* ★ 站名可点击回首页（用户口径 2026-09-23）。
+            用 `<button>` 而不是 `<a href>`：本应用没有路由，用锚点会真的
+            触发一次页面跳转（丢掉当前登录态与页内状态）。做成按钮 +
+            回到"首页视图"，语义等价且不丢状态。
+            `title`/`aria-label` 让它对键盘与读屏也可用。 */}
+        <button className="brand" onClick={goHome}
+          title="回到首页" aria-label="回到首页">
+          <span className="brand-mark" aria-hidden="true">
+            <BrandMark />
+          </span>
+          <span className="brand-text">
+            <span className="brand-name">Moss-FinAgent-Research</span>
+            <span className="brand-sub">多Agent投研工作台 · 全链路可溯源</span>
+          </span>
+        </button>
+        {/* ★ 两套导航**互斥**（管理员看不到租户业务页签，反之亦然）。
+            为什么要分开（用户口径 2026-09-23）：
+              1. 权限模型不同 —— 管理员管的是"平台与人"，租户用的是"业务功能"，
+                 混在一排会让人以为管理员也能用租户功能（那是另一套鉴权）；
+              2. 页签太多会折行变丑，且管理员最常用的"待审批"被埋在最右。
+            管理员通过账户菜单里的「切换到业务视图」仍可进入业务界面。 */}
+        {adminNav ? (
+          <nav className="tabs tabs-admin">
+            {/* 这里原来有一个 `<span class="nav-group-label">系统管理</span>`
+                作为分组标签。用户口径 2026-09-23：**删掉** ——
+                它长得像页签却点不动（标签被做成了带边框的方框），
+                既不提供信息也不提供动作，是纯噪声。 */}
+            <TL label="用户管理" active={view === "admin"}
+              tone="admin" onClick={() => setView("admin")} />
+            <TL label="资源监控" active={view === "admin-monitor"}
+              tone="admin" onClick={() => setView("admin-monitor")} />
+            <TL label="资源管控" active={view === "admin-tiers"}
+              tone="admin" onClick={() => setView("admin-tiers")} />
+            <TL label="功能权限" active={view === "admin-perms"}
+              tone="admin" onClick={() => setView("admin-perms")} />
+            <TL label="业务视图" active={false}
+              onClick={() => {
+                setTenantView(true);
+                // 业务视图的落地页取"他套餐里第一个可用页签"，
+                // 而不是固定 intraday —— 万一管理员档被关了量化交易，
+                // 切过去就是一片 403。
+                setView(visibility.isVisible("intraday") || isAdmin
+                  ? "intraday" : "research");
+              }} />
+          </nav>
+        ) : (
+          <nav className="tabs">
+            {featuresFailed && (
+              <span className="nav-warn"
+                title="页签清单按套餐权限由服务端下发；读取失败时只显示最小集合">
+                权限读取失败
+              </span>
+            )}
+            {/* 管理员的"回系统管理"不放这里（用户口径 2026-09-23：
+                业务视图里不要出现管理员相关入口）—— 走右上角头像菜单。 */}
+            {/* ★ 页签清单来自服务端（`visible_views`），不在这里硬编码。
+                管理员关掉某功能 → 该等级用户的这个页签**直接消失**。 */}
+            <TL label="投研分析" active={view === "research"}
+              show={showView("research")}
+              onClick={() => setView("research")} />
+            <TL label="调度管理" active={view === "scheduler"}
+              show={showView("scheduler")}
+              onClick={() => setView("scheduler")} />
+            <TL label="运行指标" active={view === "metrics"}
+              show={showView("metrics")}
+              onClick={() => setView("metrics")} />
+            <TL label="策略回测" active={view === "backtest"}
+              show={showView("backtest")}
+              onClick={() => setView("backtest")} />
+            <TL label="量化交易" active={view === "intraday"}
+              show={showView("intraday")}
+              onClick={() => setView("intraday")} />
+            {/* 主线挖掘：与「资金流监控」同级的顶级页签，位置固定在
+                「量化交易」右侧、「资金流监控」左侧（用户口径 2026-09-20）。 */}
+            <TL label="主线挖掘" active={view === "mainline"}
+              show={showView("mainline")}
+              onClick={() => setView("mainline")} />
+            <TL label="资金流监控" active={view === "fundflow"}
+              show={showView("fundflow")}
+              onClick={() => setView("fundflow")} />
+            {/* 情报中心：主入口是 `intel.radar`（页签可见性由服务端下发的
+                `visible_views` 决定，见 `my_features.py` 的 VIEW_FEATURE）。
+                「盘前简报」(intel.brief) 与「事件告警」(intel.alerts) 是
+                **页内能力**，不各占一个顶级页签 —— 否则顶栏会有三个
+                内容高度重叠的入口。 */}
+            <TL label="情报中心" active={view === "intel"}
+              show={showView("intel")}
+              onClick={() => setView("intel")} />
+            {/* 事件告警不属于"售卖功能"：它是每个登录用户的基础能力 */}
+            <TL label="事件告警" active={view === "alerts"}
+              onClick={() => setView("alerts")} />
+            {/* ★ 「我的自选池」顶层页签**已删除**（用户口径 2026-09-23）：
+                加自选/删自选/每只票的阈值与权重因子都能在**做T辅助**面板里
+                完成（那里有「我的池/共享」数据源开关 + 逐股权重档案编辑器），
+                顶层再挂一个页签是重复入口。
+                「我的自选池」**整个功能已删除**（用户口径 2026-09-23：
+                "很鸡肋，不需要了"）—— 加自选/删自选一直是直接写
+                `configs/intraday.yaml` 这份共享清单，从来不经过那张个人池表；
+                逐股阈值/权重因子在做T面板的「⚙ 口径」里编辑（保留）。 */}
+          </nav>
+        )}
         <AlertBell unread={unread} connected={connected}
           onClick={() => setView("alerts")} />
+        {/* 账户区放最后（顶栏最右）。
+            ★ 用户口径 2026-09-23：**不要**再把"系统管理员"这类身份徽标挂在
+            业务视图顶栏上 —— 顶栏只该是业务页签 + 一个很小的用户头像。
+            身份、套餐、系统管理入口、设备、退出全部收进头像菜单里
+            （`compact` 模式下只显示一个圆形头像）。 */}
+        {auth.user && (
+          <AccountMenu user={auth.user} compact
+            isAdmin={!!isAdmin} inAdminView={adminNav}
+            onEnterAdmin={() => { setTenantView(false); setView("admin"); }}
+            onExitAdmin={() => setTenantView(true)}
+            onLogout={auth.logout} onReload={auth.reload} />
+        )}
       </header>
 
-      {view === "scheduler" ? (
-        <SchedulerPanel />
-      ) : view === "metrics" ? (
-        <MetricsPanel />
-      ) : view === "backtest" ? (
-        <BacktestPanel />
-      ) : view === "intraday" ? (
-        <QuantTabContainer />
-      ) : view === "fundflow" ? (
-        <FundFlowPanel />
-      ) : view === "alerts" ? (
-        <AlertsPanel
-          incomingTick={incomingTick}
-          openAlertId={openAlertId}
-          onConsumeOpen={() => setOpenAlertId(null)}
-          onReadChanged={refreshUnread}
+      {/* 后端可达性横幅（连不上时才出现）。
+          放在 header 之后、面板之前：任何页签下的 "Failed to fetch"
+          都能在这里找到一句人话解释，而不是只能靠反复点击试。 */}
+      <ServerStatusBanner />
+
+      {/* 错误边界：一个面板渲染崩了只该坏那一块，不该把整页卸载成白屏
+          （2026-09-21 竞价选股点详情崩成白页的教训）。`resetKey={view}`
+          让切页签自动恢复。 */}
+      <ErrorBoundary resetKey={view} label={view}>
+        {view === "admin" && auth.user ? (
+          <AdminPanel selfId={auth.user.user_id} />
+        ) : view === "admin-monitor" ? (
+          <AdminMonitorPanel />
+        ) : view === "admin-tiers" ? (
+          <AdminTierPanel />
+        ) : view === "admin-perms" ? (
+          <AdminPermissionPanel />
+        ) : view === "scheduler" ? (
+          <SchedulerPanel />
+        ) : view === "metrics" ? (
+          <MetricsPanel />
+        ) : view === "backtest" ? (
+          <BacktestPanel />
+        ) : view === "intraday" ? (
+          <QuantTabContainer onEditProfile={setProfileCode} />
+        ) : view === "mainline" ? (
+          <MainlinePanel />
+        ) : view === "fundflow" ? (
+          <FundFlowPanel />
+        ) : view === "intel" ? (
+          <IntelPanel isAdmin={!!isAdmin} />
+        ) : view === "alerts" ? (
+          <AlertsPanel
+            incomingTick={incomingTick}
+            openAlertId={openAlertId}
+            onConsumeOpen={() => setOpenAlertId(null)}
+            onReadChanged={refreshUnread}
         />
       ) : (
       <>
@@ -298,8 +550,22 @@ export default function App() {
       {task?.report && <ReportView markdown={task.report} />}
       </>
       )}
+      </ErrorBoundary>
 
       <AlertToasts alerts={toasts} onDismiss={dismissToast} onOpen={openAlert} />
+
+      {/* 个股口径抽屉：从「自选池管理」里点某只票的「口径」打开。
+          覆盖在页面之上而不是切页签 —— 用户改完口径要能立刻回到原来的池。 */}
+      {profileCode && (
+        <div className="profile-drawer-backdrop"
+          onClick={() => setProfileCode("")}>
+          <div className="profile-drawer" onClick={(e) => e.stopPropagation()}>
+            <StockProfilePanel code={profileCode} />
+            <button className="account-mini profile-drawer-close"
+              onClick={() => setProfileCode("")}>关闭</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

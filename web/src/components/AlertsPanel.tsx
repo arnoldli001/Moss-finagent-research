@@ -149,6 +149,15 @@ export default function AlertsPanel(
           </button>
         </div>
 
+        {settings && (settings.schedule?.slots?.length ?? 0) > 0 && (
+          <div className="info-box">
+            自动扫描时机：{settings.schedule.weekday_only ? "工作日 " : ""}
+            {settings.schedule.slots!.join(" / ")}
+            {settings.schedule.startup_scan && "，服务启动后再自动补扫一次"}
+            {" · "}也可点「立即扫描」手动触发
+          </div>
+        )}
+
         {settings && !settings.email.configured && (
           <div className="info-box warn-box">
             邮件通道未配置（在 .env 设置 ALERT_SMTP_USER / ALERT_SMTP_AUTH_CODE 后重启），
@@ -237,7 +246,12 @@ export default function AlertsPanel(
                 {a.status === "active" && <span className="unread-dot" />}
               </div>
               <div className="alert-item-meta">
-                {a.source_name} · {a.event_publish_time || a.trigger_time}
+                {/* 来源按假名脱敏后**不给用户看真名**（数据源保密）。
+                    管理员响应里才有 `source_name`，那时显示真名便于排障；
+                    普通用户显示"来源已隐藏" —— 不把 `src-xxxx` 假名印出来，
+                    那会让人以为是个内部编号。 */}
+                {a.source_name || "来源已隐藏"}
+                {" · "}{a.event_publish_time || a.trigger_time}
                 {" · "}风险{Math.round(a.risk_score)}
                 /机会{Math.round(a.opportunity_score)}
                 /置信{(a.confidence * 100).toFixed(0)}%

@@ -1,0 +1,796 @@
+/* ==================================================================
+   情报中心（舆情情报页签）样式
+   ==================================================================
+
+   ## 为什么单独一个文件而不是追加到 `styles.css`
+
+   `styles.css` 已经 4200+ 行。情报中心是**一整块自带响应式的独立区域**，
+   所有规则都限定在 `.intel-*` 命名空间下，单独成文件便于整体审阅与回滚。
+
+   ⚠️ **导入顺序有讲究**：本文件在 `styles.css` **之后**导入
+   （见 `IntelPanel.tsx` 顶部），所以同名选择器这里会赢。情报中心不依赖
+   任何既有类名的覆盖，反过来也不要在这里改全局类（那会波及其它页签）。
+
+   ## 响应式策略：**容器宽度驱动，不是屏宽驱动**
+
+   三段：
+     · 手机   （< 640px）单列；卡片替代表格；页签横向滑动
+     · 平板   （640–1023px）两列 KPI；表格保留但收窄
+     · 桌面   （≥ 1024px）多列；完整表格
+
+   为什么主要用 `max-width` 断点而不是容器查询：项目其余部分都是
+   `@media`，混用会让"改一个断点要改两处"。容器查询留到将来真有
+   "同一屏里并排两种宽度的情报面板"时再说。
+*/
+
+.intel-root {
+  --intel-gap: 14px;
+  --intel-radius: 10px;
+  /* 语义色：与全局 --high/--medium/--low 区分开 —— 那些表示"数据质量"，
+     这里表示"类型/状态"，混用会让人以为颜色含义一致 */
+  --intel-blue: #4a9eff;
+  --intel-purple: #a97bff;
+  --intel-green: #2ea86e;
+  --intel-orange: #e08a3c;
+  --intel-gray: #8b98a5;
+  display: block;
+  /* `min-width: 0` 是关键：flex/grid 子项默认 `min-width: auto`，
+     内容一宽就把父容器撑破（本页最典型的"错位"成因）。 */
+  min-width: 0;
+}
+
+/* ---------- 页头 ---------- */
+.intel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.intel-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.intel-title h2 { margin: 0; font-size: 18px; }
+.intel-title .muted-text { font-size: 12px; }
+.intel-head-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.intel-chip {
+  font-size: 11.5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.intel-chip.ok { color: var(--intel-green); border-color: rgba(46,168,110,0.5); }
+.intel-chip.warn { color: var(--medium); border-color: rgba(217,161,59,0.5); }
+.intel-refresh {
+  font-size: 12.5px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.intel-refresh:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.intel-refresh:disabled { opacity: 0.55; }
+
+/* ---------- 合规横幅 ---------- */
+.intel-compliance {
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--muted);
+  background: rgba(74,158,255,0.06);
+  border: 1px solid rgba(74,158,255,0.22);
+  border-radius: var(--intel-radius);
+  padding: 9px 12px;
+  margin-bottom: var(--intel-gap);
+}
+.intel-compliance b { color: var(--text); }
+
+/* ---------- 子页签 ---------- */
+.intel-subtabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: var(--intel-gap);
+  /* 手机上横向滑动而不是折行：折行会让页签区占到半屏高 */
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.intel-subtab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 6px 14px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.intel-subtab.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.intel-subtab-n {
+  font-size: 11px;
+  opacity: 0.85;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 通用块 ---------- */
+.intel-body { min-width: 0; }
+.intel-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 28px 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+.intel-error { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.intel-foot {
+  margin-top: 12px;
+  padding-top: 8px;
+  border-top: 1px solid var(--table-line);
+  font-size: 11.5px;
+}
+.intel-gaps { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.intel-gap {
+  font-size: 11.5px;
+  color: var(--medium);
+  border: 1px solid rgba(217,161,59,0.4);
+  border-radius: 6px;
+  padding: 3px 8px;
+}
+.intel-admin-hints {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid rgba(217,161,59,0.45);
+  border-left-width: 3px;
+  border-radius: 0 8px 8px 0;
+  background: rgba(217,161,59,0.07);
+  font-size: 12px;
+  color: var(--muted);
+}
+.intel-admin-hints b { color: var(--medium); }
+.intel-admin-hints ul { margin: 6px 0 0; padding-left: 18px; }
+
+/* ---------- 类型徽标 ---------- */
+.intel-kind {
+  display: inline-block;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.intel-kind.blue { color: var(--intel-blue); background: rgba(74,158,255,0.12); border-color: rgba(74,158,255,0.3); }
+.intel-kind.purple { color: var(--intel-purple); background: rgba(169,123,255,0.12); border-color: rgba(169,123,255,0.3); }
+.intel-kind.green { color: var(--intel-green); background: rgba(46,168,110,0.12); border-color: rgba(46,168,110,0.3); }
+.intel-kind.gray { color: var(--intel-gray); background: rgba(139,152,165,0.1); border-color: rgba(139,152,165,0.28); }
+
+/* ==================================================================
+   情报流
+   ================================================================== */
+
+.intel-filterbar {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  padding-bottom: 2px;
+}
+.intel-filterbar::-webkit-scrollbar { display: none; }
+.intel-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 11px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.intel-filter.on { border-color: var(--accent); color: var(--accent); }
+.intel-filter-n {
+  font-size: 11px;
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
+
+.intel-day { margin-bottom: 16px; }
+.intel-day-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.intel-day-label { font-weight: 600; color: var(--text); }
+
+/* --- 桌面表格 --- */
+.intel-tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.intel-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.intel-table th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  font-size: 11.5px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--table-line);
+  white-space: nowrap;
+}
+.intel-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--table-line);
+  vertical-align: top;
+}
+.intel-table .c-time { width: 52px; white-space: nowrap; }
+.intel-table .c-kind { width: 84px; }
+.intel-table .c-target { width: 120px; color: var(--muted); }
+.intel-sum-cell { min-width: 0; }
+.intel-title { font-size: 12.5px; color: var(--text); line-height: 1.5; }
+.intel-sum {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.55;
+  /* 两行封顶：摘要是"提示"不是"正文"，全展开会让一屏只放得下两三条 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* --- 手机卡片（默认隐藏，窄屏才启用） --- */
+.intel-cards { display: none; }
+.intel-card {
+  border: 1px solid var(--border);
+  border-radius: var(--intel-radius);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: rgba(255,255,255,0.015);
+  /* 卡片整体可点开详情 —— 手机上给足点击区域（≥44px 高） */
+  cursor: pointer;
+  min-width: 0;
+}
+.intel-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.intel-card-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+.intel-card-time { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.intel-card-title {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+  font-weight: 600;
+  color: var(--text);
+  /* 折叠时两行 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.intel-card-sum {
+  margin: 5px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+/* 展开态：显示全文（摘要已在后端按类型截断到 ≤300 字，不会失控） */
+.intel-card.open .intel-card-title,
+.intel-card.open .intel-card-sum {
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  display: block;
+  overflow: visible;
+}
+.intel-card-target {
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--accent);
+}
+
+/* ==================================================================
+   舆情热度监控
+   ================================================================== */
+
+.heat-kpis {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: var(--intel-gap);
+}
+.heat-kpi {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  border-radius: var(--intel-radius);
+  padding: 10px 12px;
+  min-width: 0;
+}
+.heat-lab { font-size: 11.5px; color: var(--muted); }
+.heat-val {
+  font-size: 21px;
+  line-height: 1.25;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.heat-val small { font-size: 11.5px; color: var(--muted); margin-left: 2px; }
+.heat-fo { font-size: 11px; color: var(--muted); }
+
+.heat-cols {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--intel-gap);
+  margin-bottom: var(--intel-gap);
+}
+.heat-card {
+  background: rgba(255,255,255,0.015);
+  border: 1px solid var(--border);
+  border-radius: var(--intel-radius);
+  padding: 12px 14px;
+  min-width: 0;
+}
+.heat-card h3 { margin: 0 0 4px; font-size: 13.5px; color: var(--text); }
+.heat-hint { font-size: 11px; line-height: 1.55; margin: 0 0 10px; }
+
+.heat-bars { list-style: none; margin: 0; padding: 0; }
+.heat-bars li {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) 40px;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.heat-bar-lab { color: var(--muted); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.heat-bar-track {
+  height: 7px;
+  background: rgba(139,152,165,0.14);
+  border-radius: 4px;
+  overflow: hidden;
+  min-width: 0;
+}
+.heat-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--intel-blue);
+  /* 0% 的条也要看得见"这一行存在"，但不该显示成一格色块 */
+  min-width: 2px;
+}
+.heat-bar-fill.alt { background: var(--intel-purple); }
+.heat-bar-n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+
+.heat-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.heat-tags-lab {
+  font-size: 11.5px;
+  color: var(--muted);
+  margin-right: 2px;
+}
+.heat-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.heat-tag b { color: var(--accent); font-variant-numeric: tabular-nums; }
+.heat-todo { border-style: dashed; }
+.heat-todo-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.75;
+}
+.heat-todo-list b { color: var(--text); }
+
+/* ==================================================================
+   投资日历
+   ================================================================== */
+
+.cal-summary {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.cal-sum-item {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  border-radius: var(--intel-radius);
+  padding: 8px 12px;
+  min-width: 110px;
+}
+.cal-sum-item.grow { flex: 1 1 160px; }
+.cal-sum-lab { font-size: 11px; color: var(--muted); }
+.cal-sum-val {
+  font-size: 19px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.cal-sum-val.small { font-size: 12.5px; color: var(--muted); }
+.cal-sum-val small { font-size: 11px; color: var(--muted); margin-left: 2px; }
+.cal-sum-fo { font-size: 10.5px; color: var(--muted); }
+
+/* --- 批量条目（同日同类合并成一行）--- */
+.cal-row.bulk { border-bottom: 1px solid var(--table-line); }
+.cal-row.bulk.open { border-bottom-color: transparent; }
+.cal-bulk-n {
+  font-size: 11.5px;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cal-bulk-toggle {
+  margin-left: auto;
+  font-size: 11.5px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.cal-bulk-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.cal-bulk-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 0 0;
+  border-top: 1px dashed var(--table-line);
+  /* 一天可能有几十条 —— 给个上限并自己滚动，别把整页拉得很长
+     （手机上会把下面的日期推到很远，翻起来很累） */
+  max-height: 260px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.cal-bulk-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.cal-bulk-title { color: var(--text); }
+.cal-bulk-list .code { color: var(--muted); font-size: 11.5px; }
+.cal-bulk-list .cal-certain { font-size: 10px; }
+
+.cal-note-bar {
+  font-size: 11.5px;
+  line-height: 1.6;
+  margin-bottom: var(--intel-gap);
+  padding-left: 8px;
+  border-left: 2px solid var(--border);
+}
+
+.cal-group { margin-bottom: 14px; }
+.cal-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 5px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--table-line);
+}
+.cal-group-day { font-size: 13px; font-weight: 600; color: var(--text); }
+.cal-group-rel { font-size: 11.5px; color: var(--accent); }
+.cal-group-head .muted-text { margin-left: auto; font-size: 11.5px; }
+
+.cal-row {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr);
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--table-line);
+  min-width: 0;
+}
+.cal-row:last-child { border-bottom: none; }
+.cal-date { display: flex; flex-direction: column; gap: 2px; }
+.cal-day { font-size: 12.5px; color: var(--text); }
+.cal-rel { font-size: 11px; color: var(--accent); }
+.cal-body { min-width: 0; }
+.cal-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.cal-kind {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+.cal-kind.blue { color: var(--intel-blue); background: rgba(74,158,255,0.12); border-color: rgba(74,158,255,0.3); }
+.cal-kind.orange { color: var(--intel-orange); background: rgba(224,138,60,0.12); border-color: rgba(224,138,60,0.3); }
+.cal-kind.purple { color: var(--intel-purple); background: rgba(169,123,255,0.12); border-color: rgba(169,123,255,0.3); }
+.cal-kind.gray { color: var(--intel-gray); background: rgba(139,152,165,0.1); border-color: rgba(139,152,165,0.28); }
+.cal-title { font-size: 13px; color: var(--text); line-height: 1.5; min-width: 0; }
+.cal-certain {
+  font-size: 10.5px;
+  color: var(--medium);
+  border: 1px solid rgba(217,161,59,0.4);
+  border-radius: 4px;
+  padding: 0 5px;
+  white-space: nowrap;
+}
+.cal-scope {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.cal-changes { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 6px; }
+.cal-change {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--table-line);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+
+/* --- 预期差（这个页签的核心） --- */
+.cal-metrics {
+  margin-top: 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.cal-state {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  cursor: help;
+}
+.cal-state.gray { color: var(--intel-gray); background: rgba(139,152,165,0.1); border-color: rgba(139,152,165,0.28); }
+.cal-state.blue { color: var(--intel-blue); background: rgba(74,158,255,0.12); border-color: rgba(74,158,255,0.3); }
+.cal-state.green { color: var(--intel-green); background: rgba(46,168,110,0.12); border-color: rgba(46,168,110,0.3); }
+.cal-state.purple { color: var(--intel-purple); background: rgba(169,123,255,0.12); border-color: rgba(169,123,255,0.3); }
+.cal-nums {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 0;
+}
+.cal-num { display: flex; flex-direction: column; gap: 1px; }
+.cal-num dt { font-size: 10.5px; color: var(--muted); margin: 0; }
+.cal-num dd {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+.cal-num dd.strong { font-weight: 600; }
+/* 预期差的颜色：**只表示数值正负**，不表示利好利空 ——
+   措辞上也刻意用"高于/低于一致预期"，不用"超预期利好" */
+.cal-num dd.up { color: var(--intel-green); }
+.cal-num dd.down { color: var(--low); }
+.cal-srcdate {
+  font-size: 11px;
+  color: var(--medium);
+  border: 1px dashed rgba(217,161,59,0.5);
+  border-radius: 4px;
+  padding: 1px 6px;
+  cursor: help;
+}
+.cal-note { font-size: 11px; color: var(--muted); width: 100%; }
+
+/* ==================================================================
+   盘前简报
+   ================================================================== */
+
+.brief-banner {
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--muted);
+  background: rgba(74,158,255,0.06);
+  border: 1px solid rgba(74,158,255,0.22);
+  border-radius: var(--intel-radius);
+  padding: 9px 12px;
+  margin-bottom: var(--intel-gap);
+}
+.brief-banner b { color: var(--text); }
+
+.brief-sec {
+  border: 1px solid var(--border);
+  border-radius: var(--intel-radius);
+  padding: 12px 14px;
+  margin-bottom: var(--intel-gap);
+  min-width: 0;
+}
+.brief-sec-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: 7px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--table-line);
+}
+.brief-sec-head h3 { margin: 0; font-size: 14px; color: var(--text); }
+.brief-sec-head .muted-text { font-size: 11.5px; }
+.brief-sec-n { margin-left: auto; font-size: 12px; color: var(--accent); }
+
+.brief-list { list-style: none; margin: 0; padding: 0; }
+.brief-list li {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--table-line);
+  min-width: 0;
+  /* 整条可点开看全文 —— 手机上给足触控高度 */
+  cursor: pointer;
+}
+.brief-list li:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.brief-list li:last-child { border-bottom: none; }
+/* 展开态：解除行数封顶（后端已把摘要截断到 ≤300 字，不会失控） */
+.brief-list li.open .brief-sum {
+  -webkit-line-clamp: unset;
+  line-clamp: unset;
+  display: block;
+  overflow: visible;
+}
+.brief-item-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 3px;
+}
+.brief-time { font-size: 11.5px; color: var(--muted); }
+.brief-agency { font-size: 11.5px; color: var(--accent); }
+.brief-title { font-size: 13px; color: var(--text); line-height: 1.5; }
+.brief-sum {
+  margin-top: 3px;
+  font-size: 11.5px;
+  color: var(--muted);
+  line-height: 1.6;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.brief-targets { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+
+/* ==================================================================
+   响应式
+   ==================================================================
+
+   断点与项目其余部分一致（720 / 420），另外补了情报中心特有的
+   **平板段（≤1023）** —— 既有 CSS 只用 900~1180 那些是给笔记本窄窗口的，
+   而平板竖屏是 768~834，正好落在"桌面多列显得挤、手机单列又浪费"的区间。
+*/
+
+/* -- 平板竖屏 / 手机横屏：KPI 两列，双栏改单栏 -- */
+@media (max-width: 1023px) {
+  .heat-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .heat-cols { grid-template-columns: minmax(0, 1fr); }
+  /* 表格收窄：来源类型列并到标题上方不值得，改为压窄时间与标的列 */
+  .intel-table .c-target { width: 96px; }
+}
+
+/* -- 手机竖屏（覆盖 iPhone 竖屏 393~440 与小平板）-- */
+@media (max-width: 720px) {
+  .intel-root { --intel-gap: 11px; --intel-radius: 9px; }
+
+  /* 页头：标题一行、状态与刷新按钮另起一行 */
+  .intel-head { gap: 8px; }
+  .intel-title { flex: 1 1 100%; }
+  .intel-title h2 { font-size: 16px; }
+  .intel-head-right { margin-left: 0; flex: 1 1 100%; }
+  .intel-refresh { /* 触控目标 ≥40px */
+    padding: 7px 14px;
+    font-size: 13px;
+  }
+
+  /* 子页签横向滑动（3 个子页签在 393px 下会折行，折了就把内容顶下去） */
+  .intel-subtabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+  }
+  .intel-subtabs::-webkit-scrollbar { display: none; }
+  .intel-subtab { flex: 0 0 auto; padding: 7px 13px; font-size: 13px; }
+
+  /* ★ 表格 → 卡片：390px 里 4 列表格无论怎么压都会把标题折成竖排单字 */
+  .intel-tablewrap { display: none; }
+  .intel-cards { display: block; }
+
+  /* 触控目标：`.intel-filter` 桌面是 30px 高的紧凑小片，手机上点不准
+     （实测审计报"4 个触控目标 <32px"）。提到 35px，与子页签一致。
+     ⚠️ 只调 padding，不改字号 —— 字号一动整排就会换行。 */
+  .intel-filter { padding: 8px 13px; font-size: 12.5px; }
+
+  .heat-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .heat-val { font-size: 18px; }
+  /* 62px 会把「研究笔记」截成「研究笔…」（4 个中文字 ≈ 48px + padding）。
+     放到 74px，把省下的宽度从数字列扣（数字最多 3 位，36px 够）。 */
+  .heat-bars li { grid-template-columns: 74px minmax(0, 1fr) 36px; font-size: 11.5px; }
+
+  /* 日历：左边日期列再窄会截断 `09-27`，保持 58px */
+  .cal-row { grid-template-columns: 58px minmax(0, 1fr); gap: 8px; }
+  .cal-sum-item { min-width: 92px; padding: 6px 10px; }
+  .cal-sum-val { font-size: 17px; }
+  .cal-nums { gap: 10px; }
+  .cal-num dd { font-size: 12.5px; }
+
+  .brief-sec { padding: 10px 12px; }
+  .brief-title { font-size: 12.5px; }
+
+  /* iOS 安全区：底部留出 Home 指示条的高度，否则最后一行被压住点不到 */
+  .intel-root {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+}
+
+/* -- 更窄的竖屏（iPhone SE / 小屏安卓 375 及以下）-- */
+@media (max-width: 420px) {
+  .intel-title h2 { font-size: 15px; }
+  .intel-compliance { font-size: 11.5px; padding: 8px 10px; }
+  .heat-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .heat-val { font-size: 17px; }
+  /* 首页里 4 张 KPI 在 375px 下每张只剩 ~170px，`heat-fo` 的说明文字
+     会折成 3 行把卡片撑高不一致 —— 收掉它，信息在标题里已有 */
+  .heat-fo { display: none; }
+  .cal-row { grid-template-columns: 54px minmax(0, 1fr); }
+}
+
+/* -- 横屏手机 / 矮视口：保证内容不被压成一条缝 -- */
+@media (max-height: 480px) and (orientation: landscape) {
+  .intel-subtabs { position: sticky; top: 0; z-index: 5;
+    background: var(--bg); padding: 4px 0; }
+}

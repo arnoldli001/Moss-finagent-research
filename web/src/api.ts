@@ -1,3 +1,10 @@
+import {
+  ApiError,
+  apiErrorFromResponse,
+  networkError as makeNetworkError,
+} from "./errors";
+import { notifyUnauthorized } from "./unauthorized";
+
 export type AgentOutputSummary = {
   agent_id: string;
   agent_name?: string;
@@ -277,8 +284,28 @@ export type Alert = {
   affected_stocks: AffectedStock[];
   affected_industries: string[];
   impact_path: string;
-  source_name: string;
-  source_url: string;
+  /**
+   * 来源**假名**（`src-xxxxxxxx`），由后端下发。
+   *
+   * ## 为什么不是真名（2026-09-25 改）
+   *
+   * 原来是 `source_name: "东方财富-全球财经"` + `source_url: "https://..."`，
+   * 任何登录用户按 F12 就能看到**我们用了哪几个免费渠道** ——
+   * 而"渠道组合 + 采集节奏"正是这套系统的壁垒。
+   *
+   * ## 显示口径
+   *
+   * 它是**稳定假名**（同一来源恒定），只用来分组/去重。
+   * 界面上按"来源已隐藏"呈现即可 —— **不要把假名印出来**，
+   * 那会让人以为是个内部编号。
+   *
+   * 管理员请求时后端会额外带上 `source_name` / `source_url`（排障用）。
+   */
+  source_alias: string;
+  /** ⚠️ 仅管理员响应里有；普通用户响应中**不存在这个键**。 */
+  source_name?: string;
+  /** ⚠️ 仅管理员响应里有；普通用户响应中**不存在这个键**。 */
+  source_url?: string;
   event_publish_time: string;
   trigger_time: string;
   expire_time: string;
@@ -324,7 +351,14 @@ export type AlertSettings = {
   thresholds: Record<string, Record<string, number>>;
   email: { configured: boolean; smtp_host: string;
            risk_min_score: number; opp_min_score: number; to: string };
-  schedule: { job: string; cron: string | null };
+  schedule: {
+    job: string; cron: string | null;
+    // 定时班次时刻表：后端从调度注册表现算（改了 cron 不用改前端文案）
+    jobs?: { job: string; cron: string; description: string }[];
+    slots?: string[];
+    weekday_only?: boolean;
+    startup_scan?: boolean;
+  };
   disclaimer: string;
 };
 
@@ -397,7 +431,7 @@ export type IntradayScorePoint = {
   ts: string; price: number | null; total: number;
 };
 
-/** 逐bar档位：低吸/高抛/止损随时间的真实取值（档位是时刻量，不是全天恒定）。 */
+/** 逐bar档位：回踩/冲高/止损随时间的真实取值（档位是时刻量，不是全天恒定）。 */
 export type IntradayLevelPoint = {
   ts: string; low_buy: number; high_sell: number; stop_loss: number;
 };
@@ -415,20 +449,20 @@ export type IntradayLevels = {
   pct_b: number | null; bandwidth: number | null;
   vwap: number | null; atr: number | null;
   // ---- 解释字段（服务端 annotate_level_basis 补，仅当前档位对象上有）----
-  /** 低吸线由谁决定（箱体下沿/布林下轨/ATR 兜底）。 */
+  /** 回踩线由谁决定（箱体下沿/布林下轨/ATR 兜底）。 */
   low_source?: string;
-  /** 高抛线由谁决定（箱体上沿/布林上轨/高抛缓冲）。 */
+  /** 冲高线由谁决定（箱体上沿/布林上轨/冲高缓冲）。 */
   high_source?: string;
   /** 实际档位差占现价%。 */
   band_width_pct?: number | null;
   /** 档位差是否被 min/max 护栏夹过（空串=没夹）。 */
   band_clamped?: string;
-  /** 档位差护栏前的低吸线/高抛线候选位置。 */
+  /** 档位差护栏前的回踩线/冲高线候选位置。 */
   pre_clamp_low?: number | null;
   pre_clamp_high?: number | null;
-  /** 低吸触发的最高价 = 低吸线×(1+贴线带宽)。 */
+  /** 回踩触发的最高价 = 回踩线×(1+贴线带宽)。 */
   low_trigger_price?: number | null;
-  /** 高抛触发的最低价 = 高抛线×(1−贴线带宽)。 */
+  /** 冲高触发的最低价 = 冲高线×(1−贴线带宽)。 */
   high_trigger_price?: number | null;
   take_profit_buffer_pct?: number | null;
   dip_fallback_atr?: number | null;
@@ -597,6 +631,14 @@ export type IntradaySnapshot = {  code: string; name: string; trade_date: string
   news: IntradayNews | null;
   index_volume: IntradayIndexVolume | null;
   overseas: IntradayOverseas | null;
+  /**
+   * **今日做T决策**（情绪周期结论）：周期阶段 +（不）做T降本 + 是否禁止追高。
+   *
+   * 用户口径 2026-09-23：原来这三条以"数据缺口"形式堆在底部数据健康度里，
+   * 现在提到顶部「市场环境」行右侧显示成一句决策，逐条依据放在 tooltip。
+   * 周期不可用时为 `null`（不显示徽标，也不编造结论）。
+   */
+  cycle_decision: IntradayCycleDecision | null;
   /** 档位拟合摘要（规则口径 / 拟合口径、两个成功率、调整项乘数）。 */
   level_fit: IntradayLevelFit | null;
   health: IntradayHealth;
@@ -605,8 +647,84 @@ export type IntradaySnapshot = {  code: string; name: string; trade_date: string
   disclaimer: string;
 };
 
-export type IntradayWatchItem = {
-  code: string; name: string; boards: string[];
+/** 情绪周期 → 今日做T决策（顶部「市场环境」行右侧的徽标）。 */
+export type IntradayCycleDecision = {
+  available: boolean;
+  /** 周期阶段：主升期 / 试错期 / 退潮期 / 冰点 … */
+  stage: string;
+  /** 做T环境温度 0~100 */
+  temperature: number | null;
+  /** 是否允许做T降本（false = 退潮/冰点或触发一票否决） */
+  t_allowed: boolean;
+  /** 是否禁止追高（一票否决或禁止做T时为 true） */
+  no_chase: boolean;
+  /** 配置里是否开启了"周期否决正式信号" */
+  veto_signals_on: boolean;
+  /** 一句话结论，如「退潮期 · 缩量 1,180 亿 · 不做T降本 · 禁止追高」 */
+  summary: string;
+  /** 触发一票否决的逐条依据（大面/跌停家数超标等），供 tooltip 核对 */
+  reasons: string[];
+  trade_date: string;
+  /**
+   * 全市场量能预测（沪深京三市，**同一时刻同比昨日**）。
+   *
+   * 用户口径 2026-09-23：「如果预测量能低于 2 万亿或相比昨日缩量 1000 亿以上，
+   * 提示缩量XX亿不追高；放量XX亿可做T」。与情绪周期**并列**进入同一枚徽标。
+   * 取不到时为 `null`（徽标少这一段，不编造结论）。
+   */
+  turnover: IntradayMarketTurnover | null;
+  /** 量能那一段的短句，如「缩量 1,180 亿 不追高」 */
+  turnover_text: string;
+  /** "缩量" / "放量" / "平量" / ""（空=没有量能数据） */
+  turnover_verdict: string;
+};
+
+/**
+ * 全市场成交额预测量能（顶部决策徽标里的量能那一段）。
+ *
+ * 口径 = 昨日全天成交额 × (今日累计额 ÷ 昨日**同一时刻**累计额)。
+ * 为什么不用「累计 ÷ 已交易时间占比」：A股日内量能是 U 型，早盘按时间外推会
+ * 系统性高估（详见后端 `src/intraday/market_amount.py` 的说明与实测表）。
+ */
+export type IntradayMarketTurnover = {
+  available: boolean;
+  /** 数据日（YYYYMMDD） */
+  trade_date: string;
+  /** 对比日（上一交易日） */
+  prev_date: string;
+  fetched_at: string;
+  source: string;
+  /** 对比时刻（HHMM，如 "1030"） */
+  moment: string;
+  /** 今日当前累计成交额（元；**不含京市**，它没有日内成交额曲线） */
+  today_amount: number | null;
+  /** 昨日同一时刻累计成交额（元） */
+  prev_same_time_amount: number | null;
+  /** 昨日全天成交额（元，三市口径） */
+  prev_total_amount: number | null;
+  /** 全天预测成交额（元，三市口径） */
+  projected_amount: number | null;
+  /** 预测量 − 昨日全天（正=放量，负=缩量） */
+  delta_amount: number | null;
+  /** 预测量 ÷ 昨日全天 */
+  ratio: number | null;
+  verdict: string;
+  verdict_text: string;
+  /** 放量/持平 → true；缩量（含地板或缩量超 1000 亿）→ false */
+  chase_allowed: boolean;
+  t_allowed: boolean;
+  /** 命中了哪条阈值判定 */
+  reasons: string[];
+  /** 数据缺口/口径说明（如京市按量比折算） */
+  notes: string[];
+  gap: string | null;
+  /** 各市场明细 `{market: {name, today, prev_same, prev_total, projected}}` */
+  markets: Record<string, Record<string, unknown>>;
+  /** 参与合计的市场名（缺哪个市场一眼可见） */
+  markets_used: string[];
+};
+
+export type IntradayWatchItem = {  code: string; name: string; boards: string[];
   total_score: number | null;
   signal_strength: "solid" | "hollow" | "forced_exit" | "none";
   signal_kind: "low_buy" | "high_sell" | "stop_loss" | "none";
@@ -615,6 +733,14 @@ export type IntradayWatchItem = {
   quote_ts?: string;
   /** 是否置顶：置顶项永远排最前（状态存在配置文件里） */
   pinned?: boolean;
+  /**
+   * 估值结论短标签（用户口径 2026-09-23）：显示在「观望」信号右侧。
+   * 原来是主区域整块「① 估值空间」面板，已按用户要求收成列表里的一个标签。
+   * 取值为 `上涨空间充足 / 估值合理 / 估值合理偏贵 / 估值透支`，空串=没算出来。
+   */
+  valuation_label?: string;
+  /** 结论档位 `ample|moderate|stretched|expensive`（前端据此上色；空串=未计算） */
+  valuation_bucket?: string;
 };
 
 /** 自选池自动刷新的运行状态（服务端每分钟重算一次，前端据此展示刷新时间/暂停原因）。 */
@@ -808,7 +934,7 @@ export type IntradayFactorCatalog = {
   } | null;
 };
 
-/** 个股股性画像：做T友好度 + 推荐权重模板 + 推荐档位。 */
+/** 个股股性画像：做T友好度 + 预填权重模板 + 预填档位。 */
 export type CharacterProfile = {
   code: string; name: string; available: boolean; mode: string;
   sampled_days: number; source: string; gap: string | null;
@@ -822,11 +948,11 @@ export type CharacterProfile = {
   grade: "活跃" | "温和" | "钝化";
   /** 0-100 做T友好度。 */
   t_friendly: number;
-  /** 推荐模板 key。 */
+  /** 预填模板 key。 */
   template: string;
-  /** 推荐权重（已按股性微调并归一化到 100）。 */
+  /** 预填权重（已按股性微调并归一化到 100）。 */
   weights: Record<string, number>;
-  /** 推荐档位（min_band_pct/max_band_pct/stop_loss_pct/atr_stop_mult/
+  /** 预填档位（min_band_pct/max_band_pct/stop_loss_pct/atr_stop_mult/
    *  touch_band_pct/dip_fallback_atr）。 */
   levels: Record<string, number>;
   /** 中文人话说明，直接展示。 */
@@ -945,6 +1071,14 @@ export type FlowBoard = {
   session_label: string;
   sector_rank: FlowEntity[];
   stock_rank: FlowEntity[];
+  /**
+   * 用户自选个股，**单列一节、不占 `stock_rank` 的名额**。
+   *
+   * 2026-09-22 之前自选混在 `stock_rank` 里（`rank_group="自选"`），实测把
+   * `top=10` 的净流入榜挤到只剩 2 只 —— 手动加了几只票，排行榜就不成其为榜。
+   * 旧后端没有这个字段，故可选：缺失时按空数组处理。
+   */
+  stock_watch?: FlowEntity[];
   sectors: FlowEntity[];
   stocks: FlowEntity[];
   source_notes: string[];
@@ -1294,6 +1428,12 @@ export type IntradayDailyBar = {
   open: number; high: number; low: number; close: number;
   volume: number; amount: number;
   pct_chg: number | null; amplitude: number | null; turnover: number | null;
+  /**
+   * 主力资金净流入额（元；负值=净流出）。来自本地行情仓 `quant_moneyflow`，
+   * 由后端在日K快照上补齐（`src/intraday/day_extras.py`）：
+   * **只供读数与区间统计，不参与打分与信号**。当日那根形成中bar没有该值（日频 T-1 定稿）。
+   */
+  net_mf: number | null;
   is_high_volume: boolean; is_double_volume: boolean;
   is_shrink_volume: boolean; is_shrink_half: boolean;
   is_ladder_down: boolean; is_flat_volume: boolean;
@@ -1361,7 +1501,7 @@ export type IntradayProtective = {
 
 export type IntradayDailySignalMark = {
   date: string;
-  /** buy=买点；sell=卖点(S1–S3/S6)；risk=风控/止损类 */
+  /** buy=多方触发；sell=空方触发(S1–S3/S6)；risk=风控/止损类 */
   side: "buy" | "sell" | "risk";
   code: string;
   name: string;
@@ -1381,35 +1521,25 @@ export type NiuLinePoint = {
 };
 
 /**
- * 擒牛线档位线体系（日K做T 主图）。
+ * 擒牛线档位线体系（日K做T 主图）—— **下发给前端的部分**。
  *
- * 两套同花顺公式按标的类别自动选：
- *  - `variant="stock"`：个股版，CBX = SUM(AMOUNT,N)/SUM(V,N)（真实成交额均价）
- *  - `variant="index"`：指数/ETF/板块版，CBX = SUM(C*V,N)/SUM(V,N)（收盘价加权）
+ * ⚠️ 用户口径 2026-09-23：**计算口径属于核心机密，不下发**。
+ * 这里刻意只有"画图与判断需要的东西"：
+ *   - `latest`：五条线的当期数值（状态条显示"站上/跌破"）；
+ *   - `lines`：`key` + `label`（线名），用于图例与读数条；
+ *   - `points`：逐 bar 序列（画线用）。
  *
- * NML/QRL/SMX 两套完全相同，**只有 CBX 分叉**。
+ * 曾经存在的 `variant` / `reason` / `price_basis` / `cbx_scale` / `n` / `m` /
+ * `notes` / `lines[].note` **已从后端 payload 中移除** —— 它们足以还原整套公式，
+ * 所以不是"前端不渲染"，而是根本不下发。需要看口径请读
+ * `src/intraday/niuline.py` 或服务端日志，不要加回这里。
  */
 export type NiuLineSet = {
   available: boolean;
-  variant: "stock" | "index";
-  /** 为什么选了这个变体（可追溯，不猜） */
-  reason: string;
-  /** 实际用的均价口径 */
-  price_basis: "amount" | "close_volume";
-  /**
-   * CBX 换算系数：个股口径下把"每手价"换成"每股"。
-   * 本项目 volume 单位是手，故实测 ~100；不换算 CBX 会比股价高两个数量级，
-   * "站稳/跌破"判据会整体反过来。指数口径恒为 1。
-   */
-  cbx_scale: number;
-  n: number;
-  m: number;
   latest: Record<string, number | null>;
-  /** 线的展示元数据（label/note），由后端给出，前端不硬编码线名 */
-  lines: { key: string; label: string; note: string }[];
+  /** 线的展示元数据：**只有 key/label**（后端给出，前端不硬编码线名） */
+  lines: { key: string; label: string }[];
   points: NiuLinePoint[];
-  /** 口径说明与降级原因（如"成交额缺失 → 退回指数口径"） */
-  notes: string[];
 };
 
 export type IntradayDailySnapshot = {
@@ -1438,17 +1568,581 @@ export type IntradayDailySnapshot = {
 };
 
 
-async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const resp = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
-    ...init,
-  });
+/** `request` 的扩展 init：`retrySafe` 表示"这次请求重复执行一次也无副作用"。
+ *
+ * 只有**调用方知道**这件事，所以必须显式声明，不能猜：
+ * "创建自选池"重放一次会多一个池，"把套餐改成 vip"重放一次毫无变化。
+ */
+type RetryInit = RequestInit & { retrySafe?: boolean };
+
+/** 幂等键（`X-Idempotency-Key`）。
+ *
+ * 服务端认这个键的接口会做去重（`src/core/idempotency.py`），
+ * 不认的接口只是忽略这个头 —— 所以可以无条件带上。
+ */
+function newIdempotencyKey(): string {
+  const c = globalThis.crypto as Crypto | undefined;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  const buf = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === "function") c.getRandomValues(buf);
+  else for (let i = 0; i < buf.length; i += 1) buf[i] = Math.floor(Math.random() * 256);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+/** 极轻存活探针：0 I/O，专用于判断"后端进程还在吗"。
+ *
+ * ⚠️ **不要改成 `/api/v1/health`**。那个聚合健康检查会连 Ollama（2s 超时）、
+ * 校验审计链、聚合数据源健康度，正常也要 0.3~2.5 秒。拿它当探针，
+ * 服务只是"忙"就会被判成"死"，于是对着一个好好的后端弹"无法连接服务器"。
+ */
+export async function pingServer(timeoutMs = 3000): Promise<boolean> {
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const r = await fetch("/api/v1/health/live",
+                          { signal: ac.signal, cache: "no-store" });
+    clearTimeout(timer);
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** 网络层失败 → 用户可读错误。内部细节（运维指令）只在 localhost 出现，
+ * 公网用户只见"服务暂时不可用/请联系管理员"（见 errors.ts）。 */
+async function networkError(url: string): Promise<ApiError> {
+  const alive = await pingServer();
+  return makeNetworkError(url, alive);
+}
+
+async function request<T>(url: string, init?: RetryInit): Promise<T> {
+  // `retrySafe` 是本模块自己的标记，不能传给 `fetch`（会变成未知字段）。
+  const { retrySafe, ...rest } = init ?? {};
+
+  const method = (rest.method ?? "GET").toUpperCase();
+  const idempotent = method === "GET" || method === "HEAD" || method === "OPTIONS";
+  // 幂等方法重试天然安全；写操作只有在调用方声明 retrySafe（服务端有唯一
+  // 约束或幂等键兜底）时才重试 —— 否则"响应丢了"会被重试成"多建了一个"。
+  const mayRetry = retrySafe === true || (idempotent && retrySafe !== false);
+
+  // ★★ `headers` 必须**合并**，不能整体覆盖 —— 这是实测踩到的 422 bug。
+  //
+  // `fetch` 的 `headers` 是一个整体对象：后写的会把先写的**整个替换掉**，
+  // 而不是逐键合并。原来写成"先铺 Content-Type，再展开 init"，于是只要
+  // 调用方传了任何 headers（哪怕只是 `X-CSRF-Token`、甚至空对象 `{}`），
+  // `Content-Type: application/json` 就被抹掉 —— 浏览器于是按**纯文本**
+  // 发送 body，FastAPI 收到的 `body` 是字符串而不是对象，直接 422：
+  //   Input should be a valid dictionary or object to extract fields from
+  //   且 input 里显示的是 `{"account":"admin",...` 这个**字符串本身**。
+  //
+  // 症状之所以绕：**只有未登录时第一个请求就炸**（登录前没有 csrf，
+  // `mutate` 传的是 `{}`），看起来像后端参数校验问题，会一直往后端方向查。
+  // 实际是前端没声明内容类型。
+  //
+  // 正确写法：先展开调用方的 headers，再让默认头**兜底**
+  // （调用方显式指定的优先）。
+  const given = (rest.headers ?? {}) as Record<string, string>;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...given,
+  };
+  if (!idempotent && !headers["X-Idempotency-Key"]) {
+    headers["X-Idempotency-Key"] = newIdempotencyKey();
+  }
+
+  let resp: Response | undefined;
+  // 最多两次：第一次失败后立刻重试一次。
+  // 为什么值得重试：后端重启/休眠唤醒后，浏览器**仍然持有一条到旧进程的
+  // keep-alive 连接**，写请求打上去会立刻拿到 `ERR_EMPTY_RESPONSE`。
+  // 换一条新连接就好了 —— 这正是"再点一次就成功"的原因，那就自动做掉。
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      resp = await fetch(url, {
+        // `credentials: "include"` 是认证能在前端生效的前提：会话令牌
+        // （`moss_sid`）与"记住我"（`moss_rt`）都是 HttpOnly Cookie，
+        // 浏览器只在请求声明带上凭据时才会回发。默认值 `"same-origin"`
+        // 在同源下也带，但本应用有两条路径不是"同源直连"：
+        //   ① `vite dev`（:5173）经 proxy 转发；② 将来的独立前端域名。
+        credentials: "include",
+        ...rest,
+        headers,
+      });
+      break;
+    } catch (e) {
+      if (!(e instanceof TypeError)) throw e;
+      if (mayRetry && attempt === 0) {
+        await sleep(400);
+        continue;
+      }
+      throw await networkError(url);
+    }
+  }
+  if (!resp) throw await networkError(url);
+
   if (!resp.ok) {
-    const detail = await resp.text();
-    throw new Error(`请求失败(${resp.status}): ${detail.slice(0, 200)}`);
+    if (resp.status === 401) notifyUnauthorized(url);
+    // 统一走报错码契约：后端 envelope → ApiError；**不再透传响应体原文**
+    const bodyText = await resp.text();
+    throw apiErrorFromResponse(resp.status, bodyText);
   }
   return resp.json() as Promise<T>;
 }
+
+
+/** 读 CSRF Cookie（**非 HttpOnly**，由服务端下发、前端回填到请求头）。
+ *
+ * 为什么需要它：`moss_sid` 是 HttpOnly，跨站请求会**自动带上**它 ——
+ * 这正是 CSRF 的成因。服务端因此同时下发一个前端可读的随机串，
+ * 要求写操作把它放进请求头：攻击者的站点读不到这个 Cookie（同源策略），
+ * 也就伪造不出这个头。
+ */
+export function readCsrfToken(): string {
+  const m = document.cookie.match(/(?:^|;\s*)moss_csrf=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
+/** 带 CSRF 头的 POST（需要改状态时用这个）。
+ *
+ * `retrySafe` 只在"重复执行没有副作用"时传 true：接口是**设置型**
+ * （把套餐设成 vip、把状态设成 disabled），或服务端已按幂等键去重。
+ * 创建型接口（开会话、建自选池）不要传 —— 重试会多建一个。
+ */
+async function mutate<T>(url: string, body?: unknown,
+                        retrySafe = false): Promise<T> {
+  const csrf = readCsrfToken();
+  // ⚠️ 只传 init（不要重复传 headers）：`request` 内部先铺 headers 再展开 init，
+  // 若这里也传 headers，`Content-Type` 会被覆盖掉。
+  return request<T>(url, {
+    method: "POST",
+    body: body === undefined ? undefined : JSON.stringify(body),
+    headers: csrf ? { "X-CSRF-Token": csrf } : {},
+    retrySafe,
+  });
+}
+
+/** 带 CSRF 头的 DELETE（删除天然幂等 → 允许自动重试一次）。 */
+async function remove<T>(url: string): Promise<T> {
+  const csrf = readCsrfToken();
+  return request<T>(url, {
+    method: "DELETE",
+    headers: csrf ? { "X-CSRF-Token": csrf } : {},
+    retrySafe: true,
+  });
+}
+
+// ======================================================================
+// 认证 API（对应后端 `src/api/routes/auth.py` 的 12 个端点）
+// ======================================================================
+
+/** 后端外发的用户字段（**不含**哈希/令牌/明文联系方式）。 */
+export type AuthUser = {
+  user_id: string;
+  username: string;
+  display_name: string;
+  /** active | pending | disabled | expired */
+  status: string;
+  applied_tier: string;
+  valid_until: string;
+};
+
+/** 登录结果。令牌**不在**响应体里 —— 它们只走 HttpOnly Cookie。 */
+export type LoginResult = {
+  ok: boolean;
+  message: string;
+  user: AuthUser;
+  must_change_password: boolean;
+};
+
+/** `/auth/me` 的返回：身份 + **脱敏**联系方式。 */
+export type MeResult = {
+  user_id: string;
+  username: string;
+  display_name: string;
+  status: string;
+  applied_tier: string;
+  valid_until: string;
+  session_id: string;
+  contacts: Array<{ channel: string; value: string; verified: boolean }>;
+};
+
+export type SessionInfo = {
+  session_id: string;
+  current: boolean;
+  device_label: string;
+  ip: string;
+  created_at: string;
+  last_seen_at: string;
+  valid: boolean;
+};
+
+/** 图形验证码挑战（图片 + 一次性令牌）。 */
+export type CaptchaChallenge = {
+  captcha_token: string;
+  /** `data:image/png;base64,...` —— 直接给 `<img src>`，不额外开接口取图。 */
+  image_png: string;
+  expires_in: number;
+  meta: {
+    length: number;
+    width: number;
+    height: number;
+    hint: string;
+    alphabet_note: string;
+  };
+  /** 仅 dev/test 返回（生产恒为空）：本地调试不必费劲看图。 */
+  debug_answer: string;
+};
+
+export const authApi = {
+  /** 领一个图形验证码（图片 + 一次性令牌；3 分钟有效、用完即废）。 */
+  captcha: () => request<CaptchaChallenge>("/api/v1/auth/captcha"),
+
+  /** 当前 IP 登录**是否需要**图形码（据此决定是否渲染，避免白填一次表单）。 */
+  loginMode: () =>
+    request<{ require_captcha: boolean; allowed: boolean;
+              reason: string; retry_after: number }>(
+      "/api/v1/auth/login-mode"),
+
+  /** 发邮箱验证码。`scene`：register | reset_password。 */
+  verifyCode: (body: {
+    scene: string; email: string;
+    captcha_token: string; captcha_answer: string;
+  }) => mutate<{ ok: boolean; message: string; code?: string }>(
+    "/api/v1/auth/verify-code", body),
+
+  /** 注册（成功后状态为 pending，**需管理员审批才能登录**）。 */
+  register: (body: {
+    email: string; username: string; password: string;
+    code: string; captcha_token: string; captcha_answer: string;
+  }) => mutate<{ ok: boolean; message: string; code?: string }>(
+    "/api/v1/auth/register", body),
+
+  /** 登录。成功时服务端 Set-Cookie 下发三层 Cookie。
+   *
+   * `captcha_*` 只在**该 IP 已被要求图形码**时才需要填 ——
+   * 正常用户第一次登录不需要（见后端 `login` 的分层防护说明）。
+   */
+  login: (body: {
+    account: string; password: string; remember_me: boolean;
+    captcha_token?: string; captcha_answer?: string;
+  }) => mutate<LoginResult>("/api/v1/auth/login", body),
+
+  /** 用"记住我"Cookie 静默换新会话（关掉浏览器再打开免密）。 */
+  refresh: () => mutate<{ ok: boolean; user: AuthUser }>(
+    "/api/v1/auth/refresh"),
+
+  logout: (allDevices = false) => mutate<{ ok: boolean; message: string }>(
+    `/api/v1/auth/logout?all_devices=${allDevices ? "true" : "false"}`),
+
+  me: () => request<MeResult>("/api/v1/auth/me"),
+
+  forgot: (body: { email: string; captcha_token: string }) =>
+    mutate<{ ok: boolean; message: string }>(
+      "/api/v1/auth/password/forgot", body),
+
+  reset: (body: {
+    email: string; code: string; token: string; new_password: string;
+  }) => mutate<{ ok: boolean; message: string }>(
+    "/api/v1/auth/password/reset", body),
+
+  changePassword: (body: {
+    old_password: string; new_password: string;
+  }) => mutate<{ ok: boolean; message: string }>(
+    "/api/v1/auth/password/change", body),
+
+  sessions: () => request<{ sessions: SessionInfo[] }>("/api/v1/auth/sessions"),
+
+  killSession: (sessionId: string) =>
+    remove<{ ok: boolean; message: string }>(
+      `/api/v1/auth/sessions/${encodeURIComponent(sessionId)}`),
+};
+
+// ======================================================================
+// 管理员控制台 API（对应后端 `src/api/routes/admin.py`）
+// ======================================================================
+
+/** 管理台视角的用户（比 `AuthUser` 多出到期判定、在线设备数等）。 */
+export type AdminUser = {
+  user_id: string;
+  username: string;
+  display_name: string;
+  status: string;
+  tier: string;
+  valid_until: string;
+  valid_from: string;
+  created_at: string;
+  reviewed_by: string;
+  reviewed_at: string;
+  review_note: string;
+  expired: boolean;
+  can_login: boolean;
+  login_block_reason: string;
+  active_sessions: number;
+};
+
+export type AdminOverview = {
+  counts: Record<string, number>;
+  pending_count: number;
+  pending: AdminUser[];
+  tiers: string[];
+  statuses: string[];
+  /** **这个管理台管的是哪个实例的账号库**（env + 库路径）。
+   *
+   * 为什么必须下发：2026-09-23 实测踩到 —— 客户在**试点实例**（8110）注册并
+   * 提示"等待管理员审批"，而管理员打开的是**调试实例**（8100）的用户管理。
+   * 两边账号库是分开的，于是"看不到申请记录"，看起来像注册没落库，
+   * 排查方向被完全带偏。把 env + 库路径摆在标题旁边，看错实例当场可见。 */
+  instance?: { env: string; db: string };
+};
+
+export type AdminUserDetail = {
+  user: AdminUser;
+  contacts: Array<{ kind: string; masked: string; verified: boolean;
+                    is_primary: boolean }>;
+  sessions: Array<{ session_id: string; device_label: string; ip: string;
+                    created_at: string; last_seen_at: string; valid: boolean }>;
+  reviews: Array<{ action: string; from_status: string; to_status: string;
+                   reviewer_id: string; note: string; tier_code: string;
+                   valid_until: string; created_at: string }>;
+};
+export type StockProfile = {
+  code: string;
+  mode: string;
+  name: string;
+  weights: Record<string, number>;
+  thresholds: Record<string, number>;
+  levels: Record<string, number>;
+  boards: string[];
+  overseas: string[];
+  from_user: boolean;
+  source: string;
+  /** 口径指纹：只由 mode/权重/阈值/档位决定（相同则计算可共享） */
+  caliber_key: string;
+  updated_at: string;
+  /** 后端给出的"这条口径从哪来"说明，前端直接显示 */
+  explain?: string;
+};
+
+export const profileApi = {
+  list: (mode = "") =>
+    request<{ profiles: StockProfile[]; total: number }>(
+      `/api/v1/me/profiles${mode ? `?mode=${mode}` : ""}`),
+
+  get: (code: string, mode = "intraday") =>
+    request<StockProfile>(
+      `/api/v1/me/profiles/${encodeURIComponent(code)}?mode=${mode}`),
+
+  save: (code: string, body: {
+    mode: string;
+    weights: Record<string, number>;
+    thresholds: Record<string, number>;
+    levels: Record<string, number>;
+    boards: string[];
+    overseas: string[];
+  }) => mutate<{ ok: boolean; message: string; profile: StockProfile }>(
+    `/api/v1/me/profiles/${encodeURIComponent(code)}`, body),
+
+  /** 还原系统默认（= 删掉我自己的那份，回退到模板/内置默认）。 */
+  reset: (code: string, mode = "intraday") =>
+    remove<{ ok: boolean; removed: boolean; message: string;
+             profile?: StockProfile }>(
+      `/api/v1/me/profiles/${encodeURIComponent(code)}?mode=${mode}`),
+};
+
+/** 一个等级的完整套餐（资源上限 + 功能权限 + 每项定价）。
+ *
+ * ⚠️ **没有 `monthly_price`**（套餐月费）：该字段已下线（用户口径 2026-09-23，
+ * 定价不由本系统维护）。服务端 `TierPlan` 与 `configs/platform_tiers.json`
+ * 里也已一并移除 —— 前端类型保留一个后端不再返回的字段，会让"这个值到底
+ * 谁在用"永远说不清。
+ */
+export type TierPlan = {
+  key: string;
+  label: string;
+  sellable: boolean;
+  resources: Record<string, number>;
+  features: Record<string, boolean>;
+  pricing: Record<string, number>;
+  note: string;
+};
+
+export type TierConfigPayload = {
+  tiers: TierPlan[];
+  /** 功能键 → 中文名（前端渲染表单用，不硬编码） */
+  features: Record<string, string>;
+  /** 资源键 → 中文名 */
+  resources: Record<string, string>;
+  config_path: string;
+};
+
+/** 我的可见页签与额度（前端照着 `visible_views` 渲染页签）。 */
+export type MyFeatures = {
+  user_id: string;
+  tier: string;
+  tier_label: string;
+  features: Record<string, boolean>;
+  feature_labels: Record<string, string>;
+  visible_views: string[];
+  quant_views: Record<string, boolean>;
+  resources: Record<string, number>;
+  pricing: Record<string, number>;
+  note: string;
+};
+
+/** 一个租户的"用掉多少 / 上限多少 / 还剩多少"（目标口径：展示剩余配额）。 */
+export type TenantUsage = {
+  calls_today: number;
+  calls_today_limit: number;
+  calls_today_remaining: number;
+  calls_today_used_pct: number | null;
+  tokens_month: number;
+  tokens_month_limit: number;
+  tokens_month_remaining: number;
+  tokens_month_used_pct: number | null;
+  /** false = **还没量到**（不是"用掉 0"）。两者对决策的含义相反，界面必须区分。 */
+  tokens_measured: boolean;
+};
+
+export type MonitorTenant = {
+  tenant_id: string;
+  label: string;
+  /** 该租户是否对应一个套餐等级（false = 匿名/平台自身流量，没有额度）。 */
+  known_tier: boolean;
+  calls: number;
+  errors: number;
+  error_rate: number;
+  users: number;
+  latency_ms: { avg: number; p50: number; p95: number; max: number };
+  top_paths: Array<[string, number]>;
+  limits: Record<string, number>;
+  llm_tokens: number;
+  usage: TenantUsage;
+};
+
+export type MonitorPayload = {
+  window_minutes: number;
+  sampled_calls: number;
+  audit_file: string;
+  overall: { calls: number; errors: number; avg_ms: number; p95_ms: number };
+  by_tenant: MonitorTenant[];
+  by_path: Array<{ path: string; calls: number; errors: number;
+                  avg_ms: number; p95_ms: number }>;
+  /** 配额口径与局限（直接渲染，不让人猜数字怎么来的）。 */
+  quota_basis: {
+    day_start: string;
+    month_start: string;
+    audit_file: string;
+    audit_lines: number;
+    audit_truncated: boolean;
+    tokens_truncated: boolean;
+    notes: string[];
+  };
+  data_sources: Array<{ name: string; kind: string; available: boolean;
+                        detail: string }>;
+  data_sources_note: string;
+};
+
+export const platformApi = {
+  myFeatures: () => request<MyFeatures>("/api/v1/me/features"),
+
+  tiers: () => request<TierConfigPayload>("/api/v1/admin/platform/tiers"),
+
+  /** 改某个等级的资源/功能/标签。**不含价格**（见 `TierPlan` 的说明）。 */
+  updateTier: (tier: string, patch: {
+    label?: string; sellable?: boolean; note?: string;
+    resources?: Record<string, number>;
+    features?: Record<string, boolean>;
+    pricing?: Record<string, number>;
+  }) => request<{ ok: boolean; message: string; tier: TierPlan }>(
+    `/api/v1/admin/platform/tiers/${encodeURIComponent(tier)}`, {
+      method: "PUT", body: JSON.stringify(patch), retrySafe: true,
+    }),
+
+  matrix: () => request<{
+    rows: Array<{ feature: string; label: string;
+                  tiers: Record<string, { enabled: boolean; price: number }> }>;
+    tiers: Array<{ key: string; label: string; sellable: boolean }>;
+  }>("/api/v1/admin/platform/permissions-matrix"),
+
+  monitor: (minutes = 60) =>
+    request<MonitorPayload>(
+      `/api/v1/admin/platform/monitor?minutes=${minutes}`),
+};
+
+export const adminApi = {
+  overview: () => request<AdminOverview>("/api/v1/admin/overview"),
+
+  users: (params: { status?: string; keyword?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (params.status) q.set("status", params.status);
+    if (params.keyword) q.set("keyword", params.keyword);
+    const suffix = q.toString() ? `?${q}` : "";
+    return request<{ users: AdminUser[]; total: number }>(
+      `/api/v1/admin/users${suffix}`);
+  },
+
+  user: (userId: string) =>
+    request<AdminUserDetail>(`/api/v1/admin/users/${encodeURIComponent(userId)}`),
+
+  approve: (userId: string, body: {
+    tier: string; days: number; display_name?: string; note?: string;
+  }) => mutate<{ ok: boolean; message: string; user: AdminUser }>(
+    `/api/v1/admin/users/${encodeURIComponent(userId)}/approve`, body, true),
+
+  reject: (userId: string, note: string) =>
+    mutate<{ ok: boolean; message: string; user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/reject`
+      + `?note=${encodeURIComponent(note)}`, undefined, true),
+
+  /** 改状态 / 套餐 / 有效期（只传要改的字段）。设置型 → 可安全重试。 */
+  updateUser: (userId: string, body: {
+    status?: string; tier?: string; days?: number;
+    valid_until?: string; display_name?: string; note?: string;
+  }) => request<{ ok: boolean; message: string; user: AdminUser }>(
+    `/api/v1/admin/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+      retrySafe: true,
+    }),
+
+  /** 直接开号。
+   *
+   * `retrySafe: true` 的依据**不在前端**，而在服务端：这个接口实现
+   * `X-Idempotency-Key`（`src/core/idempotency.py`），重试同一个键只会
+   * 回放上次结果，不会开出第二个账号。所以这里敢让 `request` 自动重试。
+   */
+  createUser: (body: {
+    username: string; email?: string; password: string;
+    tier: string; days: number; display_name?: string;
+    must_change_password?: boolean;
+  }) => mutate<{ ok: boolean; message: string; user: AdminUser;
+                initial_password: string }>("/api/v1/admin/users", body, true),
+
+  deleteUser: (userId: string, note = "") =>
+    remove<{ ok: boolean; message: string; revoked_sessions: number }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}`
+      + `?note=${encodeURIComponent(note)}`),
+
+  resetPassword: (userId: string, newPassword: string,
+                  mustChange = true) =>
+    mutate<{ ok: boolean; message: string }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/reset-password`,
+      { new_password: newPassword, must_change_password: mustChange }, true),
+
+  kickAll: (userId: string) =>
+    remove<{ ok: boolean; message: string; revoked_sessions: number }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/sessions`),
+
+  reviews: (limit = 100) =>
+    request<{ reviews: Array<{
+      user_id: string; action: string; from_status: string; to_status: string;
+      reviewer_id: string; note: string; tier_code: string;
+      valid_until: string; created_at: string;
+    }> }>(`/api/v1/admin/reviews?limit=${limit}`),
+};
 
 export type BacktestJobStarted = {
   job_id: string;
@@ -1506,6 +2200,13 @@ export const api = {
     }
     return payload.data_sources.health;
   },
+  /** 大盘量能（**独立小接口**）：前端可单独轮询，不依赖个股快照。
+   *  取不到时返回 `available:false` + `reason`（如"数据源熔断冷却"）。 */
+  marketTurnover: () => request<{
+    available: boolean; text: string; reason: string;
+    t_allowed?: boolean; chase_allowed?: boolean; reasons?: string[];
+    turnover: Record<string, unknown>;
+  }>("/api/v1/intraday/market-turnover"),
   schedulerJobs: () =>
     request<{ jobs: SchedulerJob[] }>("/api/v1/scheduler/jobs"),
   schedulerTrigger: (name: string) =>
@@ -1569,10 +2270,16 @@ export const api = {
   alertSettings: () => request<AlertSettings>("/api/v1/alerts/settings"),
 
   // ---- 做T辅助 ----
-  intradaySnapshot: (code: string, refresh = false) =>
+  /**
+   * 单标的快照。`light=true` 只取「分时图 + 行情 + 关键价位 + 总分/信号」，
+   * 跳过消息面 LLM/估值/板块分时/大盘/海外映射 —— 用于两段式首屏：
+   * 冷标的一次完整快照实测 4.5~7 秒，而用户点开一只票第一眼看的是分时图。
+   */
+  intradaySnapshot: (code: string, refresh = false, light = false) =>
     request<IntradaySnapshot>(
       `/api/v1/intraday/snapshot?code=${encodeURIComponent(code)}` +
-      (refresh ? "&refresh=true" : "")),
+      (refresh ? "&refresh=true" : "") +
+      (light ? "&light=true" : "")),
   /**
    * 自选标的概览。
    *
@@ -1590,7 +2297,20 @@ export const api = {
       `/api/v1/intraday/watchlist?limit=${limit}`
       + (force ? "&force=true" : "")
       + (force && active ? `&active=${encodeURIComponent(active)}` : "")),
-  /** 置顶/取消置顶一只自选（状态写入 configs/intraday.yaml，跨浏览器一致）。 */
+
+  /** **按当前用户**解析的自选概览（多用户路径）。
+   *
+   * 数据来源：`configs/intraday.yaml`（**全系统一份**）。
+   *
+   * ⚠️ 自选池功能已删除（用户口径 2026-09-23）：原先还有一条
+   * `intradayWatchlistMine`（取"当前用户自己的池"），随功能一起移除。
+   *
+   * - 本方法**没有 `force`/`active` 参数**：后端那条路径是"按用户短 TTL 缓存 +
+   *   按需计算"，没有共享那份的后台刷新循环，传 force 也没有对应语义
+   *   （假装支持会让人以为"强制刷新生效了"，而实际上没有）。
+   * - 它**不参与 WS 推送**：推送仍走共享那份（见设计 §7.2 的共享计算层，
+   *   那是让"100 人"成立的下一步）。
+   */
   intradayPinWatch: (code: string, pinned = true) =>
     request<{ ok: boolean; code: string; pinned: boolean;
               watchlist: Record<string, unknown>[] }>(
@@ -1620,7 +2340,7 @@ export const api = {
     return request<IntradayFactorCatalog>(
       `/api/v1/intraday/factors?${query.toString()}`);
   },
-  /** 个股股性画像（推荐权重/档位的来源）。 */
+  /** 个股股性画像（预填权重/档位的来源）。 */
   intradayCharacter: (code: string, mode: IntradayMode = "intraday",
                       refresh = false) =>
     request<CharacterProfile>(
@@ -1635,6 +2355,33 @@ export const api = {
     request<IntradayLevelFit>(
       `/api/v1/intraday/level-fit?code=${encodeURIComponent(code)}`
       + (refresh ? "&refresh=true" : "")),
+  /**
+   * 某只票**已保存**的「关联板块 / 海外映射」绑定（切股/加自选时预填输入框）。
+   *
+   * 用户口径 2026-09-23：配置存在数据库里，删了自选再加回来要能自动加载。
+   * 服务端在保存时也会自己回落到这份绑定，所以**不预填也不会丢** ——
+   * 这个接口是为了让用户**看得见、改得动**已存的值。
+   */
+  intradayStockBinding: (code: string) =>
+    request<{ ok: boolean; code: string; boards: string[]; overseas: string[];
+              saved: boolean }>(
+      `/api/v1/intraday/stock-bindings/${encodeURIComponent(code)}`),
+  /** 全部已保存的绑定 —— 给输入框做**联想下拉**（提示"以前给哪些票配过什么"）。 */
+  intradayStockBindings: () =>
+    request<{ items: { code: string; name: string; boards: string[];
+                       overseas: string[] }[]; count: number }>(
+      `/api/v1/intraday/stock-bindings`),
+  /**
+   * **批量**实时快照（只读）：给自定义板块的成分行显示涨跌幅用。
+   *
+   * 与 `/intraday/watchlist` 的区别是**覆盖面**：那个只来自选池；自定义板块的
+   * 成分里没进自选的票，只能靠这个接口拿价格。调用方应按 code 缓存 ——
+   * 同一只票可能同时属于多个板块（用户口径 2026-09-23）。
+   */
+  intradayQuotes: (codes: string[]) =>
+    request<{ items: { code: string; name: string; price: number | null;
+                       change_pct: number | null }[]; count: number }>(
+      `/api/v1/intraday/quotes?codes=${encodeURIComponent(codes.join(","))}`),
   /** 资金流监控快照（榜单 + 已选实体走势；盘中 60 秒缓存，refresh 穿透）。 */
   fundflowSnapshot: (refresh = false, window = 10, top = 20) =>
     request<FlowBoard>(
