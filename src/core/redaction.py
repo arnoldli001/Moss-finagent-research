@@ -149,6 +149,55 @@ def source_pseudonym(source_id: object, *, prefix: str = "src") -> str:
     return f"{prefix}-{hashlib.sha256(raw.encode('utf-8', 'ignore')).hexdigest()[:8]}"
 
 
+#: 上游异常里**允许保留**的语义关键词 → 用户可读原因。
+#:
+#: 为什么用白名单：`requests`/`httpx`/`akshare` 的异常文本天然带
+#: **完整请求 URL**（见下），而渗透工具会专门构造上游失败来读这段文本
+#: —— 一次超时就能问出"你在调 api.zsxq.com/v2/groups/48848484411448"。
+#:
+#: 所以异常对外只保留"**哪一类**失败"，不保留"**哪个地址**失败"。
+#: 这既够用户判断（超时/限流/鉴权），又不出地址。
+_ERROR_HINTS: Final[tuple[tuple[str, str], ...]] = (
+    ("timeout", "上游超时"),
+    ("timed out", "上游超时"),
+    ("connection", "上游连接失败"),
+    ("connect", "上游连接失败"),
+    ("ssl", "上游 TLS 失败"),
+    ("proxy", "上游代理失败"),
+    ("401", "上游鉴权失败"),
+    ("403", "上游拒绝访问"),
+    ("429", "上游限流"),
+    ("rate limit", "上游限流"),
+    ("5", "上游服务异常"),      # 5xx（放最后，避免误匹配）
+)
+
+
+def sanitize_error(exc: object, *, limit: int = 120) -> str:
+    """异常 → **可外发**的一句话。**保证不含 URL、不含来源标识。**
+
+    这是防渗透的关键工具：连接器的错误会进 `failures` 字典、
+    进而可能进接口响应或日志。渗透工具会构造上游失败来读这段文本。
+
+    返回形如 `"HTTPStatusError：上游拒绝访问"` —— 有排查价值，零来源信息。
+
+    ⚠️ 不要用 `str(exc)` 替代本函数。即使 `redact()` 能拦住已知形态，
+    那是"黑名单式"防御：上游换个异常措辞、或换一个库，就可能漏。
+    本函数是**白名单式**：只从异常里提取**语义标签**，原文一律不出去。
+    """
+    name = type(exc).__name__
+    try:
+        raw = str(exc).lower()
+    except Exception:  # noqa: BLE001 连 str() 都失败的异常（极少见）不该再抛
+        raw = ""
+    for token, label in _ERROR_HINTS:
+        if token in raw:
+            return f"{name}：{label}"
+    # 白名单没命中 → **只给类型名**，不给原文。
+    # 宁可少一句排查线索，也不冒泄漏来源的风险。
+    out = f"{name}：未归类失败"
+    return out[:limit]
+
+
 def safe_extra(mapping: dict[str, Any] | None) -> dict[str, Any]:
     """结构化字段脱敏：命中 `SENSITIVE_KEYS` 的值打码，其余原样。"""
     if not mapping:
@@ -161,16 +210,6 @@ def safe_extra(mapping: dict[str, Any] | None) -> dict[str, Any]:
             continue
         out[key] = redact(value) if isinstance(value, str) else value
     return out
-
-
-__all__ = [
-    "SENSITIVE_KEYS",
-    "assert_no_secret",
-    "redact",
-    "redact_prompt",
-    "safe_extra",
-    "source_pseudonym",
-]
 
 
 def assert_no_secret(text: str, *, context: str = "") -> None:
@@ -197,5 +236,6 @@ __all__ = [
     "redact",
     "redact_prompt",
     "safe_extra",
+    "sanitize_error",
     "source_pseudonym",
 ]

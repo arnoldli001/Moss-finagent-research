@@ -55,6 +55,27 @@ SOURCE_KINDS: Final[dict[str, str]] = {
 #: 只存成功与否与耗时，**不存任何来源标识**。
 _HEALTH: dict[str, dict[str, Any]] = {}
 
+#: `extra` 里**允许出接口**的键白名单。
+#:
+#: 白名单而非黑名单：`url` / `report_url` / `source_url` 都必须**默认不出去**。
+#: 拿不到 URL，用户就无法顺着 URL 找到数据源本身 —— 这是保密的关键一环
+#: （有链接 = 有入口 = 可以自己去订阅）。
+_PUBLIC_EXTRA_KEYS: Final[frozenset[str]] = frozenset({
+    "forecast",        # 盈利预测（研报正文里的公开数字）
+    "rating_change",   # 评级变动
+    "period",          # 报告期
+})
+
+#: 绝不能出现在任何出接口响应里的键（供单测断言用）。
+#: ⚠️ 这张表是**测试的判据**，不是运行时过滤器 —— 运行时靠
+#: `to_public()` 的白名单构造。两者配合：前者防"忘了加"，后者防"加错了"。
+FORBIDDEN_PUBLIC_KEYS: Final[frozenset[str]] = frozenset({
+    "source_url", "url", "link", "report_url", "pdf", "pdf_url",
+    "group_id", "groupid", "gid", "chat_id", "channel_id",
+    "author", "author_id", "user_id", "uid", "member_id",
+    "topic_id", "raw_html", "html", "token", "cookie", "session",
+})
+
 
 @dataclass
 class IntelItem:
@@ -80,12 +101,31 @@ class IntelItem:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_public(self) -> dict[str, Any]:
-        """转成**可出接口**的形状。
+        """转成**可出接口**的形状 —— 这是防 F12 的第一道也是最后一道闸。
 
-        契约层就把敏感字段挡掉 —— 而不是指望调用方记得脱敏。
-        这是 `INTEL_PERMISSION_DESIGN.md` §5.1「第 1 层」的落地：
-        `source_url` / `group_id` / `author_id` **根本不存在于返回体**。
+        ## 威胁模型是「用户按 F12」，不是「日志泄漏」
+
+        日志脱敏（`src/core/redaction.redact`）挡不住 F12 —— 响应体是**直接
+        发给浏览器**的，Network 面板里看得一清二楚。所以必须在**契约层**
+        就把来源标识挡掉，而不是指望调用方记得脱敏。
+
+        ## 为什么用「白名单构造」而不是「字典推导剔除」
+
+        剔除式（`{k: v for k, v in ... if k not in BANNED}`）有个隐蔽缺陷：
+        **将来给 `IntelItem` 加一个字段，它会自动出现在响应里**。
+        白名单式则相反 —— 新字段默认**不出**，必须显式加进来才可见。
+        对一个"泄漏即失去壁垒"的资产，默认值必须偏向"不输出"。
+
+        ## `extra` 必须过滤（首版这里漏了）
+
+        首版直接 `dict(self.extra)` 透传，而 `extra` 里装着
+        `url` / `report_url` —— **拿到 URL 就等于拿到数据源**。
+        现在改成白名单：只放行明确安全的键，URL 一律不出去。
         """
+        safe_extra = {
+            k: v for k, v in self.extra.items()
+            if k in _PUBLIC_EXTRA_KEYS
+        }
         return {
             "kind": self.kind,
             "kind_label": SOURCE_KINDS.get(self.kind, self.kind),
@@ -98,7 +138,7 @@ class IntelItem:
             "rating_origin": self.rating_origin,
             "agency": self.agency,
             "content_hash": self.content_hash,
-            "extra": dict(self.extra),
+            "extra": safe_extra,
         }
 
 
@@ -287,16 +327,22 @@ _FETCHERS: Final[tuple[tuple[str, Callable[[dict[str, Any]], list[IntelItem]]], 
 
 async def _run_one(name: str, fn: Callable[[dict[str, Any]], list[IntelItem]],
                    ctx: dict[str, Any]) -> tuple[str, list[IntelItem], str]:
-    """跑一个源。**失败不抛** —— 单源失败不能让整批采集挂掉。"""
+    """跑一个源。**失败不抛** —— 单源失败不能让整批采集挂掉。
+
+    ⚠️ 失败信息用 `sanitize_error()` 而**不是** `str(exc)`：
+    上游异常文本天然带完整请求 URL（`... for url 'https://api.zsxq.com/...'`），
+    而渗透工具会**专门构造上游失败来读这段文本** —— 一次超时就能问出数据源。
+    `sanitize_error` 是白名单式：只保留"哪一类失败"，不保留"哪个地址失败"。
+    """
     import time
 
     t0 = time.perf_counter()
     try:
         items = await asyncio.to_thread(fn, ctx)
     except Exception as exc:  # noqa: BLE001 单源失败是常态（限频/改版），必须隔离
-        from src.core.redaction import redact
+        from src.core.redaction import sanitize_error
 
-        msg = redact(f"{type(exc).__name__}: {exc}")
+        msg = sanitize_error(exc)
         _record_health(name, False, (time.perf_counter() - t0) * 1000, msg)
         logger.warning("情报源 %s 采集失败：%s", name, msg)
         return name, [], msg
@@ -353,6 +399,7 @@ async def fetch_all(
 
 
 __all__ = [
+    "FORBIDDEN_PUBLIC_KEYS",
     "SOURCE_KINDS",
     "IntelItem",
     "fetch_all",
