@@ -63,6 +63,16 @@ EXPORT_DATA: Final = "export:data"              # **批量导出是泄漏主通�
 MANAGE_TENANT: Final = "manage:tenant"          # 建租户/改权限
 MANAGE_DATA_SOURCE: Final = "manage:data_source"  # 接新数据源（含 LLM 生成连接器）
 
+#: 读类（舆情情报，2026-09-25 新增）
+#: ⚠️ 原始情报正文（含来源标识）**默认谁都不给**。
+#: 理由不是角色隔离，是**来源即资产** —— 对手拿到群组 ID / 公众号名
+#: 就能自己去订阅，几百块复制掉整条采集层。
+#: 本动作不进管理台开关矩阵，只作 break-glass 调试与合规取证通道。
+READ_INTEL_RAW: Final = "read:intel_raw"
+
+#: 写类（舆情情报）
+WRITE_ALERT_STATE: Final = "write:alert_state"  # 确认/忽略/指派事件
+
 
 #: 动作 → 允许的角色集合。**未列出即拒绝。**
 _POLICY: Final[dict[str, frozenset[Role]]] = {
@@ -86,6 +96,13 @@ _POLICY: Final[dict[str, frozenset[Role]]] = {
                             Role.COMPLIANCE}),
     MANAGE_TENANT: frozenset({Role.ADMIN}),
     MANAGE_DATA_SOURCE: frozenset({Role.ADMIN, Role.RESEARCHER}),
+
+    # 舆情情报：处置事件（确认/忽略/指派）。
+    # 研究、投资、风控可处置；**合规与审计只读** —— 保证处置动作可归因到人。
+    WRITE_ALERT_STATE: frozenset({Role.RESEARCHER, Role.PM, Role.RISK}),
+    # 原始情报正文：**全角色都不给**（空集 = 未列出即拒绝，双保险）。
+    # 见上方 READ_INTEL_RAW 的注释：来源标识是核心资产，不是权限粒度问题。
+    READ_INTEL_RAW: frozenset(),
 }
 
 #: 需要**双人复核**的动作（四眼原则）。命中后调用方必须走审批流，
@@ -102,6 +119,9 @@ _REQUIRED_DATA_CLASS: Final[dict[str, DataClass]] = {
     READ_AUDIT: DataClass.CONFIDENTIAL,
     WRITE_STRATEGY: DataClass.CONFIDENTIAL,
     MANAGE_TENANT: DataClass.RESTRICTED,
+    # 原始情报正文含来源标识 —— 与 MANAGE_TENANT 同档（RESTRICTED）。
+    # 定在同一档是刻意的：它就是当前最高敏感级的资产。
+    READ_INTEL_RAW: DataClass.RESTRICTED,
 }
 
 
