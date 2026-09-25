@@ -231,6 +231,63 @@ def test_agency_only_exposed_for_broker_reports() -> None:
     assert wire["agency"] == "", "快讯不应通过 agency 泄漏渠道名"
 
 
+def test_rich_tags_hiding_platform_domain_are_stripped() -> None:
+    """上游正文里的内联富文本标签必须剥掉 —— 它夹带着**数据源平台名**。
+
+    ## 为什么常规 URL 过滤拦不住它（实测踩到的真泄漏）
+
+    知识星球正文长这样：
+
+        ...英伟达 CoWoS-L 扩产展望 <e type="web"
+        href="https%3A%2F%2Fwx.zsxq.com%2Fmweb%2Fexternal_link.html%3F...">网页链接</e>
+
+    两个坑叠在一起：
+
+      ① 地址是**百分号编码**的（`https%3A%2F%2F…`），不是裸 `https://`
+      ② `wx.zsxq.com` 是**协议相对**写法，连 `//` 前缀都没有
+
+    而过滤规则通常写成"匹配 `https?://`"，于是 `wx.zsxq.com` 就这么跟着
+    `summary` 上了公网接口 —— 用户按 F12 一眼看到数据源平台名。
+    """
+    from src.infrastructure.connectors.intel_sources import (
+        IntelItem, _strip_rich_tags,
+    )
+
+    cases = [
+        # 自闭合
+        'A <e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fm%2Fx.html" />',
+        # 带内容
+        'B<e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fm%2Fs.html%3Fk%3D1">'
+        '网页链接</e>',
+        # 整条只有标签
+        '<e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fx">分享</e>',
+        # ★ 被截断在半途（源文本身就不完整）—— 最容易漏的一种
+        'C <e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fy"',
+        # 标签之后还有正文，正文不能一起被删掉
+        'D <e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fz"/>后文还在',
+    ]
+    for raw in cases:
+        out = _strip_rich_tags(raw)
+        for leak in ("zsxq", "%2F", "<e", "href"):
+            assert leak not in out, f"{raw[:40]!r} → {out!r} 仍含 {leak!r}"
+    # 标签外的正文要保留（否则等于把内容删没了）
+    assert _strip_rich_tags(cases[4]).endswith("后文还在")
+    assert _strip_rich_tags("正常正文 没有标签") == "正常正文 没有标签"
+    assert _strip_rich_tags("") == ""
+    assert _strip_rich_tags(None) == ""
+
+    # 端到端：`to_public()` 的输出里不得出现平台域名
+    pub = IntelItem(
+        kind="research_note",
+        title='<e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fz">x</e>',
+        summary='正文 <e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fa">链接</e> 结束',
+        published_at="2026-09-25T10:00:00+0800").to_public()
+    blob = json.dumps(pub, ensure_ascii=False)
+    for leak in ("zsxq", "%2F", "<e", "http"):
+        assert leak not in blob, f"to_public 输出泄漏 {leak!r}：{blob[:200]}"
+    assert "结束" in pub["summary"], "剥离标签时不该把正文一起删掉"
+
+
 def test_kind_label_table_covers_every_produced_kind() -> None:
     """`SOURCE_KINDS` 必须覆盖**所有**会被塞进 `IntelItem` 的 kind。
 

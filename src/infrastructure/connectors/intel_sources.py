@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Final
@@ -149,7 +150,9 @@ class IntelItem:
         return {
             "kind": self.kind,
             "kind_label": SOURCE_KINDS.get(self.kind, self.kind),
-            "title": self.title,
+            # 标题也过一遍富文本剥离：知识星球有整条主题以 `<e>` 开头的
+            # （分享链接类），标题里同样会带平台地址。
+            "title": _strip_rich_tags(self.title),
             # 摘要截断：源文本最长 800+ 字（政策全文），直接下发会把移动端
             # 撑爆 —— 820 字在手机上约 45 行，一条就占满一屏。截断放在
             # **契约层**，这样任何调用方拿到的都是安全长度。
@@ -189,9 +192,46 @@ SUMMARY_MAX_BY_KIND: Final[dict[str, int]] = {
 }
 
 
+#: 上游正文里**夹带平台标识的内联标签**。
+#:
+#: 实测知识星球的正文长这样（`<e>` 是它自己的富文本标签）：
+#:
+#:     ...英伟达 CoWoS-L 扩产展望 <e type="web"
+#:     href="https%3A%2F%2Fwx.zsxq.com%2Fmweb%2F...">网页链接</e>
+#:
+#: 两个坑叠在一起，导致它**逃过了常规 URL 过滤**：
+#:
+#:   ① 地址是**百分号编码**的（`https%3A%2F%2F…`），不是裸 `https://`
+#:   ② `wx.zsxq.com` 是**协议相对**写法，连 `//` 前缀都没有
+#:
+#: 而过滤规则通常写成"匹配 `https?://`"，于是 `wx.zsxq.com` 就这么
+#: 跟着 `summary` 上了接口 —— 用户按 F12 一眼看到数据源平台名。
+#:
+#: 这里**整个标签连同内容一起删掉**：`<e>` 的内容从来只是"网页链接"
+#: 这类占位文字，没有信息量；保留它反而会让摘要里剩一句无意义的占位语。
+_RICH_TAG_RE: Final = re.compile(r"<e\b[^>]*>(?:.*?</e>)?", re.S | re.I)
+
+
+def _strip_rich_tags(text: object) -> str:
+    """剥掉上游正文里的内联富文本标签（含其中的百分号编码地址）。"""
+    s = "" if text is None else str(text)
+    if not s or "<e" not in s.lower():
+        return s
+    # ① 完整标签（含内容）
+    s = _RICH_TAG_RE.sub("", s)
+    # ② 属性碎片：有的正文被截断，`</e>` 或结尾的 `>` 都不在
+    s = re.sub(r'type="web"\s*href="[^"]*"\s*/?>?', "", s)
+    # ③ 兜底：**任何**还没配平的 `<e`，从这里截到串尾。
+    #    不加这条时实测会残留 `…展望 <e type="web" href="https%3A%2F%2Fwx.zsxq.com%2Fy"`
+    #    （源文被截断在半途），`<e` 与 `%2F` 照样上了接口。
+    s = re.sub(r"<e\b.*$", "", s, flags=re.S | re.I)
+    # 收尾：多出来的空白与空行
+    return re.sub(r"[ \t]{2,}", " ", s).strip()
+
+
 def _clip(text: object, limit: int) -> str:
     """按字符截断并加省略号。**不切断 UTF-8 码点**（Python 字符串天然安全）。"""
-    s = "" if text is None else str(text)
+    s = _strip_rich_tags(text)
     if limit <= 0 or len(s) <= limit:
         return s
     return s[:limit].rstrip() + "…"
@@ -226,8 +266,6 @@ def sort_key(published_at: object) -> str:
 
     解析不出来的原样返回（稳定排序下至少不会崩，也不会把数据丢掉）。
     """
-    import re
-
     s = "" if published_at is None else str(published_at).strip()
     if not s:
         return ""
