@@ -121,9 +121,13 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
-def fetch_topics(*, limit: int = DEFAULT_LIMIT,
+def fetch_topics(*, limit: int = DEFAULT_LIMIT, end_time: str | None = None,
                  root: Path | None = None) -> list[ZsxqTopic]:
-    """拉取最新主题。**同步**（调用方负责 to_thread）。
+    """拉取主题。**同步**（调用方负责 to_thread）。
+
+    `end_time`：只取**早于等于**该时间戳的内容（用于增量回填）。
+    实测确认服务端支持该参数，且**含边界**（会返回恰好等于它的那条）——
+    所以调用方过滤时要按"严格大于水位线"判新，否则会重复处理边界那条。
 
     抛 `TokenExpired` 表示凭证失效；其它异常按普通失败处理。
     `root` 仅测试用（指定热加载凭证的根目录）。
@@ -141,9 +145,12 @@ def fetch_topics(*, limit: int = DEFAULT_LIMIT,
         raise RuntimeError("未配置群组标识")
 
     url = f"{_upstream_host()}/v2/groups/{group}/topics"
+    params: dict[str, str] = {"scope": "all", "count": str(int(limit))}
+    if end_time:
+        params["end_time"] = end_time
     try:
         r = httpx.get(url, headers=_headers(token), timeout=TIMEOUT_SECONDS,
-                      params={"scope": "all", "count": str(int(limit))})
+                      params=params)
     except httpx.TimeoutException as exc:
         # 超时**不是** token 问题，不要误导用户去重登
         raise RuntimeError("上游超时") from exc
