@@ -37,8 +37,16 @@ SENSITIVE_KEYS: Final[frozenset[str]] = frozenset({
     "session", "cookie", "id_card", "idcard", "phone", "mobile",
     "email", "bank_card", "account", "position", "holding", "持仓",
     "密码", "令牌", "密钥", "身份证", "手机号", "银行卡",
+    # ── 数据源标识（agent 平台核心资产，泄漏即可被复制）──
+    # 加这些键名是因为：来源本身是可复制资产 —— 对手拿到 group_id / 公众号名
+    # 就能自己去订阅，几百块复制掉整条采集层。详见 docs/INTEL_PERMISSION_DESIGN.md §5。
+    "group_id", "groupid", "gid", "chat_id", "channel_id",
+    "author_id", "user_id", "uid", "member_id",
+    "source_url", "source_id", "feed_id", "webhook", "bot_id",
+    "数据源", "群组", "星球", "公众号", "作者",
 })
 
+#: 掩码文案。数据源场景给**可追溯的假名**，便于"同源去重"又不暴露是谁。
 _MASK: Final = "***REDACTED***"
 
 #: 明显的占位符 —— 出现这些词就不判为敏感内容。
@@ -53,6 +61,19 @@ _PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}\b")),
     ("bearer", re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]{12,}")),
     ("aws_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    # ── 知识星球：域名 / 接口路径 / 群组与用户 ID ──
+    # 这几条要放在最前（先长后短）：一旦 URL 被部分规则先切碎，
+    # 后面的域名与 ID 规则就匹配不到了。
+    ("zsxq_url", re.compile(
+        r"https?://(?:api|wx)\.zsxq\.com[^\s\"'<>）)]*")),
+    ("zsxq_group", re.compile(
+        r"(?i)(?:/groups?/|group_id[\"'\s:=]+|gid[\"'\s:=]+)(\d{8,})")),
+    ("zsxq_topic", re.compile(r"(?i)(?:/topics?/|topic_id[\"'\s:=]+)(\d{6,})")),
+    ("zsxq_token", re.compile(
+        # 键名锚定，不假设 token 具体格式：实测 zsxq_access_token 是
+        # 8-4-4-4-12 的 GUID 变体，但格式可能变；绑在键名上更稳。
+        r"(?i)\b(zsxq[_\-]?access[_\-]?token|x-access-token)"
+        r"[\"'\s:=]+[A-Za-z0-9\-_.~+/=]{16,}")),
     ("id_card", re.compile(r"\b[1-9]\d{5}(19|20)\d{2}(0[1-9]|1[0-2])"
                            r"(0[1-9]|[12]\d|3[01])\d{3}[0-9Xx]\b")),
     ("phone", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
@@ -109,6 +130,25 @@ def redact_prompt(text: object, *, prefix: int = 80,
             f"{head}{'…' if len(raw) > limit else ''}")
 
 
+def source_pseudonym(source_id: object, *, prefix: str = "src") -> str:
+    """数据源标识 → **稳定假名**（`src-3f9a2c1b`）。
+
+    这是数据源保密的核心工具：内部要用 `group_id` 做去重、限流、增量判断，
+    但**接口响应里绝不能出现真实 ID**。用哈希假名同时满足两件事：
+
+    - **稳定**：同一来源永远得到同一个假名 → 去重、限流、按源统计都成立；
+    - **不可逆**：只暴露 8 位哈希，无法反推是哪个星球/公众号。
+
+    ⚠️ 为什么不是"打码成 ***"：那样所有来源会变成同一个值，
+    去重与限流直接失效（表现为"所有来源被当成同一个源"，
+    是一类很难查的静默故障）。假名保留区分度、去掉可识别性。
+    """
+    raw = "" if source_id is None else str(source_id).strip()
+    if not raw:
+        return ""
+    return f"{prefix}-{hashlib.sha256(raw.encode('utf-8', 'ignore')).hexdigest()[:8]}"
+
+
 def safe_extra(mapping: dict[str, Any] | None) -> dict[str, Any]:
     """结构化字段脱敏：命中 `SENSITIVE_KEYS` 的值打码，其余原样。"""
     if not mapping:
@@ -121,6 +161,16 @@ def safe_extra(mapping: dict[str, Any] | None) -> dict[str, Any]:
             continue
         out[key] = redact(value) if isinstance(value, str) else value
     return out
+
+
+__all__ = [
+    "SENSITIVE_KEYS",
+    "assert_no_secret",
+    "redact",
+    "redact_prompt",
+    "safe_extra",
+    "source_pseudonym",
+]
 
 
 def assert_no_secret(text: str, *, context: str = "") -> None:
@@ -147,4 +197,5 @@ __all__ = [
     "redact",
     "redact_prompt",
     "safe_extra",
+    "source_pseudonym",
 ]
