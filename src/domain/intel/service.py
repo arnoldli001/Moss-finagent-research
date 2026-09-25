@@ -110,26 +110,28 @@ async def build_feed(*, watch_codes: list[str] | None = None,
 
     # ── 2) 知识星球（增量，独立失败域）──
     try:
+        from src.infrastructure.connectors.intel_sources import IntelItem
         from src.infrastructure.connectors.zsxq_incremental import (
             fetch_incremental, save_watermark,
         )
 
         inc = await asyncio.to_thread(fetch_incremental)
         for t in inc.topics:
-            items.append({
-                "kind": "research_note",
-                "kind_label": KIND_LABELS["research_note"],
-                "title": t.title,
-                "summary": t.text,
-                "published_at": t.created_at,
-                "source_alias": "zsxq",
-                "codes": [],
-                "industry": "",
-                "rating_origin": "",
-                "agency": "",
-                "content_hash": t.content_hash,
-                "extra": {},
-            })
+            # ⚠️ 必须走 `IntelItem.to_public()`，不能在这里手写 dict。
+            #
+            # 手写 dict 会**绕过脱敏与截断**（那两道闸都长在 `to_public` 上）：
+            #   · `source_alias` 直接写明文 `"zsxq"` → 数据源泄漏
+            #   · `summary` 不截断 → 实测最长 3400+ 字，移动端一条占满十屏
+            # 首版就是这样：五个内置源的 `to_public` 修好了，这条旁路没有。
+            # 统一从同一条出口走，将来加字段也只需要改一处。
+            items.append(IntelItem(
+                kind="research_note",
+                title=t.title,
+                summary=t.text,
+                published_at=t.created_at,
+                source_alias="research-note-zsxq",
+                content_hash=t.content_hash,
+            ).to_public())
         # 只在成功时推进水位线：失败推进会导致**永久丢内容**
         if inc.watermark and inc.new_count:
             await asyncio.to_thread(save_watermark, inc.watermark,
@@ -179,12 +181,60 @@ async def build_feed(*, watch_codes: list[str] | None = None,
         counts[k] = counts.get(k, 0) + 1
 
     return IntelFeed(
-        items=deduped[:limit],
+        items=_balanced_take(deduped, limit),
         gaps=gaps,
         counts=counts,
         fetched_at=_now_iso(),
         degraded=bool(gaps),
     )
+
+
+def _balanced_take(items: list[dict[str, Any]], limit: int
+                   ) -> list[dict[str, Any]]:
+    """按类型**轮流取样**，而不是纯时间取前 N 条。
+
+    ## 为什么不能只按时间截断
+
+    纯 `sorted(...)[:limit]` 在真实数据上会**整类消失**。实测：单次聚合
+    156 条里 `newswire` 占 140 条，若按时间取前 60，结果几乎是清一色快讯
+    —— `broker_report`（券商研报）与 `research_note`（研究笔记）**一条都
+    出不来**。而这两类恰恰是用户最想看的，快讯反而是廉价那类。
+
+    原因是数量级差异：日报类快讯一天上百条，研报一天几条。时间序截断
+    等价于"按产量分配版面"，产量高的必然挤掉产量低的。
+
+    ## 做法
+
+    各类型内部**保持时间倒序**（同类里新的在前），类型之间轮流各取一条。
+    这样：稀缺类型（研报/笔记）一定能露面，充裕类型（快讯）也不会被饿死。
+    """
+    if limit <= 0:
+        return []
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for it in items:            # items 已按时间倒序，分桶后桶内仍有序
+        buckets.setdefault(str(it.get("kind") or "other"), []).append(it)
+    # 类型顺序按「各自最新一条的时间」定 —— 谁有最新消息谁先露头，
+    # 而不是固定字典序（那会让某个类型永远排第一）。
+    order = sorted(
+        buckets,
+        key=lambda k: str(buckets[k][0].get("published_at") or ""),
+        reverse=True,
+    )
+    out: list[dict[str, Any]] = []
+    idx = 0
+    while len(out) < limit:
+        progressed = False
+        for k in order:
+            bucket = buckets[k]
+            if idx < len(bucket):
+                out.append(bucket[idx])
+                progressed = True
+                if len(out) >= limit:
+                    break
+        if not progressed:      # 全部桶都取空了
+            break
+        idx += 1
+    return out
 
 
 #: 情报类型 → 中文标签（前端只认这个，不认内部源名）

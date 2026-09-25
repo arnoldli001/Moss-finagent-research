@@ -126,17 +126,36 @@ class IntelItem:
             k: v for k, v in self.extra.items()
             if k in _PUBLIC_EXTRA_KEYS
         }
+        # `source_alias` 必须过假名（首版这里漏了）。
+        #
+        # 构造点写的是 `"newswire-em"` / `"policy-cctv"` / `"broker-太平洋"`
+        # 这种**语义明文** —— 等于把"我用了哪几个免费渠道"直接印在响应里。
+        # 那正是本项目的壁垒：`source_pseudonym()` 早就写好了，但没人调用它，
+        # 于是泄漏一直存在（隐私测试只测了 helper 本身，没测 `to_public` 输出，
+        # 所以没抓到）。
+        #
+        # 注意假名要**稳定**：同一来源永远同一个假名，前端才能按源去重、
+        # 分组、限流。所以是在这里做，而不是在构造点各写各的。
+        from src.core.redaction import source_pseudonym
+
         return {
             "kind": self.kind,
             "kind_label": SOURCE_KINDS.get(self.kind, self.kind),
             "title": self.title,
-            "summary": self.summary,
+            # 摘要截断：源文本最长 800+ 字（政策全文），直接下发会把移动端
+            # 撑爆 —— 820 字在手机上约 45 行，一条就占满一屏。截断放在
+            # **契约层**，这样任何调用方拿到的都是安全长度。
+            "summary": _clip(self.summary,
+                             SUMMARY_MAX_BY_KIND.get(self.kind,
+                                                     SUMMARY_MAX_CHARS)),
             "published_at": self.published_at,
-            "source_alias": self.source_alias,
+            "source_alias": source_pseudonym(self.source_alias),
             "codes": list(self.codes),
             "industry": self.industry,
             "rating_origin": self.rating_origin,
-            "agency": self.agency,
+            # `agency` 对**研报**是公开署名（报告本身就是这家出的），
+            # 保留；但只在研报类型下给，避免快讯渠道从别处漏出去。
+            "agency": self.agency if self.kind == "broker_report" else "",
             "content_hash": self.content_hash,
             "extra": safe_extra,
         }
@@ -144,6 +163,30 @@ class IntelItem:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+#: 单条摘要的最大字符数（出接口前截断）
+#:
+#: 实测源文本最长 820 字（政策全文），移动端一行约 18 字，820 字是 45 行 ——
+#: 一条就占满一屏，卡片列表直接不可用。截断放在契约层，前端拿到就是安全长度。
+#: 「政策信号」这类正文价值高的给宽一点，「快讯」本来就短。
+SUMMARY_MAX_CHARS: Final[int] = 220
+
+#: 按类型区分的摘要上限（缺省用 `SUMMARY_MAX_CHARS`）
+SUMMARY_MAX_BY_KIND: Final[dict[str, int]] = {
+    "policy": 300,        # 政策全文有价值，留宽些
+    "research_note": 260,
+    "broker_report": 200,
+    "newswire": 160,
+}
+
+
+def _clip(text: object, limit: int) -> str:
+    """按字符截断并加省略号。**不切断 UTF-8 码点**（Python 字符串天然安全）。"""
+    s = "" if text is None else str(text)
+    if limit <= 0 or len(s) <= limit:
+        return s
+    return s[:limit].rstrip() + "…"
 
 
 def _hash(*parts: object) -> str:

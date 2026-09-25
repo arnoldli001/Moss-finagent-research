@@ -8,18 +8,28 @@
 > 让本地模型少量多次的去获取，建议 2 小时一次。
 > 还要考虑下半夜关闭电脑，再次开机后自动启动这些服务。
 
-## 方案：水位线 + 翻页回填 + 硬上限
+## 方案：最老边界水位线 + 连续回取 + 硬上限
 
-    水位线 watermark = 已处理过的**最新** create_time
+    watermark = "**已处理区间的最老边界**"，不变式是
+                「[watermark, 现在] 区间内的内容都已处理完」
 
-    正常：拉第一页 → 只保留 create_time > watermark 的
-    停机后：第一页可能全比 watermark 新（中间断了）→ 用 `end_time` 往回翻页
+    拉取只有**一个方向**：`end_time=watermark` 连续往回取，
+    取到什么就把 watermark 推到这批里最老的那条；
+    取空 = 已追平到"现在"。
 
-⚠️ **`end_time` 是含边界的**（实测返回 `<=` 该时间的那条）。
-所以：
-  · 过滤用**严格大于** watermark，否则每次重复处理边界那条；
-  · 翻页时 `end_time` 取当前页**最早**那条的时间，下一次自然会把它自己
-    再带回来一次 —— 靠上面的严格过滤去掉。
+    为什么不是"处理过的最新一条"：那会把一个时间戳当成两个边界用，
+    导致"水位线推过去了、它下面的内容却还没取" —— 而那些内容
+    再也不会被请求（静默丢数据，详见 `fetch_incremental` 的 docstring）。
+
+⚠️ **`end_time` 是含边界的**（实测返回 `<=` 该时间的那条），所以每条
+边界记录都会在下一轮再回来一次 —— 靠 `content_hash` 去重，
+并且**边界那条要预置进去重集**（否则追平后每轮都收那 1 条，永不收敛）。
+
+⚠️ **数据源会偶发返回空页**（实测同一请求 6 次里 1 次空返回）。
+空返回必须复核再判定"已追平"，否则水位线会原地不动、内容静静停住。
+详见 `fetch_incremental` 里的空结果复核。
+
+⚠️ **不要在"只取到几条"时把水位线推到最新**。首版就是那样丢掉 29 条的。
 
 ## 为什么必须有上限（用户明确提醒）
 
@@ -58,6 +68,12 @@ MAX_ANALYZE_PER_RUN = 20
 
 #: 单页请求条数
 PAGE_SIZE = 30
+
+#: 空结果重试次数
+#:
+#: 数据源**会偶发返回空页**（实测同一请求 6 次里 1 次空），
+#: 不重试就会把抖动当"已追平"，水位线原地不动、内容静静停在原地。
+_EMPTY_RETRY = 2
 
 
 @dataclass
@@ -133,75 +149,141 @@ def fetch_incremental(*, root: Path | None = None,
                       max_pages: int = MAX_PAGES) -> IncrementalResult:
     """增量拉取。**同步**（调用方 `to_thread`）。
 
-    只在"水位线为空"时拉一整页当作首次基线；
-    之后只返回严格新于水位线的内容。
+    ## 水位线语义：**已处理过的最新时间戳**（high-water mark）
+
+    ## 水位线语义：**已处理区间的最老边界**
+
+    不变式：**`[水位线, 现在]` 区间内的内容都已处理完。**
+
+    取法永远只有一个方向 —— `end_time=水位线` **连续地往回取**，
+    取到什么就把水位线往前推到这批里最老的那条：
+
+        水位线 T   → 取 (…, T]     → 水位线 = 这批最老 t1
+        水位线 t1  → 取 (…, t1]    → 水位线 = 这批最老 t2
+        ……一直追到取空（说明已经追平到"现在"）
+
+    ## 为什么不能用"处理过的最新一条"当水位线
+
+    那是首版的写法，有一个**静默丢数据**的 bug：
+
+        水位线 13:15:06 → 第 1 页（无 end_time）30 条：13:15:41 … 11:43:09
+        → 过滤 `ts > 水位线` 只剩 1 条（13:15:41）
+        → 收 1 条，水位线推到 13:15:41
+        → 下一轮第 1 页没有更新的 → `fresh` 空 → break
+        → 第 2 页那 29 条**永远不会被取**
+
+    根因是它把"一个时间戳"当成了两个边界（新鲜区的下界 **和** 回填走的上界）。
+    "最新一条"只说明**它自己**处理过，不说明它**下面**的内容处理过 ——
+    而水位线一旦推过去，下面的内容就再也不会被请求。
+
+    "最老边界"没有这个问题：它天然是连续区间的端点，推进即代表区间扩大。
     """
     from src.infrastructure.connectors.zsxq_source import fetch_topics
 
     watermark = load_watermark(root)
-    wm_dt = _parse_ts(watermark) if watermark else None
 
     collected: list[Any] = []
+    seen: set[str] = set()
     pages = 0
     truncated = False
-    end_time = ""
+    back = watermark or ""          # 连续回取的起点
 
     while pages < max_pages and len(collected) < max_fetch:
         pages += 1
-        page = fetch_topics(limit=PAGE_SIZE, end_time=end_time or None)
+        before = len(seen)
+        # `end_time` 含边界 → 边界那条每轮都会再回来，靠 content_hash 去重。
+        page = fetch_topics(limit=PAGE_SIZE, end_time=back or None)
+
+        # ── 空结果复核（数据源会抖，实测约 1/6 概率）──
+        #
+        # 同一个 `end_time` 连续调用 6 次：try0~3 各 30 条、**try4 返回 0 条**、
+        # try5 又 30 条。把这个抖动当成"已追平"，水位线会停在原地不再推进，
+        # 而调用方看到 `new_count=0` 会认为无事发生 —— 又是一种静默停摆。
+        #
+        # 复核：不带 `end_time` 拿最新一页，若其中存在比水位线**更老**的内容，
+        # 说明两侧对不上（水位线之前还有东西没取），那就重试。
+        # 最多试 `_EMPTY_RETRY` 次，避免把偶发抖动变成偶发延迟。
+        if not page and back:
+            probe = fetch_topics(limit=PAGE_SIZE, end_time=None) or []
+            oldest_probe = min((t.created_at for t in probe if t.created_at),
+                               default="")
+            if oldest_probe and oldest_probe < back:
+                for _ in range(_EMPTY_RETRY):
+                    page = fetch_topics(limit=PAGE_SIZE, end_time=back)
+                    if page:
+                        logger.info("增量首取为空（数据源抖动）后重试成功")
+                        break
+
         if not page:
-            break
+            break                   # 取空 = 已追平到"现在"
 
-        fresh = []
+        # ── 预置"边界那条" ──
+        #
+        # `end_time` **含边界**，所以往回要时**边界那条自己**总会被返回一次；
+        # 而它必然已经处理过（水位线就是它）。必须在这里先放进去重集：
+        #
+        #   · 不预置 → 追平后每轮都把这 1 条当新内容收下，`new_count` 永远为 1、
+        #     水位线不动 —— 表现为**永不收敛**（实测卡在 1 条）。
+        #   · 用"页首 == 边界就 break"来代替 → 会误伤正常翻页
+        #     （正常翻页时页首本来就可能正好落在边界上，那是健康推进）。
+        #
+        # 预置只影响**正好等于边界**的那一条，不影响它后面真正的新内容。
+        if back:
+            for t in page:
+                if str(getattr(t, "created_at", "") or "") == back:
+                    h = str(getattr(t, "content_hash", "") or "")
+                    if h:
+                        seen.add(h)
+                    break
+
         for t in page:
-            ts = _parse_ts(t.created_at)
-            if ts is None:
-                # 时间戳解析失败：保守地**当作新的**收下，并在缺口里说明。
-                # 宁可多处理一条，也不要静默丢内容（本项目"不猜"口径：
-                # 不知道新旧时，倾向于不丢）。
-                fresh.append(t)
+            h = str(getattr(t, "content_hash", "") or "")
+            if h and h in seen:
                 continue
-            if wm_dt is None or ts > wm_dt:
-                fresh.append(t)
-        collected.extend(fresh)
+            if h:
+                seen.add(h)
+            collected.append(t)
+            if len(collected) >= max_fetch:
+                break
 
-        # 翻页：取本页最早时间；下一轮 end_time 用它（含边界，
-        # 该条会再回来一次，但会被上面的严格过滤剔除）
-        times = [t.created_at for t in page if t.created_at]
-        if not times:
+        new_tail = min((t.created_at for t in page if t.created_at), default="")
+        if not new_tail:
+            # 整页都没有可用时间戳 → 无法推进，停在原地而不是死循环
+            logger.warning("增量页无可用时间戳，提前结束")
+            truncated = bool(page)
             break
-        earliest = min(times)
-        if end_time and earliest >= end_time:
-            # 没往前推进（服务端忽略 end_time）→ 停止，避免死循环
-            logger.warning("增量翻页未推进（end_time 可能未被支持），提前结束")
-            truncated = True
-            break
-        end_time = earliest
 
-        # 本页如果全是老内容，说明已经追上水位线，可以停
-        if not fresh:
+        # ⚠️ 判定"到底了"要用**去重集有没有增长**，不能用 `new_tail >= back`。
+        #
+        # 追平之后服务端会稳定返回"以边界那条为最新的一小页"，此时页尾正好
+        # 等于 `back`，于是 `new_tail >= back` 成立 —— 但那是**正常追平**，
+        # 不是"服务端忽略了 end_time"。首版这样判会把"已追平"误报成警告，
+        # 并且每轮都返回那 1 条边界记录，**永不收敛**。
+        if len(seen) == before:
+            break                   # 本页全是在去重集里的内容 = 到底了
+        back = new_tail
+
+        # 没满页 = 服务端已给到最老，追平了
+        if len(page) < PAGE_SIZE:
             break
 
     # ── 截断判定 ──
-    # 首版这里写的是 `pages >= max_pages and len(collected) >= max_fetch`，
-    # 漏了一种常见情形：**第一页就装满上限**（行情密集时段 30 条约 20 分钟
-    # 就满），此时 pages=1 < max_pages，于是 truncated=False ——
-    # 界面上不会提示"数据不完整"，而实际已丢弃更早内容。
-    #
-    # 正确判据：只要**收够了上限**或**翻满页数**，就说明还有没取完的。
+    # 只要**收够了上限**或**翻满页数**，就说明还有更早的没取完。
+    # （首版判据 `pages >= max_pages and len >= max_fetch` 漏了
+    #  "第一页就装满上限"这种最常见的情形，界面不会提示数据不完整。）
     if collected and (len(collected) >= max_fetch or pages >= max_pages):
         truncated = True
 
     collected = collected[:max_fetch]
 
-    # 新水位线 = 本次见过的**最新**时间（没取到就用旧的）
-    newest = watermark
-    for t in collected:
-        ts = _parse_ts(getattr(t, "created_at", "") or "")
-        if ts is None:
-            continue
-        if not newest or ts > (_parse_ts(newest) or ts):
-            newest = t.created_at
+    # ── 新水位线 = 本次取到的**最老**那条 ──
+    # 没取到内容就保持原值（"只处理了几条就把水位线推过去"正是首版丢数据的机制）。
+    new_watermark = watermark
+    if collected:
+        oldest = min((t.created_at for t in collected if t.created_at),
+                     default="")
+        if oldest:
+            new_watermark = oldest
 
     gap = ""
     if truncated:
@@ -210,7 +292,7 @@ def fetch_incremental(*, root: Path | None = None,
 
     return IncrementalResult(
         topics=collected,
-        watermark=newest,
+        watermark=new_watermark,
         pages_used=pages,
         new_count=len(collected),
         truncated=truncated,

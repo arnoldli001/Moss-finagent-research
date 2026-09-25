@@ -169,10 +169,15 @@ def _default_config() -> dict[str, Any]:
                     "max_backtest_days": 1825,
                 },
                 "features": vip_features,
+                # ⚠️ **不要**在这里手写字面量键名 —— 加功能时必漏。
+                # admin/trial 用 `dict.fromkeys(FEATURES, 0.0)` 自动跟随，
+                # VIP 因为要给 `quant.auction` 单独定价，才写成了展开式：
+                # 先按 FEATURES 铺满 0.0，再覆盖需要收费的那一项。
+                # 首版是纯字面量，于是加了 3 个 intel 功能后 VIP 缺这 3 个
+                # 定价键 —— 测试报 "vip 缺定价键"，而 features 却齐全，
+                # 因为 features 走的是 `dict.fromkeys(FEATURES, True)`。
                 "pricing": {
-                    "research": 0.0, "scheduler": 0.0, "metrics": 0.0,
-                    "backtest": 0.0, "mainline": 0.0, "fundflow": 0.0,
-                    "quant.intraday": 0.0, "quant.select": 0.0,
+                    **dict.fromkeys(FEATURES, 0.0),
                     "quant.auction": 199.0,      # 单独加购
                 },
                 "note": "含主要业务功能；竞价选股需单独加购",

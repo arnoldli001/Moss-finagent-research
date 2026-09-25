@@ -144,6 +144,93 @@ def test_alias_carries_no_raw_id() -> None:
     assert len(alias) <= 14
 
 
+#: 构造点写过的所有**语义明文**别名（这些绝不能出现在接口响应里）。
+#:
+#: 首版 `to_public` 直接透传 `source_alias`，于是一按 F12 就能看到
+#: `newswire-em` / `policy-cctv` —— 等于把"我用了哪几个免费渠道"
+#: 直接交出去。那正是本项目的壁垒。
+#: ⚠️ 原来的隐私测试**只测了 `source_pseudonym()` 这个 helper 本身**，
+#: 没测 `to_public()` 的实际输出，所以这个泄漏一直存在而测试全绿。
+_LEAKY_ALIASES = (
+    "newswire-em", "newswire-ths", "newswire-sina", "policy-cctv",
+    "broker", "broker-太平洋", "zsxq",
+)
+
+
+def test_to_public_pseudonymises_source_alias() -> None:
+    """**核心回归**：`to_public()` 输出里的 `source_alias` 必须是假名。
+
+    测的是**实际输出**，不是 helper —— 泄漏就发生在"helper 写好了但
+    没人调用"这个缝隙里。
+    """
+    from src.infrastructure.connectors.intel_sources import IntelItem
+
+    for raw in _LEAKY_ALIASES:
+        pub = IntelItem(kind="newswire", title="t", summary="s",
+                     published_at="2026-01-01", source_alias=raw).to_public()
+        alias = pub["source_alias"]
+        assert alias.startswith("src-"), (
+            f"source_alias 未过假名：{raw!r} → {alias!r}")
+        assert raw not in alias, f"假名里仍含明文：{alias!r}"
+        for token in ("em", "ths", "sina", "cctv", "zsxq", "太平洋"):
+            assert token not in alias, (
+                f"假名泄漏渠道线索 {token!r}：{raw!r} → {alias!r}")
+
+
+def test_source_alias_pseudonym_is_stable() -> None:
+    """假名要**稳定**：同一来源恒等，否则前端按源去重/统计会失效。"""
+    from src.infrastructure.connectors.intel_sources import IntelItem
+
+    a = IntelItem(kind="newswire", title="t1", summary="s",
+                  published_at="2026-01-01",
+                  source_alias="newswire-em").to_public()["source_alias"]
+    b = IntelItem(kind="newswire", title="t2", summary="s",
+                  published_at="2026-01-01",
+                  source_alias="newswire-em").to_public()["source_alias"]
+    c = IntelItem(kind="newswire", title="t3", summary="s",
+                  published_at="2026-01-01",
+                  source_alias="newswire-sina").to_public()["source_alias"]
+    assert a == b, "同一来源的假名必须稳定"
+    assert a != c, "不同来源必须得到不同假名（打码成 *** 会让去重失效）"
+
+
+def test_summary_is_clipped_per_kind() -> None:
+    """摘要必须截断 —— 源文本最长 800+ 字，直接下发会把移动端撑爆。"""
+    from src.infrastructure.connectors.intel_sources import (
+        SUMMARY_MAX_BY_KIND, SUMMARY_MAX_CHARS, IntelItem,
+    )
+
+    long_text = "测" * 2000
+    for kind in ("newswire", "policy", "broker_report", "research_note",
+                 "other"):
+        pub = IntelItem(kind=kind, title="t", summary=long_text,
+                         published_at="2026-01-01").to_public()
+        limit = SUMMARY_MAX_BY_KIND.get(kind, SUMMARY_MAX_CHARS)
+        assert len(pub["summary"]) <= limit + 1, (
+            f"{kind} 摘要未截断：{len(pub['summary'])} > {limit}")
+        assert pub["summary"].endswith("…"), f"{kind} 截断后应有省略号"
+
+    # 短文本不能被改
+    short = IntelItem(kind="newswire", title="t", summary="很短",
+                         published_at="2026-01-01").to_public()
+    assert short["summary"] == "很短"
+
+
+def test_agency_only_exposed_for_broker_reports() -> None:
+    """`agency` 只对研报公开署名；快讯不应从 `agency` 漏出渠道。"""
+    from src.infrastructure.connectors.intel_sources import IntelItem
+
+    rpt = IntelItem(kind="broker_report", title="t", summary="s",
+                    published_at="2026-01-01",
+                    agency="某某证券").to_public()
+    assert rpt["agency"] == "某某证券", "研报署名是公开信息，应保留"
+
+    wire = IntelItem(kind="newswire", title="t", summary="s",
+                     published_at="2026-01-01",
+                     agency="某渠道").to_public()
+    assert wire["agency"] == "", "快讯不应通过 agency 泄漏渠道名"
+
+
 def test_group_id_redacted_in_text() -> None:
     """日志/异常侧：group_id 与接口 URL 都要脱敏。"""
     from src.core.redaction import redact
