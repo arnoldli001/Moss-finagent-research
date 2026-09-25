@@ -120,6 +120,11 @@ class IntelFeed:
     #: ⚠️ **只统计 has_tone 的条目** —— 把未定算进多空比，
     #: 等于替用户做了一个我们并不确定的判断。
     tone_dist: dict[str, int] = field(default_factory=dict)
+    #: 内容过滤统计 {丢弃原因: 条数}。
+    #:
+    #: 单列出来是为了**可观测**：过滤是悄悄减少条数的操作，
+    #: 没有这个统计就没人能发现规则误杀（"今天为什么只有 3 条笔记"）。
+    filter_stats: dict[str, int] = field(default_factory=dict)
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -132,6 +137,7 @@ class IntelFeed:
             "credibility_dist": self.credibility_dist,
             "cluster_stats": self.cluster_stats,
             "tone_dist": self.tone_dist,
+            "filter_stats": self.filter_stats,
         }
 
 
@@ -254,6 +260,25 @@ async def build_feed(*, watch_codes: list[str] | None = None,
                 "kind_label": KIND_LABELS["research_note"],
                 "message": "研究笔记暂无更新",
             })
+
+    # ── 2.5) 内容过滤：挡掉无内容与平台运营话术 ──
+    #
+    # 用户口径（2026-09-25）："知识星球爬取的数据，什么都没有也显示了，
+    # 只有'#文字图片信息'，这种就直接过滤掉；内容中出现 WD调研、礼物
+    # 等这些无关个股、行业、政策的信息，都要过滤掉。"
+    #
+    # ⚠️ 放在 **dedup 之前**：被丢掉的条目不该参与去重与聚类，
+    # 否则垃圾会挤掉真实内容（`content_hash` 是内容指纹，过滤不改指纹，
+    # 所以游标与跨次去重不受影响）。
+    #
+    # ⚠️ 用**规则**而不是本地模型：这类噪音是**格式性**的（空条目、
+    # 表情标记、运营话术），正则能百分之百拦住；而模型会偶尔漏
+    # （同一份数据两次结果不同）。而且它在流水线最前面、每条都要过 ——
+    # 60 条 × 770ms = 46 秒，为一批注定要丢的垃圾付这个代价不值得。
+    from src.domain.intel.content_filter import filter_items
+
+    filter_log: list[dict[str, Any]] = []
+    items, filter_stats = filter_items(items, log=filter_log)
 
     # ── 3) 归一：按时间倒序 + 去重 + 截断 ──
     #
@@ -384,6 +409,7 @@ async def build_feed(*, watch_codes: list[str] | None = None,
         credibility_dist=dist,
         cluster_stats=cluster_stats,
         tone_dist=tone_dist,
+        filter_stats=filter_stats,
     )
 
 
