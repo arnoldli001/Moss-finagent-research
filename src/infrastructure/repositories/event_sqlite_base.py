@@ -71,6 +71,33 @@ CREATE TABLE IF NOT EXISTS fact_alerts (
 );
 CREATE INDEX IF NOT EXISTS idx_alerts_status ON fact_alerts(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_alerts_trigger ON fact_alerts(trigger_time);
+
+-- 按**用户**的已读状态。
+--
+-- ## 为什么必须单独一张表（实测发现的漏洞）
+--
+-- 已读原来写在 `fact_alerts.status` 上（`active` / `read`），那是**告警行上
+-- 的单值** —— 而告警是按 `tenant_id` 共享的。实测：pilot 库 47 条告警
+-- **全部**是 `tenant_id='tenant_001'`，而系统里有 13 个 vip 用户，
+-- 于是**任何一个用户点"已读"，全体 13 个人的未读角标一起清零**。
+-- 每个用户的已读状态根本不存在。
+--
+-- 参考实现里 `tenant_id` 参数默认就是常量 `DEFAULT_TENANT`、前端又从不传，
+-- 所以"按租户隔离"连名义上的隔离都没有。
+--
+-- ## 语义
+--
+--   · `fact_alerts.status` 保留，但只表示**告警自身的生命周期**
+--     （`active` / `expired`），不再是"谁读过"
+--   · 本表表示"**这个用户**读过这一条"
+--   · 未读 = 该租户 `active` 的告警 − 该用户在本表里的记录
+CREATE TABLE IF NOT EXISTS user_alert_read (
+    user_id TEXT NOT NULL,
+    alert_id TEXT NOT NULL,
+    read_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    PRIMARY KEY (user_id, alert_id)
+);
+CREATE INDEX IF NOT EXISTS idx_uar_user ON user_alert_read(user_id);
 """
 
 _EVENT_COLS = (

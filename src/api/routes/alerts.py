@@ -109,6 +109,28 @@ async def _viewer_is_admin(request: Request) -> bool:
         return False
 
 
+async def _viewer_user_id(request: Request) -> str:
+    """当前请求的**用户** ID，拿不到返回空串。
+
+    ## 为什么每个读/写已读的端点都必须拿它
+
+    已读原来是写在 `fact_alerts.status` 上的**行级单值**，而告警行按
+    `tenant_id` 共享 —— 实测 pilot 库 47 条告警全是 `tenant_001`，
+    而系统里有 13 个 vip 用户。于是**任何一个人点已读，全体一起清零**。
+    按用户隔离的前提就是"知道是谁"。
+
+    返回空串时调用方退回旧的全局行为（不假装隔离成功）——
+    这在只读展示上是可接受的降级，但**不该出现在写路径上**。
+    """
+    try:
+        from src.api.session_ctx import current_user
+
+        user_id, _ = await current_user(request, write=False)
+        return str(user_id)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def alert_to_public(alert, *, is_admin: bool) -> dict:
     """告警 → 可出接口的 dict。
 
@@ -219,7 +241,9 @@ async def alert_settings(request: Request) -> dict:
 @router.get("/alerts/unread-count")
 async def unread_count(request: Request, tenant_id: str = DEFAULT_TENANT) -> dict:
     runtime = _require_stack(request)
-    return {"unread": await runtime.event_repo.count_unread(tenant_id)}
+    # 按**用户**统计 —— 不是全局。见 _viewer_user_id 的说明。
+    return {"unread": await runtime.event_repo.count_unread(
+        tenant_id, user_id=await _viewer_user_id(request))}
 
 
 @router.post("/alerts/scan", status_code=202)
@@ -274,7 +298,10 @@ async def scan_latest(request: Request) -> dict:
 @router.post("/alerts/read-all")
 async def mark_all_read(request: Request, tenant_id: str = DEFAULT_TENANT) -> dict:
     runtime = _require_stack(request)
-    return {"updated": await runtime.event_repo.mark_all_read(tenant_id)}
+    # 只把**这个用户**的告警标成已读。原来是一条 UPDATE 把整个租户的
+    # 告警全置 read —— 一个人点"全部已读"，13 个人的角标一起清零。
+    return {"updated": await runtime.event_repo.mark_all_read(
+        tenant_id, user_id=await _viewer_user_id(request))}
 
 
 @router.get("/alerts/{alert_id}")
@@ -294,7 +321,8 @@ async def mark_read(
     request: Request, alert_id: str, tenant_id: str = DEFAULT_TENANT,
 ) -> dict:
     runtime = _require_stack(request)
-    updated = await runtime.event_repo.mark_read(alert_id, tenant_id)
+    updated = await runtime.event_repo.mark_read(
+        alert_id, tenant_id, user_id=await _viewer_user_id(request))
     if not updated:
         raise HTTPException(status_code=404, detail="告警不存在或已读")
     return {"alert_id": alert_id, "status": "read"}
@@ -308,10 +336,14 @@ async def list_alerts(
 ) -> dict:
     runtime = _require_stack(request)
     limit = max(1, min(limit, 200))
+    uid = await _viewer_user_id(request)
     alerts = await runtime.event_repo.list_alerts(
         alert_type=type, alert_level=level, status=status,
-        limit=limit, include_expired=include_expired, tenant_id=tenant_id)
-    unread = await runtime.event_repo.count_unread(tenant_id)
+        limit=limit, include_expired=include_expired, tenant_id=tenant_id,
+        user_id=uid)
+    # 未读数也要按用户 —— 否则列表是我的未读、角标是全体的未读，
+    # 两个数对不上，用户会以为系统坏了
+    unread = await runtime.event_repo.count_unread(tenant_id, user_id=uid)
     is_admin = await _viewer_is_admin(request)
     return {"alerts": [alert_to_public(a, is_admin=is_admin) for a in alerts],
             "total": len(alerts), "unread": unread}
@@ -397,12 +429,18 @@ async def alerts_ws(websocket: WebSocket, tenant_id: str = DEFAULT_TENANT) -> No
 
     ident = await ws_identity(websocket)
     is_admin = bool(ident and ident[1] == "admin")
+    # 用户 ID 同样按连接取 —— 快照里的"未读"必须是**这个人**的未读，
+    # 否则他推上来会看到别人的已读状态（或漏掉自己的未读）
+    ws_user_id = str(ident[0]) if ident else ""
 
-    await hub.connect(websocket, tenant_id, is_admin=is_admin)
+    await hub.connect(websocket, tenant_id, is_admin=is_admin,
+                      user_id=ws_user_id)
     try:
         unread = await runtime.event_repo.list_alerts(
-            status="active", limit=10, tenant_id=tenant_id)
-        unread_count = await runtime.event_repo.count_unread(tenant_id)
+            status="active", limit=10, tenant_id=tenant_id,
+            user_id=ws_user_id)
+        unread_count = await runtime.event_repo.count_unread(
+            tenant_id, user_id=ws_user_id)
         await websocket.send_json({
             "type": "snapshot", "unread": unread_count,
             "data": [alert_to_public(a, is_admin=is_admin) for a in unread]})

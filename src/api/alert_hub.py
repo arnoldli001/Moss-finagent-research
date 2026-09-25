@@ -39,7 +39,8 @@ from src.domain.alerts.normalize import now_iso
 logger = logging.getLogger(__name__)
 
 
-def alert_payload(alert: Alert, *, is_admin: bool) -> dict:
+def alert_payload(alert: Alert, *, is_admin: bool,
+                  user_id: str = "") -> dict:
     """单条告警 → 面向某类观看者的 payload。
 
     真正的脱敏规则在 `src.api.routes.alerts.alert_to_public`（那里同时服务
@@ -57,18 +58,28 @@ class AlertHub:
         self._clients: dict[str, set[WebSocket]] = defaultdict(set)
         #: 连接 → 是不是管理员（决定它能不能看到来源真名与链接）
         self._admin: dict[WebSocket, bool] = {}
+        #: 连接 → 用户 ID。
+        #:
+        #: ⚠️ 推送的告警对**每个连接**都是"未读"（刚生成就推你），
+        #: 但前端要判断"这条我是不是已经读过了" —— 同一个人可能在两个设备
+        #: 上开着，A 设备读过的，B 设备的推送不该再算未读。
+        #: 所以按连接记 user_id，序列化时带上该用户的状态。
+        self._user: dict[WebSocket, str] = {}
 
     async def connect(self, websocket: WebSocket,
                       tenant_id: str = DEFAULT_TENANT,
-                      *, is_admin: bool = False) -> None:
+                      *, is_admin: bool = False,
+                      user_id: str = "") -> None:
         await websocket.accept()
         self._clients[tenant_id].add(websocket)
         self._admin[websocket] = bool(is_admin)
+        self._user[websocket] = str(user_id or "")
 
     def disconnect(self, websocket: WebSocket,
                    tenant_id: str = DEFAULT_TENANT) -> None:
         self._clients[tenant_id].discard(websocket)
         self._admin.pop(websocket, None)
+        self._user.pop(websocket, None)
 
     def client_count(self, tenant_id: str = DEFAULT_TENANT) -> int:
         return len(self._clients.get(tenant_id, ()))
@@ -78,6 +89,10 @@ class AlertHub:
         拿不准时按"非管理员"处理，少给信息总比泄源好）。"""
         return self._admin.get(websocket, False)
 
+    def user_id(self, websocket: WebSocket) -> str:
+        """该连接属于哪个用户（未登记时空串 → 退回全局行为）。"""
+        return self._user.get(websocket, "")
+
     async def broadcast(
         self, alert: Alert, tenant_id: str = DEFAULT_TENANT,
     ) -> int:
@@ -86,7 +101,8 @@ class AlertHub:
         sent = 0
         for websocket in list(self._clients.get(tenant_id, ())):
             # 按连接序列化（见模块 docstring：缓存一份就会把管理员视图发出去）
-            payload = alert_payload(alert, is_admin=self.is_admin(websocket))
+            payload = alert_payload(alert, is_admin=self.is_admin(websocket),
+                                    user_id=self.user_id(websocket))
             try:
                 await websocket.send_json({"type": "alert", "data": payload})
                 sent += 1
@@ -96,6 +112,7 @@ class AlertHub:
         for websocket in dead:
             self._clients[tenant_id].discard(websocket)
             self._admin.pop(websocket, None)
+            self._user.pop(websocket, None)
         return sent
 
     async def heartbeat(self) -> int:
@@ -113,4 +130,5 @@ class AlertHub:
             for websocket in dead:
                 sockets.discard(websocket)
                 self._admin.pop(websocket, None)
+                self._user.pop(websocket, None)
         return alive

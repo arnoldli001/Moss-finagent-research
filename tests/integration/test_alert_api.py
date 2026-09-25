@@ -32,7 +32,7 @@ class FakeCollector:
 
 
 class FakeAnalyzer:
-    async def analyze(self, events):
+    async def analyze(self, events, force: bool = False):
         out = []
         for e in events:
             if "重大" in e.title:
@@ -110,7 +110,7 @@ def test_settings_endpoint_reports_thresholds_and_email(client):
     assert data["available"] is True
     assert data["thresholds"]["risk"]["high"] == 75
     assert data["email"]["configured"] is False
-    assert data["email"]["to"] == "1027312283@qq.com"
+    assert data["email"]["to"] == "2693888583@qq.com"
     assert data["email"]["risk_min_score"] == 69.0
     assert data["email"]["opp_min_score"] == 85.0
     assert data["schedule"]["cron"] == "30 17 * * 1-5"
@@ -142,7 +142,12 @@ def test_full_scan_creates_alert_and_ws_snapshot(client):
     alerts = c.get("/api/v1/alerts").json()
     assert alerts["total"] == 1 and alerts["unread"] == 1
     alert = alerts["alerts"][0]
-    assert alert["alert_type"] == "opportunity" and alert["source_url"]
+    assert alert["alert_type"] == "opportunity"
+    # 来源脱敏：用户响应里**不存在** source_url / source_name，
+    # 只有稳定假名 source_alias；管理员视图才保留真名与链接。
+    # （这个测试客户端未登录，走的是非管理员路径）
+    assert "source_url" not in alert and "source_name" not in alert
+    assert alert["source_alias"]
     assert c.get("/api/v1/alerts/unread-count").json()["unread"] == 1
     assert c.get("/api/v1/alerts", params={"level": "high"}).json()["total"] == 1
     assert c.get("/api/v1/alerts", params={"level": "low"}).json()["total"] == 0
@@ -156,6 +161,13 @@ def test_full_scan_creates_alert_and_ws_snapshot(client):
     # 已读流
     assert c.post(f"/api/v1/alerts/{alert['alert_id']}/read").status_code == 200
     assert c.get("/api/v1/alerts/unread-count").json()["unread"] == 0
+    # ⚠️ 这个测试客户端**未登录**，所以走的是**旧的全局行为**
+    # （_viewer_user_id() 拿不到身份 → 退回按行的 status 字段），
+    # 因此重复标记仍是 404。
+    #
+    # 按用户隔离那条路径需要真实会话，在**仓储层**测更干净：
+    # 见 	ests/unit/test_alert_user_read.py —— 那里直接拿两个 user_id
+    # 验证"A 标记不影响 B"，不需要把认证栈塞进这个 fixture。
     assert c.post(f"/api/v1/alerts/{alert['alert_id']}/read").status_code == 404
 
 
@@ -175,7 +187,9 @@ def test_ws_receives_alert_pushed_during_scan(client):
     assert data["alert_level"] == "high"
     assert data["opportunity_score"] == 90
     assert data["confidence"] == 0.91
-    assert data["source_name"] == "测试快讯"
+    # 来源脱敏（这个客户端未登录 → 非管理员路径）：推送帧里同样不能有真名
+    assert "source_name" not in data and "source_url" not in data
+    assert data["source_alias"]
     assert "不构成投资建议" in data["disclaimer"]
     # 前端铃铛最终与REST一致
     assert c.get("/api/v1/alerts/unread-count").json()["unread"] == 1
