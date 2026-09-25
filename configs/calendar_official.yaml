@@ -24,39 +24,75 @@
 #   date      发布日期 YYYY-MM-DD
 #   previous  上一期值（可比对，**不是预测**）
 #   kind      macro（国内）| fed（海外议息）
+#   match     模式契约（**强烈建议填**，见下）
+#
+# ## match：为什么必须写清"哪个名字才是这个指标"
+#
+# 预期值/前值由全球财经日历按**事件名**自动补。但日历里同一个指标有
+# 好几条变体，靠名字猜必然猜错 —— 实测踩过的两个坑：
+#
+#   · "CPI" 会被 "中国台湾9月未季调CPI**读数**" 命中（双向包含），
+#     拿到 112.32。那是**指数读数**，不是同比%，与国内 CPI 不可比。
+#   · "制造业PMI" 与 "非制造业PMI" 归一化后**同名**，字典后写覆盖
+#     前写，拿到 49.0（非制造业），真值 49.8。
+#
+# 所以用 include / exclude 把"是哪个指标"写死：
+#
+#   include   全部子串都要在事件名里（AND）
+#   exclude   任一子串命中即淘汰
+#
+# 匹配不上时界面显示「待公布」/「暂无一致预期值」—— **不编数字**。
 #
 # ⚠️ 合规：本文件只列**日程**（哪天发布），不含任何方向判断。
 
 macro:
   # ── 近期（用于验证"预期差"匹配通路）──
-  # 说明：预期值/前值会由全球财经日历**按事件名自动补**，
-  # 匹配不上时界面显示「待公布」或「暂无一致预期值」—— 不编数字。
   - key: industrial_profit_202608
     name: 规模以上工业企业利润
     date: "2026-09-27"
     kind: macro
+    match:
+      include: [规模以上工业企业利润, 年率]
+      exclude: [单月, 金额]
   - key: pmi_202609
     name: 制造业PMI
     date: "2026-09-30"
     kind: macro
+    match:
+      include: [制造业PMI]
+      exclude: [非制造业, 综合]
 
   # ── 2026 年 10 月 ──
   - key: cpi_202609
     name: CPI
     date: "2026-10-09"
     kind: macro
+    match:
+      include: [CPI, 年率]
+      exclude: [台湾, 香港, 月率, 季调, 读数]
   - key: ppi_202609
     name: PPI
     date: "2026-10-09"
     kind: macro
+    match:
+      include: [PPI, 年率]
+      exclude: [台湾, 香港, 月率, 读数]
   - key: gdp_2026q3
     name: GDP
     date: "2026-10-19"
     kind: macro
+    # GDP 的变体最多（年率累计 / 年率当季 / 季率 / 总量），
+    # 最容易错的是 "GDP总量"（361511 亿元）—— 那不是增速。
+    match:
+      include: [GDP, 年率]
+      exclude: [台湾, 香港, 总量, 季率, 金额]
   - key: pmi_202610
     name: 制造业PMI
     date: "2026-10-31"
     kind: macro
+    match:
+      include: [制造业PMI]
+      exclude: [非制造业, 综合]
 
 fed:
   # FOMC 议息日程（美联储官网公布，一年 8 次）

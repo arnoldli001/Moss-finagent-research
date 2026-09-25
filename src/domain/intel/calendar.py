@@ -48,7 +48,21 @@ from typing import Any, Final
 logger = logging.getLogger(__name__)
 
 #: 默认展望窗口（天）
-DEFAULT_HORIZON_DAYS: Final = 30
+DEFAULT_HORIZON_DAYS: Final = 45
+
+#: 财经日历**抓取**窗口上限（天）
+#:
+#: 该接口是**按天**请求的，抓 45 天就是 45 次 HTTP。远期条目 YAML 已经
+#: 给了权威日程，只需要近期数据补预期/前值，所以抓取窗口比展示窗口短，
+#: 两者解耦：`DEFAULT_HORIZON_DAYS` 决定"日历上显示多久"，
+#: 这个常量决定"为补数值最多打多少次请求"。
+FEED_FETCH_MAX_DAYS: Final = 30
+
+#: 源日期与官方日程的**可接受时差**（天）
+#:
+#: 超出这个时差，候选只有在带 `expected`/`published` 时才被采用；
+#: 只带 `previous` 的一律丢弃 —— 那是上一期的条目，贴到这一期就是编数据。
+_DATE_TOLERANCE_DAYS: Final = 2
 
 #: 日历数据源标签（**只用于管理员侧**）
 CALENDAR_SOURCE_LABELS: Final[dict[str, str]] = {
@@ -454,92 +468,231 @@ def _norm_name(name: str) -> str:
     return s.lower()
 
 
-def _match_index(norm: str, index: dict[str, dict[str, Any]]
-                 ) -> dict[str, Any] | None:
-    """在索引里找**最匹配**的一条。短名是长名子串即命中。
+def _date_gap_days(a: Any, b: Any) -> int:
+    """两个 `YYYY-MM-DD` 相差几天。解析不出来时给一个大数（视作"很远"）。"""
+    try:
+        da = datetime.fromisoformat(str(a)[:10])
+        db = datetime.fromisoformat(str(b)[:10])
+    except (ValueError, TypeError):
+        return 10 ** 6
+    return abs((da - db).days)
 
-    优先精确相等，其次双向包含（取命中里最长的，即最具体的那个）。
-    返回 `None` 表示没找到 —— 调用方据此保持 `pending`/`prior_only`，
-    **不编数字**。
+
+def _match_index(norm: str, rows: list[dict[str, Any]],
+                 match: dict[str, Any] | None = None,
+                 date: str | None = None) -> dict[str, Any] | None:
+    """在财经日历记录表里找**最匹配**的那一条，找不到返回 `None`。
+
+    `match` 是 YAML 给的**模式契约**。没有它就只能靠名字双向包含去猜，
+    而那样猜必错 —— 实测踩过的三个坑：
+
+      · "CPI" 被 "中国台湾9月未季调CPI**读数**" 命中 → 前值 112.32，
+        那是**指数读数**不是同比%，与国内 CPI 不可比
+      · "制造业PMI" 与 "非制造业PMI" 归一化后**同名**，互相覆盖 →
+        拿到 49.0（非制造业），真值 49.8
+      · "GDP" 被 "GDP**总量**" 命中 → 前值 361511.0（亿元），
+        真值 4.7（当季同比%）
+
+    所以能写清"哪个名字才是这个指标"的，都要在 YAML 里写清：
+    `include` 是**全部**必须命中的子串，`exclude` 任一命中即淘汰。
+
+    判定在**原始事件名**上做，不能先 `_norm_name` —— 归一化会把
+    "年初至今/单月/金额/年率" 这些**区分性词**删掉，删完可能剩空串，
+    而空串是任何字符串的子串 → 该条条件形同虚设。
     """
-    if not norm:
+    if not rows:
         return None
-    if norm in index:
-        return index[norm]
-    hits = [(k, v) for k, v in index.items() if norm in k or k in norm]
-    if not hits:
+    inc = [str(x) for x in (match or {}).get("include") or []]
+    exc = [str(x) for x in (match or {}).get("exclude") or []]
+    cand = rows
+    if inc or exc:
+        cand = [r for r in cand
+                if all(x in str(r.get("raw_name") or "") for x in inc)
+                and not any(x in str(r.get("raw_name") or "") for x in exc)]
+    elif norm:
+        cand = [r for r in cand
+                if norm in str(r.get("norm") or "")
+                or str(r.get("norm") or "") in norm]
+    if not cand:
         return None
-    hits.sort(key=lambda kv: len(kv[0]), reverse=True)
-    return hits[0][1]
+    if date:
+        # 日期**只作同分优先**。两个源的日期口径本来就不一致（实测源把
+        # 9 月 CPI 记在 10-14，官方日程是 10-09），硬过滤会把能用的
+        # 数据全滤掉。反过来，没有这一层时 "10 月 PMI" 会拿到 9 月那条
+        # 49.8 —— 那就成编数据了。所以：同日优先，其次限时差，再不行
+        # 只在候选带前瞻数据（预期/公布）时才要。
+        same = [r for r in cand if r.get("date") == date]
+        if same:
+            cand = same
+        else:
+            near = [r for r in cand
+                    if _date_gap_days(r.get("date"), date) <= _DATE_TOLERANCE_DAYS]
+            if near:
+                cand = near
+            else:
+                ahead = [r for r in cand
+                         if r.get("expected") is not None
+                         or r.get("published") is not None]
+                if not ahead:
+                    return None
+                cand = ahead
+    return cand[0]
+
+
+def _tag_src_date(metrics: dict[str, Any], hit: dict[str, Any],
+                  official_date: str) -> None:
+    """源日期与官方日程不一致时，把**源日期**标进 metrics。
+
+    为什么必须标：10-31 那条制造业PMI，源给的是 **9 月**的值 49.8。
+    数值和口径都对，但用户看到"前值 49.8"会以为是**10 月**的前值 ——
+    而 10 月还没发布，9 月的值确实是它最近的一期。不标清楚就是误导。
+    """
+    src_date = str(hit.get("date") or "")[:10]
+    if not src_date or src_date == official_date:
+        return
+    if _date_gap_days(src_date, official_date) <= _DATE_TOLERANCE_DAYS:
+        return
+    metrics["src_date"] = src_date
+    base = metrics.get("note")
+    hint = f"数据日期 {src_date}"
+    metrics["note"] = f"{base}；{hint}" if base else hint
 
 
 def fetch_macro_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                          ) -> tuple[list[CalendarEvent], list[str]]:
-    """宏观发布日程。主源静态 YAML（官方日程表），备源全球财经日历。"""
+    """宏观发布日程 + **预期差**。
+
+    做法：静态 YAML 给**权威日程**（哪天发），再用全球财经日历
+    **按事件名匹配**补上预期值/前值/公布值。两者是"骨架 + 血肉"：
+
+      · 只用 YAML    → 有日程但没数据，用户看不出预期差
+      · 只用财经日历  → 有数据但日程不全，还夹带大量非中国条目与日频噪音
+
+    匹配不上时**保留 YAML 条目**并标 `pending`/`prior_only` ——
+    宁可少一个数字，也不要丢一个已知日程。
+    """
     events: list[CalendarEvent] = []
     tried: list[str] = []
     today = datetime.now()
     end = today + timedelta(days=horizon_days)
 
-    tried.append("macro_static")
+    # ── ① 先取财经日历，建记录表（血肉）──
+    #
+    # ⚠️ 这里必须是**记录列表**，不能是 `dict[归一化名 → 单条]`。
+    # `_norm_name` 会删掉 "年初至今/单月/金额/年率" 这些**区分性词**，
+    # 于是同一指标的多个变体会塌成同一个 key 互相覆盖。实测塌掉的例子：
+    #
+    #   规模以上工业企业利润  → 金额 45820.6 / 年率年初至今 17.6 / 年率单月 11.2
+    #   GDP                  → 年率累计 4.7 / 年率当季 4.3 / 季率 0.9 / 总量 361511.0
+    #
+    # 三条塌成一条，谁最后写谁赢 —— 所以曾出现 "GDP 前值 361511.0"
+    # 这种明显不是增速的"数据"。归一化名只适合做**粗筛**，不适合做键。
+    tried.append("macro_baidu")
+    feed_rows: list[dict[str, Any]] = []
+    try:
+        import akshare as ak
+
+        # 抓取窗口比展示窗口短：这个接口是**按天**请求的，30 天就是 30 次
+        # HTTP。远期条目 YAML 已经给了权威日程，只需要近期数据补预期/前值。
+        for off in range(0, min(horizon_days, FEED_FETCH_MAX_DAYS) + 1):
+            d = (today + timedelta(days=off)).strftime("%Y%m%d")
+            try:
+                df = ak.news_economic_baidu(date=d)
+            except Exception:  # noqa: BLE001 单日失败不影响其它日
+                continue
+            for _, row in df.iterrows():
+                region = str(row.get("地区") or "")
+                # 只要**中国内地**。"中国" 是 "中国台湾"/"中国香港" 的子串，
+                # 只用 `"中国" in region` 会把港台一并收进来 —— 而港台
+                # 指标与内地**同名不同义**（台湾 CPI 是读数指数，内地是
+                # 同比%），混在一起必然张冠李戴。
+                if "中国" not in region or "台湾" in region or "香港" in region:
+                    continue
+                name = str(row.get("事件") or "").strip()
+                if not name:
+                    continue
+                feed_rows.append({
+                    "norm": _norm_name(name),
+                    "raw_name": name,
+                    "date": str(row.get("日期") or "")[:10],
+                    "expected": row.get("预期"),
+                    "previous": row.get("前值"),
+                    "published": row.get("公布"),
+                    "importance": row.get("重要性"),
+                })
+    except Exception as exc:  # noqa: BLE001
+        from src.core.redaction import sanitize_error
+        logger.warning("全球财经日历失败：%s", sanitize_error(exc))
+
+    # ── ② 静态 YAML：权威日程（骨架）──
+    tried.insert(0, "macro_static")
     cfg = Path("configs/calendar_official.yaml")
     if cfg.exists():
         try:
             import yaml
 
             data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
-            for row in (data.get("macro") or []):
-                d = str(row.get("date") or "")[:10]
-                if not d:
-                    continue
-                try:
-                    dt = datetime.fromisoformat(d)
-                except ValueError:
-                    continue
-                if not (today - timedelta(days=1) <= dt <= end):
-                    continue
-                events.append(CalendarEvent(
-                    event_id=f"macro_{row.get('key', d)}",
-                    kind="macro",
-                    date=d,
-                    title=str(row.get("name") or "宏观数据发布"),
-                    scope={"kind": "market", "company_count": 0,
-                           "industries": [], "codes": []},
-                    certainty="rule",       # 官方日程表，按规则发布
-                    metrics={"previous": row.get("previous")},
-                ))
+            for section in ("macro", "fed"):
+                for row in (data.get(section) or []):
+                    d = str(row.get("date") or "")[:10]
+                    if not d:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(d)
+                    except ValueError:
+                        continue
+                    if not (today - timedelta(days=1) <= dt <= end):
+                        continue
+                    name = str(row.get("name") or "宏观数据发布")
+                    match = row.get("match") or {}
+                    hit = _match_index(_norm_name(name), feed_rows,
+                                       match=match, date=d) or {}
+                    metrics = build_expectation(
+                        expected=hit.get("expected") or row.get("expected"),
+                        previous=hit.get("previous") or row.get("previous"),
+                        published=hit.get("published"))
+                    if hit.get("importance") is not None:
+                        metrics["importance"] = hit["importance"]
+                    _tag_src_date(metrics, hit, d)
+                    events.append(CalendarEvent(
+                        event_id=f"{section}_{row.get('key', d)}",
+                        kind="macro",
+                        date=d,
+                        title=name,
+                        scope={"kind": "market", "company_count": 0,
+                               "industries": [], "codes": []},
+                        certainty="rule",       # 官方日程表，按规则发布
+                        metrics=metrics,
+                    ))
         except Exception as exc:  # noqa: BLE001
             from src.core.redaction import sanitize_error
             logger.warning("静态宏观日程解析失败：%s", sanitize_error(exc))
 
-    if events:
-        return events, tried
-
-    # 备源：全球财经日历，按"中国"过滤
-    tried.append("macro_baidu")
-    try:
-        import akshare as ak
-
-        df = ak.news_economic_baidu(date=today.strftime("%Y%m%d"))
-        for _, row in df.iterrows():
-            if "中国" not in str(row.get("地区") or ""):
+    # ── ③ YAML 没覆盖到时，用财经日历的宏观条目兜底 ──
+    if not events and feed_rows:
+        _noise = ("仓单", "竞拍", "国债", "回购")   # 日频噪音，不是宏观日程
+        for info in feed_rows[:60]:
+            raw = str(info.get("raw_name") or "")
+            if any(n in raw for n in _noise):
                 continue
-            name = str(row.get("事件") or "")
-            if not name:
+            d = info.get("date") or ""
+            if not d:
                 continue
+            metrics = build_expectation(
+                expected=info.get("expected"), previous=info.get("previous"),
+                published=info.get("published"))
+            metrics["importance"] = info.get("importance")
             events.append(CalendarEvent(
-                event_id=f"macro_{name[:24]}",
+                event_id=f"macro_{info.get('norm', '')[:24]}",
                 kind="macro",
-                date=str(row.get("日期") or "")[:10],
-                title=name,
+                date=d,
+                title=raw,          # 原始名信息量最大（含单位与口径）
                 scope={"kind": "market", "company_count": 0,
                        "industries": [], "codes": []},
                 certainty="scheduled",
-                metrics={"previous": row.get("前值"), "forecast": row.get("预期")},
+                metrics=metrics,
             ))
-    except Exception as exc:  # noqa: BLE001
-        from src.core.redaction import sanitize_error
-        logger.warning("全球财经日历失败：%s", sanitize_error(exc))
+        events.sort(key=lambda e: e.date)
 
     return events, tried
 
