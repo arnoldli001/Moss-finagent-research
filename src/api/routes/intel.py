@@ -58,17 +58,32 @@ async def intel_feed(
                        description="返回条数上限"),
     codes: str = Query(default="",
                        description="关注标的（逗号分隔，用于拉取对应研报）"),
+    sort: str = Query(default="credibility",
+                      pattern="^(credibility|time)$",
+                      description="取样顺序：credibility 优先纳入高可信条目｜"
+                                  "time 纯时间"),
+    filter: str = Query(default="all",
+                        description="可信度筛选档：all/high/mid_up/low/"
+                                    "official/broker（只作用于**返回结果**，"
+                                    "计数 counts 始终是全量口径）"),
 ) -> dict[str, Any]:
     """聚合六源情报流。
 
     **单源失败不影响整体** —— 失败进 `gaps`，并置 `degraded=true`，
     前端据此显示"数据不完整"（**不显示具体是哪个源坏了**）。
+
+    ## 筛选为什么在服务端做，而不是前端过滤
+
+    前端过滤只能过滤"已经取回来的这一页"（默认 60 条），于是
+    "高可信 ≥80" 可能只有 6 条、而全量里其实有 30 条 —— 用户看到的是
+    **取样的结果**，不是**数据的真相**。所以筛选必须在下发前做：
+    服务端按档位重新取样，保证这一页就是"符合该档位的最近 N 条"。
     """
     await require_feature(request, FEATURE_RADAR)
 
     watch = [c.strip() for c in codes.split(",") if c.strip()]
     try:
-        feed = await build_feed(watch_codes=watch, limit=limit)
+        feed = await build_feed(watch_codes=watch, limit=limit, sort=sort)
     except Exception as exc:  # noqa: BLE001 聚合层不该把 500 抛给用户
         logger.exception("情报聚合失败")
         raise HTTPException(
@@ -84,6 +99,52 @@ async def intel_feed(
                    for g in feed.gaps]
     payload["gaps"] = public_gaps
     payload["admin_hints"] = admin_hints
+
+    # ── 可信度筛选（下发前做）──
+    from src.domain.intel.credibility import (
+        FILTERS, level_of, matches_filter,
+    )
+
+    if filter not in FILTERS:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "bad_filter",
+                    "message": f"filter 必须是 {'/'.join(FILTERS)} 之一"})
+
+    all_items = payload.get("items") or []
+    kept = []
+    for it in all_items:
+        raw = it.get("credibility") or {}
+        try:
+            score = int(raw.get("score"))
+        except (TypeError, ValueError):
+            score = 0
+        # 复用 `credibility.Credibility` 的判据，避免前后端两套口径漂移
+        from src.domain.intel.credibility import Credibility
+
+        cred = Credibility(
+            score=score,
+            source_base=int(raw.get("source_base") or 0),
+            content_base=int(raw.get("content_base") or 0),
+            source_reason=str(raw.get("source_reason") or ""),
+            content_reason=str(raw.get("content_reason") or ""))
+        if matches_filter(cred, str(it.get("kind") or ""), filter):
+            kept.append(it)
+    payload["items"] = kept
+    payload["filter"] = filter
+    payload["sort"] = sort
+    # 分层计数（面向筛选 tab 的角标）。**基于全量 counts 的同批条目**，
+    # 不随当前 filter 变化 —— 否则切一次 tab 角标就全变了，用户会以为数据在动。
+    dist: dict[str, int] = {}
+    for it in all_items:
+        raw = it.get("credibility") or {}
+        try:
+            lv = level_of(int(raw.get("score")))[0]
+        except (TypeError, ValueError):
+            lv = "doubt"
+        dist[lv] = dist.get(lv, 0) + 1
+    payload["credibility_dist"] = dist
+    payload["filters"] = FILTERS
     return payload
 
 

@@ -73,8 +73,27 @@ def _now_iso() -> str:
 
 async def build_feed(*, watch_codes: list[str] | None = None,
                      limit: int = DEFAULT_LIMIT,
-                     policy_date: str = "") -> IntelFeed:
-    """并发聚合六源。**单源失败隔离**，失败进 `gaps`。"""
+                     policy_date: str = "",
+                     sort: str = "credibility") -> IntelFeed:
+    """并发聚合六源。**单源失败隔离**，失败进 `gaps`。
+
+    `sort` 决定取样顺序（**不是**返回顺序的最终排序，见下方说明）：
+
+      · `credibility`（默认）按**可信度**取样 —— 让"最可核实的那些"先露面。
+        这是"筛选与排序都要"的落地：用户不必自己从 185 条里挑。
+      · `time` 按时间取样（旧行为）。
+
+    ## 为什么排序在**取样**阶段做，而不是取完再排
+
+    纯"取 60 条再按可信度排"仍然会被产量淹没：140 条快讯里挑 60 条，
+    研报与笔记照样一条都进不来。所以取样必须先按**类型**轮流
+    （保证多样性），类型内部再按 `sort` 决定先后 —— 两个目标同时成立。
+
+    另外：**可信度排序不能取代时间完整性**。取样后仍按时间倒序返回，
+    因为界面要的是"最近发生了什么，其中哪些更可核实"；
+    完全按可信度排会让一条三天前的官方公告压在今天所有快讯之上，
+    那是另一种误导（用户会以为它刚发生）。
+    """
     from src.infrastructure.connectors.intel_sources import fetch_all
 
     if not policy_date:
@@ -130,6 +149,9 @@ async def build_feed(*, watch_codes: list[str] | None = None,
                 summary=t.text,
                 published_at=t.created_at,
                 source_alias="research-note-zsxq",
+                # 真实来源名（**内部字段，不出接口**）：分级表靠中文属性词
+                # 识别档次，写英文标识（`zsxq`）会落进保守档 38。
+                source_name="知识星球-调研纪要",
                 content_hash=t.content_hash,
             ).to_public())
         # 只在成功时推进水位线：失败推进会导致**永久丢内容**
@@ -188,8 +210,18 @@ async def build_feed(*, watch_codes: list[str] | None = None,
         k = str(it.get("kind") or "other")
         counts[k] = counts.get(k, 0) + 1
 
+    taken = _balanced_take(deduped, limit, sort=sort)
+    # ★ 取样后**按时间倒序返回**。
+    #
+    # 取样用可信度决定"谁能进这一页"，但**展示顺序仍是时间** ——
+    # 因为界面要回答的是"最近发生了什么，其中哪些更可核实"。
+    # 完全按可信度排会让一条三天前的官方公告压在今天所有快讯之上，
+    # 那是另一种误导（用户会以为它刚发生）。
+    # 可信度的作用体现在**筛选 tab** 与每条旁边的分数环上。
+    taken.sort(key=lambda x: sort_key(x.get("published_at")), reverse=True)
+
     return IntelFeed(
-        items=_balanced_take(deduped, limit),
+        items=taken,
         gaps=gaps,
         counts=counts,
         fetched_at=_now_iso(),
@@ -197,9 +229,9 @@ async def build_feed(*, watch_codes: list[str] | None = None,
     )
 
 
-def _balanced_take(items: list[dict[str, Any]], limit: int
-                   ) -> list[dict[str, Any]]:
-    """取前 N 条：**天之间按时间取最近的，天内按类型轮流**。
+def _balanced_take(items: list[dict[str, Any]], limit: int,
+                   sort: str = "credibility") -> list[dict[str, Any]]:
+    """取前 N 条：**类型之间轮流，类型内部按 `sort` 决定先后**。
 
     ## 为什么不能只按时间截断
 
@@ -230,19 +262,37 @@ def _balanced_take(items: list[dict[str, Any]], limit: int
       · 界面**不做天分组标题**，改为每行显示日期
         （见 `IntelFeedTab.tsx` 的说明）—— 时序信息由每行承载，
         不靠分组标题，于是也就不存在"同一天被切碎"的问题
+
+    ## `sort` 只影响**谁能进这一页**，不影响展示顺序
+
+    `credibility` 模式下桶内按可信度降序，于是稀缺的高可信条目
+    （交易所公告、持牌研报）优先入选。但返回后 `build_feed` 仍按时间重排
+    —— 展示顺序必须是时间，否则会误导（见 `build_feed` 的说明）。
     """
     if limit <= 0:
         return []
     from src.infrastructure.connectors.intel_sources import sort_key
 
+    def _rank(it: dict[str, Any]) -> tuple:
+        """桶内排序键。**时间永远做兜底**，保证同分时顺序稳定可预测。"""
+        t = sort_key(it.get("published_at"))
+        if sort == "time":
+            return (t,)
+        cred = it.get("credibility") or {}
+        try:
+            score = int(cred.get("score"))
+        except (TypeError, ValueError):
+            score = -1        # 缺分数的排最后（不假装它有分）
+        return (score, t)
+
     buckets: dict[str, list[dict[str, Any]]] = {}
     for it in items:
         buckets.setdefault(str(it.get("kind") or "other"), []).append(it)
-    # 桶内时间倒序：`items` 整体已按 `sort_key` 排序，但切桶后必须再排一次
-    # —— 各来源时间戳格式不同，不重排会随到达顺序漂移。
+    # 桶内重排：`items` 整体按时间排过，但切桶后必须再排一次 ——
+    # 一是各来源时间戳格式不同、不重排会随到达顺序漂移；
+    # 二是 `sort=credibility` 时这里才是"谁先入选"的真正决定处。
     for k in buckets:
-        buckets[k].sort(key=lambda x: sort_key(x.get("published_at")),
-                        reverse=True)
+        buckets[k].sort(key=_rank, reverse=True)
     # 类型顺序：谁有最新一条谁先露头（不写死字典序，否则某个类型永远第一）
     order = sorted(
         buckets,

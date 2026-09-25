@@ -96,6 +96,14 @@ class IntelItem:
     published_at: str         # ISO8601
     #: 来源假名。内部用它做去重与限流；对外就是它，不可反推。
     source_alias: str = ""
+    #: **真实来源名**（如"东方财富-全球财经"）。
+    #:
+    #: ⚠️ **绝不出接口** —— `to_public()` 是白名单构造，不会带上它。
+    #: 它只用于一件事：可信度打分的**来源分级**。分级靠的是中文属性词
+    #: （"公告"/"研报"/"快讯"/"传闻"），而 `source_alias` 是英文标识
+    #: （`newswire-em`），查不到档 —— 实测把英文标识传进去会让所有条目
+    #: 落进保守档 38，整个打分形同虚设。
+    source_name: str = ""
     #: 关联标的（代码），无则空
     codes: list[str] = field(default_factory=list)
     #: 行业（第三方原文给的行业分类）
@@ -147,6 +155,19 @@ class IntelItem:
         # 分组、限流。所以是在这里做，而不是在构造点各写各的。
         from src.core.redaction import source_pseudonym
 
+        # 可信度（规则层，零 LLM）。**在这里算**而不是在聚合层：
+        # 只有这里同时拿得到 `source_name`（真实来源名，用于分级）
+        # 与标题/摘要（用于内容分）。聚合层拿到的是已经脱敏的公开 dict。
+        #
+        # ⚠️ 延迟导入：`src.domain.intel.credibility` 反过来不该依赖连接器，
+        # 在模块顶部导入会形成环。
+        from src.domain.intel.credibility import score_item
+
+        cred = score_item(
+            source_name=self.source_name or self.agency or self.source_alias,
+            kind=self.kind, title=self.title, summary=self.summary,
+            agency=self.agency)
+
         return {
             "kind": self.kind,
             "kind_label": SOURCE_KINDS.get(self.kind, self.kind),
@@ -169,6 +190,9 @@ class IntelItem:
             "agency": self.agency if self.kind == "broker_report" else "",
             "content_hash": self.content_hash,
             "extra": safe_extra,
+            # 可信度：**可复算、可展开看构成**（`explain`）。
+            # 它只描述"多可核实"，不含任何方向判断。
+            "credibility": cred.to_public(),
         }
 
 
@@ -330,6 +354,7 @@ def _fetch_broker_reports(symbol: str, *, limit: int = 30) -> list[IntelItem]:
             published_at=date,
             # 研报是**公开署名内容**，机构名不是机密 → 作为来源身份保留
             source_alias=f"broker-{agency}" if agency else "broker",
+            source_name=f"{agency}研究所" if agency else "券商研究所",
             codes=[code] if code else [],
             industry=industry,
             rating_origin=rating,
@@ -374,6 +399,7 @@ def _fetch_em_newswire(*, limit: int = 100) -> list[IntelItem]:
             summary=digest,
             published_at=ts,
             source_alias="newswire-em",
+            source_name="东方财富-全球财经快讯",
             content_hash=_hash("em", title, ts),
             extra={"url": link},
         ))
@@ -396,6 +422,7 @@ def _fetch_ths_newswire(*, limit: int = 30) -> list[IntelItem]:
             summary=body,
             published_at=ts,
             source_alias="newswire-ths",
+            source_name="同花顺-全球直播快讯",
             content_hash=_hash("ths", title, ts),
             extra={"url": str(row.get("链接", "") or "")},
         ))
@@ -418,6 +445,7 @@ def _fetch_sina_newswire(*, limit: int = 30) -> list[IntelItem]:
             summary=body,
             published_at=ts,
             source_alias="newswire-sina",
+            source_name="新浪-7x24快讯",
             content_hash=_hash("sina", body[:200], ts),
         ))
     return items
@@ -442,6 +470,7 @@ def _fetch_policy_cctv(date: str, *, limit: int = 30) -> list[IntelItem]:
             summary=body,
             published_at=d,
             source_alias="policy-cctv",
+            source_name="央视-新闻联播政策",
             content_hash=_hash("cctv", title, d),
         ))
     return items
