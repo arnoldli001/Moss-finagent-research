@@ -87,6 +87,43 @@ async def intel_feed(
     return payload
 
 
+@router.get("/calendar")
+async def intel_calendar(
+    request: Request,
+    horizon_days: int = Query(default=30, ge=1, le=180,
+                              description="展望天数"),
+) -> dict[str, Any]:
+    """投资日历：预约披露 / 限售解禁 / 宏观发布 / 交易日。
+
+    每类**主备互用**（见 `src/domain/intel/calendar.py`）：
+    主源失败自动走备源，全失败则进 `gaps` 并置 `degraded=true`。
+
+    ⚠️ **交易日历刻意无备源** —— 交易日是交易所规则，不存在"第二个可信来源"，
+    用不可信的日历会让整个调度在错误的日子跑，后果比"日历不可用"严重。
+
+    合规：只呈现**已公布的日程**与**覆盖范围统计**，
+    不含方向判断、不给目标价、不给买卖时点。
+    """
+    await require_feature(request, FEATURE_RADAR)
+
+    from src.domain.intel.calendar import build_calendar
+
+    try:
+        res = await build_calendar(horizon_days=horizon_days)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("投资日历聚合失败")
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "calendar_unavailable",
+                    "message": brief(exc) or "投资日历暂时不可用"}) from exc
+
+    payload = res.to_public()
+    payload["disclaimer"] = ("本日历只呈现已公布的日程安排与覆盖范围统计，"
+                             "不含方向判断，不构成投资建议。"
+                             "日程可能变更，请以交易所与公司公告为准。")
+    return payload
+
+
 @router.get("/sources/health")
 async def intel_sources_health(request: Request) -> dict[str, Any]:
     """各源最近一次采集健康度 —— **只给聚合状态，不按源名细分**。
