@@ -210,6 +210,22 @@ _CONTENT_RULES: Final[tuple[tuple[int, str, str], ...]] = (
 #: 真正压住它的仍然是来源分（两轴取低者占 85%）。
 _CONTENT_NEUTRAL: Final = 50
 
+#: 标题里的**持牌机构署名**（实测踩到的低估）。
+#:
+#: 券商研报经常**走快讯通道**转载，来源名是"东方财富-全球财经快讯"这类 ——
+#: 名字里既没有"研报"也没有"研究所"，于是被判成"财经自媒体"只给 54 分。
+#: 实测一条标题写着 `【中信证券：展望2026年下半年…】` 的内容只拿 58 分，
+#: 与它的权威性明显不符（那是持牌机构的研究结论，不是自媒体小作文）。
+#:
+#: 所以标题里出现机构署名时**提一次档**。只提档不降档 ——
+#: 宁可高估研报的权威性，也不要把它和自媒体混为一谈。
+_BROKER_SIGNATURE: Final = re.compile(
+    r"[\u4e00-\u9fff]{2,6}(?:证券|研究所|研究院)"
+    r"|【[^】]{0,20}(?:证券|研究)[^】]{0,20}】")
+
+#: 提档后的来源分与理由（取"持牌机构研报"档）
+_BROKER_BASE: Final = 84
+
 
 @dataclass
 class ContentScore:
@@ -295,6 +311,14 @@ def score_item(*, source_name: str, kind: str, title: str,
         if kbase is not None:
             base, label = kbase, klabel
 
+    # ★ 标题里的**持牌机构署名**再提一次档（只提不降）。
+    #
+    # 实测踩到：券商研报常走快讯通道转载，来源名是"…全球财经快讯"，
+    # 于是被判成"财经自媒体"54 分 —— 而内容其实是中信证券的研究结论。
+    # `kind` 也可能是 `newswire`（采集通道），所以只能从标题里认。
+    if base < _BROKER_BASE and _BROKER_SIGNATURE.search(title or ""):
+        base, label = _BROKER_BASE, "持牌机构研报（署名识别）"
+
     cs = content_score(title, summary)
     lo, hi = min(base, cs.score), max(base, cs.score)
     score = int(round(_W_LOW * lo + _W_HIGH * hi))
@@ -376,11 +400,70 @@ def matches_filter(cred: Credibility, kind: str, key: str) -> bool:
     return True  # 未知档位不过滤（宁可多给，不要静默清空列表）
 
 
+#: 每个独立佐证带来的加分，与**加分上限**
+#:
+#: 设计稿 §4 写的是 `+ 独立佐证数 × 4`，并明确"封顶 +20"（即最多 5 个来源）。
+#: 封顶不是可选项：没有它，一条低权威内容靠"被转载很多次"就能刷到高分 ——
+#: 那恰好破坏了"来源分即上限"这条最重要的性质。
+_CORROBORATION_STEP: Final = 4
+_CORROBORATION_CAP: Final = 20
+
+
+def apply_corroboration(public_cred: dict[str, Any],
+                        corroboration: Any) -> dict[str, Any]:
+    """把聚类算出的**独立佐证数**并进已下发的可信度 dict。
+
+    入参与出参都是 `Credibility.to_public()` 的形状 —— 这样聚合层
+    不需要重建对象，只需替换这一个字段。
+
+    ## 为什么必须封顶，以及为什么仍以**低分轴**为准
+
+    设计稿的 `+ 佐证 × 4`（封顶 +20）是在加权混合**之上**的小幅加成。
+    没有封顶时，一条 54 分的内容被 20 个渠道转载就能拿到 54+80=134 → 100，
+    比交易所公告还高 —— 而"被转得多"与"更可核实"根本不是一回事
+    （假消息往往传得最快）。
+
+    所以这里：`新分 = min(100, 混合分 + min(佐证, 5) × 4)`，
+    且**不越过 100**。佐证是"多条独立来源说了同一件事"这一事实的
+    小幅加分，不是可信度的主要来源。
+    """
+    out = dict(public_cred or {})
+    try:
+        corr = int(corroboration)
+    except (TypeError, ValueError):
+        corr = 0
+    corr = max(0, corr)
+
+    out["corroboration"] = corr
+    base = out.get("score")
+    try:
+        base_i = int(base)
+    except (TypeError, ValueError):
+        return out
+
+    if corr <= 0:
+        return out
+
+    bonus = min(corr, _CORROBORATION_CAP // _CORROBORATION_STEP) \
+        * _CORROBORATION_STEP
+    new_score = max(0, min(100, base_i + bonus))
+    out["score"] = new_score
+    # 低可信阈值要跟着重算 —— 否则"加了佐证分却不允许做倾向分析"
+    # （或反之）会让界面上的说明与判据不一致。
+    out["tone_allowed"] = new_score >= MIN_CREDIBILITY_FOR_TONE
+    if new_score != base_i:
+        out["explain"] = (f"{out.get('explain', '')}"
+                          f" · 多来源印证 +{bonus}"
+                          f"（{corr} 个独立来源，封顶 +{_CORROBORATION_CAP}）")
+    return out
+
+
 __all__ = [
     "FILTERS",
     "LEVELS",
     "MIN_CREDIBILITY_FOR_TONE",
     "Credibility",
+    "apply_corroboration",
     "content_score",
     "level_of",
     "matches_filter",

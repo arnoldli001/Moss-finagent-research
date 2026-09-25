@@ -218,6 +218,155 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ---------- 筛选 + 排序 操控条 ---------- */
+.intel-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.intel-sortbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.intel-sort {
+  font-size: 11.5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+}
+.intel-sort.on { border-color: var(--accent); color: var(--accent); }
+.intel-sort:disabled, .intel-filter:disabled { opacity: 0.55; }
+
+/* ---------- 可信度环 + 可展开构成 ---------- */
+.cred {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  min-width: 0;
+}
+.cred-ring {
+  /* 44px：手机上也是可靠的触控目标（审计阈值 32px） */
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+/* 分档配色 —— 与后端 `credibility.LEVELS` 逐一对应 */
+.cred-ring.high { border-color: #2ea86e; color: #2ea86e; }
+.cred-ring.upper { border-color: #7cc47a; color: #7cc47a; }
+.cred-ring.mid { border-color: var(--medium); color: var(--medium); }
+.cred-ring.low { border-color: #e08a3c; color: #e08a3c; }
+.cred-ring.doubt { border-color: var(--low); color: var(--low); }
+.cred-meta {
+  font-size: 10.5px;
+  line-height: 1.45;
+  color: var(--muted);
+  min-width: 0;
+}
+.cred-meta b { display: block; color: var(--text); font-size: 11px; }
+.cred-detail {
+  flex: 1 1 100%;
+  margin: 0;
+  padding: 8px 0 0;
+  border-top: 1px dashed var(--table-line);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.cred-detail > div { display: flex; gap: 6px; }
+.cred-detail dt { flex: 0 0 60px; color: var(--muted); margin: 0; }
+.cred-detail dd { margin: 0; color: var(--text); min-width: 0; }
+.cred-formula {
+  display: block !important;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--table-line);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+/* 展开后让表格单元格占满整行（构成面板需要宽度） */
+.intel-table .c-cred { width: 150px; }
+.cred.open { flex-wrap: wrap; }
+
+/* --- 手机卡片里的可信度 --- */
+.intel-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.intel-card-foot .intel-card-target { margin-top: 0; margin-left: auto; }
+
+/* ---------- 关联新闻（同一件事的其他来源，点数字才展开） ---------- */
+.rel { margin-top: 6px; }
+.rel-btn {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(169,123,255,0.45);
+  background: rgba(169,123,255,0.1);
+  color: var(--intel-purple);
+  white-space: nowrap;
+}
+.rel-btn:hover { border-color: var(--intel-purple); }
+.rel-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 0 0;
+  border-top: 1px dashed var(--table-line);
+  font-size: 11.5px;
+}
+.rel-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  padding: 3px 0;
+  min-width: 0;
+}
+.rel-score {
+  flex: 0 0 auto;
+  min-width: 24px;
+  text-align: right;
+  color: var(--intel-purple);
+  font-variant-numeric: tabular-nums;
+}
+.rel-kind {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.rel-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text);
+  /* 展开里的标题也限两行 —— 否则长标题会把"关联"块撑得比主条还高 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.rel-time { flex: 0 0 auto; color: var(--muted); font-size: 10.5px; }
+.rel-more { color: var(--muted); }
+
 /* --- 桌面表格 --- */
 .intel-tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .intel-table {
@@ -747,6 +896,18 @@
      （实测审计报"4 个触控目标 <32px"）。提到 35px，与子页签一致。
      ⚠️ 只调 padding，不改字号 —— 字号一动整排就会换行。 */
   .intel-filter { padding: 8px 13px; font-size: 12.5px; }
+  /* ⚠️ 角标数字（"全部 301"这种）会把页签撑得很宽，实测把「仅研报」
+     挤出屏幕外。窄屏收掉数字：信息在页签文案里已有，数字只是辅助。 */
+  .intel-filter-n { display: none; }
+
+  /* 操控条：手机上筛选与排序各占一行，否则挤在一行两边都截断 */
+  .intel-controls { gap: 8px; }
+  .intel-sortbar { margin-left: 0; flex: 1 1 100%; }
+  .intel-sort { padding: 6px 12px; font-size: 12.5px; }
+
+  /* 可信度环在卡片里给足触控尺寸 */
+  .cred-ring { width: 42px; height: 42px; font-size: 14px; }
+  .cred-detail dt { flex-basis: 56px; }
 
   .heat-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
   .heat-val { font-size: 18px; }

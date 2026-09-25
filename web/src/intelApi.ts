@@ -28,6 +28,52 @@ import { notifyUnauthorized } from "./unauthorized";
 
 const BASE = "/api/v1/intel";
 
+/**
+ * 可信度（**规则层打分，可复算**）。
+ *
+ * 它只回答一个问题：**这条信息有多可核实**。不是"会不会涨"。
+ * 两个轴都是查表/形态匹配算出来的，**不经过任何模型**，所以没有幻觉风险。
+ *
+ * ⚠️ 界面必须**可展开看构成**（`explain`），不做黑盒分数 ——
+ * 一个说不出理由的分数，用户只能选择信或不信，而两者都不合适。
+ */
+export interface IntelCredibility {
+  /** 0–100 综合分。低权威来源**封顶**在它的来源档附近（内容写得再好也抬不动）。 */
+  score: number;
+  /** 来源轴（权威性）：监管公告 94 … 未证实传闻 28 */
+  source_base: number;
+  /** 内容轴（可核实程度）：附公告编号 100 … 纯推测 12 */
+  content_base: number;
+  /** 来源档的中文名（如"财经自媒体"）—— **不含任何渠道标识** */
+  source_reason: string;
+  /** 内容档的中文名（如"有数据支撑"） */
+  content_reason: string;
+  /**
+   * 独立佐证数。**第一步恒为 `null`** —— 需要按事件轴聚类（第二步）。
+   * 界面对 `null` 要显示"暂未统计"，**不能显示 0**
+   * （0 的意思是"查过了没有第二条来源"）。
+   */
+  corroboration: number | null;
+  /** 是否允许进入倾向统计（低于 50 分不做倾向分析） */
+  tone_allowed: boolean;
+  /** 一句话解释这个分是怎么来的 */
+  explain: string;
+}
+
+/**
+ * 一条**关联新闻**（同一件事的另一个来源）。
+ *
+ * ⚠️ 刻意**不含** `source_alias` —— 那是假名，不上屏。
+ * 只带判断"是不是同一件事、分别多可核实"所需的最小字段。
+ */
+export interface RelatedNews {
+  title: string;
+  kind_label: string;
+  published_at: string;
+  /** 该条自己的可信度分（与主条可能不同 —— 同一件事、不同来源） */
+  credibility_score: number | null;
+}
+
 /** 单条情报（`IntelItem.to_public()` 的白名单输出）。 */
 export interface IntelItem {
   kind: string;
@@ -48,6 +94,23 @@ export interface IntelItem {
   agency: string;
   content_hash: string;
   extra: Record<string, unknown>;
+  credibility?: IntelCredibility;
+  /**
+   * 相似新闻聚合：**同一件事的其他来源条数**。
+   *
+   * 后端已把同一簇里的非代表条**收起**（不再单独占位），所以这个数字
+   * 就是"被折叠了几条"。点它才展开 `related` —— 用户口径：
+   * "相似相同观点的可以聚合成一条的，把信息源在关联数字里……
+   * 点开数字可以展开看"。
+   */
+  related_count?: number;
+  /** 关联新闻明细（最多 4 条）。**只在展开时渲染**。 */
+  related?: RelatedNews[];
+  /** 独立佐证数（= 不同来源数 − 1），由聚类算出 */
+  corroboration?: number;
+  /** 这一簇的代表条（非代表条已被后端收起，前端一般看不到） */
+  is_cluster_lead?: boolean;
+  cluster_id?: string;
 }
 
 /** 数据缺口。`message` 面向普通用户，**不含源名与错误原文**。 */
@@ -67,6 +130,29 @@ export interface IntelFeed {
   degraded: boolean;
   /** 仅管理员可见的运维提示（`applied_tier === 'admin'` 时才渲染） */
   admin_hints?: string[];
+  /** 当前生效的筛选档（服务端下发，前端不自己猜） */
+  filter?: string;
+  /** 当前生效的取样顺序 */
+  sort?: string;
+  /**
+   * 分层计数：`{high, upper, mid, low, doubt}` → 条数。
+   *
+   * ⚠️ **基于全量条目**，不随当前 `filter` 变化 —— 否则切一次 tab
+   * 角标就全变了，用户会以为数据在动。所以角标要用它，不要用 `items`。
+   */
+  credibility_dist?: Record<string, number>;
+  /** 可用筛选档：`key → 中文名`（定义在服务端，避免前后端两套口径） */
+  filters?: Record<string, string>;
+  /**
+   * 相似新闻聚合统计：`{clusters, clustered_items, folded, pairs}`。
+   *
+   * 聚合是**悄悄减少条数**的操作 —— 没有这个统计就没人能发现阈值配错了
+   * （比如把不相关的事合在一起）。界面把它显示在页脚，当"可见的账"。
+   */
+  cluster_stats?: {
+    clusters?: number; clustered_items?: number;
+    folded?: number; pairs?: number;
+  };
 }
 
 /** 日历事件。四类：`earnings` 预约披露 / `unlock` 解禁 / `macro` 宏观 / `trade` 交易日。 */
@@ -159,12 +245,14 @@ async function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
 
 /** 情报流。`codes` 是关注标的（用于额外拉取对应研报）。 */
 export function fetchIntelFeed(
-  opts: { limit?: number; codes?: string[] } = {},
+  opts: { limit?: number; codes?: string[]; sort?: string; filter?: string } = {},
   signal?: AbortSignal,
 ): Promise<IntelFeed> {
   const q = new URLSearchParams();
   if (opts.limit) q.set("limit", String(opts.limit));
   if (opts.codes?.length) q.set("codes", opts.codes.join(","));
+  if (opts.sort) q.set("sort", opts.sort);
+  if (opts.filter && opts.filter !== "all") q.set("filter", opts.filter);
   const qs = q.toString();
   return getJson<IntelFeed>(`/feed${qs ? `?${qs}` : ""}`, signal);
 }
@@ -326,7 +414,53 @@ export const EXPECTATION_STATES: Record<
   },
 };
 
-/** 数值格式化：保留合适位数，`null`/`undefined` → `—`（**不填 0**）。 */
+/** 情报类型 → 中文标签（前端只认这个，不认内部源名） */
+export const KIND_FALLBACK_LABELS: Record<string, string> = {
+  newswire: "财经快讯",
+  broker_report: "券商研报",
+  policy: "政策信号",
+  research_note: "研究笔记",
+  other: "其他",
+};
+
+/**
+ * 可信度分层（与后端 `credibility.LEVELS` **逐项对应**）。
+ *
+ * 阈值写在前端是为了给分数环上色（后端只下发 `credibility_dist` 的
+ * 分层计数，不下发每条的分层 key —— 那会让响应多一个冗余字段）。
+ * 改阈值必须**同时改两处**，`tests/unit/test_intel_credibility.py`
+ * 的 `test_level_boundaries` 锁住后端那一侧。
+ */
+export const CRED_LEVELS: Array<{
+  lower: number; key: string; label: string;
+}> = [
+  { lower: 80, key: "high", label: "高" },
+  { lower: 65, key: "upper", label: "较高" },
+  { lower: 50, key: "mid", label: "中" },
+  { lower: 35, key: "low", label: "低" },
+  { lower: 0, key: "doubt", label: "存疑" },
+];
+
+/** 分数 → 分层 key（与后端 `level_of` 同口径）。 */
+export function credLevel(score: number): string {
+  for (const lv of CRED_LEVELS) {
+    if (score >= lv.lower) return lv.key;
+  }
+  return "doubt";
+}
+
+/** 分层 key → 中文名。 */
+export function credLevelLabel(score: number): string {
+  const key = credLevel(score);
+  return CRED_LEVELS.find((l) => l.key === key)?.label ?? "存疑";
+}
+
+/**
+ * 数值格式化：保留合适位数，`null`/`undefined` → `—`（**不填 0**）。
+ *
+ * ⚠️ 这条规则在本项目是硬约束：`—` 表示"没有这个数"，
+ * `0` 表示"这个数是零"，两者不能混。
+ */
 export function fmtNum(v: unknown, digits = 2): string {
   if (v === null || v === undefined || v === "") return "—";
   const n = Number(v);

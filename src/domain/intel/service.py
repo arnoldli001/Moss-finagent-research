@@ -35,6 +35,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Final
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,54 @@ DEFAULT_LIMIT: Final = 60
 
 #: 研报按关注标的逐个拉，限量控频
 MAX_BROKER_CODES: Final = 8
+
+#: 自选清单（研报按标的拉，不传标的的话**一条研报都取不到**）
+_WATCHLIST_PATH: Final = Path("configs/intraday.yaml")
+
+
+def watchlist_codes(limit: int = MAX_BROKER_CODES) -> list[str]:
+    """从自选清单取关注标的，供研报采集用。
+
+    ## 为什么必须有这个兜底（实测踩到的）
+
+    研报是**按标的**拉的（`watch_codes`），不是"全市场最新研报"那种接口。
+    而 `/intel/feed` 的 `codes` 参数**从来没人传** —— 于是默认情况下
+    池子里一条研报都没有，连带两个后果：
+
+      · 「仅研报」筛选永远空
+      · 「高可信 ≥80」也是空的 —— 因为整个池子的来源档最高只到 74
+        （权威媒体档），而研报档是 84
+
+    用户会以为"没有高可信信息""没有研报"，而实际是**根本没去取**。
+
+    自选清单本来就是这个用途（做T面板在用同一份），直接复用；
+    将来前端加了"关注标的"输入框，用它覆盖这里即可。
+    """
+    try:
+        import yaml
+
+        raw = yaml.safe_load(_WATCHLIST_PATH.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, ImportError):
+        return []
+    out: list[str] = []
+    for row in (raw.get("watchlist") or []):
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        if code and code not in out:
+            out.append(code)
+        if len(out) >= limit:
+            break
+    return out
+
+
+#: 取样池大小。`limit` 是**返回条数**，这是"从多少条里挑"。
+#:
+#: ⚠️ 必须有这么一个大于 `limit` 的池子，否则筛选项形同虚设：
+#: 实测 `limit=60` 时池内最高分只有 78，于是「高可信 ≥80」**永远空**，
+#: 而全量里其实有 30 条 80+ 的 —— 用户会以为"没有高可信信息"。
+#: 取值也为可分页留余量（将来加"下一页"时不必再改这里）。
+FILTER_POOL: Final = 500
 
 
 @dataclass
@@ -55,6 +104,17 @@ class IntelFeed:
     counts: dict[str, int] = field(default_factory=dict)
     fetched_at: str = ""
     degraded: bool = False
+    #: 可信度分层计数（**筛选之前**、于池子上统计）。
+    #:
+    #: 单列出来的理由：筛选 tab 的角标必须与当前档位**无关** ——
+    #: 拿筛过的 `items` 去数会让"切一次 tab 所有角标都变"，
+    #: 用户会以为数据在动。
+    credibility_dist: dict[str, int] = field(default_factory=dict)
+    #: 相似新闻聚合统计（簇数 / 涉及条数 / 被收起的条数）。
+    #:
+    #: 单列出来是为了**可观测**：聚合是"悄悄减少条数"的操作，
+    #: 没有这个统计就没人能发现阈值配错了（比如把不相关的事合在一起）。
+    cluster_stats: dict[str, int] = field(default_factory=dict)
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -64,6 +124,8 @@ class IntelFeed:
             "fetched_at": self.fetched_at,
             # 前端据此显示"数据不完整"提示（**不显示具体源名**）
             "degraded": self.degraded,
+            "credibility_dist": self.credibility_dist,
+            "cluster_stats": self.cluster_stats,
         }
 
 
@@ -74,30 +136,32 @@ def _now_iso() -> str:
 async def build_feed(*, watch_codes: list[str] | None = None,
                      limit: int = DEFAULT_LIMIT,
                      policy_date: str = "",
-                     sort: str = "credibility") -> IntelFeed:
+                     sort: str = "credibility",
+                     filter: str = "all") -> IntelFeed:
     """并发聚合六源。**单源失败隔离**，失败进 `gaps`。
 
-    `sort` 决定取样顺序（**不是**返回顺序的最终排序，见下方说明）：
+    ## `limit` 是**返回条数**，不是取样池大小
 
-      · `credibility`（默认）按**可信度**取样 —— 让"最可核实的那些"先露面。
-        这是"筛选与排序都要"的落地：用户不必自己从 185 条里挑。
-      · `time` 按时间取样（旧行为）。
+    ⚠️ 这是个容易搞错的地方，实测踩过：函数内部会先取 `FILTER_POOL`
+    条作为取样池，**筛完**再截到 `limit`。第一版拿 `limit` 当池子，
+    于是 `limit=60` 时整个池子最多 60 条 —— 而实测那 60 条里
+    分数最高的只有 78 分，于是「高可信 ≥80」**永远是空列表**，
+    而全量里其实有 30 条 80+ 的。用户会以为"没有高可信信息"。
 
-    ## 为什么排序在**取样**阶段做，而不是取完再排
-
-    纯"取 60 条再按可信度排"仍然会被产量淹没：140 条快讯里挑 60 条，
-    研报与笔记照样一条都进不来。所以取样必须先按**类型**轮流
-    （保证多样性），类型内部再按 `sort` 决定先后 —— 两个目标同时成立。
-
-    另外：**可信度排序不能取代时间完整性**。取样后仍按时间倒序返回，
-    因为界面要的是"最近发生了什么，其中哪些更可核实"；
-    完全按可信度排会让一条三天前的官方公告压在今天所有快讯之上，
-    那是另一种误导（用户会以为它刚发生）。
+    `sort` / `filter` 见 `_balanced_take` 与 `matches_filter`。
     """
     from src.infrastructure.connectors.intel_sources import fetch_all
 
     if not policy_date:
         policy_date = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+
+    # ★ 研报按**标的**拉：不传标的就一条都没有，连带「仅研报」与
+    #   「高可信 ≥80」两个筛选项**永远是空的**（实测：池内来源档最高
+    #   只到 74 的权威媒体档，而研报档是 84）。用户会以为"没有研报/
+    #   没有高可信信息"，实际是**根本没去取**。
+    #   所以没有显式关注标的时，用自选清单兜底。
+    if not watch_codes:
+        watch_codes = watchlist_codes()
 
     items: list[dict[str, Any]] = []
     gaps: list[dict[str, str]] = []
@@ -210,7 +274,58 @@ async def build_feed(*, watch_codes: list[str] | None = None,
         k = str(it.get("kind") or "other")
         counts[k] = counts.get(k, 0) + 1
 
-    taken = _balanced_take(deduped, limit, sort=sort)
+    from src.domain.intel.credibility import level_of
+
+    taken = _balanced_take(deduped, FILTER_POOL, sort=sort)
+
+    # ── 可信度分层计数：在**筛选之前**、于池子上统计 ──
+    #
+    # 顺序很重要：先统计再筛选，这样角标与当前档位无关。
+    # 反过来（先筛后统计）会让"切一次 tab 所有角标都变"。
+    dist: dict[str, int] = {}
+    for it in taken:
+        raw = it.get("credibility") or {}
+        try:
+            lv = level_of(int(raw.get("score")))[0]
+        except (TypeError, ValueError):
+            lv = "doubt"
+        dist[lv] = dist.get(lv, 0) + 1
+
+    # ── 相似新闻聚合（**在池子上做**，不是在 limit 之后）──
+    #
+    # ⚠️ 顺序很重要：聚类要在**截断之前**、于整个池子上做。
+    # 第一版放在返回前、只对 `limit` 条做，结果 301 条里只合出
+    # 11 簇 / 22 条 —— 因为同一件事的各个转载分散在池子的不同位置，
+    # 只比最后 60 条自然匹配不上几对。
+    #
+    # 聚合之后**把非代表条收起**（用户口径："相似相同观点的可以聚合成
+    # 一条的，把信息源在关联数字里"）—— 所以它同时是**去噪**：
+    # 同一件事在情报流里只占一行，而不是刷五遍。
+    from src.domain.intel.related import attach
+
+    cluster_stats = attach(taken)
+
+    # 用聚类算出的**独立佐证数**重算可信度。
+    #
+    # 这是设计稿公式里 `+ 独立佐证数 × 4` 那一项，也是"多来源印证"
+    # 唯一诚实的算法：同一份信息被转发 3 次**不算** 3 个独立来源
+    # （设计稿 §5.4 明确警告过"共振虚高"）。
+    # ⚠️ 必须**封顶**：低权威来源不能靠"被转得多"刷分 ——
+    # 来源分即上限这条性质不能被佐证项破坏。
+    from src.domain.intel.credibility import apply_corroboration
+
+    for it in taken:
+        cred = it.get("credibility")
+        if cred:
+            it["credibility"] = apply_corroboration(
+                cred, it.get("corroboration"))
+
+    # 收起非代表条（同一簇只留时间最新的那条）
+    taken = [it for it in taken if it.get("is_cluster_lead", True)]
+
+    # ── 可信度筛选（在**池子**上做，不是在 limit 之后做）──
+    taken = [it for it in taken if _passes_filter(it, filter)]
+    taken = taken[:max(1, limit)]
     # ★ 取样后**按时间倒序返回**。
     #
     # 取样用可信度决定"谁能进这一页"，但**展示顺序仍是时间** ——
@@ -226,7 +341,34 @@ async def build_feed(*, watch_codes: list[str] | None = None,
         counts=counts,
         fetched_at=_now_iso(),
         degraded=bool(gaps),
+        credibility_dist=dist,
+        cluster_stats=cluster_stats,
     )
+
+
+def _passes_filter(item: dict[str, Any], key: str) -> bool:
+    """一条情报是否落在某个可信度筛选档里。
+
+    判据复用 `credibility.matches_filter` —— **前后端两套口径漂移**
+    是这类筛选最容易出的问题（界面说 80 分算高可信、服务端按 85 筛，
+    用户看到"高可信"里有 82 分的、却没有 84 分的）。
+    """
+    if key in ("", "all"):
+        return True
+    from src.domain.intel.credibility import Credibility, matches_filter
+
+    raw = item.get("credibility") or {}
+    try:
+        score = int(raw.get("score"))
+    except (TypeError, ValueError):
+        return False      # 缺分数的**不进任何档**（不假装它有分）
+    cred = Credibility(
+        score=score,
+        source_base=int(raw.get("source_base") or 0),
+        content_base=int(raw.get("content_base") or 0),
+        source_reason=str(raw.get("source_reason") or ""),
+        content_reason=str(raw.get("content_reason") or ""))
+    return matches_filter(cred, str(item.get("kind") or ""), key)
 
 
 def _balanced_take(items: list[dict[str, Any]], limit: int,
