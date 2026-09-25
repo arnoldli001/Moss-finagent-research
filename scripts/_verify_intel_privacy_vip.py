@@ -19,6 +19,7 @@ import http.cookiejar
 import json
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -62,23 +63,36 @@ def check(ok: bool, text: str) -> None:
         FAILED.append(text)
 
 
-def call(path: str, data: dict | None = None) -> tuple[int, str]:
-    req = urllib.request.Request(
-        BASE + path,
-        data=json.dumps(data).encode() if data else None,
-        headers={"Content-Type": "application/json", "User-Agent": _UA,
-                 "Accept": "application/json, text/plain, */*",
-                 "Referer": BASE + "/"})
-    try:
-        r = OP.open(req, timeout=60)
-        return r.status, r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.read().decode("utf-8", "replace")
-    except Exception as e:  # noqa: BLE001
-        # `RemoteDisconnected`（连接被对端关掉）**不是** `HTTPError`，
-        # 不接住的话整个脚本会以 traceback 崩掉 —— 而这是隧道/Cloudflare
-        # 常见的偶发行为，不该让"隐私检查"变成一条看不懂的堆栈。
-        return -1, f"{type(e).__name__}: {e}"
+def call(path: str, data: dict | None = None,
+         retries: int = 2) -> tuple[int, str]:
+    """发一次请求。**对连接层抖动重试。**
+
+    ⚠️ Cloudflare 隧道偶发 `RemoteDisconnected`（对端直接关连接，连状态行
+    都没有）—— 那是**环境抖动**，不是接口问题。不重试的话脚本会报一条
+    看不懂的 `状态 -1`，看起来像隐私检查失败，实际是网络打了两个嗝
+    （实测同一条请求隔几秒再发就是 200）。
+    """
+    last: tuple[int, str] = (-1, "")
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(
+            BASE + path,
+            data=json.dumps(data).encode() if data else None,
+            headers={"Content-Type": "application/json", "User-Agent": _UA,
+                     "Accept": "application/json, text/plain, */*",
+                     "Referer": BASE + "/",
+                     # 明确不要复用连接：隧道抖动时 keep-alive 会一直打在同一条
+                     # 已经半死的连接上，重试也没用
+                     "Connection": "close"})
+        try:
+            r = OP.open(req, timeout=60)
+            return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001
+            last = (-1, f"{type(e).__name__}: {e}")
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+    return last
 
 
 def scan(label: str, body: str, *, allow_alias: bool) -> None:
