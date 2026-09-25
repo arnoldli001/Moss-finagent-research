@@ -62,6 +62,21 @@ _ADMIN_ONLY_FIELDS = ("source_name", "source_url")
 #: 用户可见字段里**可能夹带上游 URL 的文本**
 _TEXT_FIELDS = ("description", "impact_path", "content")
 
+#: `raw_data` 里**允许出接口**的键（白名单）。
+#:
+#: ⚠️ 必须白名单，不能黑名单。实测 `raw_data` 里躺着 `source_tag: "sina"` ——
+#: 那是**内部来源标识**，等于把渠道名直接印在事件里，前面给 `source_name`
+#: 做的假名化在这里全白费。黑名单式（"剔除 source_tag"）挡不住下次
+#: 有人再往里塞一个 `channel` / `feed` / `vendor`。
+_RAW_DATA_PUBLIC_KEYS = frozenset({"importance"})
+
+
+def _safe_raw_data(raw: object) -> dict:
+    """只保留白名单键的 `raw_data`（新键默认**不出**）。"""
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if k in _RAW_DATA_PUBLIC_KEYS}
+
 
 def _strip_urls(text: object) -> str:
     """抹掉文本里的 URL，保留其余内容。
@@ -120,6 +135,9 @@ def alert_to_public(alert, *, is_admin: bool) -> dict:
     for f in _TEXT_FIELDS:
         if f in data:
             data[f] = _strip_urls(data.get(f))
+    # `raw_data` 走白名单（实测里面有内部 `source_tag`）
+    if "raw_data" in data:
+        data["raw_data"] = _safe_raw_data(data.get("raw_data"))
 
     if is_admin:
         # 管理员要能溯源排障：保留真名与链接
@@ -140,6 +158,10 @@ def event_to_public(event, *, is_admin: bool) -> dict:
     for f in _TEXT_FIELDS:
         if f in data:
             data[f] = _strip_urls(data.get(f))
+    # ★ 这是实测抓到的泄漏点：`raw_data.source_tag = "sina"` 原样出接口，
+    #   用户直接看到渠道名，而 `source_alias` 的假名化在这里全白费。
+    if "raw_data" in data:
+        data["raw_data"] = _safe_raw_data(data.get("raw_data"))
 
     if is_admin:
         return data

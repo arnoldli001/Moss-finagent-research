@@ -288,6 +288,58 @@ def test_rich_tags_hiding_platform_domain_are_stripped() -> None:
     assert "结束" in pub["summary"], "剥离标签时不该把正文一起删掉"
 
 
+def test_event_raw_data_is_allowlisted() -> None:
+    """事件/告警的 `raw_data` 必须走**白名单**。
+
+    ## 实测泄漏（公网抓到的）
+
+    `/api/v1/events` 的响应里每个事件都带着：
+
+        "raw_data":{"source_tag":"sina","importance":null}
+
+    `source_tag` 是**内部来源标识** —— 等于把渠道名直接印在事件里，
+    而 `source_name → source_alias` 的假名化在这里全白费。
+
+    为什么用白名单而不是"剔除 source_tag"：黑名单挡不住下次有人再往里
+    塞一个 `channel` / `feed` / `vendor`。白名单下新键**默认不出** ——
+    这正是本项目在情报契约上已经确立的口径。
+    """
+    from src.api.routes.alerts import _safe_raw_data, event_to_public
+
+    assert _safe_raw_data({"source_tag": "sina", "importance": 2}) == {
+        "importance": 2}
+    assert _safe_raw_data({"channel": "weibo"}) == {}
+    assert _safe_raw_data(None) == {}
+    assert _safe_raw_data("不是字典") == {}
+
+    class _FakeEvent:
+        def model_dump(self) -> dict:
+            return {
+                "event_id": "e1", "title": "t",
+                "content": "正文 https://finance.eastmoney.com/a/1.html 结束",
+                "source_name": "新浪-7x24快讯",
+                "source_url": "https://finance.sina.com.cn/x.html",
+                "raw_data": {"source_tag": "sina", "importance": 2,
+                             "channel": "weibo"},
+            }
+
+    user = json.dumps(event_to_public(_FakeEvent(), is_admin=False),
+                      ensure_ascii=False)
+    for leak in ("sina", "eastmoney", "http", "%2F", "source_tag",
+                 "channel", "source_name", "source_url"):
+        assert leak.lower() not in user.lower(), f"用户视图泄漏 {leak!r}：{user}"
+    # 白名单里保留的键还在
+    assert '"importance": 2' in user.replace(" ", "").replace(
+        '"importance":2', '"importance": 2') or "importance" in user
+
+    # 管理员保留真名与链接（他要排障），但 `raw_data` 仍然只出白名单键 ——
+    # 内部标识连管理员界面都不需要
+    adm = event_to_public(_FakeEvent(), is_admin=True)
+    assert adm["source_name"] == "新浪-7x24快讯"
+    assert "source_tag" not in adm["raw_data"]
+    assert adm["raw_data"] == {"importance": 2}
+
+
 def test_kind_label_table_covers_every_produced_kind() -> None:
     """`SOURCE_KINDS` 必须覆盖**所有**会被塞进 `IntelItem` 的 kind。
 
