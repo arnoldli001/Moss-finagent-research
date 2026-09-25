@@ -199,7 +199,7 @@ async def build_feed(*, watch_codes: list[str] | None = None,
 
 def _balanced_take(items: list[dict[str, Any]], limit: int
                    ) -> list[dict[str, Any]]:
-    """按类型**轮流取样**，而不是纯时间取前 N 条。
+    """取前 N 条：**天之间按时间取最近的，天内按类型轮流**。
 
     ## 为什么不能只按时间截断
 
@@ -211,21 +211,39 @@ def _balanced_take(items: list[dict[str, Any]], limit: int
     原因是数量级差异：日报类快讯一天上百条，研报一天几条。时间序截断
     等价于"按产量分配版面"，产量高的必然挤掉产量低的。
 
-    ## 做法
+    ## 为什么轮流取样是**全局**的（不在天内做）
 
-    各类型内部**保持时间倒序**（同类里新的在前），类型之间轮流各取一条。
-    这样：稀缺类型（研报/笔记）一定能露面，充裕类型（快讯）也不会被饿死。
+    试过"先按天分桶、天内再轮流"，结果**更糟**。原因是实测数据长这样：
+
+        2026-09-25   newswire ×140
+        2026-09-24   policy   ×15
+        2026-09-22   research_note ×30
+
+    **每一天只有一种类型**（快讯天天有、政策按日发、笔记断续来）。
+    于是"按天取"必然退化回单类型 —— `limit=60`（默认值）时返回
+    60 条清一色快讯，政策和笔记**一条都没有**，多样性完全失效。
+
+    所以在**这份数据**上，"天分组 / 类型多样 / 严格时间序"三者
+    不可能同时满足。取舍是：
+
+      · 服务端保证 **类型多样 + 组内时间序**（这个函数）
+      · 界面**不做天分组标题**，改为每行显示日期
+        （见 `IntelFeedTab.tsx` 的说明）—— 时序信息由每行承载，
+        不靠分组标题，于是也就不存在"同一天被切碎"的问题
     """
     if limit <= 0:
         return []
     from src.infrastructure.connectors.intel_sources import sort_key
 
     buckets: dict[str, list[dict[str, Any]]] = {}
-    for it in items:            # items 已按时间倒序，分桶后桶内仍有序
+    for it in items:
         buckets.setdefault(str(it.get("kind") or "other"), []).append(it)
-    # 类型顺序按「各自最新一条的时间」定 —— 谁有最新消息谁先露头，
-    # 而不是固定字典序（那会让某个类型永远排第一）。
-    # 同样要过 `sort_key()`：三种时间戳格式直接比字符串会排错。
+    # 桶内时间倒序：`items` 整体已按 `sort_key` 排序，但切桶后必须再排一次
+    # —— 各来源时间戳格式不同，不重排会随到达顺序漂移。
+    for k in buckets:
+        buckets[k].sort(key=lambda x: sort_key(x.get("published_at")),
+                        reverse=True)
+    # 类型顺序：谁有最新一条谁先露头（不写死字典序，否则某个类型永远第一）
     order = sorted(
         buckets,
         key=lambda k: sort_key(buckets[k][0].get("published_at")),
@@ -242,7 +260,7 @@ def _balanced_take(items: list[dict[str, Any]], limit: int
                 progressed = True
                 if len(out) >= limit:
                     break
-        if not progressed:      # 全部桶都取空了
+        if not progressed:      # 全部桶取空
             break
         idx += 1
     return out
