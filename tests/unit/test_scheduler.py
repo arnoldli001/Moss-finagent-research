@@ -8,8 +8,9 @@ import pytest
 
 from src.scheduler.celery_app import _parse_cron, celery_app
 from src.scheduler.jobs import execute_job
-from src.scheduler.registry import JOB_REGISTRY
+from src.scheduler.registry import JOB_REGISTRY, alert_scan_schedule
 from src.scheduler.run_log import RunLog
+from src.scheduler.service import cron_due
 
 
 class _FakeGraph:
@@ -188,10 +189,97 @@ class _EventRuntime:
         self.event_service = service
 
 
-def test_event_alert_job_registered_weekday_1730():
-    spec = JOB_REGISTRY["event_alert_daily"]
-    assert spec.kind == "event_alert_scan"
-    assert spec.cron == "30 17 * * 1-5"
+def test_event_alert_jobs_cover_open_noon_and_close():
+    """用户口径 2026-09-24：盘中也要出告警（开盘/午盘各一次），收盘后补全量。"""
+    intraday = JOB_REGISTRY["event_alert_intraday"]
+    noon = JOB_REGISTRY["event_alert_noon"]
+    daily = JOB_REGISTRY["event_alert_daily"]
+    for spec in (intraday, noon, daily):
+        assert spec.kind == "event_alert_scan"
+        assert spec.name in JOB_REGISTRY
+    assert intraday.cron == "30 9,10,13,14 * * 1-5"   # 09:30/10:30/13:30/14:30
+    assert noon.cron == "0 12 * * 1-5"                # 午休时段跑，13:00 前到位
+    assert daily.cron == "30 17 * * 1-5"              # 收盘后全量（原口径保留）
+
+    schedule = alert_scan_schedule()
+    assert schedule["slots"] == [
+        "09:30", "10:30", "12:00", "13:30", "14:30", "17:30"]
+    assert schedule["weekday_only"] is True
+    assert schedule["startup_scan"] is True
+    assert {j["job"] for j in schedule["jobs"]} == {
+        "event_alert_intraday", "event_alert_noon", "event_alert_daily"}
+
+
+def test_alert_cron_due_only_fires_on_intraday_points():
+    """盘中班次只在点位那一分钟到期，且周末不触发。"""
+    thursday = datetime(2026, 9, 24)  # 周四
+    assert cron_due("30 9,10,13,14 * * 1-5",
+                    thursday.replace(hour=9, minute=30))
+    assert cron_due("0 12 * * 1-5", thursday.replace(hour=12, minute=0))
+    assert not cron_due("30 9,10,13,14 * * 1-5",
+                        thursday.replace(hour=9, minute=29))
+    assert not cron_due("30 9,10,13,14 * * 1-5",
+                        thursday.replace(hour=11, minute=30))
+    saturday = datetime(2026, 9, 26)
+    assert not cron_due("30 9,10,13,14 * * 1-5",
+                        saturday.replace(hour=9, minute=30))
+
+
+async def test_startup_scan_triggers_event_alert_once():
+    """服务启动补扫：调用 trigger('event_alert_intraday', source='startup')。
+
+    `delay=0` 只跳过那 90 秒让路等待，路径本身与生产一致。
+    """
+    import src.api.main as main_mod
+
+    calls: list[tuple[str, str]] = []
+
+    class _Scheduler:
+        async def trigger(self, name, *, source="startup"):
+            calls.append((name, source))
+            return {"status": "success", "records_processed": 2}
+
+    class _Runtime:
+        event_service = object()
+
+    await main_mod._run_event_alert_on_startup(
+        _Scheduler(), _Runtime(), delay=0)
+    assert calls == [("event_alert_intraday", "startup")]
+
+
+async def test_startup_scan_skips_without_event_stack():
+    """子系统没装配（或没有调度器）时不去写一条注定 failed 的运行记录。"""
+    import src.api.main as main_mod
+
+    calls: list[str] = []
+
+    class _Scheduler:
+        async def trigger(self, name, *, source="startup"):
+            calls.append(name)
+            return {}
+
+    class _Runtime:
+        event_service = None
+
+    await main_mod._run_event_alert_on_startup(
+        _Scheduler(), _Runtime(), delay=0)
+    await main_mod._run_event_alert_on_startup(None, _Runtime(), delay=0)
+    assert calls == []
+
+
+async def test_startup_scan_swallows_errors():
+    """补扫失败只记日志：扫描炸了也不能让服务起不来。"""
+    import src.api.main as main_mod
+
+    class _Scheduler:
+        async def trigger(self, name, *, source="startup"):
+            raise RuntimeError("全部快讯源被阻断")
+
+    class _Runtime:
+        event_service = object()
+
+    await main_mod._run_event_alert_on_startup(
+        _Scheduler(), _Runtime(), delay=0)
 
 
 async def test_execute_event_scan_success(tmp_dir):
@@ -250,3 +338,62 @@ async def test_execute_event_scan_in_progress_marks_skipped(tmp_dir):
         _EventRuntime(_BusyService()), "event_alert_daily", log)
     assert rec["status"] == "skipped"
     assert "跳过" in rec["error_message"]
+
+def test_every_registry_kind_has_a_handler() -> None:
+    """JOB_REGISTRY 里**每个 `kind`** 都必须在 jobs.py 里有分发分支。
+
+    ## 这条测试来自一次实测事故
+
+    JOB_REGISTRY 声明了 intel_zsxq_collect（2 小时增量采集）与
+    intel_token_alert（授权到期邮件提醒），而 jobs.py 的分发链里
+    **没有**对应的 if spec.kind == ... —— 于是它们每次触发都走到最底下
+    那句 未知作业类型，记一条 failed 就结束。后果正命中用户点名的两条：
+
+      · "建议 2 小时一次"的采集**从来没跑过**
+      · token 7/14 天过期**没有任何提醒**，只在前端静默变成"暂无更新"
+
+    而且**不会有任何明显症状**：任务在 registry 里、面板上看得见，
+    只是每次都是 failed —— 除非有人专门去翻运行记录，否则发现不了。
+
+    ## ⚠️ 必须按 `kind` 判，不能按 registry 的 **key**
+
+    第一版写成 `for kind in JOB_REGISTRY`（那是 **key**），于是报了 19 个
+    "缺失" —— 全是假阳性，因为 `JobSpec.kind` 与 key **可以不同**：
+
+        key="snapshot_macro"       kind="graph_snapshot"        ← 已有分支
+        key="strategy_cases_daily" kind="strategy_cases_fetch"  ← 已有分支
+        key="intel_zsxq_collect"   kind="intel_zsxq_collect"    ← 确实没有
+
+    运行时分发用的是 **`spec.kind`**，所以判据必须是 kind 的**去重集合**。
+    """
+    import inspect
+
+    from src.scheduler import jobs as jobs_module
+
+    src = inspect.getsource(jobs_module)
+    kinds = {spec.kind for spec in JOB_REGISTRY.values()}
+    missing = sorted(k for k in kinds if f'spec.kind == "{k}"' not in src)
+    assert not missing, (
+        "这些 kind 在 JOB_REGISTRY 里声明了，但 jobs.py 没有分发分支 —— "
+        f"它们每次触发都只会计一条「未知作业类型」的 failed：{missing}")
+
+
+def test_registry_kind_is_a_nonempty_string() -> None:
+    """`kind` 必须非空 —— 空串会让分发永远落到"未知作业类型"。"""
+    for key, spec in JOB_REGISTRY.items():
+        assert str(spec.kind or "").strip(), f"{key} 的 kind 为空"
+
+
+def test_job_registry_cron_not_overcrowded() -> None:
+    """同一个 cron 上不该挤太多任务（会同一秒抢资源）。
+
+    这条是**提示线**而不是死规则：超过阈值的时刻值得人看一眼是不是
+    设计成并行的。
+    """
+    from collections import Counter
+
+    counts = Counter(spec.cron for spec in JOB_REGISTRY.values())
+    crowded = {cron: n for cron, n in counts.items() if n > 4}
+    assert not crowded, (
+        f"这些 cron 上挤了超过 4 个任务：{crowded} —— "
+        "确认它们是设计成并行的，否则错开分钟")

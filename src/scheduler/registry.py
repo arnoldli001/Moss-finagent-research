@@ -435,7 +435,10 @@ JOB_REGISTRY: dict[str, JobSpec] = {
             "同一级别只发一次，重新授权后自动重置。"
             "只发管理员，用户侧无感"
         ),
-        params={"warn_after_days": 5, "stale_after_days": 7},
+        # 阈值由 	oken_alerts 模块自己的常量决定（WARN_AFTER=5/STALE=7），
+        # **不在这里传** —— 两处各写一套必然漂移，且第一版按参数名传时
+        # 与 check_and_notify 的真实签名不符（它只有 root/dry_run/refresh_cmd/force）。
+        params={},
     ),
     # 知识星球**增量**采集（用户口径 2026-09-25）：
     #   "上次获取到 A 时间，这次就从当前时间到 A 时间获取；
