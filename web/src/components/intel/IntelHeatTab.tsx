@@ -110,6 +110,20 @@ export default function IntelHeatTab({ feed }: { feed: IntelFeed }) {
   const maxDay = Math.max(1, ...byDay.map(([, n]) => n));
   const maxKind = Math.max(1, ...byKind.map((b) => b.n));
 
+  /**
+   * 原文倾向分布（第三步的产物）。
+   *
+   * ⚠️ **分母只算 `has_tone` 的条目** —— 把"未定"算进多空比，
+   * 等于替用户做了一个我们并不确定的判断。所以这里的三个数加起来
+   * 会**小于**总条数，那是正常的，界面上要说明。
+   */
+  const toneDist = feed.tone_dist ?? {};
+  const bull = toneDist["偏多"] ?? 0;
+  const bear = toneDist["偏空"] ?? 0;
+  const neutral = toneDist["中性"] ?? 0;
+  const toned = bull + bear + neutral;
+  const pct = (n: number) => (toned > 0 ? Math.round((n / toned) * 100) : null);
+
   return (
     <div className="intel-heat">
       <div className="heat-kpis">
@@ -223,17 +237,60 @@ export default function IntelHeatTab({ feed }: { feed: IntelFeed }) {
         )}
       </section>
 
+      <section className="heat-card">
+        <h3>原文倾向分布</h3>
+        <p className="heat-hint muted-text">
+          这是<b>第三方原文自己的语气</b>归类，不是平台判断、不构成投资建议。
+          分母是<b>已判定倾向的 {toned} 条</b>（未定的不计入 ——
+          把"未定"算进多空比等于替用户做了一个我们并不确定的判断）。
+        </p>
+        {toned === 0 ? (
+          <div className="muted-text" style={{ fontSize: 12 }}>
+            当前窗口还没有已抽取倾向的条目。抽取是 2 小时一次的定时任务，
+            新条目在下一批抽到之前没有倾向。
+          </div>
+        ) : (
+          <>
+            <ul className="heat-bars">
+              {[["偏多", bull], ["中性", neutral], ["偏空", bear]].map(
+                ([label, n]) => (
+                  <li key={String(label)}>
+                    <span className="heat-bar-lab">{label}</span>
+                    <span className="heat-bar-track">
+                      <span
+                        className={`heat-bar-fill ${
+                          label === "偏多" ? "tone-bull"
+                            : label === "偏空" ? "tone-bear" : ""}`}
+                        style={{
+                          width: `${Math.round((Number(n) / Math.max(1, toned)) * 100)}%`,
+                        }}
+                      />
+                    </span>
+                    <span className="heat-bar-n code">{String(n)}</span>
+                  </li>
+                ))}
+            </ul>
+            <div className="heat-tone-sum">
+              多空比 <b className="code">{bull} : {bear}</b>
+              {pct(bull) !== null && (
+                <span className="muted-text">
+                  （偏多 {pct(bull)}% / 中性 {pct(neutral)}% / 偏空 {pct(bear)}%）
+                </span>
+              )}
+            </div>
+          </>
+        )}
+      </section>
+
       {/* 缺什么就说什么，不用占位数字糊过去 */}
       <section className="heat-card heat-todo">
         <h3>尚未提供的统计量</h3>
         <p className="muted-text">
-          以下几项依赖尚未接入的**分层打分**与**原文倾向抽取**，当前接口
-          不产出这些字段，因此**不给估值**：
+          以下几项依赖尚未接入的能力，当前接口不产出这些字段，
+          因此**不给估值**：
         </p>
         <ul className="heat-todo-list">
-          <li><b>可信度分层</b> —— 需要来源分 + 内容分 + 独立佐证数</li>
-          <li><b>原文倾向分布（多空比）</b> —— 需要逐条抽取第三方语气</li>
-          <li><b>情绪分歧度 / 异常放大</b> —— 依赖上两项的时序基线</li>
+          <li><b>情绪分歧度 / 异常放大</b> —— 需要倾向的时序基线（先积累若干天）</li>
           <li><b>与平台信号交叉验证</b> —— 需要板块拥挤度/ETF 份额对齐</li>
         </ul>
         <p className="muted-text" style={{ marginTop: 6 }}>

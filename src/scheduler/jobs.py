@@ -315,6 +315,12 @@ async def execute_job(
                 return run_log.finish(
                     record, status=status, records_processed=processed,
                     error_message="" if status == "success" else detail[:500])
+            if spec.kind == "intel_tone_extract":
+                processed, detail = await _intel_tone_extract(spec)
+                status = "success" if not detail.startswith("失败") else "failed"
+                return run_log.finish(
+                    record, status=status, records_processed=processed,
+                    error_message="" if status == "success" else detail[:500])
             if spec.kind == "dynamic_collection":
                 indicators = spec.params.get("indicators") or []
                 processed, errors = await _collect_through_pipeline(
@@ -423,6 +429,63 @@ async def _intel_token_alert(spec: Any) -> tuple[int, str]:
         return 1, f"授权状态 {state}，已发提醒（收件人见 TOKEN_ALERT_EMAIL_TO）"
     skip = str(outcome.get("skipped") or "")
     return 0, f"授权状态 {state}，未发提醒" + (f"（{skip}）" if skip else "")
+
+
+async def _intel_tone_extract(spec: Any) -> tuple[int, str]:
+    """原文倾向抽取（本地模型，排在采集之后 15 分钟）。
+
+    ## 为什么单独一个任务
+
+    本地模型单条 ~770ms，40 条约 31 秒。混进采集任务里会让"采集"的耗时
+    失去意义（它本该是秒级的），也让**失败归因变模糊** ——
+    采集失败（要重试）与模型失败（下一批补上即可）是两件事。
+
+    ## 只抽可信度 ≥50 的条目
+
+    用户口径（2026-09-25）："可信度低的也不做倾向分析。"
+    低可信条目连模型都不调 —— 省算力，也避免"抽错了没人发现"。
+    """
+    from src.domain.intel import tone_job
+
+    max_items = int(spec.params.get("max_items") or tone_job.MAX_PER_RUN)
+
+    # 网关从 runtime 拿不到（`execute_job` 只传 runtime 给部分任务），
+    # 这里按需构造 —— `LLMGateway` 内部有语义缓存与断路器，
+    # 每次新建只是丢掉了进程内缓存，不影响正确性。
+    from src.core.config import get_settings
+    from src.infrastructure.llm import LLMGateway
+
+    gateway = LLMGateway(settings=get_settings())
+
+    # 取一批当前条目（走聚合层，这样拿到了同样的 `credibility` 与
+    # `content_hash`；池子给足，否则抽不到多少就没了）
+    from src.domain.intel.service import build_feed
+
+    try:
+        feed = await build_feed(limit=500)
+    except Exception as exc:  # noqa: BLE001
+        from src.core.redaction import sanitize_error
+        logger.warning("倾向抽取取数失败：%s", sanitize_error(exc))
+        return 0, f"失败：{sanitize_error(exc)}"
+
+    try:
+        stats = await tone_job.run_once(gateway=gateway, items=feed.items,
+                                       max_items=max_items)
+    except Exception as exc:  # noqa: BLE001 模型挂了不该让任务记 failed
+        from src.core.redaction import sanitize_error
+        logger.warning("倾向抽取失败：%s", sanitize_error(exc))
+        return 0, f"失败：{sanitize_error(exc)}"
+
+    tones = stats.get("tones") or {}
+    detail = (f"抽取 {stats.get('extracted', 0)} 条，"
+              f"落库 {stats.get('written', 0)} 条"
+              f"（跳过：低可信 {stats.get('skipped_low_credibility', 0)} /"
+              f"已抽过 {stats.get('skipped_already_done', 0)} /"
+              f"无指纹 {stats.get('skipped_no_hash', 0)}）；"
+              f"倾向分布 " + "/".join(f"{k}{v}" for k, v in tones.items()))
+    if stats.get("pruned"):
+        detail += f"；清理过期 {stats['pruned']} 条"
+    return int(stats.get("extracted") or 0), detail
 
 
 async def _auction_tick_capture(spec: Any) -> tuple[int, str]:

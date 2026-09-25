@@ -41,6 +41,7 @@ import {
   credLevel, credLevelLabel, dayKey, daysBetween, fmtNum, formatTime,
   IntelCredibility, IntelFeed, IntelItem, todayKey,
 } from "../../intelApi";
+import ToneBadge from "./ToneBadge";
 
 /** 排序模式。服务端决定"谁能进这一页"，前端只切它。 */
 type SortKey = "credibility" | "time";
@@ -356,7 +357,10 @@ export default function IntelFeedTab({
                       {it.summary && it.summary !== it.title && (
                         <div className="intel-sum">{it.summary}</div>
                       )}
-                      <RelatedBadge item={it} />
+                      <div className="intel-tags-row">
+                        <ToneBadge tone={it.tone} />
+                        <RelatedBadge item={it} />
+                      </div>
                     </td>
                     <td className="c-cred">
                       <CredRing cred={it.credibility} />
@@ -409,7 +413,10 @@ export default function IntelFeedTab({
               {it.summary && it.summary !== it.title && (
                 <p className="intel-card-sum">{it.summary}</p>
               )}
-              <RelatedBadge item={it} />
+              <div className="intel-tags-row">
+                <ToneBadge tone={it.tone} />
+                <RelatedBadge item={it} />
+              </div>
               <div className="intel-card-foot">
                 <CredRing cred={it.credibility} />
                 {tgt && <div className="intel-card-target">{tgt}</div>}

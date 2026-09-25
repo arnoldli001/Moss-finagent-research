@@ -115,6 +115,11 @@ class IntelFeed:
     #: 单列出来是为了**可观测**：聚合是"悄悄减少条数"的操作，
     #: 没有这个统计就没人能发现阈值配错了（比如把不相关的事合在一起）。
     cluster_stats: dict[str, int] = field(default_factory=dict)
+    #: 原文倾向分布 {偏多: n, 偏空: n, 中性: n}。
+    #:
+    #: ⚠️ **只统计 has_tone 的条目** —— 把未定算进多空比，
+    #: 等于替用户做了一个我们并不确定的判断。
+    tone_dist: dict[str, int] = field(default_factory=dict)
 
     def to_public(self) -> dict[str, Any]:
         return {
@@ -126,6 +131,7 @@ class IntelFeed:
             "degraded": self.degraded,
             "credibility_dist": self.credibility_dist,
             "cluster_stats": self.cluster_stats,
+            "tone_dist": self.tone_dist,
         }
 
 
@@ -323,6 +329,40 @@ async def build_feed(*, watch_codes: list[str] | None = None,
     # 收起非代表条（同一簇只留时间最新的那条）
     taken = [it for it in taken if it.get("is_cluster_lead", True)]
 
+    # ── 原文倾向：**只读存储**，接口里不调模型 ──
+    #
+    # 本地模型单条实测 ~770ms，一页 60 条现算就是 +46 秒 ——
+    # 接口会从"秒回"退化成"超时"。所以抽取走定时任务
+    # （`tone_job.run_once`，2 小时一次）落进 `tone_store`，
+    # 这里只按 `content_hash` 查，O(1)。
+    #
+    # 查不到就**不给倾向字段**（而不是编一个）—— 前端会说"尚未抽取"。
+    # 规则层能定的那些由 `tone.rule_tone` 在抽取时一并处理，
+    # 所以"没抽过"与"抽过但未定"在存储里是两种状态。
+    from src.domain.intel import tone_store
+
+    for it in taken:
+        hit = tone_store.get(str(it.get("content_hash") or ""))
+        if hit:
+            it["tone"] = {
+                "tone": hit.get("tone"),
+                "has_tone": bool(hit.get("has_tone")),
+                "phrases": list(hit.get("phrases") or []),
+                "codes": list(hit.get("codes") or []),
+                "confidence": hit.get("confidence"),
+                "source": hit.get("source"),
+                "explain": hit.get("explain"),
+            }
+
+    # 倾向分布（热度页的多空比用它）。**只统计 `has_tone` 的条目** ——
+    # 把"未定"算进多空比等于替用户做了一个我们并不确定的判断。
+    tone_dist: dict[str, int] = {}
+    for it in taken:
+        t = it.get("tone") or {}
+        if t.get("has_tone"):
+            k = str(t.get("tone"))
+            tone_dist[k] = tone_dist.get(k, 0) + 1
+
     # ── 可信度筛选（在**池子**上做，不是在 limit 之后做）──
     taken = [it for it in taken if _passes_filter(it, filter)]
     taken = taken[:max(1, limit)]
@@ -343,6 +383,7 @@ async def build_feed(*, watch_codes: list[str] | None = None,
         degraded=bool(gaps),
         credibility_dist=dist,
         cluster_stats=cluster_stats,
+        tone_dist=tone_dist,
     )
 
 

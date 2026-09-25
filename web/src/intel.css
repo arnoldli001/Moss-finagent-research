@@ -367,6 +367,64 @@
 .rel-time { flex: 0 0 auto; color: var(--muted); font-size: 10.5px; }
 .rel-more { color: var(--muted); }
 
+/* ---------- 原文倾向（第三方原文的语气，不是平台判断） ---------- */
+.intel-tags-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+.tone { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.tone-pending { font-size: 11px; }
+.tone-tag {
+  font-size: 11px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.tone-tag b { font-weight: 600; }
+/* `未定` 刻意**不用**多空配色 —— 它既不是多也不是空，
+   给了颜色就等于给了倾向（用户会按颜色读） */
+.tone-tag.unknown { border-style: dashed; color: var(--muted); }
+.tone-tag.bull { border-color: rgba(46,168,110,0.5); color: var(--intel-green); }
+.tone-tag.bear { border-color: rgba(217,92,74,0.5); color: var(--low); }
+.tone-tag.neutral { border-color: rgba(139,152,165,0.4); color: var(--text); }
+.tone-conf { opacity: 0.7; margin-left: 4px; font-variant-numeric: tabular-nums; }
+.tone-detail {
+  flex: 1 1 100%;
+  margin-top: 5px;
+  padding: 7px 0 0;
+  border-top: 1px dashed var(--table-line);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.tone-explain { margin-bottom: 4px; }
+.tone-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+.tone-phrase {
+  border: 1px solid var(--table-line);
+  border-radius: 4px;
+  padding: 0 6px;
+  color: var(--text);
+  /* 逐字依据可能较长（整句），限两行 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 100%;
+}
+.tone-note { font-size: 10.5px; }
+
 /* --- 桌面表格 --- */
 .intel-tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
 .intel-table {
@@ -537,6 +595,20 @@
   min-width: 2px;
 }
 .heat-bar-fill.alt { background: var(--intel-purple); }
+/* 倾向配色：与 `.tone-tag` 一致，多绿空红 —— 只表示**原文语气** */
+.heat-bar-fill.tone-bull { background: var(--intel-green); }
+.heat-bar-fill.tone-bear { background: var(--low); }
+.heat-tone-sum {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px dashed var(--table-line);
+  font-size: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+.heat-tone-sum b { color: var(--text); }
 .heat-bar-n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
 
 .heat-tags {

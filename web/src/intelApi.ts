@@ -74,6 +74,40 @@ export interface RelatedNews {
   credibility_score: number | null;
 }
 
+/**
+ * **原文倾向**（第三步：语义抽取）。
+ *
+ * ## ⚠️ 字段名 `tone` 的含义被严格限定
+
+ * 它是「**这条第三方原文自己**是什么语气」，**不是**平台判断、不是预测。
+ * 界面上必须显示为「原文倾向」，且**永远**与 `phrases`（原文词组）一起
+ * 出现 —— 用户能拿它去原文核对。说不出理由的倾向标签，用户只能选择
+ * 信或不信，而两者都不合适。
+ *
+ * ## 为什么 `confidence` 可能是 `null`
+
+ * 用户口径（2026-09-25）："原则上有幻觉风险的可以不显示数值。"
+ * 有幻觉风险的情形就是**规则层与模型层判定不一致** —— 那时给
+ * `tone="未定"` 且 `confidence=null`，界面上不显示倾向标签，
+ * 也不显示任何数值。只有两层一致时才给数值（且取两者较小值）。
+ */
+export interface IntelTone {
+  /** `偏多` | `偏空` | `中性` | `未定` */
+  tone: string;
+  /** 界面靠它决定"显示标签还是显示未定"（服务端算好，前端不重复判断） */
+  has_tone: boolean;
+  /** 原文词组（**逐字来自原文**，已过服务端子串校验） */
+  phrases: string[];
+  /** 原文中真实出现的 A 股代码（已过幻觉拦截） */
+  codes: string[];
+  /** 0~1，**两层一致时才有值**；不一致时为 `null` */
+  confidence: number | null;
+  /** `rules` | `rules+llm` | `skipped` */
+  source: string;
+  /** 一句话解释（不含来源标识） */
+  explain: string;
+}
+
 /** 单条情报（`IntelItem.to_public()` 的白名单输出）。 */
 export interface IntelItem {
   kind: string;
@@ -111,6 +145,12 @@ export interface IntelItem {
   /** 这一簇的代表条（非代表条已被后端收起，前端一般看不到） */
   is_cluster_lead?: boolean;
   cluster_id?: string;
+  /**
+   * 原文倾向。**可能不存在** —— 抽取是定时任务（2 小时一次），
+   * 新条目在下一批抽到之前没有这个字段。界面要说尚未抽取，
+   * **不能编一个默认值**。
+   */
+  tone?: IntelTone;
 }
 
 /** 数据缺口。`message` 面向普通用户，**不含源名与错误原文**。 */
@@ -153,6 +193,14 @@ export interface IntelFeed {
     clusters?: number; clustered_items?: number;
     folded?: number; pairs?: number;
   };
+  /**
+   * 原文倾向分布 {偏多: n, 偏空: n, 中性: n}。
+   *
+   * ⚠️ 服务端**只统计 has_tone 的条目** —— 把未定算进多空比，
+   * 等于替用户做了一个我们并不确定的判断。所以这里的三个数之和
+   * **小于**条目总数，那是正常的。
+   */
+  tone_dist?: Record<string, number>;
 }
 
 /** 日历事件。四类：`earnings` 预约披露 / `unlock` 解禁 / `macro` 宏观 / `trade` 交易日。 */
