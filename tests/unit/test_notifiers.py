@@ -66,6 +66,39 @@ async def test_hub_connect_broadcast_disconnect():
     assert hub.client_count() == 0
 
 
+@pytest.mark.asyncio
+async def test_hub_notify_broadcasts_a_signalling_message_across_tenants():
+    """`notify` 是**信令**通道：跨租户广播，且照样清理死连接。
+
+    它服务的是"情报流后台建好了，前端可以来拉了"这类通知（见
+    `src/api/routes/intel.py`）。与 `broadcast` 的分工是硬的：
+
+      · `broadcast`  推**告警正文** ⇒ 必须逐连接脱敏（管理员才看得到来源真名）
+      · `notify`     推**只有序号/时间戳的信令** ⇒ 跨租户广播不泄漏任何东西
+
+    ⚠️ 这条边界只能靠纪律守：往 `notify` 里塞任何业务字段，它就退化成
+    "把管理员的视图发给所有人"那条老事故，而代码评审里看不出来。
+    所以本用例顺带钉住"两个租户都收到了同一条**无内容**消息"。
+    """
+    hub = AlertHub()
+    a, b, dead = _FakeWebSocket(), _FakeWebSocket(), _FakeWebSocket(fail=True)
+    await hub.connect(a, "tenant_a")
+    await hub.connect(b, "tenant_b")
+    await hub.connect(dead, "tenant_a")
+
+    msg = {"type": "intel_feed", "data": {"seq": 3, "built_at": "2026-10-01"}}
+    assert await hub.notify(msg) == 2        # 死连接不算送达
+    assert a.sent == [msg] and b.sent == [msg]
+    assert hub.client_count("tenant_a") == 1, "死连接没被清理"
+    # 载荷里不许出现任何业务内容（这条断言就是上面那句纪律的落点）
+    assert set(msg["data"]) == {"seq", "built_at"}
+
+    # `heartbeat` 复用了同一条出口 —— 清理逻辑只有一份
+    before = len(a.sent)
+    await hub.heartbeat()
+    assert a.sent[before]["type"] == "heartbeat"
+
+
 def _settings(**overrides):
     return get_settings().model_copy(update=overrides)
 
@@ -104,7 +137,7 @@ async def test_email_score_gate_boundaries(monkeypatch):
         "src.infrastructure.notifiers.email_notifier.smtplib.SMTP_SSL", _SMTP)
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="1027312283@qq.com"))
+        alert_email_to="2693888583@qq.com"))
     assert notifier.is_configured()
 
     # 风险类：69不发（严格大于），70发；与站内级别无关（medium也发）
@@ -126,7 +159,7 @@ async def test_email_score_gate_boundaries(monkeypatch):
         opportunity_score=85.0))
     assert sent_opp.status == "sent" and sent_calls
     # 收件人固定为需求邮箱
-    assert sent_calls[-1][1] == ["1027312283@qq.com"]
+    assert sent_calls[-1][1] == ["2693888583@qq.com"]
 
 
 @pytest.mark.asyncio
@@ -154,7 +187,7 @@ async def test_email_gate_thresholds_configurable(monkeypatch):
         "src.infrastructure.notifiers.email_notifier.smtplib.SMTP_SSL", _SMTP)
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="1027312283@qq.com",
+        alert_email_to="2693888583@qq.com",
         alert_email_risk_min_score=79.0, alert_email_opp_min_score=90.0))
     assert (await notifier.send(_alert(risk_score=75.0))).status == "suppressed"
     assert (await notifier.send(_alert(risk_score=80.0))).status == "sent"
@@ -177,7 +210,7 @@ async def test_email_failure_does_not_raise(monkeypatch):
         _BrokenSMTP)
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="1027312283@qq.com"))
+        alert_email_to="2693888583@qq.com"))
     result = await notifier.send(_alert())
     assert result.status == "failed" and "连接被拒绝" in result.detail
 
@@ -202,7 +235,7 @@ def test_email_body_has_disclaimer_and_html_escape():
     """TR-7.1/D12：邮件正文必带免责声明，外部字段HTML转义防注入。"""
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="1027312283@qq.com"))
+        alert_email_to="2693888583@qq.com"))
     alert = _alert()
     alert.title = '<script>alert("x")</script>固态电池政策'
     text = notifier._render_text(alert)

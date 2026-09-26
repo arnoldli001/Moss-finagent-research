@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -42,6 +43,13 @@ def _event(key: str, etype: EventType = EventType.POLICY,
 
 def _alert(key: str, atype: AlertType = AlertType.RISK,
            level: AlertLevel = AlertLevel.HIGH) -> Alert:
+    """未过期告警。
+
+    ⚠️ `expire_time` **必须相对现在算**：原来写死 `2026-09-21`，那天一过
+    读路径的懒过期（`_expire_due`）就把这些告警全置成 expired，默认列表
+    直接把它们过滤掉 —— 本文件 4 条用例在 2026-09-21 之后集体转红，
+    而产品行为（默认隐藏过期）本身是对的、另有 `_alert_expired` 专门覆盖。
+    """
     return Alert(
         alert_id=f"al_{key}", alert_key=key, event_id="evt_p1",
         alert_type=atype, alert_level=level, title="政策风险告警",
@@ -53,7 +61,7 @@ def _alert(key: str, atype: AlertType = AlertType.RISK,
         source_name="测试源", source_url="https://src/1",
         event_publish_time="2026-09-14 08:00:00",
         trigger_time="2026-09-14T17:30:00+08:00",
-        expire_time="2026-09-21T17:30:00+08:00",
+        expire_time=(datetime.now() + timedelta(days=7)).isoformat(),
     )
 
 
@@ -125,6 +133,29 @@ async def test_existing_event_keys_membership(repo):
     known = await repo.existing_event_keys(["p1", "s1", "c1"])
     assert known == {"p1", "s1"}
     assert await repo.existing_event_keys([]) == set()
+
+
+@pytest.mark.asyncio
+async def test_unanalyzed_backlog_prefers_fresh_news_over_future_schedule(repo):
+    """2026-09-24 事故回归：未来日程不许排在当天快讯前（候选饥饿 → 告警恒 0）。
+
+    真实数据：`百度财经-财报披露日程` 把 publish_time 写成未来披露日
+    （09-28~10-01），按它倒序取积压，这批"未来日程"永远占满候选窗口，
+    当天 184 条快讯一条都进不了 LLM。
+    """
+    news = _event("news", EventType.POLICY, url="https://src/8")
+    news.publish_time = "2026-09-24 11:05:00"          # 当天快讯
+    news.fetch_time = "2026-09-24T11:05:30+08:00"
+    # 故意**后插**日程行：如果出队顺序只看入库时间（created_at/rowid），
+    # 它就会排第一 —— 这样断言才真正压住"未来时间要沉底"这条规则。
+    schedule = _event("schedule", EventType.STOCK, url="https://src/9")
+    schedule.publish_time = "2099-01-01 09:00:00"      # 未来披露日
+    schedule.fetch_time = "2026-09-24T09:15:00+08:00"
+    await repo.upsert_events([news, schedule])
+
+    backlog = await repo.list_unanalyzed_events(limit=10)
+
+    assert [e.event_key for e in backlog] == ["news", "schedule"]
 
 
 @pytest.mark.asyncio

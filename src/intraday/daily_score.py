@@ -16,7 +16,7 @@
 本模块是**加权打分**（多维度各自给分再合成）。两者刻意不做成一条链：
 
 - 规则信号回答"**满不满足某套具体战法的形态**"，可解释到每一条条件；
-- 加权总分回答"**综合来看现在偏向低吸还是高抛**"，能容纳"条件只满足一半"的情形。
+- 加权总分回答"**综合来看现在偏向回踩还是冲高**"，能容纳"条件只满足一半"的情形。
 
 所以 `DailySnapshot` 里两者是并列字段。**不要**把加权总分接回 `_finish` 的
 `triggered` 判定 —— 那会让"某个形态满足了三条中的两条"也发正式信号，
@@ -117,7 +117,7 @@ def trend_score_from(*, price: float | None, ma5: float | None, ma10: float | No
 
 def position_score_from(*, percentile: float | None, streak: int = 0,
                         from_high_pct: float | None = None) -> float | None:
-    """位置与身位分：分位越低越偏多（有低吸空间），越高越偏空（透支/待兑现）。
+    """位置与身位分：分位越低越偏多（有回踩空间），越高越偏空（透支/待兑现）。
 
     `streak`（当前连续涨停板数）是**额外的风险扣分**，不是线性项：
     连板越多，做T的赔率越差（一次 T 反就是 -10% 量级），
@@ -132,7 +132,7 @@ def position_score_from(*, percentile: float | None, streak: int = 0,
     elif streak == 2:
         penalty = 0.08
     # 贴着区间高点（≤2%）时再加一点"突破未确认"的折价：
-    # 此时低吸线会被箱体上沿顶到现价上方，档位差不足以覆盖摩擦成本。
+    # 此时回踩线会被箱体上沿顶到现价上方，档位差不足以覆盖摩擦成本。
     if from_high_pct is not None and 0 <= -from_high_pct <= 2.0:
         penalty += 0.1
     return ind.clip(base - penalty)
@@ -185,7 +185,7 @@ def signal_rule_score_from(*, buy_signals: list[Any],
     只为**已触发**的信号计分（`triggered=True`），未触发的不给"部分分"——
     否则每只票都会因为"沾点边"而拿到一堆小分，总分退化成噪声。
 
-    归一化用 3 条满仓：触发 3 条以上买入信号就接近满分。
+    归一化用 3 条满仓：触发 3 条以上多方条件就接近满分。
     实测（`docs/INTRADAY_T_DESIGN.md` §11）里同时满足 3 条以上属于罕见情形，
     所以这个刻度不会长期饱和。
     """
@@ -396,7 +396,7 @@ def compose_daily_scorecard(
     triggered_sell = [i for i in (sell_signals or []) if getattr(i, "triggered", False)]
     outcomes["signal_rule"] = DailyFactorOutcome(
         rule_score or 0.0,
-        f"已触发买入信号 {len(triggered_buy)} 条"
+        f"已触发多方条件 {len(triggered_buy)} 条"
         f"（{'、'.join(getattr(i, 'code', '') for i in triggered_buy) or '无'}）；"
         f"卖出/风控 {len(triggered_sell)} 条"
         f"（{'、'.join(getattr(i, 'code', '') for i in triggered_sell) or '无'}）",
@@ -467,11 +467,11 @@ def compose_daily_scorecard(
         verdict = (f"日线做T总分 {total:+.1f}，但**保护线已破**"
                    f"（{protective.get('stop_basis', '')}）→ 先处理风险，不做T")
     elif zone == "strong_buy_zone":
-        verdict = f"日线做T总分 {total:+.1f} 突破动手线 +{action:g} → 偏多，可考虑低吸滚动"
+        verdict = f"日线做T总分 {total:+.1f} 突破动手线 +{action:g} → 偏多，可考虑回踩滚动"
     elif zone == "buy_zone":
         verdict = f"日线做T总分 {total:+.1f} 位于提示线 +{hint:g}～动手线之间 → 偏多，小仓位试"
     elif zone == "strong_sell_zone":
-        verdict = f"日线做T总分 {total:+.1f} 跌破动手线 -{action:g} → 偏空，优先高抛降仓"
+        verdict = f"日线做T总分 {total:+.1f} 跌破动手线 -{action:g} → 偏空，优先冲高降仓"
     elif zone == "sell_zone":
         verdict = f"日线做T总分 {total:+.1f} 位于 -{hint:g}～-{action:g} 之间 → 偏空，逢高减"
     else:

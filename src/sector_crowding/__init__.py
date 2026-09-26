@@ -20,6 +20,14 @@ from src.sector_crowding.db import (
     query_sector_crowding,
     upsert_sector_crowding,
 )
+from src.sector_crowding.metrics import (
+    compute_all_metrics,
+    compute_water_changes,
+    get_metric_progress,
+    metrics_summary,
+    start_metric_compute,
+    week_key,
+)
 from src.sector_crowding.refresh import (
     calculate_and_store,
     compute_series,
@@ -33,17 +41,23 @@ __all__ = [
     "SectorCrowdingConfig",
     "calculate_and_store",
     "clear_config_cache",
+    "compute_all_metrics",
     "compute_series",
+    "compute_water_changes",
     "get_db_connection",
+    "get_metric_progress",
     "get_refresh_progress",
     "init_tables",
     "is_concept_board",
     "load_config",
+    "metrics_summary",
     "query_alerts",
     "query_all_latest_water_level",
     "query_sector_crowding",
     "refresh_all_incremental",
     "refresh_single_sector",
+    "start_metric_compute",
     "start_refresh_all",
     "upsert_sector_crowding",
+    "week_key",
 ]

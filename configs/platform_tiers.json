@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "_comment": "由管理员控制台「资源管控 / 功能权限」维护；可进 Git 评审与回滚。",
+  "plans": {
+    "admin": {
+      "label": "管理员",
+      "sellable": false,
+      "resources": {
+        "api_calls_per_minute": 600,
+        "api_calls_per_day": 200000,
+        "llm_tokens_per_month": 20000000,
+        "watchlist_stocks": 100,
+        "watchlist_pools": 5,
+        "concurrent_tasks": 8,
+        "max_backtest_days": 3650
+      },
+      "features": {
+        "research": true,
+        "scheduler": true,
+        "metrics": true,
+        "backtest": true,
+        "mainline": true,
+        "fundflow": true,
+        "quant.auction": true,
+        "quant.select": true,
+        "quant.intraday": true,
+        "intel.hot": true,
+        "intel.alerts": true
+      },
+      "pricing": {
+        "research": 0.0,
+        "scheduler": 0.0,
+        "metrics": 0.0,
+        "backtest": 0.0,
+        "mainline": 0.0,
+        "fundflow": 0.0,
+        "quant.auction": 0.0,
+        "quant.select": 0.0,
+        "quant.intraday": 0.0,
+        "intel.hot": 0.0,
+        "intel.alerts": 0.0
+      },
+      "note": "内部角色，不售；含全部功能与最高资源上限"
+    },
+    "vip": {
+      "label": "VIP",
+      "sellable": true,
+      "resources": {
+        "api_calls_per_minute": 300,
+        "api_calls_per_day": 50000,
+        "llm_tokens_per_month": 100000,
+        "watchlist_stocks": 100,
+        "watchlist_pools": 5,
+        "concurrent_tasks": 4,
+        "max_backtest_days": 1825
+      },
+      "features": {
+        "research": true,
+        "scheduler": false,
+        "metrics": false,
+        "backtest": true,
+        "mainline": true,
+        "fundflow": true,
+        "quant.auction": true,
+        "quant.select": true,
+        "quant.intraday": true,
+        "intel.hot": true,
+        "intel.alerts": true
+      },
+      "pricing": {
+        "research": 0.0,
+        "scheduler": 0.0,
+        "metrics": 0.0,
+        "backtest": 0.0,
+        "mainline": 0.0,
+        "fundflow": 0.0,
+        "quant.auction": 199.0,
+        "quant.select": 0.0,
+        "quant.intraday": 0.0,
+        "intel.hot": 0.0,
+        "intel.alerts": 0.0
+      },
+      "note": "含主要业务功能；竞价选股需单独加购"
+    },
+    "trial": {
+      "label": "试用",
+      "sellable": true,
+      "resources": {
+        "api_calls_per_minute": 60,
+        "api_calls_per_day": 3000,
+        "llm_tokens_per_month": 300000,
+        "watchlist_stocks": 25,
+        "watchlist_pools": 5,
+        "concurrent_tasks": 1,
+        "max_backtest_days": 0
+      },
+      "features": {
+        "research": false,
+        "scheduler": false,
+        "metrics": false,
+        "backtest": false,
+        "mainline": true,
+        "fundflow": true,
+        "quant.auction": true,
+        "quant.select": true,
+        "quant.intraday": true,
+        "intel.hot": true,
+        "intel.alerts": false
+      },
+      "pricing": {
+        "research": 0.0,
+        "scheduler": 0.0,
+        "metrics": 0.0,
+        "backtest": 0.0,
+        "mainline": 0.0,
+        "fundflow": 0.0,
+        "quant.auction": 0.0,
+        "quant.select": 0.0,
+        "quant.intraday": 0.0,
+        "intel.hot": 0.0,
+        "intel.alerts": 0.0
+      },
+      "note": "只读+做T体验；回测与选股类不开放"
+    }
+  }
+}

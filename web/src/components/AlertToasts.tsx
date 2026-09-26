@@ -52,12 +52,18 @@ export default function AlertToasts({ alerts, onDismiss, onOpen }: Props) {
         >
           <div className="toast-title">
             <span className={`badge alert-tag-${a.alert_type}`}>
-              {a.alert_type === "risk" ? "风险" : "机会"}·{a.alert_level}
+              {/* 展示词是**利空 / 利多**（不是"风险 / 机会"）——
+                  "机会"带操作暗示，而这两个词只描述第三方原文的语气，
+                  与情报流里的 `tone` 同一套措辞。
+                  底层枚举仍是 risk/opportunity，只改文案。 */}
+              {a.alert_type === "risk" ? "利空" : "利多"}·{a.alert_level}
             </span>
             <span className="toast-text">{a.title}</span>
           </div>
           <div className="toast-meta">
-            风险 {Math.round(a.risk_score)} / 机会 {Math.round(a.opportunity_score)}
+            {/* 两个分数都保留：单看一个方向分看不出"多头空头在打架"，
+                同时给出来才看得出这条其实是**分歧**而不是共识 */}
+            利空 {Math.round(a.risk_score)} / 利多 {Math.round(a.opportunity_score)}
             {" · "}置信 {(a.confidence * 100).toFixed(0)}%
           </div>
           <button

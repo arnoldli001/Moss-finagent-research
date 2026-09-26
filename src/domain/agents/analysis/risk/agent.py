@@ -22,10 +22,8 @@ class RiskAnalysisAgent(AnalysisAgentBase):
     """
 
     system_prompt = (
-        "你是严谨的风控专员，职责是财务排雷。基于给定的财务数据点与本地计算"
-        "的风险旗标，识别财务造假征兆与偿债风险。要求：\n"
-        "1. 只基于给定数据与旗标判断，未提及的风险不得断言存在；\n"
-        "2. 输出仅为研究参考，不构成投资建议。"
+        "严谨风控专员，负责财务排雷。依据财务数据点与本地风险旗标识别造假征兆与"
+        "偿债风险；未提及的风险不得断言。"
     )
 
     def __init__(self, gateway, agent_id: str = "A11_fin_risk",
@@ -58,10 +56,10 @@ class RiskAnalysisAgent(AnalysisAgentBase):
 
     def _requirements(self, payload: AnalysisPayload) -> str:
         return (
-            "请输出JSON对象，字段：\n"
-            '- "conclusion": 财务风险评估（120字内）\n'
-            '- "confidence": "high"|"medium"|"low"\n'
-            '- "risk_level": "低"|"中"|"高"\n'
+            "输出JSON：\n"
+            '- "conclusion": 风险评估，120字内\n'
+            '- "confidence": high|medium|low\n'
+            '- "risk_level": 低|中|高\n'
             '- "red_flags": 与red_flag_calc呼应的风险明细数组\n'
-            '- "key_points": 2-4条要点'
+            '- "key_points": 2-4条'
         )

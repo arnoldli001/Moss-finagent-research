@@ -154,3 +154,93 @@ def test_fundamental_panel_prefers_tushare(tmp_dir) -> None:
     assert snapshot.loc["600519", "roe"] == pytest.approx(18.0)
     # 公告日之前不可见
     assert "600519" not in panel.as_of("20260701").index
+
+
+# ============== 按需装配（needs） ==============
+
+def test_lazy_panels_load_only_requested_fields(tmp_dir) -> None:
+    """给了 needs 就只装这些字段，且进入**严格模式**。"""
+    from src.quant.panel_needs import needs_for_factor
+    from src.quant.panels import MissingPanelField
+
+    _write_daily(tmp_dir, close=100.0)
+    panels = build_panels(DATES, root=tmp_dir,
+                          needs=needs_for_factor("momentum_20"))
+    assert panels.strict is True
+    assert "price:close" in panels.loaded
+    assert "price:close_raw" in panels.loaded        # close 的派生列
+    assert panels.basics == {} and panels.flows == {}
+    assert panels.fundamentals is None               # 纯价格因子不必读财务面板
+    with pytest.raises(MissingPanelField) as excinfo:
+        panels.basic("pe_ttm")
+    message = str(excinfo.value)
+    assert "daily_basic.pe_ttm" in message or "basic.pe_ttm" in message
+    assert "needs" in message, "报错必须告诉用户怎么修"
+
+
+def test_eager_panels_stay_permissive(tmp_dir) -> None:
+    """不给 needs（= 单票回测的老路径）时不能因为严格模式而炸掉。"""
+    _write_daily(tmp_dir, close=100.0)
+    panels = build_panels(DATES, root=tmp_dir)
+    assert panels.strict is False
+    assert panels.basic("不存在的字段").isna().all().all()
+
+
+def test_lazy_and_eager_produce_identical_factors(tmp_dir) -> None:
+    """按需装配与全量装配算出的因子必须**逐位一致**（合成数据版）。
+
+    真实数据上的同款对拍见 `_needs_check.py` 的记录（35 个因子 × 39 个交易日，
+    面板/因子/IC 表三层全部逐位一致）。
+    """
+    from src.quant.panel_needs import needs_for_factors
+
+    _write_daily(tmp_dir, close=100.0)
+    keys = ["momentum_20", "ep", "free_float_mv", "amihud"]
+    lazy = build_panels(DATES, root=tmp_dir, needs=needs_for_factors(keys))
+    eager = build_panels(DATES, root=tmp_dir)
+    for key in keys:
+        pd.testing.assert_frame_equal(compute_factors(lazy, keys=[key])[key],
+                                      compute_factors(eager, keys=[key])[key],
+                                      check_dtype=False)
+
+
+# ============== 股票池过滤 ==============
+
+def _write_liquidity_fixture(root: str) -> None:
+    """4 只票、成交额 log 级差；价格相同（只测列裁剪，不测因子）。"""
+    codes = ["000001", "000002", "000003", "000004"]
+    amounts = [1e9, 1e8, 1e7, 1e6]
+    daily = DatasetStore("daily", root=root)
+    for date in DATES:
+        daily.write(date, pd.DataFrame({
+            "code": codes, "open": [10.0] * 4, "high": [10.0] * 4,
+            "low": [10.0] * 4, "close": [10.0] * 4,
+            "volume_lot": [1e4] * 4, "amount": amounts}))
+
+
+def test_liquidity_filter_narrows_columns_and_keeps_daily_mask(tmp_dir) -> None:
+    from src.quant.liquidity import LiquidityFilter
+    from src.quant.panel_needs import needs_for_factors
+
+    _write_liquidity_fixture(tmp_dir)
+    # window=1 让这个测试只关心"列裁剪 + 掩码"，不依赖滚动历史
+    panels = build_panels(DATES, root=tmp_dir,
+                          needs=needs_for_factors(["momentum_20"]),
+                          liquidity=LiquidityFilter(enabled=True, drop_pct=0.5,
+                                                    window=1, min_days=1,
+                                                    keep_ratio=0.5))
+    assert len(panels.codes) == 2, f"列没被裁窄：{panels.codes}"
+    mask = panels.exclusion_mask()
+    assert mask is not None and mask.shape == (3, 2)
+    assert not mask.to_numpy().any(), "被裁掉的列不该再出现在掩码里"
+    assert any("股票池过滤生效" in gap for gap in panels.gaps)
+
+
+def test_liquidity_filter_off_by_default(tmp_dir) -> None:
+    from src.quant.liquidity import LiquidityFilter
+
+    _write_liquidity_fixture(tmp_dir)
+    panels = build_panels(DATES, root=tmp_dir,
+                          liquidity=LiquidityFilter())      # enabled=False
+    assert len(panels.codes) == 4
+    assert panels.exclusion_mask() is None

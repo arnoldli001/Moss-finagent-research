@@ -22,7 +22,37 @@
 
 `content_hash` 是内容指纹（不含来源），`tone`/`phrases`/`codes` 都来自
 原文。**没有任何来源字段** —— 这份文件即使被读到也不泄漏渠道。
+
+## ⚠️ 加字段必须**向后兼容**（2026-09-25 第二轮）
+
+第二轮往里加了 `summary` / `events` / `bullish` / `bearish`
+（原文里明写的利好/利空行业与个股 + 关键事件）。
+
+**已经落库的 176 行没有这些键**（那是第一轮的格式）。所以：
+
+  · 读取侧一律 `hit.get("summary") or ""`、`hit.get("bullish") or {}` ——
+    **不许** `hit["summary"]`；缺键是**正常状态**（老行），不是损坏
+  · 写入侧走 `build_row` 的白名单，不整份透传 —— 见那个函数的说明
+  · 不需要回填/迁移：旧行缺的就是"那轮没抽过"，接口少显示一块，
+    下一轮抽到同一条（`content_hash` 变了或 force 重抽）自然补上。
+    为几天的数据写迁移脚本，成本比收益高。
+
+第三轮（2026-09-25）同理：方向桶里多了 `boards`（概念板块名 + 主线挖掘的
+板块代码），老行没有这个键 —— 读取侧由 `_side_view` 统一补成空列表。
+
+第四轮（2026-09-25）加了**分段抽取的来源说明**：`segments` / `calls` /
+`skipped_segments`。它们是"这个结果是怎么来的"（内部过程），不是"原文讲了什么"：
+
+    segments          本条实际处理的段数（= 模型调用次数，短文本为 1）
+    calls             本条**实际发起**的模型调用次数（短文本恒为 0）
+    skipped_segments  因段数上限跳过的段区间（空串 = 一段没跳）
+
+⚠️ 老行同样没有这三个键，读取侧给**保守默认值**（1 段 / 0 次调用 / 没跳过），
+而不是 `0 段` —— `segments=0` 会让界面显示"这条没有段"，
+而事实是"这条是老格式，我们不知道它切了几段"。默认值必须选那个
+**不会误导人**的：至少一段。
 """
+
 
 from __future__ import annotations
 
@@ -93,10 +123,139 @@ def load(*, root: Path | None = None, force: bool = False) -> dict[str, dict]:
 
 
 def get(content_hash: str, *, root: Path | None = None) -> dict[str, Any] | None:
-    """按内容指纹取一条倾向结果。**没抽过返回 `None`**（不编造）。"""
+    """按内容指纹取一条倾向结果。**没抽过返回 `None`**（不编造）。
+
+    ⚠️ 老行（第一轮格式）**没有** `summary`/`events`/`bullish`/`bearish`
+    四个键，调用方必须用 `view()` 取字段 —— 直接下标会 KeyError。
+    """
     if not content_hash:
         return None
     return load(root=root).get(content_hash)
+
+
+def view(hit: dict[str, Any] | None) -> dict[str, Any]:
+    """把一条存储行摊成**读取侧的稳定形状**（缺键给空值，不抛）。
+
+    ## 为什么需要它（而不是让每个读取方自己 `.get(k) or []`）
+
+    这份存储里**同时存在两种格式的行**：第一轮落的（只有 tone/phrases/
+    codes/…）与第二轮落的（多了 summary/events/bullish/bearish）。
+    老行缺键是**正常状态**，不是损坏 —— 但"缺键"与"空值"在代码里
+    长得一样，于是每加一个字段，每个读取点都要记得写一次 `or []`。
+    漏一处就是线上 KeyError（把整个情报流打挂），而它只在
+    "用户翻到一条几天前的老数据"时才复现。
+
+    集中在这里摊平，读取方拿到的形状永远一样：
+    `hit = view(tone_store.get(h))`。
+
+    `None` 入参（没抽过）也返回同一个形状，且 `has_tone=False` ——
+    "没抽过"与"抽过但未定"在存储里是两种状态，但在**读取侧的形状**
+    上两者都只能给"没有倾向字段"，界面靠 `has_tone` 区分
+    （见 `service.build_feed`）。
+    """
+    h = hit or {}
+    return {
+        "tone": str(h.get("tone") or "未定"),
+        "has_tone": bool(h.get("has_tone")),
+        "neutral": bool(h.get("neutral")),
+        "phrases": list(h.get("phrases") or []),
+        "codes": list(h.get("codes") or []),
+        "confidence": h.get("confidence"),
+        "source": str(h.get("source") or ""),
+        "explain": str(h.get("explain") or ""),
+        # ── 第二轮字段：老行没有 → 空值（界面显示"这块没有"）──
+        "summary": str(h.get("summary") or ""),
+        "events": list(h.get("events") or []),
+        "bullish": _side_view(h.get("bullish")),
+        "bearish": _side_view(h.get("bearish")),
+        # ── 第四轮字段：分段来源说明（老行没有 → 保守默认值）──
+        # ⚠️ 默认值**不能**是 0 段：那会被读成"这条没抽过"。
+        #    老行（第一~三轮）都是单次调用，所以"至少 1 段"才是事实。
+        "segments": int(h.get("segments") or 1),
+        "calls": int(h.get("calls") or 0),
+        "skipped_segments": str(h.get("skipped_segments") or ""),
+        # ── 第五轮字段：券商名 / 分析师名（模型给的，**只作审计**）──
+        # ⚠️ 老行没有这两个键 → 空列表（正常状态，不是损坏）。
+        #    ⚠️ 它们**不上屏**：界面上的"机构：X / 分析师：X"由
+        #    `alert_rules` 的确定性扫描保证（见 `tone.validate_people`）。
+        #    这里透传是为了让"模型到底认出了谁"可回看（扩名单时的依据）。
+        "brokers": [str(x) for x in (h.get("brokers") or []) if str(x)],
+        "analysts": [str(x) for x in (h.get("analysts") or []) if str(x)],
+    }
+
+
+def _side_view(side: Any) -> dict[str, Any]:
+    """方向桶的读取侧形状（老行 / 坏行一律给空桶）。"""
+    s = side if isinstance(side, dict) else {}
+    stocks: list[dict[str, Any]] = []
+    for raw in (s.get("stocks") or []):
+        if not isinstance(raw, dict):
+            continue
+        stocks.append({
+            "name": str(raw.get("name") or ""),
+            "code": str(raw.get("code") or ""),
+            "count": int(raw.get("count") or 0),
+        })
+    # 第三轮字段：与 `industries` 同一批板块 + 主线挖掘的板块代码。
+    # ⚠️ 必须在这里透传：读取方拿到的是本函数的**投影**，漏一个键的表现是
+    # "抽到了、落库了、接口永远看不到"，不会有任何报错（同 `to_public` 那条纪律）。
+    boards: list[dict[str, Any]] = []
+    for raw in (s.get("boards") or []):
+        if not isinstance(raw, dict):
+            continue
+        boards.append({
+            "name": str(raw.get("name") or ""),
+            "code": str(raw.get("code") or ""),
+        })
+    return {
+        "industries": [str(x) for x in (s.get("industries") or []) if str(x)],
+        "stocks": stocks,
+        "boards": boards,
+        "count": int(s.get("count") or (len(s.get("industries") or []) + len(stocks))),
+    }
+
+
+#: 一份结果里**允许落库**的键（白名单）。
+#:
+#: ## 为什么是白名单，而不是 `**r` 整份透传
+#:
+#: 第一轮写的是 `{"content_hash": h, "at": ..., **r}` —— 调用方给什么就存什么。
+#: 那个写法在这份数据上有个具体危害：`tone_job` 的中间结果里带着
+#: `rejected`（被拦掉的幻觉原文）。**被拦掉的东西不该进持久层** ——
+#: 这份文件是排障时要 `tail -f` 直接看的（模块 docstring 里写了这条优点），
+#: 幻觉文本躺在里面会被下一个排障的人当成真实抽取结果。
+#:
+#: 白名单还有一个好处：将来 `ToneResult` 加字段时，
+#: **默认不进存储**，必须在这里显式加一行 —— 与 `to_public()` 同一条纪律。
+_ROW_KEYS: Final[tuple[str, ...]] = (
+    "tone", "has_tone", "neutral", "phrases", "codes",
+    "confidence", "source", "explain", "summary",
+    # ── 第二轮 ──
+    # ⚠️ `bullish` / `bearish` 是**整份**放行的，所以第三轮在方向桶里
+    # 新增的 `boards`（板块名 + 主线挖掘板块代码）跟着它们一起落库，
+    # 这里不需要（也不该）再列一遍 —— 但**读取侧要显式透传**，
+    # 见 `_side_view`：那边是投影，漏键不会报错、只会静默少一块数据。
+    "events", "bullish", "bearish",
+    # ── 第四轮：分段抽取的来源说明 ──
+    # ⚠️ 这三项**必须显式列**（白名单不列就是"算了但用户/排障永远看不到"，
+    # 与 `to_public()` 漏字段同一种失败，且没有任何报错）。
+    # 它们不是模型输出，是 `tone_job` 自己算出来的整数/字符串 ——
+    # 没有幻觉风险，但仍然逐个决定，不整份透传。
+    "segments", "calls", "skipped_segments",
+    # ── 第五轮：券商名 / 分析师名（模型给的，审计用）──
+    # ⚠️ 同样**必须显式列**：白名单不列 = "模型认出了孙潇雅，但存储里没有"，
+    # 而表现只是"提示词要了、模型给了、审计时查不到"，没有任何报错。
+    "brokers", "analysts",
+)
+
+
+def build_row(result: dict[str, Any]) -> dict[str, Any]:
+    """把一份抽取结果**按白名单**整理成可落库的行（含 `content_hash`/`at`）。
+
+    缺键的**不补默认值** —— 读取侧本来就按"缺键 = 那轮没抽过"处理
+    （见模块 docstring 的向后兼容要求）。
+    """
+    return {k: result[k] for k in _ROW_KEYS if k in result}
 
 
 def save_many(results: list[dict[str, Any]], *,
@@ -111,7 +270,7 @@ def save_many(results: list[dict[str, Any]], *,
         h = str(r.get("content_hash") or "")
         if not h or not r.get("tone"):
             continue
-        rows.append({"content_hash": h, "at": _now(), **r})
+        rows.append({"content_hash": h, "at": _now(), **build_row(r)})
     if not rows:
         return 0
 
@@ -187,10 +346,12 @@ def stats(*, root: Path | None = None) -> dict[str, Any]:
 
 __all__ = [
     "RETAIN_DAYS",
+    "build_row",
     "get",
     "load",
     "prune",
     "save_many",
     "stats",
     "store_path",
+    "view",
 ]

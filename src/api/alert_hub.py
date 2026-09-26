@@ -115,9 +115,28 @@ class AlertHub:
             self._user.pop(websocket, None)
         return sent
 
-    async def heartbeat(self) -> int:
-        """服务端心跳：防止反向代理回收空闲WS，顺带清理死连接。"""
-        message = {"type": "heartbeat", "ts": now_iso()}
+    async def notify(self, message: dict) -> int:
+        """把一个**不含任何业务数据**的应用级通知推给**所有**在线连接。
+
+        ## 为什么这个方法可以跨租户，而 `broadcast` 不行
+
+        `broadcast` 推的是告警正文，所以必须**逐连接**脱敏（管理员看得到来源
+        真名与原文链接，普通用户看不到 —— 见模块 docstring 里那次事故）。
+
+        这里推的是"某个后台作业建好了，你该去重新拉一次"这种**信令**：
+        载荷只有 `type` 与一个序号/时间戳。信令里没有内容 ⇒ 跨租户广播
+        不泄漏任何东西 ⇒ 不需要按连接序列化。
+
+        ⚠️ **这条边界必须靠纪律守住**：往这个方法的 `message` 里塞任何
+        业务字段（哪怕只是标题），它就立刻退化成"把管理员的视图发给所有人"
+        那条老路，而那种泄漏在代码评审里看不出来。要推内容请用 `broadcast`。
+
+        ## 为什么与 `heartbeat` 共用一个出口
+
+        两者都是"发给全部连接 + 清理死连接"。写成两遍的话，
+        将来只给其中一个加上清理逻辑（或加上重试），另一个就成了死连接的
+        永久持有者 —— 而表现是"连接数只涨不跌"，查起来毫无线索。
+        """
         alive = 0
         for _tenant_id, sockets in list(self._clients.items()):
             dead: list[WebSocket] = []
@@ -125,10 +144,14 @@ class AlertHub:
                 try:
                     await websocket.send_json(message)
                     alive += 1
-                except Exception:  # noqa: BLE001 心跳失败即视为死连接
+                except Exception:  # noqa: BLE001 发送失败即视为死连接
                     dead.append(websocket)
             for websocket in dead:
                 sockets.discard(websocket)
                 self._admin.pop(websocket, None)
                 self._user.pop(websocket, None)
         return alive
+
+    async def heartbeat(self) -> int:
+        """服务端心跳：防止反向代理回收空闲WS，顺带清理死连接。"""
+        return await self.notify({"type": "heartbeat", "ts": now_iso()})

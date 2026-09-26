@@ -168,6 +168,33 @@ class MacroRepository(DataPointRepository):
         return await asyncio.to_thread(
             self._delete_sync, indicator, start_date, end_date)
 
+    def _delete_by_source_sync(self, source_name: str) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM fact_data_points WHERE source_name = ?",
+                (source_name,),
+            )
+            return cursor.rowcount
+
+    async def delete_points_by_source(self, source_name: str) -> int:
+        """按来源删除数据点（源退役/坏点清理），返回删除行数。"""
+        return await asyncio.to_thread(self._delete_by_source_sync, source_name)
+
+    def _prune_before_sync(self, cutoff_date: str) -> int:
+        # 仅删可定期间且早于截止线的行；空 period_date 不参与日期型保留。
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM fact_data_points "
+                "WHERE period_date IS NOT NULL AND period_date != '' "
+                "AND period_date < ?",
+                (cutoff_date,),
+            )
+            return cursor.rowcount
+
+    async def prune_before(self, cutoff_date: str) -> int:
+        """保留策略：删除所有早于 cutoff_date（YYYY-MM-DD）的数据点。"""
+        return await asyncio.to_thread(self._prune_before_sync, cutoff_date)
+
     def _count_sync(self) -> dict[str, int]:
         with self._connect() as conn:
             rows = conn.execute(

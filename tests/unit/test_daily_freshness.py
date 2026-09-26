@@ -161,10 +161,13 @@ class _RecordingBackend:
 
     def __init__(self, points: list | None = None) -> None:
         self.calls: list[tuple[str, str | None, str | None]] = []
+        self.min_dates: list[str | None] = []
         self.points = points if points is not None else []
 
-    async def fetch(self, indicator, start_date=None, end_date=None):  # noqa: ANN001
+    async def fetch(self, indicator, start_date=None, end_date=None,  # noqa: ANN001
+                    *, min_date=None):
         self.calls.append((indicator, start_date, end_date))
+        self.min_dates.append(min_date)
         return self.points
 
 
@@ -231,6 +234,56 @@ def test_daily_snapshot_exposes_refresh_seconds_for_frontend() -> None:
     snapshot = asyncio_run(fetch_daily_snapshot("600036", "", config, backend))
     assert snapshot.config_snapshot["refresh_seconds"] == config.data.daily_snapshot_ttl
     assert config.data.daily_snapshot_ttl == 180      # 3 × 分钟级数据源周期
+
+
+# ==================== 当日形成中bar：市场时钟做新鲜度下限 ====================
+#
+# 2026-09-23 用户报障：盘中（10:07）日K面板仍停在 09-22，提示还写着
+# "QMT 日线订阅未生效"（QMT 自 2026-09-22 起已默认关闭，这句是误导）。
+# 实测两层根因：① 腾讯日K**带区间**时不返回当天形成中bar（连接器已修，
+# 见 test_tencent_daily_connector.py）；② 路由的自动下限是"本地 DB 最新日期"
+# = 昨天，第一个返回昨天的源就被采纳，带当天 bar 的源没机会被问到。
+# 所以链路要把"市场时钟当天"当 `min_date` 传下去。
+
+
+def test_daily_snapshot_passes_market_clock_as_freshness_floor(monkeypatch) -> None:
+    """盘中：`min_date` 必须等于市场时钟当天，否则"只到昨天"的源会把当天bar挡掉。"""
+    from src.intraday.config import IntradayConfig
+    from src.intraday.daily import fetch_daily_snapshot
+
+    monkeypatch.setattr("src.intraday.daily.live_session_date",
+                        lambda: "2026-09-23")
+    backend = _RecordingBackend(_daily_points())
+    asyncio_run(fetch_daily_snapshot("600036", "招商银行",
+                                     IntradayConfig(), backend))
+    assert backend.min_dates == ["2026-09-23"]
+
+
+def test_daily_snapshot_fails_open_when_market_clock_unavailable(monkeypatch) -> None:
+    """时钟探测失败 → 下限传 None（fail-open），取数照常，绝不因时钟坏了取不到数。"""
+    from src.intraday.config import IntradayConfig
+    from src.intraday.daily import fetch_daily_snapshot
+
+    def _boom() -> str:
+        raise RuntimeError("模拟：时钟探测超时")
+
+    monkeypatch.setattr("src.intraday.daily.live_session_date", _boom)
+    backend = _RecordingBackend(_daily_points())
+    snapshot = asyncio_run(fetch_daily_snapshot("600036", "招商银行",
+                                                IntradayConfig(), backend))
+    assert backend.min_dates == [None]
+    assert snapshot.available is True
+
+
+def test_session_min_date_returns_clock_value_or_none(monkeypatch) -> None:
+    """时钟返回空串时是 None（路由的下限退回默认口径），而不是空字符串。"""
+    from src.intraday.daily import _session_min_date
+
+    monkeypatch.setattr("src.intraday.daily.live_session_date", lambda: "")
+    assert _session_min_date() is None
+    monkeypatch.setattr("src.intraday.daily.live_session_date",
+                        lambda: "2026-09-23")
+    assert _session_min_date() == "2026-09-23"
 
 
 # ==================== 服务层缓存 ====================

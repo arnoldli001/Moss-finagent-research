@@ -19,11 +19,20 @@ from src.core import eastmoney_direct as em
 
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
-    """每个用例前后恢复原状（含探测缓存与已安装的壳）。"""
+    """每个用例前后恢复原状（含探测缓存、坏 IP 表与已安装的壳）。
+
+    ⚠️ 必须连**模块级 `requests.get/post`** 一起恢复：`install()` 会把它们换成
+    走壳的版本，不还原就会污染同进程里后续所有用例（它们是模块级的全局名字，
+    不是实例属性）。`test_install_also_patches_module_level_get` 直接钉住这条。
+    """
     original = requests.Session
+    original_get, original_post = requests.get, requests.post
     monkeypatch.setattr(em, "_probe_result", {}, raising=False)
+    monkeypatch.setattr(em, "_bad_ips", {}, raising=False)
     yield
     requests.Session = original
+    requests.get, requests.post = original_get, original_post
+    requests.api.get, requests.api.post = original_get, original_post
     em._enabled_flag = False
 
 
@@ -45,6 +54,75 @@ def test_install_is_idempotent_and_subclass(monkeypatch) -> None:
     assert session.adapters, "原生属性（连接池）要照常可用"
     with requests.Session() as ctx:
         assert ctx is not None
+
+
+def test_install_also_patches_module_level_get(monkeypatch) -> None:
+    """模块级 `requests.get/post` 也必须被换掉（实测踩坑，见 install 的 docstring）。
+
+    akshare 的东财接口（`stock_zh_a_hist_min_em` / `stock_zh_a_hist` /
+    `fund_etf_hist_em` / `stock_zh_a_spot_em` 走的 `fetch_paginated_data`）
+    **直接调模块级 `requests.get`**，不经过 `Session` 类。
+    只换 Session 时实测 `probe_report()` 恒为空 `{}` —— 一次探测都没发生，
+    开关打开等于没打开。
+    """
+    monkeypatch.setattr(em, "_enabled_flag", True)
+    before_get, before_post = requests.get, requests.post
+    assert em.install() is True
+    assert requests.get is not before_get, "模块级 requests.get 未被打补丁"
+    assert requests.post is not before_post, "模块级 requests.post 未被打补丁"
+    assert requests.api.get is requests.get, "requests.api.get 必须与 requests.get 同源"
+    assert requests.api.post is requests.post
+    assert requests.get.__name__ == "get", "名字要保留（第三方库可能读 __name__）"
+
+
+def test_mark_bad_rotates_cached_ip(monkeypatch) -> None:
+    """被标记为坏的 IP 不能再被缓存直接复用。
+
+    原来 `_resolve_direct_ip` 只要缓存里有 `ip` 就直接返回，于是坏节点会被
+    无限复用（每次请求都撞同一面墙），而 `probe_report()` 还显示"可用" —— 假阳性。
+    """
+    monkeypatch.setattr(em, "_enabled_flag", True)
+    em._probe_result["push2his.eastmoney.com"] = {
+        "ip": "1.1.1.1", "candidates": ["1.1.1.1", "2.2.2.2"], "at": 1.0}
+    em.mark_bad("push2his.eastmoney.com", "1.1.1.1")
+    assert em._bad_ips["push2his.eastmoney.com"] == ["1.1.1.1"]
+    # 坏节点仍在候选里（排到最后），节点恢复后还能回来
+    assert "1.1.1.1" in em._probe_result["push2his.eastmoney.com"]["candidates"]
+    # 幂等：重复标记不重复入表
+    em.mark_bad("push2his.eastmoney.com", "1.1.1.1")
+    assert em._bad_ips["push2his.eastmoney.com"] == ["1.1.1.1"]
+
+
+def test_ipv4_addresses_resolves_multiple_rounds(monkeypatch) -> None:
+    """东财 DNS 轮转：单次解析常只给 1 个 A 记录，必须多轮取并集。
+
+    实测踩坑：单次解析只拿到 `117.184.38.143`（握手即断），于是判定"无可用 IP"，
+    规避机制形同虚设；而实际可用节点在其他轮次里才出现。
+    """
+    calls = {"n": 0}
+
+    class Row:
+        def __init__(self, address):
+            self.family = em.socket.AF_INET
+            self.address = address
+
+        def __getitem__(self, index):
+            if index == 0:
+                return self.family
+            if index == 4:
+                return (self.address, 443)
+            return None
+
+    def fake_getaddrinfo(*args, **kwargs):  # noqa: ANN002, ANN003
+        calls["n"] += 1
+        # 每轮给一个不同节点，模拟 DNS 轮转
+        return [Row(f"10.0.0.{calls['n']}")]
+
+    monkeypatch.setattr(em.socket, "getaddrinfo", fake_getaddrinfo)
+    addresses = em.ipv4_addresses("push2his.eastmoney.com")
+    assert calls["n"] == em.DNS_RESOLVE_ROUNDS, "必须多轮解析"
+    assert len(addresses) == em.DNS_RESOLVE_ROUNDS, "各轮结果要取并集"
+    assert len(set(addresses)) == len(addresses), "必须去重"
 
 
 def test_only_eastmoney_hosts(monkeypatch) -> None:

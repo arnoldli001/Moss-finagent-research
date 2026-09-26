@@ -92,9 +92,14 @@ def main() -> int:
         print("        kind → label:", pairs)
         bad = [k for k, l in pairs if k == l]
         check(not bad, f"kind_label 无机器名（可疑：{bad}）")
-        check(not feed.get("degraded"),
-              f"数据完整性（degraded={feed.get('degraded')}，"
-              f"gaps={[g.get('message') for g in feed.get('gaps', [])]}）")
+        # `degraded` 是**正常状态**不是故障：它表示"有来源这次没取满"
+        # （实测：知识星球停机后首次回填会命中上限，下次继续追平）。
+        # 所以这里只提示，不算失败 —— 把它当失败会让人去修一个不存在的问题。
+        if feed.get("degraded"):
+            msgs = [g.get("message") for g in feed.get("gaps", [])]
+            print(f"        提示：数据不完整（正常，下次采集补齐）{msgs}")
+        else:
+            print("        数据完整（无缺口）")
         # 来源字段：只应有假名，不应有真名/链接
         blob = body
         for needle in ("source_url", "report_url", "group_id", "zsxq",

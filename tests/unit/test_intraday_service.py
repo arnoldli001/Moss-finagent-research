@@ -317,7 +317,17 @@ def test_should_push_only_solid_by_default() -> None:
     assert ok is True
 
 
-def test_should_push_respects_cooldown() -> None:
+def test_should_push_respects_cooldown(monkeypatch) -> None:
+    """冷却窗口：窗口内不再推，窗口过后可以再推。
+
+    ⚠️ 2026-09-25 改：冷却的记账从**进程内存**（`_last_push` + `now=` 入参）
+    搬到了**落盘**的 `notify_dedup`（因为内存版进程一重启就清空，
+    正是刷屏的成因之一）。所以本用例改为通过落盘记录的时间戳来驱动，
+    被测意图不变：**冷却内拦下、冷却后放行**。
+    """
+    import datetime as _dt
+
+    from src.intraday import notify_dedup
     from src.intraday.models import TradeSignal
     from src.intraday.notifier import SignalNotifier
 
@@ -326,15 +336,43 @@ def test_should_push_respects_cooldown() -> None:
     notifier = SignalNotifier(config)
     notifier._pending_code = "300308"  # noqa: SLF001
     signal = TradeSignal(kind="low_buy", strength="solid", triggered=True,
-                         price=10.0, ts="2026-09-15 10:00", total_score=35.0,
+                         price=10.0, ts="2026-09-24 10:00", total_score=35.0,
                          reason="")
-    assert notifier.should_push(signal, now=1000.0)[0] is True
-    notifier.mark_pushed(signal, now=1000.0)
-    ok, reason = notifier.should_push(signal, now=1100.0)
+
+    # 还没通知过 → 放行
+    assert notifier.should_push(signal, trade_date="2026-09-24")[0] is True
+
+    # ⚠️ 必须同时钉住"写入时间戳的现在"（`_now`）与"判冷却时的现在"
+    # （`notify_dedup.datetime`）—— 只钉一个会让两者相差真实时差
+    # （实测：记录写成 10:00、判冷却时却拿真实 19:45，冷却被算成早已过期）。
+    now = _dt.datetime(2026, 9, 24, 10, 0)
+
+    class _Frozen(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003
+            return cls(2026, 9, 24, 10, 0)
+
+    monkeypatch.setattr(notify_dedup, "datetime", _Frozen)
+    monkeypatch.setattr(notify_dedup, "_now",
+                        lambda: now.isoformat(timespec="seconds"))
+    notify_dedup.mark_notified(trade_date="2026-09-24", code="300308",
+                               kind="low_buy", price=10.0)
+    notify_dedup.reset()
+
+    # 刚通知过 → 冷却中
+    ok, reason = notifier.should_push(signal, trade_date="2026-09-24")
     assert ok is False
     assert "冷却" in reason
-    # 冷却窗口过后可再次推送
-    assert notifier.should_push(signal, now=1000.0 + 30 * 60 + 1)[0] is True
+
+    # 把"现在"推到 31 分钟之后（冷却已过）→ 可以再推
+    class _Later(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ARG003
+            return cls(2026, 9, 24, 10, 31)
+
+    monkeypatch.setattr(notify_dedup, "datetime", _Later)
+    assert notifier.should_push(
+        signal, trade_date="2026-09-24")[0] is True
 
 
 def test_should_push_ignores_untriggered() -> None:
@@ -379,10 +417,10 @@ def test_render_includes_levels_and_disclaimer() -> None:
         disclaimer="仅供技术研究")
     signal = TradeSignal(kind="low_buy", strength="solid", triggered=True,
                          price=9.5, ts="2026-09-15 10:00", total_score=35.0,
-                         reason="价格触及低吸线")
+                         reason="价格触及回踩线")
     title, text = SignalNotifier.render(snapshot, signal)
     assert "中际旭创" in title
-    assert "低吸" in title
+    assert "回踩" in title
     assert "止损 9.40" in text
     assert "仅供技术研究" in text
 

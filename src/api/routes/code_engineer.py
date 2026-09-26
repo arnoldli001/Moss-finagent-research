@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
+from src.api.error_codes import api_error
 from src.infrastructure.connectors.dynamic_loader import get_dynamic_loader
 
 router = APIRouter(prefix="/api/v1/code-engineer", tags=["code-engineer"])
@@ -25,10 +26,10 @@ async def fix_gap(req: FixGapRequest) -> dict[str, Any]:
 
     runtime = getattr(app.state, "runtime", None)
     if runtime is None:
-        raise HTTPException(status_code=500, detail="运行时未初始化")
+        raise api_error("SYS_5100")
     agent = runtime.agents.get("A19_code_engineer")
     if agent is None:
-        raise HTTPException(status_code=503, detail="A19编码实现Agent未注册")
+        raise api_error("ANA_5031", message="编码实现Agent未注册")
 
     from src.core.models import AgentInput
 
@@ -43,7 +44,7 @@ async def fix_gap(req: FixGapRequest) -> dict[str, Any]:
             },
         ))
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise api_error("ANA_5401", cause=exc) from exc
 
     return {
         "status": "ok",

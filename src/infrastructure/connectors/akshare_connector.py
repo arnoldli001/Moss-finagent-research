@@ -31,6 +31,7 @@ from datetime import date as _date
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import requests
 
 from src.core import symbols
@@ -46,6 +47,23 @@ from src.infrastructure.connectors.real_industry_connector import (
     parse_csindex_pe,
 )
 from src.infrastructure.connectors.xtquant_connector import QUOTE_PREFIXES
+
+#: 复权口径标签列/键：行情点统一带 `extra["adjust"]`
+#: （与腾讯 `re"qfq"` / Tushare `extra["adjust"]` / baostock 同一口径命名）。
+#: 它既是"这行是什么价"的溯源，也是链上换源时的对拍依据 ——
+#: 缺了它，一次漏传 `adjust=` 的改动会静默污染整条 K 线却无人察觉。
+ADJUST_COLUMN = "adjust"
+
+
+def _is_missing_adjust_param(exc: BaseException) -> bool:
+    """该 TypeError 是否是"这个版本的 akshare 没有 `adjust` 形参"。
+
+    只在消息里**同时**出现 `unexpected keyword argument` 与 `adjust` 时才认。
+    宽泛地按 `TypeError` 判定会把其它真实缺陷吞掉（实测踩过：调用方签名不匹配
+    也被当成"不支持 adjust"，现场只剩一条误导性告警）。
+    """
+    text = str(exc)
+    return "unexpected keyword argument" in text and "adjust" in text
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +86,39 @@ def _pick_date_column(columns: list[str]) -> str | None:
             if hint in col:
                 return col
     return None
+
+
+#: 股 → 手。新浪各日线接口的成交量单位是**股**，本项目统一口径是**手**
+_SINA_SHARES_PER_LOT = 100.0
+
+
+def _sina_volume_to_lots(df: Any) -> Any:
+    """新浪日线帧的成交量：股 → 手（÷100），**就地统一到项目口径**。
+
+    实测（2026-09-22，三源同日对照）：
+      600036  新浪 stock_zh_a_daily  volume=43,342,069 ↔ 腾讯 433,421 手（**差 100 倍**）
+      510300  新浪 fund_etf_hist_sina volume=644,587,351 ↔ 腾讯 6,445,874 手（差 100 倍）
+      000300  新浪 stock_zh_index_daily volume=17,786,387,600 ↔ Tushare index_daily
+              17,886,387,600 股（同量级，同为股）
+    同日成交额三个源完全一致（新浪 1,770,009,799 元 = Tushare amount 千元×1000），
+    说明**只有成交量**这一个字段的单位与项目约定不同。
+
+    这不是"风格问题"：本项目 `extra["volume"]` 的口径是手（东财/腾讯/Tushare/baostock
+    都按手），新浪路径不换算就是 100 倍级静默误差，且下游 `daily_bars_from_points`
+    只认列名、不做单位校验，量比/量能类因子会整体失真。
+    只对有 `volume` 列的新浪帧生效；东财路径（`stock_zh_a_hist` 等）本身即为手，不经此处。
+
+    顺带把换算后的值再写一份 `成交量` 列：东财路径的 extra 用的是中文列名，
+    下游 `daily_bars_from_points` 的列名别名表里 `成交量` 排在 `volume` 之后 ——
+    两个名字都给出，取数侧就不必关心这一跳走的是哪个子源。
+    """
+    if df is None or len(df) == 0 or "volume" not in df.columns:
+        return df
+    df = df.copy()
+    lots = df["volume"] / _SINA_SHARES_PER_LOT
+    df["volume"] = lots
+    df["成交量"] = lots
+    return df
 
 
 def _pick_value_column(df: Any, columns: list[str], date_col: str | None) -> str | None:
@@ -452,14 +503,24 @@ class AkshareConnector(BaseConnector):
     def _filter_frame_dates(
         df: Any, start_date: str | None, end_date: str | None
     ) -> Any:
-        """对自带全历史的新浪帧按YYYYMMDD字符串过滤。"""
+        """对自带全历史的新浪帧按YYYYMMDD字符串过滤。
+
+        ⚠️ 两个区间条件必须合成**一个不带索引的**掩码（实测踩坑 2026-09-22）：
+        新浪返回的是全历史表（上证指数 8731 行、沪深300 5998 行）。若先
+        `df = df[dates >= 起]` 再 `df = df[dates <= 止]`，第二个掩码仍带着**原表**
+        的 RangeIndex，pandas 会把它 reindex 到已过滤的小表上（UserWarning:
+        "Boolean Series key will be reindexed to match DataFrame index"），
+        未对齐的位置一律按 False 处理 —— 实测把 2020-01-01~2026-09-22 的指数/ETF
+        查询**静默**截断成 2020-01-02~2025-12-31（1631 行，丢掉 2026 全年），
+        面板上少一年数据却没有任何报错。改用 numpy 数组（无索引）即不会 reindex。
+        """
         dates = df["日期"].astype(str).str.replace("-", "")
+        mask = np.ones(len(df), dtype=bool)
         if start_date:
-            df = df[dates >= start_date.replace("-", "")]
+            mask &= (dates >= start_date.replace("-", "")).to_numpy()
         if end_date:
-            df = df[df["日期"].astype(str).str.replace("-", "")
-                    <= end_date.replace("-", "")]
-        return df
+            mask &= (dates <= end_date.replace("-", "")).to_numpy()
+        return _sina_volume_to_lots(df[mask])
 
     def _index_dataframe(
         self, ak: Any, code: str,
@@ -753,30 +814,105 @@ class AkshareConnector(BaseConnector):
     def _stock_dataframe(
         self, ak: Any, code: str, start_date: str | None, end_date: str | None
     ) -> Any:
-        """东财主源失败时回退新浪前复权；返回列名统一为中文（日期/收盘…）。"""
+        """东财主源前复权，失败回退新浪前复权；返回列名统一为中文（日期/收盘…）。
+
+        ## 复权口径（2026-09-22 修复了一处**静默口径错误**）
+
+        原来东财分支调 `ak.stock_zh_a_hist(...)` **不传 `adjust`** ——
+        akshare 的该参数默认 `""`（不复权），于是这条"主源"返回的是**不复权**价，
+        而**只有回退分支**（新浪）传了 `adjust="qfq"`。后果是同一只票的日线
+        会随"走主源还是走回退"而变口径，且完全没有痕迹：
+        分红除权日会凭空多出一个向下跳空缺口，K线形态/缠论笔/回测收益率全被污染。
+        项目其它日线源（腾讯 fqkline / Tushare pro_bar / baostock adjustflag=2）
+        都是前复权，这条链必须对齐。
+
+        现在两个分支都请求 `qfq`；另外把实际生效的复权口径回写到每一行
+        （见 `_fetch_sync` 与 `_annotate_adjust`），让"链上换源"可被事后核对。
+        """
         try:
             return ak.stock_zh_a_hist(
                 symbol=code,
                 period="daily",
                 start_date=start_date or "",
                 end_date=end_date or "",
+                adjust="qfq",
             )
+        except TypeError as exc:
+            # 老版本 akshare 的 `stock_zh_a_hist` 没有 `adjust` 形参。
+            # ⚠️ 这里**必须精确判定**：TypeError 也可能来自帧/参数处理里的别的
+            # 缺陷（实测：测试替身的签名不匹配就会走到这里）。宽泛地吞掉它会让
+            # 真正的异常被改写成"接口不支持 adjust"的告警，然后第二个 try 里
+            # 的同一个异常又冒出来 —— 现场只剩下一条误导性的日志。
+            # 只认"unexpected keyword argument 'adjust'" 这一种。
+            if not _is_missing_adjust_param(exc):
+                raise
+            # 宁可如实标注不复权，也不能静默当成前复权。
+            logger.warning(
+                "东财行情接口不支持 adjust 形参（%s），本次按**不复权**取数并标注: %s",
+                code, brief(exc, BRIEF_TIGHT))
+            try:
+                df = ak.stock_zh_a_hist(
+                    symbol=code,
+                    period="daily",
+                    start_date=start_date or "",
+                    end_date=end_date or "",
+                )
+            except Exception as retry_exc:  # noqa: BLE001 连降级调用也失败 → 走新浪
+                # ⚠️ 这一层**必须**有：只把"不支持 adjust"当成一条可恢复的告警、
+                # 却不兜住降级调用本身的失败，会让异常直接穿出 `_stock_dataframe`——
+                # 于是"东财挂了应该回退新浪"这条容灾路径在最需要它的时候失效。
+                logger.warning("东财行情接口失败（%s），回退新浪源: %s", code, retry_exc)
+                return self._sina_daily_frame(
+                    ak, code, start_date, end_date)
+            df = df.copy()
+            df[ADJUST_COLUMN] = "none"
+            return df
         except Exception as exc:  # noqa: BLE001 源故障回退（实测东财偶发RemoteDisconnected）
             logger.warning("东财行情接口失败（%s），回退新浪源: %s", code, exc)
-            df = ak.stock_zh_a_daily(symbol=self._sina_symbol(code), adjust="qfq")
-            df = df.rename(columns={"date": "日期", "close": "收盘"})
-            if start_date or end_date:
-                dates = df["日期"].astype(str).str.replace("-", "")
-                if start_date:
-                    df = df[dates >= start_date]
-                if end_date:
-                    df = df[df["日期"].astype(str).str.replace("-", "") <= end_date]
-            return df
+            return self._sina_daily_frame(ak, code, start_date, end_date)
+
+    def _sina_daily_frame(
+        self, ak: Any, code: str, start_date: str | None, end_date: str | None
+    ) -> Any:
+        """新浪前复权日线（东财不可用时的回退通道）。
+
+        抽成独立方法是因为它现在有**两个**调用点（首次失败、降级调用再失败），
+        复制两份区间过滤逻辑正是本项目"两处口径漂移"类缺陷的温床 ——
+        下面那段掩码写法踩过坑，见注释。
+        """
+        df = ak.stock_zh_a_daily(symbol=self._sina_symbol(code), adjust="qfq")
+        df = df.rename(columns={"date": "日期", "close": "收盘"})
+        if start_date or end_date:
+            # ⚠️ 两个区间条件必须合成**一个**布尔掩码（实测踩坑 2026-09-22）：
+            # 新浪返回的是全历史表（600036 共 5867 行）。若先 `df = df[dates >= 起]`
+            # 再 `df = df[dates <= 止]`，第二个掩码仍带着**原表**的 RangeIndex，
+            # pandas 会把它 reindex 到已过滤的小表上（UserWarning:
+            # "Boolean Series key will be reindexed to match DataFrame index"），
+            # 未对齐的位置一律按 False 处理 —— 实测把长区间查询截断成
+            # 2020-01-02~2025-12-31（1455 行，且**静默**丢掉 2026 全年），
+            # 结果就是日K面板整整少一年数据却毫无报错。
+            dates = df["日期"].astype(str).str.replace("-", "")
+            # 用 numpy 数组（**不带索引**）做掩码：pandas 不会对 ndarray 触发
+            # reindex，两个条件因此可以安全地逐次相与。
+            mask = np.ones(len(df), dtype=bool)
+            if start_date:
+                mask &= (dates >= start_date.replace("-", "")).to_numpy()
+            if end_date:
+                mask &= (dates <= end_date.replace("-", "")).to_numpy()
+            df = df[mask]
+        # 新浪成交量单位是股 → 统一折成手（与东财/腾讯/Tushare 口径一致）
+        return _sina_volume_to_lots(df)
 
     def _fetch_sync(
         self, indicator: str, start_date: str | None, end_date: str | None
     ) -> list[DataPoint]:
-        """同步取数（线程池执行）：扩展指标直接出点，其余走DataFrame通用转换。"""
+        """同步取数（线程池执行）：扩展指标直接出点，其余走DataFrame通用转换。
+
+        行情三件套（`stock/index/etf_close`）出来后统一补一个 `ADJUST_COLUMN`
+        口径标签（见下）。`adj_factor` 那种按日查表的口径不适合塞进每行的
+        `extra`（会误导下游以为"每行复权系数不同"），所以这里只在**序列型**
+        日线上标注。
+        """
         try:
             import akshare as ak
         except ImportError as exc:
@@ -785,7 +921,34 @@ class AkshareConnector(BaseConnector):
         if extra is not None:
             return extra
         df = self._load_dataframe(indicator, start_date, end_date)
-        return df_to_data_points(df, indicator, self.source_name, self.source_url)
+        points = df_to_data_points(df, indicator, self.source_name, self.source_url)
+        if indicator.startswith(QUOTE_PREFIXES):
+            self._annotate_adjust(points, indicator, df)
+        return points
+
+    @staticmethod
+    def _annotate_adjust(points: list[DataPoint], indicator: str,
+                         df: Any) -> None:
+        """给行情点补 `ADJUST_COLUMN` 复权口径标签（与腾讯/baostock 同口径）。
+
+        口径来源优先级：
+          1. 帧里已经带了 `ADJUST_COLUMN` —— 那是**实际请求**的口径
+             （例如东财分支降级成不复权时写进来的 `none`），**必须采信它**；
+          2. 否则按指标前缀推断：个股/ETF 走 `qfq`，指数不除权走 `none`。
+
+        为什么要标：本项目历史上出过"链上换源导致复权口径悄悄变了"的问题
+        （东财分支漏传 `adjust` 就是其中一例）。标出来才能让"K线上多出的
+        除权跳空"这类现象被定位到具体某一跳，而不是靠猜。
+        """
+        fallback = ("none" if indicator.startswith("index_close:") else "qfq")
+        frame_has = (df is not None and hasattr(df, "columns")
+                     and ADJUST_COLUMN in [str(c) for c in df.columns])
+        values = ([str(v) for v in df[ADJUST_COLUMN].tolist()] if frame_has else [])
+        for index, point in enumerate(points):
+            if not isinstance(point.extra, dict):
+                continue
+            point.extra[ADJUST_COLUMN] = (
+                values[index] if index < len(values) else fallback)
 
     async def fetch(
         self,

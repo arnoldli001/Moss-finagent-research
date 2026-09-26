@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -32,17 +33,28 @@ from src.infrastructure.connectors.a_share_liquidity_connector import (
     AShareLiquidityConnector,
 )
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
+from src.infrastructure.connectors.baostock_connector import BaostockConnector
+from src.infrastructure.connectors.cached_news_fetcher import CachedNewsFetcher
 from src.infrastructure.connectors.dynamic_loader import get_dynamic_loader
 from src.infrastructure.connectors.fedwatch_connector import FedWatchConnector
+from src.infrastructure.connectors.coal_inventory_connector import (
+    CoalInventoryConnector,
+)
 from src.infrastructure.connectors.index_valuation_connector import (
     IndexValuationConnector,
+)
+from src.infrastructure.connectors.industry_valuation_connector import (
+    IndustryValuationConnector,
+)
+from src.infrastructure.connectors.liquor_price_connector import (
+    LiquorPriceConnector,
 )
 from src.infrastructure.connectors.local_csv_connector import LocalCsvConnector
 from src.infrastructure.connectors.margin_trading_connector import (
     MarginTradingConnector,
 )
 from src.infrastructure.connectors.mock_industry_connector import MockIndustryConnector
-from src.infrastructure.connectors.news_fetcher import AkshareNewsFetcher
+from src.infrastructure.connectors.news_fetcher import LocalFallbackNewsFetcher
 from src.infrastructure.connectors.northbound_flow_connector import (
     NorthboundFlowConnector,
 )
@@ -69,6 +81,7 @@ from src.infrastructure.repositories.fund_flow_sqlite_repo import (
 )
 from src.infrastructure.repositories.repository_factory import (
     build_intraday_profile_repository,
+    build_news_cache_repository,
     build_repository,
 )
 from src.intraday.service import IntradayService
@@ -102,35 +115,106 @@ class Runtime:
     quant_select: Any = None
 
 
+def build_daily_connector_chain(
+    *,
+    repo: DataPointRepository | None = None,
+    disable_cache: bool = False,
+    disable_db: bool = False,
+) -> ConnectorRouter:
+    """只含**日线行情**指标的采集链（`stock/index/etf_close:{code}`）。
+
+    ## 为什么单独抽出来
+
+    `build_runtime()` 里那条 15+ 源的链是给 Agent 做**全指标**采集用的；
+    但「价格面板 / 全量下载 / 回测取数」只需要日线三件套，而且**不经过 Agent** ——
+    它们原来是各自 new 一个 `XtQuantConnector` 直连 QMT 的。2026-09 QMT 失去
+    行情权限后，那些直连点全部取不到数，且完全绕过了项目已经配好的容灾链
+    （AkShare → 腾讯 → Tushare → baostock）与失败冷却。
+
+    所以把日线这 6 条路由抽成一个函数，让 runtime 与这些离线调用方**共用同一份
+    顺序与同一套口径** —— 顺序只存在一处，不会再出现"runtime 改了、价格面板没改"
+    这种漂移。顺序与理由见 `build_runtime()` 的注释：
+    在线源 → 停更的本地CSV → [QMT 开关]，**QMT 在最末**（终端短期内无法恢复
+    行情权限，放在任何位置之前都只会贡献一次必然失败的连接等待）。
+
+    `repo` 不传时用**无 DB 短路**的纯网络链：批量下载要的就是"取到最新的"，
+    库里的旧区间会把请求遮掉。
+    """
+    settings = get_settings()
+    routes: list[tuple[Any, Any]] = []
+    routes.append((AkshareConnector(), AkshareConnector.supports))
+    routes.append((TencentDailyConnector(), TencentDailyConnector.supports))
+    routes.append((TushareConnector(), TushareConnector.supports))
+    routes.append((BaostockConnector(), BaostockConnector.supports))
+    if settings.local_quote_dir:
+        routes.append((
+            LocalCsvConnector(settings.local_quote_dir), LocalCsvConnector.supports))
+    if settings.qmt_enabled:
+        routes.append((XtQuantConnector(), XtQuantConnector.supports))
+    return ConnectorRouter(
+        routes, repo=repo, disable_cache=disable_cache,
+        disable_db=disable_db or repo is None)
+
+
 def build_runtime() -> Runtime:
     """按生产默认配置组装全部Agent与StateGraph。"""
     settings = get_settings()
     gateway = LLMGateway(settings=settings)
     repo = build_repository(settings)
-    # 采集后端（有序路由，首个supports命中者处理，失败抛错由上层记录）：
-    # 1) QMT本地终端日线（全历史，XtMiniQmt需运行；未启动自动回退）
-    # 2) 本地QMT导出CSV（LOCAL_QUOTE_DIR配置后启用，QMT服务未开时的本地兜底）
-    # 3) AkShare在线：CPI/PPI/M2/社融/行情兜底/个股PE/PB/财务比率/社零/煤价真实序列
-    # 4) 腾讯财经日K（独立于东财/新浪的通道，前复权）
-    # 5) Tushare Pro个股日线（在线兜底；前4个源都拿不到或都比本地DB旧时才用）
-    # 6) 模拟产业数据(其余ind:前缀，付费产业接口接入前占位，三重模拟标记)
-    qmt = XtQuantConnector()
-    routes: list[tuple[Any, Any]] = [(qmt, XtQuantConnector.supports)]
+    # 采集后端（有序路由，首个supports命中者处理，失败抛错由上层记录）。
+    #
+    # ⚠️ 链序在 2026-09 做过一次**整体重排**，原因是本机 QMT 终端已失去行情权限
+    # 且不在运行（127.0.0.1:58610 不通），连带它导出的本地CSV也停在 2026-08-31：
+    #   旧序 QMT → 本地CSV → AkShare → 腾讯 → Tushare
+    #     ① QMT 在链首时每次取数都要先等一次必然失败的连接；
+    #     ② 本地CSV（已停更）排在**在线源之前**，会把 AkShare/腾讯/Tushare 挡在门外
+    #        —— 实测就出现过"日K面板停在 2026-08-31，而腾讯当天明明有数据"。
+    #   新序 AkShare → 腾讯 → Tushare → baostock → 本地CSV → [QMT 仅在开关打开时]
+    #     ① 先打在线的活源；② 停更的本地CSV退到最后；③ QMT 默认关闭且排**全链最后**
+    #        —— 终端短期内无法恢复行情权限，放在任何位置之前都只会贡献一次
+    #        必然失败的连接等待（实测 4~5s）。将来权限恢复时改一个环境变量即可兜底。
+    routes: list[tuple[Any, Any]] = []
+
+    # 1) AkShare 在线：CPI/PPI/M2/社融/行情/个股PE/PB/财务比率/社零/煤价真实序列。
+    #    放在链首是因为它的覆盖面最广（宏观 + 行情 + 估值一个连接器全包）。
+    akshare = AkshareConnector()
+    routes.append((akshare, AkshareConnector.supports))
+
+    # 2) 腾讯财经日K：**独立于东财/新浪的通道**。实测（2026-09-17）AkShare 的东财主源
+    #    被阻断、新浪回退断连**同时**发生，而腾讯通道正常（做T面板的实时链路一直走它）。
+    #    实测（2026-09-22）腾讯对个股/ETF/指数都可用；一次最多约 641 根，
+    #    长区间由连接器用 end 锚点自动翻页补齐。
+    tencent_daily = TencentDailyConnector()
+    routes.append((tencent_daily, TencentDailyConnector.supports))
+
+    # 3) Tushare Pro：全历史在线源（个股前复权 pro_bar / 指数 index_daily / ETF fund_daily）。
+    #    实测个股 2845 行 0.33s、指数 5998 行、ETF 3483 行，都是一次调用取全量。
+    #    排在腾讯之后：需要 token 与积分，属于"有凭据才可用"的一跳。
+    tushare_connector = TushareConnector()
+    routes.append((tushare_connector, TushareConnector.supports))
+
+    # 4) baostock：**免 token 的第四个独立故障域**，一次调用返回全历史。
+    #    排在这里的唯一原因是它慢（实测约 3.8s/只、指数约 8.2s/只）——
+    #    前面三个源都拿不到时才值得付这个时间。
+    baostock_connector = BaostockConnector()
+    routes.append((baostock_connector, BaostockConnector.supports))
+
+    # 5) 本地QMT导出CSV：**退到最后**。它是 QMT 的导出文件，本机已停在 2026-08-31，
+    #    排在在线源前面会把更新的在线数据挡掉（实测踩过：面板停在两周前）。
+    #    放在在线源之后，它的角色变成"断网时唯一还能给点东西的源"。
     if settings.local_quote_dir:
         csv_connector = LocalCsvConnector(settings.local_quote_dir)
         routes.append((csv_connector, LocalCsvConnector.supports))
-    akshare = AkshareConnector()
-    routes.append((akshare, AkshareConnector.supports))
-    # 腾讯财经日K：**独立于东财/新浪的通道**。实测（2026-09-17）AkShare 的东财主源
-    # 被阻断、新浪回退断连**同时**发生，而腾讯通道正常（做T面板的实时链路一直走它）。
-    tencent_daily = TencentDailyConnector()
-    routes.append((tencent_daily, TencentDailyConnector.supports))
-    # Tushare Pro 个股日线：**日线链的最后一道在线兜底**。
-    # 实测 QMT 一掉线，链上就没有源能给出 300308 的日线（本地CSV没有这只票的文件、
-    # AkShare 两个子源同时失败）；Tushare 0.14 秒返回最新 2026-09-16（前复权，与 QMT 一致）。
-    # 放在最后：前面的源够新就不会打它（不增加常态延迟）。
-    tushare_connector = TushareConnector()
-    routes.append((tushare_connector, TushareConnector.supports))
+
+    # 6) 迅投QMT：**整个日线链的最后一位**，且默认关闭（QMT_ENABLED）。
+    #    终端已无行情权限且不运行，**短期内无法恢复**，所以它既排在在线源之后、
+    #    也排在停更的本地CSV之后 —— 放在 CSV 之前没有意义（CSV 至少是本地文件，
+    #    读它不付网络超时；而 QMT 每次都要先等一次必然失败的 xtquant 连接，
+    #    实测 4~5s）。将来权限恢复时打开开关即可兜底。
+    if settings.qmt_enabled:
+        qmt = XtQuantConnector()
+        routes.append((qmt, XtQuantConnector.supports))
+
     # 申万行业估值（一级/二级/三级PE/PB/股息率截面，AKShare免费接口）
     sw_valuation = SWIndustryValuationConnector()
     routes.append((sw_valuation, SWIndustryValuationConnector.supports))
@@ -158,6 +242,19 @@ def build_runtime() -> Runtime:
     # 科技行业真实产业数据：WSTS半导体销售额同比/统计局集成电路产量同比/中证全指半导体PE-TTM
     real_tech = RealTechIndustryConnector()
     routes.append((real_tech, RealTechIndustryConnector.supports))
+    # 消费/周期/医药行业真实估值：中证指数官网行业指数PE-TTM（主）→申万一级（备）
+    industry_valuation = IndustryValuationConnector()
+    routes.append((industry_valuation, IndustryValuationConnector.supports))
+    # 白酒价格：酒排名「酒价内参」终端零售均价（口径是零售均价、非批价，source_name 已披露）
+    liquor_price = LiquorPriceConnector()
+    routes.append((liquor_price, LiquorPriceConnector.supports))
+    # 电厂煤炭库存：中电联CECI周报「纳入统计的发电企业煤炭库存」（官方JSON接口）
+    coal_inventory = CoalInventoryConnector()
+    routes.append((coal_inventory, CoalInventoryConnector.supports))
+    # ⚠️ 模拟产业连接器：**只作为尚未接入真实源的指标的兜底**，必须排在所有真实源之后。
+    #    已被真实源覆盖的指标（科技三指标、消费/周期/医药行业PE、白酒价格、电厂煤炭库存、
+    #    社零、煤价）永远不该走到这里 —— 排在真实源之前会把真数据挡在门外
+    #    （与 QMT/本地CSV 的链序教训同一条）。
     mock_industry = MockIndustryConnector()
     routes.append((mock_industry, MockIndustryConnector.supports))
     # 动态连接器（自修复生成的，热加载；优先级最低，不覆盖已有静态指标）
@@ -167,9 +264,25 @@ def build_runtime() -> Runtime:
     dynamic_routes = get_dynamic_loader().load_all()
     routes.extend(dynamic_routes)
     backend = ConnectorRouter(routes, repo=repo)
-    # 个股新闻自动抓取（akshare缺失/失败时fetch_news返回空列表，不阻断主链路）
-    news_fetcher = AkshareNewsFetcher()
-    # LLM驱动的Supervisor规划器（动态选择Agent与指标，失败回退规则路由）
+    # 个股新闻自动抓取（akshare缺失/失败时fetch_news返回空列表，不阻断主链路）。
+    # 用组合版：akshare 取不到时退本地私有直连源（公开仓库无该来源 → 行为同原实现），
+    # 否则本机 `ak.stock_news_em()` 恒为空，做T「消息面情绪」整块没数据。
+    news_fetcher = LocalFallbackNewsFetcher()
+    # 新闻缓存：TTL 内重复分析/做T扫描直接读库，避免每次网络取数。
+    # 仓储装配失败降级为纯内存 TTL，再不行退回原 fetcher（增强链路不阻断）。
+    if settings.news_cache_enabled:
+        try:
+            news_cache_repo = build_news_cache_repository(settings)
+            news_fetcher = CachedNewsFetcher(
+                news_fetcher, repo=news_cache_repo,
+                ttl_seconds=settings.news_cache_ttl_seconds)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "新闻缓存仓储装配失败（降级：仅进程内/无缓存）", exc_info=True)
+            news_fetcher = CachedNewsFetcher(
+                LocalFallbackNewsFetcher(),
+                ttl_seconds=settings.news_cache_ttl_seconds)
+    # LLM驱动的Supervisor规划器（动态选择Agent，失败回退规则路由）
     planner = LLMSupervisorPlanner(gateway)
     agents: dict[str, Any] = {
         "A01_data_collector": DataCollectorAgent(backend),

@@ -1,3 +1,4 @@
+import Disclaimer from "./Disclaimer";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api, CharacterProfile, FactorMetaItem, IntradayFactorCatalog, IntradayLevels,
@@ -32,19 +33,19 @@ const LEVEL_FIELDS: {
   min: number; max: number; step: number;
 }[] = [
   { key: "min_band_pct", label: "最小档位差 %", step: 0.1, min: 0, max: 10,
-    hint: "低吸线~高抛线的最小间距。做T一轮双边成本≈0.2%，档位差太小会被摩擦成本吃光" },
+    hint: "回踩线~冲高线的最小间距。做T一轮双边成本≈0.2%，档位差太小会被摩擦成本吃光" },
   { key: "max_band_pct", label: "最大档位差 %", step: 0.5, min: 0.1, max: 40,
-    hint: "档位差上限。箱体过宽（如20日振幅25%）时防止低吸/高抛线离现价太远而永不触发" },
+    hint: "档位差上限。箱体过宽（如20日振幅25%）时防止回踩/冲高线离现价太远而永不触发" },
   { key: "stop_loss_pct", label: "止损下限 %", step: 0.1, min: 0.1, max: 20,
-    hint: "低吸线下方止损距离的百分比口径；与 ATR 口径取更宽的那个" },
+    hint: "回踩线下方止损距离的百分比口径；与 ATR 口径取更宽的那个" },
   { key: "atr_stop_mult", label: "ATR止损倍数", step: 0.1, min: 0, max: 5,
-    hint: "止损距离 = max(低吸线×止损%，该倍数×ATR)。高波动票靠它，固定百分比会被噪声打穿；填 0=只用百分比口径" },
+    hint: "止损距离 = max(回踩线×止损%，该倍数×ATR)。高波动票靠它，固定百分比会被噪声打穿；填 0=只用百分比口径" },
   { key: "touch_band_pct", label: "贴线带宽 %", step: 0.1, min: 0.01, max: 5,
-    hint: "判定「价格触及档位」的容差：price ≤ 低吸线×(1+该值%)。太小则永远等不到，太大则信号失焦" },
-  { key: "dip_fallback_atr", label: "低吸兜底距离（×ATR）", step: 0.1, min: 0, max: 3,
-    hint: "箱体下沿/布林下轨都跑到现价上方时（跳空高开、强势股上冲），低吸线按「现价下方该倍数×ATR」给一个真实可触及的位置" },
-  { key: "take_profit_buffer_pct", label: "高抛缓冲 %", step: 0.1, min: -10, max: 10,
-    hint: "高抛线在此缓冲之上才允许减仓（负值=允许提前一点减）" },
+    hint: "判定「价格触及档位」的容差：price ≤ 回踩线×(1+该值%)。太小则永远等不到，太大则信号失焦" },
+  { key: "dip_fallback_atr", label: "回踩兜底距离（×ATR）", step: 0.1, min: 0, max: 3,
+    hint: "箱体下沿/布林下轨都跑到现价上方时（跳空高开、强势股上冲），回踩线按「现价下方该倍数×ATR」给一个真实可触及的位置" },
+  { key: "take_profit_buffer_pct", label: "冲高缓冲 %", step: 0.1, min: -10, max: 10,
+    hint: "冲高线在此缓冲之上才允许减仓（负值=允许提前一点减）" },
   { key: "vwap_extreme_z", label: "VWAP偏离极值 z", step: 0.1, min: 0.1, max: 6,
     hint: "|z|≥该值时视为「价格触及关键档位」的等效条件（对应需求里的 VWAP 极值）" },
 ];
@@ -176,17 +177,17 @@ const REGIME_TEXT: Record<string, string> = {
 
 /** 分区中文名（与打分面板 `IntradayScore.ZONE_TEXT` 同一套口径）。 */
 const ZONE_TEXT: Record<string, string> = {
-  strong_buy_zone: "偏多低吸区",
+  strong_buy_zone: "偏多回踩区",
   buy_zone: "偏多试仓区",
   neutral: "震荡区间",
   sell_zone: "偏空试减区",
-  strong_sell_zone: "偏空高抛区",
+  strong_sell_zone: "偏空冲高区",
 };
 
 /** 档位刻度上的短标签。 */
 const LEVEL_TEXT: Record<string, string> = {
-  low_buy: "低吸线",
-  high_sell: "高抛线",
+  low_buy: "回踩线",
+  high_sell: "冲高线",
   stop_loss: "止损位",
   vwap: "当日均价VWAP",
   boll: "布林轨",
@@ -199,7 +200,7 @@ export default function WeightProfileEditor({
   name?: string;
   mode: IntradayMode;
   /**
-   * 面板上**此刻**显示的关键价位（低吸/高抛/止损/VWAP）。
+   * 面板上**此刻**显示的关键价位（回踩/冲高/止损/VWAP）。
    *
    * 传进来的唯一用途是当「改动前」那一列：档位是时刻量（每分钟随 VWAP/布林重算），
    * 预览又要 1~3 秒，若让服务端自己再取一次基准，前后两次的 VWAP 会差 0.1% 量级，
@@ -337,7 +338,7 @@ export default function WeightProfileEditor({
    * 这三项是**实时**从东财涨停池/炸板池取的（服务端 60 秒 TTL 缓存），不是写死的
    * 常量。把它摆在权重表旁边是有必要的：「市场情绪周期」这个因子的得分完全由
    * 温度映射而来（温度 100→+1、50→0、0→−1），不看到原始计数就无法判断这个分数
-   * 是否合理；退潮/冰点期还会一票否决低吸。
+   * 是否合理；退潮/冰点期还会一票否决回踩。
    */
   const loadCycle = useCallback(async (force = false) => {
     try {
@@ -533,7 +534,7 @@ export default function WeightProfileEditor({
       setCharacter(data);
       if (!data.available) {
         setCharacterError(data.gap
-          ?? "该票日线样本不足，无法按股性推荐（不做任何猜测性填充）");
+          ?? "该票日线样本不足，无法按股性预填（不做任何猜测性填充）");
         return;
       }
       setWeights((prev) => {
@@ -556,7 +557,7 @@ export default function WeightProfileEditor({
       setSourceTag("auto_character");
       setSaveError(null);
     } catch (exc) {
-      setCharacterError(`按股性推荐失败：${humanizeError(exc)}`);
+      setCharacterError(`按股性预填失败：${humanizeError(exc)}`);
     } finally {
       setCharacterLoading(false);
     }
@@ -622,7 +623,7 @@ export default function WeightProfileEditor({
   /**
    * 表单一变就自动重算（防抖 800ms）。
    *
-   * 为什么不像原来那样只留手动按钮：用户拖滑杆问的是「**现在**低吸线是多少、
+   * 为什么不像原来那样只留手动按钮：用户拖滑杆问的是「**现在**回踩线是多少、
    * 还差多少分」，手动预览永远慢一拍 —— 拖完看到的是上一版数字，很容易据此
    * 得出反向结论。代价是每次预览走一遍服务端完整快照（1~3 秒），因此：
    *   - 权重合计不等于 100 时**不自动预览**（那种口径本来就不合法）；
@@ -792,16 +793,17 @@ export default function WeightProfileEditor({
           <h2>
             权重编辑 · {name ? `${name} ` : ""}
             <span className="mono">{code}</span>
-            <span className="muted-text">（{tab === "intraday" ? "日内分时" : "日K"}口径）</span>
+            <span className="muted-text">（{tab === "intraday" ? "分时" : "日K"}口径）</span>
           </h2>
           <button className="btn-ghost tiny" onClick={onClose}>关闭 (Esc)</button>
         </div>
 
         <div className="weight-editor-bar">
+      <Disclaimer compact />
           <nav className="help-tabs">
             <button className={tab === "intraday" ? "mode-btn active" : "mode-btn"}
                     onClick={() => setTab("intraday")}
-                    title="日内分时做T的14因子混合权重 + ±动手线/提示线 + 低吸高抛档位">
+                    title="分时做T的14因子混合权重 + ±动手线/提示线 + 回踩冲高档位">
               分时做T（14因子）
             </button>
             <button className={tab === "daily" ? "mode-btn active" : "mode-btn"}
@@ -890,7 +892,7 @@ export default function WeightProfileEditor({
                       实时取自涨停池/炸板池（{cycle.fetched_at.slice(11, 19)} 取数，
                       60 秒缓存）——「市场情绪周期」因子的得分就是由温度映射而来
                       （100→+1 / 50→0 / 0→−1），不是写死的常量。
-                      {cycle.t_allowed ? "" : "⛔ 当前阶段禁止正式低吸做T。"}
+                      {cycle.t_allowed ? "" : "⛔ 当前阶段禁止正式回踩区间提示。"}
                     </span>
                     <button className="btn-ghost tiny" onClick={() => void loadCycle(true)}>
                       刷新
@@ -1000,12 +1002,12 @@ export default function WeightProfileEditor({
                      onToggle={(e) => setLevelOpen(e.currentTarget.open)}>
               <summary>
                 阈值与档位（{tab === "intraday"
-                  ? "动手线 / 提示线 / 低吸高抛档位"
+                  ? "动手线 / 提示线 / 回踩冲高档位"
                   : "动手线 / 提示线"}）
               </summary>
               <p className="muted-text">
                 动手线=正式信号门槛（实心三角），提示线=软提示门槛（空心三角）。
-                档位决定「低吸线/高抛线离现价多远」，与权重无关，但同样按票而异。
+                档位决定「回踩线/冲高线离现价多远」，与权重无关，但同样按票而异。
               </p>
               <div className="weight-editor-levels-grid">
                 <label>
@@ -1079,13 +1081,13 @@ export default function WeightProfileEditor({
             </div>
 
             <div className="weight-editor-block">
-              <h3>按股性推荐（用这只票自己的历史定权重）</h3>
+              <h3>按股性预填（用这只票自己的历史定权重）</h3>
               <div className="weight-editor-inline">
                 <button className="btn-ghost"
                         disabled={characterLoading || (character !== null && !character.available)}
                         onClick={() => void recommend()}
                         title="按该股近120~250日的振幅/ATR/涨停基因/趋势效率，推荐一套权重与档位">
-                  {characterLoading ? "分析中…" : "按股性推荐"}
+                  {characterLoading ? "分析中…" : "按股性预填"}
                 </button>
                 {character && (
                   <button className="btn-ghost tiny"
@@ -1098,7 +1100,7 @@ export default function WeightProfileEditor({
               </div>
               {character && !character.available && (
                 <div className="warn-box">
-                  该票日线样本不足，无法按股性推荐：
+                  该票日线样本不足，无法按股性预填：
                   {character.gap ?? "数据缺口"}（已禁用该按钮的效果，
                   表单未被改动 —— 不做任何猜测性填充）
                 </div>
@@ -1129,7 +1131,7 @@ export default function WeightProfileEditor({
                   </div>
                   {character.template_label && (
                     <p className="muted-text">
-                      推荐模板「{character.template_label}」：
+                      预填模板「{character.template_label}」：
                       {character.template_description}
                     </p>
                   )}
@@ -1157,7 +1159,7 @@ export default function WeightProfileEditor({
               <h3>
                 实时价格线影响
                 <span className="muted-text">
-                  （改动会怎么影响低吸/高抛/止损与触发门槛）
+                  （改动会怎么影响回踩/冲高/止损与触发门槛）
                 </span>
               </h3>
               <div className="weight-editor-inline">
@@ -1366,7 +1368,7 @@ export default function WeightProfileEditor({
                 <p className="muted-text">
                   {impact && !impact.available
                     ? `暂不可用：${impact.reason}`
-                    : "改动后低吸/高抛/止损会落在哪个价位、还差多少分多少价才出信号 —— "
+                    : "改动后回踩/冲高/止损会落在哪个价位、还差多少分多少价才出信号 —— "
                       + "这里会直接算给你看（改完自动重算，也可点「立即重算」）。"}
                 </p>
               )}
@@ -1404,8 +1406,8 @@ export default function WeightProfileEditor({
                   <p className="muted-text">{preview.notice}</p>
                   {levelSet && (
                     <p className="mono muted-text">
-                      本次口径的档位：低吸 {num(levelSet.low_buy, 2)}
-                      （触发 {num(levelSet.low_trigger_price, 2)}）· 高抛 {num(levelSet.high_sell, 2)}
+                      本次口径的档位：回踩 {num(levelSet.low_buy, 2)}
+                      （触发 {num(levelSet.low_trigger_price, 2)}）· 冲高 {num(levelSet.high_sell, 2)}
                       （触发 {num(levelSet.high_trigger_price, 2)}）· 止损 {num(levelSet.stop_loss, 2)}
                       {levelSet.band_width_pct !== null && levelSet.band_width_pct !== undefined
                         && ` · 档位差 ${num(levelSet.band_width_pct, 2)}%`}
@@ -1498,7 +1500,7 @@ export default function WeightProfileEditor({
               {live && (
                 <p className="muted-text">
                   该票已有档案：{live.describe}
-                  （{live.source === "auto_character" ? "股性自动推荐" : "手工调整"}，
+                  （{live.source === "auto_character" ? "股性自动预填" : "手工调整"}，
                   更新于 {live.updated_at || "—"}）
                 </p>
               )}
@@ -1528,7 +1530,7 @@ export default function WeightProfileEditor({
           前端不写死任何一项。
           <br />
           ⚠️ 两条链路要分开读：**因子权重只影响总分**（够不够格动手），
-          **档位参数只影响低吸/高抛/止损三条线**（在哪个价位动手）——
+          **档位参数只影响回踩/冲高/止损三条线**（在哪个价位动手）——
           调权重不会让价格线移动一分钱。操作细节见
           <span className="mono"> docs/INTRADAY_T_OPERATION_GUIDE.md</span>。
         </div>

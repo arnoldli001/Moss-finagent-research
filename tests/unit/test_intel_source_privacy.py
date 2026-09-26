@@ -40,6 +40,42 @@ ALLOWED_PUBLIC_KEYS: frozenset[str] = frozenset({
     "kind", "kind_label", "title", "summary", "published_at",
     "source_alias", "codes", "industry", "rating_origin", "agency",
     "content_hash", "extra",
+    # 可信度（规则层打分）。**它本身不含来源标识** ——
+    # 出口只有分数与中文理由（"财经自媒体"这类档位名），
+    # 真实来源名只在打分内部用。另有专门用例断言这一点。
+    "credibility",
+    # 公开平台名（东方财富/同花顺/财联社/…）。
+    #
+    # ⚠️ 加这个字段前确认过用户口径：**公开数据平台可以暴露**
+    # （"公开数据的地方（AkShare/腾讯/新浪/东财/QMT）可以暴露"），
+    # 只有平台/群身份（知识星球调研、群 id）要藏。
+    # 实现是**白名单映射**（`intel_sources.PUBLIC_PLATFORMS`）：
+    # 表外的来源（`broker-*` / `research-note-zsxq`）一律给空串。
+    # 下面的用例逐条断言了"表外来源拿不到平台名"。
+    "platform",
+    # 内容里出现的**机构名**（"中泰证券"/"天风证券"…）。
+    #
+    # ⚠️ 加这个字段前确认过用户口径（2026-10-01）：
+    # "券商名不一定要告警，但是**一定要前端输出信息**。"
+    #
+    # 它与 `source_alias` / `platform` 是**两类东西**，别混：
+    #   · 本字段     **内容里写的机构** —— 研报本来就公开署名，不是机密
+    #   · 后两者     "这条**来自哪个渠道**" —— 平台/群身份，一律藏
+    # 所以加它**不削弱**本文件守的那条纪律：它一个字都不透露渠道身份。
+    # 下面的用例（`test_institutions_...`）逐条断言了这两者的边界。
+    "institutions",
+    # 内容里出现的**分析师名**（用户点名的六人名单：孙潇雅、赵宇阳、武超则、
+    # 陈果、刘晨明、洪灏）。
+    #
+    # ⚠️ 加这个字段前确认过用户口径（2026-10-01）：
+    # "如果有以下内容必须要输出：股票名 板块名 券商 孙潇雅、赵宇阳、武超则、
+    #  陈果、刘晨明、洪灏 …… 推送到前端展示。"
+    # 这六个人原先**只用于告警触发**、界面上一个字都没有 —— 现在要上屏。
+    #
+    # 与 `institutions` 完全同类：**原文里写的名字**（公开署名），
+    # 不是"这条来自哪个渠道"。渠道身份照旧走 `source_pseudonym()`。
+    # 专门的用例在 `tests/unit/test_intel_analyst_export.py`。
+    "analysts",
 })
 
 #: 值层面的泄漏形态
@@ -197,7 +233,9 @@ def test_source_alias_pseudonym_is_stable() -> None:
 def test_summary_is_clipped_per_kind() -> None:
     """摘要必须截断 —— 源文本最长 800+ 字，直接下发会把移动端撑爆。"""
     from src.infrastructure.connectors.intel_sources import (
-        SUMMARY_MAX_BY_KIND, SUMMARY_MAX_CHARS, IntelItem,
+        SUMMARY_MAX_BY_KIND,
+        SUMMARY_MAX_CHARS,
+        IntelItem,
     )
 
     long_text = "测" * 2000
@@ -250,7 +288,8 @@ def test_rich_tags_hiding_platform_domain_are_stripped() -> None:
     `summary` 上了公网接口 —— 用户按 F12 一眼看到数据源平台名。
     """
     from src.infrastructure.connectors.intel_sources import (
-        IntelItem, _strip_rich_tags,
+        IntelItem,
+        _strip_rich_tags,
     )
 
     cases = [
@@ -406,8 +445,46 @@ def test_sort_key_normalises_all_three_timestamp_formats() -> None:
     assert sort_key("不是时间") == "不是时间"
 
 
+def test_platform_only_discloses_public_venues() -> None:
+    """`platform` 字段**只**能暴露公开财经平台，私域与研报署名一律空串。
+
+    用户口径：公开数据平台可以暴露（东财/同花顺/财联社…），
+    平台与群身份（知识星球调研）要藏。这条用例是那个口径的**执行者** ——
+    没有它，将来给 `IntelItem` 加一个私域源时，只要有人顺手往
+    `PUBLIC_PLATFORMS` 里补一行，泄漏就静默发生了。
+    """
+    from src.infrastructure.connectors.intel_sources import (
+        PUBLIC_PLATFORM_FALLBACK,
+        PUBLIC_PLATFORMS,
+    )
+
+    def _pub(alias: str, kind: str, agency: str = "") -> dict:
+        return IntelItem(
+            kind=kind, title="标题", summary="正文" * 30,
+            published_at="2026-09-25 10:00:00",
+            source_alias=alias, source_name=alias,
+            agency=agency, content_hash="h",
+        ).to_public()
+
+    # 公开平台：必须给出**可读平台名**（不是假名，也不是空串）
+    for alias, label in PUBLIC_PLATFORMS.items():
+        got = _pub(alias, "newswire")["platform"]
+        assert got == label, (alias, got, label)
+        assert got != PUBLIC_PLATFORM_FALLBACK
+
+    # 私域 / 研报署名：**必须空串**，且不能把机构名漏出去
+    for alias, kind, agency in (
+        ("research-note-zsxq", "research_note", ""),
+        ("broker-太平洋", "broker_report", "太平洋"),
+        ("broker-中信证券", "broker_report", "中信证券"),
+    ):
+        got = _pub(alias, kind, agency)["platform"]
+        assert got == "", f"{alias} 泄漏了平台身份：{got!r}"
+        assert "太平洋" not in got and "中信" not in got
+        assert "zsxq" not in got.lower()
+
+
 def test_group_id_redacted_in_text() -> None:
-    """日志/异常侧：group_id 与接口 URL 都要脱敏。"""
     from src.core.redaction import redact
 
     gid = "48848484411448"

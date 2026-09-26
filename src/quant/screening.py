@@ -51,6 +51,10 @@ class ScreenConfig:
     winsorize: bool = True
     n_groups: int = 5
     target_count: int = 20          # 去重后期望因子数上限
+    #: 剔除 ST（历史名称口径，见 `st_status.StStatus`）。
+    #: 默认 False：**它会改变截面构成**，按项目一贯原则"会改变结果的过滤
+    #: 必须是显式选项"，不开就明确标注"未剔除"。
+    exclude_st: bool = False
 
 
 @dataclass
@@ -164,6 +168,18 @@ def ic_table(factors: dict[str, pd.DataFrame],
                      "periods": metrics.n_periods})
     table = pd.DataFrame(rows)
     if not table.empty:
+        # **数值列必须是 float（而不是 None/object）**：期数不足 5 的因子
+        # ICIR 是 `None`，整列会退化成 object dtype，之后任何 `.abs()` 都会抛
+        # `TypeError: bad operand type for abs(): 'NoneType'` ——
+        # 触发条件是"区间短到某些因子凑不满 5 期 IC"（例如 39 个交易日 ×
+        # 20 日前瞻），用户随手填个近一个月就会撞上，而报错信息完全看不出
+        # "样本太少"这层意思。统一转成 NaN 后：
+        #   · `.abs()` / `.mean()` 正常；
+        #   · 门槛比较 `>= x` 对 NaN 自然为 False（= 不合格，语义正确）；
+        #   · 序列化给前端时 `_records()` 再把 NaN 还原成 null。
+        for column in ("IC", "ICIR", "t", "IC>0", "periods"):
+            if column in table.columns:
+                table[column] = pd.to_numeric(table[column], errors="coerce")
         table["abs_icir"] = table["ICIR"].abs()
         table = table.sort_values("abs_icir", ascending=False).drop(columns="abs_icir")
     return table.reset_index(drop=True)
@@ -266,7 +282,8 @@ def select_representatives(corr: pd.DataFrame, table: pd.DataFrame,
                            threshold: float) -> tuple[list[str], list[dict[str, str]],
                                                      list[dict[str, Any]]]:
     """每簇保留 |ICIR| 最高者；其余记入 dropped 并注明"与谁高相关"。"""
-    icir = {row["factor"]: (row["ICIR"] if row["ICIR"] is not None else 0.0)
+    icir = {row["factor"]: (float(row["ICIR"]) if row["ICIR"] == row["ICIR"]
+                            else 0.0)
             for _, row in table.iterrows()}
     clusters = cluster_by_correlation(corr, threshold)
     selected: list[str] = []
@@ -332,10 +349,47 @@ def walk_forward(
 # ==================================================================
 
 
+def apply_exclusion_mask(factors: dict[str, pd.DataFrame], mask: pd.DataFrame,
+                         label: str) -> tuple[dict[str, pd.DataFrame], str]:
+    """把掩码为 True 的格子置为 NaN，并返回一句可读的说明。
+
+    为什么是"置 NaN"而不是"删掉这些票"：同一天其它票仍要参与截面排序，
+    而 NaN 会被 `compute_ic_series` 的成对剔除与 `qcut` 自动排除 ——
+    这是最小侵入的做法，且不改变日期/代码轴的形状。
+
+    `label` 是说明的**整句前缀**（"已剔除 ST（历史名称口径）"），
+    **必须分开调用**：实测踩过 —— 把两个掩码先并起来再传进来，结果说明写成
+    "已剔除 ST：13.46%"，而其中绝大部分其实是流动性过滤干的，
+    这种错误说明比没有说明更有害。
+    """
+    masked: dict[str, pd.DataFrame] = {}
+    valid_total = 0
+    removed_total = 0
+    for key, panel in factors.items():
+        grid = mask.reindex(index=panel.index, columns=panel.columns)
+        grid = grid.fillna(False).to_numpy(dtype=bool)
+        valid = panel.notna().to_numpy()
+        valid_total += int(valid.sum())
+        removed_total += int((valid & grid).sum())
+        masked[key] = panel.mask(grid)
+    share = (removed_total / valid_total * 100) if valid_total else 0.0
+    note = (f"{label}：{removed_total:,} 个「股票日」被排除出截面，"
+            f"占有效值 {share:.2f}%")
+    return masked, note
+
+
+def apply_st_mask(factors: dict[str, pd.DataFrame],
+                  st_mask: pd.DataFrame) -> tuple[dict[str, pd.DataFrame], str]:
+    """剔除 ST（`apply_exclusion_mask` 的 ST 专用入口，保留旧签名给单测用）。"""
+    return apply_exclusion_mask(factors, st_mask, "已剔除 ST（历史名称口径）")
+
+
 def screen(
     panels: FactorPanels, factors: dict[str, pd.DataFrame], *,
     config: ScreenConfig | None = None,
     industry_map: dict[str, str] | None = None,
+    st_mask: pd.DataFrame | None = None,
+    pool_mask: pd.DataFrame | None = None,
     progress: Any = None,
 ) -> ScreenResult:
     """完整筛选：中性化 → 训练集 IC → 相关性去重 → **样本外复核** → 分层回测。
@@ -344,6 +398,13 @@ def screen(
     门槛过滤、聚类代表选择、合成权重全部来自前 `train_ratio` 的交易日；
     后 30% 只用来评估，不参与任何选择。若用全样本 IC 挑因子，样本外指标会虚高，
     这正是设计文档没做、而我在第一版里也写错的地方（实测暴露："样本外 ICIR 反而更高"）。
+
+    `st_mask`：`(日期 × 代码)` 布尔表（True = ST），由 `st_status.StStatus.mask`
+    生成。给了它就在中性化之后、算 IC 之前把 ST 格子置 NaN。
+
+    `pool_mask`：股票池过滤的逐日剔除掩码（`liquidity.liquidity_exclusion`）。
+    **必须与 `st_mask` 分开传**：两个来源要各自出现在结果说明里，
+    合并之后说明会指鹿为马（实测：把并集说成"已剔除 ST"）。
     """
     cfg = config or ScreenConfig()
     notes: list[str] = []
@@ -356,6 +417,18 @@ def screen(
     neutral, neutralize_notes = neutralize_factors(
         factors, panels, config=cfg, industry_map=industry_map)
     notes.extend(neutralize_notes)
+    for mask, label in ((st_mask, "已剔除 ST（历史名称口径）"),
+                        (pool_mask, "已剔除股票池过滤（按 20 日均成交额"
+                                    "每日剔除最差部分）")):
+        if mask is not None:
+            neutral, excluded_note = apply_exclusion_mask(neutral, mask, label)
+            notes.append(excluded_note)
+    if st_mask is None and cfg.exclude_st:
+        # 开关打开了却没有数据：降级为不剔除，但**必须说出来**，
+        # 否则用户会以为结果已经剔除了 ST。
+        notes.append("要求剔除 ST，但 namechange 数据缺失 → **本次未剔除**；"
+                     "补数据：python scripts/quant_sync.py download "
+                     "--namechange-only --start 2006-01-01 --end <今天>")
     if cfg.neutralize_mv:
         notes.append("已做市值中性化：规模类因子（total_mv/circ_mv/log_mv/"
                      "free_float_mv）与中性化变量共线，其 IC 仅供参考，"

@@ -34,9 +34,9 @@ node_modules/
 # TS构建缓存
 *.tsbuildinfo
 
-# 本地临时探针脚本与下载日志（根目录，勿提交）
-/_tmp_*.py
-/_*.log
+# 本地临时探针脚本与数据源勘察产物（根目录下划线开头的全部是临时物，勿提交：
+# _coal_*.py/txt/json、_ak_*.txt 等连接器调研现场，可随时重跑再生）
+/_*
 # 本地跑测试留下的日志（`pytest ... *> tests_full.log`），不是产物
 /*.log
 
@@ -75,6 +75,7 @@ node_modules/
 # QMT侧竞价策略/信号服务器/模拟盘实现（79KB策略核心）
 /qmt/
 /scripts/auction_replay.py
+/scripts/auction_data_audit.py
 /scripts/shortterm_backtest.py
 /scripts/model_backtest_variants.py
 /scripts/run_model_backtest.py
@@ -87,6 +88,7 @@ node_modules/
 /web/src/auctionApi.ts
 # 暴露私有逻辑/公式的文档与决策明细
 /docs/AUCTION_SELECT.md
+/docs/AUCTION_DATA_REDUNDANCY.md
 /docs/MODEL_BACKTEST.md
 /docs/QUANT_SELECT.md
 /docs/SHORTTERM_BACKTEST.md
@@ -106,6 +108,10 @@ node_modules/
 /tests/unit/test_auction_select.py
 /tests/unit/test_auction_sentiment.py
 /tests/unit/test_auction_universe_pinning.py
+/tests/unit/test_auction_source_chain.py
+/tests/unit/test_auction_local_source.py
+# 情绪周期五线的口径与公式（出自《情绪周期表的用法》，与选股公式同属私有资产）
+/tests/unit/test_sentiment_cycle.py
 /tests/unit/test_moss_selector.py
 /tests/unit/test_selector_labels_and_buckets.py
 /tests/unit/test_preheat_cache.py

@@ -12,8 +12,14 @@ routing:
     primary: deepseek-flash
     fallback: local_medium
   decision:           # 投研建议综合（A17）
+    # fallback 必须是**另一个 provider**：原来写的是 deepseek-flash，而
+    # deepseek-v4-pro 与 deepseek-flash 同属 provider=deepseek（同一端点、
+    # 同一份 key、同一个熔断器），于是 DeepSeek 一熔断主备一起被拒、
+    # 整条链必然失败 —— 等于没兜底，而本机 Ollama 明明是好的却没人用。
+    # 实测踩过：deepseek 熔断后投研分析直接报
+    # 「全部模型调用失败（链: deepseek-v4-pro→deepseek-flash）」。见 docs/LLM_ROUTING.md
     primary: deepseek-v4-pro
-    fallback: deepseek-flash
+    fallback: local_medium
 
 models:
   local_light:

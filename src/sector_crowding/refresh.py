@@ -489,13 +489,69 @@ def refresh_single_sector(sector_code: str, *, conn: Any = None,
 # 全量/增量刷新（一键刷新入口）
 # ======================================================================
 
+def _drop_blacklisted(boards: list[dict[str, Any]]
+                      ) -> tuple[list[dict[str, Any]], int]:
+    """剔除板块黑名单里的板块，返回 `(保留的板块, 剔除数量)`。
+
+    ## 为什么拥挤度侧也要挡一次
+
+    主线挖掘侧的黑名单只在 `import_crowding_pool` 生效（决定谁入 `ml_board`），
+    但**拥挤度的日更并不经过那条路径** —— 不在这里再挡一次，
+    那 488 个板块的日线仍会被持续拉取和写入，只是没有任何人读。
+    用户口径是"黑名单板块**不再更新数据**"，所以必须挡在刷新入口。
+
+    ## 两个刻意的边界
+
+    1. **只挡更新，不删历史。** 已写入的 `sector_crowding_daily` 行保持原样：
+       删历史是不可逆的，而"停止更新"是可逆的。代价是恢复跟踪某个板块时，
+       它的日线会有一段缺口，需要单独回补（`refresh_all_incremental`
+       按 `latest_trade_date` 增量，不会自动补这段）。
+    2. **清单读不到时不挡**（`None` 而非空集合）。与主线侧同一口径：
+       把"读不到清单"当成"不排除任何板块"会让刷新量无声翻倍，
+       而把"读不到"当成"排除全部"更糟 —— 会一个板块都不刷。
+       `load_sector_blacklist` 用 `None` 表达不可用，这里原样传递。
+    """
+    from src.mainline.config import load_sector_blacklist
+    from src.sector_crowding.config import load_crowding_exclusions
+
+    blacklist = load_sector_blacklist()
+    if not blacklist:
+        return boards, 0
+    # ⚠️ 停日更用**整份**主黑名单 ∪ **拥挤度剔除清单**（2026-09-22 补）。
+    #
+    # 为什么这里可以用整份、而 `metrics` / `db` 不行：停日更**不删数据、
+    # 不影响任何人看历史**，代价只是"以后不刷了"；而"算不算指标/显不显示"
+    # 直接决定看板上有没有它。用户明确说的是「不再**下载数据**关注其拥挤度
+    # 相关的信息」—— 下载这一侧他要求的就是"别刷了"，所以整份黑名单
+    # （含历史遗留的 865xxx / GICS 行业）在这里一并停掉是符合口径的。
+    #
+    # 新增的 `crowding_exclusions.yaml` 是用户在**拥挤度功能**里点名剔除的
+    # 那 82 个（含 GICS 式行业名与同花顺指数），它们不在主黑名单里，
+    # 所以必须单独并进来，否则"不再下载"这一半要求会落空。
+    extra = load_crowding_exclusions()
+    if extra:
+        blacklist = frozenset(blacklist) | frozenset(extra)
+    kept = [item for item in boards
+            if str(item.get("sector_code") or "") not in blacklist]
+    return kept, len(boards) - len(kept)
+
+
 def refresh_all_incremental(*, task_id: str = "", config: SectorCrowdingConfig | None = None,
                             concepts_only: bool = False,
-                            max_sectors: int = 0) -> RefreshTask:
-    """后台执行：全部板块增量刷新。**同步函数**，由线程调用。
+                            max_sectors: int = 0,
+                            pool_only: bool = True) -> RefreshTask:
+    """后台执行：板块增量刷新。**同步函数**，由线程调用。
 
-    `concepts_only=False` 默认刷**全部**板块（含行业/地区）：数据先全量落库，
-    告警再按"仅概念"过滤 —— 这样以后想看行业拥挤度不用重跑 6 年。
+    `pool_only=True`（默认）只刷**关注板块池** —— 也就是
+    `sector_crowding_list` 里**可见**的那些板块（用户在清单里增删/置顶的那份，
+    主线挖掘的板块池正是从这里导入的，见 `mainline/datastore.py`）。
+    2026-09-24 用户报障："一键刷新显示 1850 个板块，可我关注的池子只有几百个" ——
+    原来按钮默认全量扫（2517 个板块减去黑名单 ≈ 1850），既慢又与"关注"这个词不符。
+
+    `pool_only=False` 才是全量（含行业/地区）：数据先全量落库，告警再按概念过滤 ——
+    想看行业拥挤度时用它，日常增量不必。
+
+    `concepts_only=True` 是在此之上的**再**一层过滤（只保留概念板块），保留原语义。
     """
     config = config or load_config()
     task_id = task_id or uuid.uuid4().hex[:12]
@@ -520,6 +576,24 @@ def refresh_all_incremental(*, task_id: str = "", config: SectorCrowdingConfig |
         boards = sources.list_boards(config)
         if concepts_only:
             boards = [item for item in boards if item["is_concept"]]
+        boards, blocked = _drop_blacklisted(boards)
+        if blocked:
+            logger.info("板块黑名单：跳过 %d 个板块的日更（清单 "
+                        "configs/sector_blacklist.yaml）", blocked)
+        if pool_only:
+            # 关注板块池 = 清单里**可见**的板块（用户增删过的那份）。
+            # 池子为空时**退回全量**而不是刷 0 个：按钮点了什么都不发生，
+            # 用户只会以为"刷新坏了"。
+            pool = set(db.list_visible_codes(conn, concepts_only=False))
+            if pool:
+                before = len(boards)
+                boards = [item for item in boards
+                          if str(item.get("sector_code") or "") in pool]
+                logger.info("按关注板块池过滤：%d → %d 个板块（池内可见 %d 个）",
+                            before, len(boards), len(pool))
+            else:
+                logger.warning("关注板块池为空（sector_crowding_list 无可见板块），"
+                               "本次退回全量刷新")
         if max_sectors > 0:
             boards = boards[:max_sectors]
         task.total = len(boards)
@@ -608,10 +682,13 @@ def _refresh_one_isolated(board: dict[str, Any], config: SectorCrowdingConfig,
 
 
 def start_refresh_all(*, concepts_only: bool = False,
-                      max_sectors: int = 0) -> dict[str, Any]:
+                      max_sectors: int = 0,
+                      pool_only: bool = True) -> dict[str, Any]:
     """一键刷新入口：注册任务 + 起后台线程，**立即返回** task_id。
 
     返回体与 `get_refresh_progress` 同构，前端一次就能拿到首帧进度。
+    `pool_only=True` 只刷关注板块池（默认），`False` 才是全量 —— 见
+    `refresh_all_incremental` 的说明。
     """
     with _TASKS_LOCK:
         running = [item for item in _TASKS.values() if item.status == "running"]
@@ -627,7 +704,7 @@ def start_refresh_all(*, concepts_only: bool = False,
     thread = threading.Thread(
         target=refresh_all_incremental, name="crowding-refresh",
         kwargs={"task_id": task.task_id, "concepts_only": concepts_only,
-                "max_sectors": max_sectors},
+                "max_sectors": max_sectors, "pool_only": pool_only},
         daemon=True)
     thread.start()
     return task.to_dict()

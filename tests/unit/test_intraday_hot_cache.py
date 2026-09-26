@@ -59,7 +59,11 @@ def test_saved_file_is_plain_json(tmp_path: Path) -> None:
     assert isinstance(raw["saved_at"], float)
     assert set(raw["items"][0]) <= {
         "code", "name", "boards", "total_score", "signal_strength",
-        "signal_kind", "price", "change_pct", "quote_ts", "pinned"}
+        "signal_kind", "price", "change_pct", "quote_ts", "pinned",
+        # 估值结论（用户口径 2026-09-23：从主区域面板收成列表里的标签）。
+        # ⚠️ 这两个必须是**标量字符串** —— 本用例正是那条约束的守卫：
+        #    写成 dict 的话 `_to_plain` 只留叶子类型，会把它们静默丢掉。
+        "valuation_label", "valuation_bucket"}
 
 
 def test_save_is_atomic_no_tmp_left_behind(tmp_path: Path) -> None:

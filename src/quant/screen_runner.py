@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from src.core.errors import (
     BRIEF_DEFAULT,
@@ -34,38 +35,157 @@ def _read_json(path: str) -> str:
 
 
 def _peak_memory_mb() -> float:
-    """当前进程峰值常驻内存（Windows 用 win32 API，其它平台退回 resource）。"""
-    try:
-        import ctypes
-        from ctypes import wintypes
+    """当前进程峰值常驻内存（Windows 用 win32 API，其它平台退回 resource）。
 
-        class ProcessMemoryCounters(ctypes.Structure):
-            _fields_ = [
-                ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
-                ("PeakWorkingSetSize", ctypes.c_size_t),
-                ("WorkingSetSize", ctypes.c_size_t),
-                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                ("PagefileUsage", ctypes.c_size_t),
-                ("PeakPagefileUsage", ctypes.c_size_t),
-            ]
+    2026-09-25 修：原实现在 Windows 上**恒返回 0.0**（内存体检等于瞎的 ——
+    `--probe` 报 `peak_memory_mb: 0.0`，而外部采样同一进程得到 5.1 GB）。
+    两个原因：
 
-        counters = ProcessMemoryCounters()
-        counters.cb = ctypes.sizeof(counters)
-        handle = ctypes.windll.kernel32.GetCurrentProcess()
-        if ctypes.windll.psapi.GetProcessMemoryInfo(
-                handle, ctypes.byref(counters), counters.cb):
-            return counters.PeakWorkingSetSize / 1024 / 1024
-    except Exception:  # noqa: BLE001 非 Windows 或 API 不可用时退回
-        pass
+    1. `GetCurrentProcess()` 返回的是**伪句柄** `-1`。不声明
+       `restype = wintypes.HANDLE` 时 ctypes 按 `c_int` 取，符号扩展之后
+       是个无效句柄，调用直接失败；
+    2. `psapi.GetProcessMemoryInfo` 依赖 `psapi.dll` 已被加载 ——
+       现代 Windows 应优先用 kernel32 的 `K32GetProcessMemoryInfo`。
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class ProcessMemoryCounters(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            get_info = getattr(kernel32, "K32GetProcessMemoryInfo", None)
+            if get_info is None:                      # 很老的 Windows 才走这里
+                get_info = ctypes.WinDLL("psapi", use_last_error=True).\
+                    GetProcessMemoryInfo
+            get_info.argtypes = [wintypes.HANDLE,
+                                 ctypes.POINTER(ProcessMemoryCounters),
+                                 wintypes.DWORD]
+            get_info.restype = wintypes.BOOL
+            counters = ProcessMemoryCounters()
+            counters.cb = ctypes.sizeof(counters)
+            if get_info(kernel32.GetCurrentProcess(), ctypes.byref(counters),
+                        counters.cb):
+                return counters.PeakWorkingSetSize / 1024 / 1024
+        except Exception:  # noqa: BLE001 非 Windows 或 API 不可用时退回
+            pass
     try:
         import resource
 
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+# ==================================================================
+# 内存预算：**整条筛选链**（区间 × 股票 × 字段 的硬约束）
+# ==================================================================
+#
+# 2026-09-25 做了分阶段归因实测（663 个交易日 × 5320 只 × 35 因子，
+# 每个阶段各跑一个独立进程，读进程自身的 PeakWorkingSetSize）：
+#
+# | 阶段 | 全量装配（43 字段） | 按需装配（17 字段） |
+# |---|---:|---:|
+# | 只 build_panels | 5,719 MB / 150s | **3,466 MB / 42s** |
+# | + compute_factors | 5,731 MB / +101s | 3,557 MB / +102s |
+# | + screen（整条链） | **5,925 MB** / +273s | **5,343 MB** / +229s |
+#
+# 两个结论都很重要：
+#   1. 按需装配把**装配**这一步砍掉 39% 内存、快 3.9 倍；
+#   2. 但**整条链的峰值由筛选流程本身主导**（中性化要再复制一份面板、
+#      相关性聚类要给每个因子做全区间秩矩阵 ≈ 35 × 8 字节/格 ≈ 1 GB），
+#      所以端到端只降了 ~10% 内存、~18% 耗时。
+# 护栏估算的是"整条链"，因此必须把流程那部分算进去，否则会低估。
+
+#: 固定开销（MB）：解释器 + pandas/numpy + 与规模无关的结构。
+_SCREEN_BASE_MB = 1500.0
+#: 面板部分：每个「交易日 × 股票 × 字段」格（实测约 5.9 字节，
+#: 面板 + 中性化复制；取 8 字节偏保守）。
+_SCREEN_MB_PER_CELL_PER_FIELD = 8.0 / 1024.0 / 1024.0
+#: 流程部分：每个「交易日 × 股票」格（实测约 1050 字节 —— 相关性秩矩阵、
+#: IC 序列、分组回测的中间对象；取 1200 偏保守）。
+_SCREEN_MB_PER_CELL = 1200.0 / 1024.0 / 1024.0
+#: 估算用的股票数：取 A 股当前全市场只数。全历史早期只数更少，故为**高估**，
+#: 方向上安全（宁可提前拒绝，也不要跑到一半被 OOM 杀掉）。
+ASSUMED_UNIVERSE = 5500
+#: 全量装配的字段数（`PanelNeeds.everything()` ≈ 43 个字段）。
+#: 只用于"没给字段数"时的默认估算（= 历史口径）。
+DEFAULT_FIELD_COUNT = 51
+#: 默认预算 8 GB。实测口径：663 个交易日（2024 起 / 17 字段 / 35 因子）
+#: ≈ 7.6 分钟 / **5.4 GB**（通过）；约 4 年（≈1000 个交易日）时估算触到 8 GB；
+#: 2590 个交易日（2015 起）≈ 19 GB（拒绝，需要显式放宽预算并腾出内存）；
+#: 5037 个交易日（2006 起）≈ 35 GB（单机不可行，需要分批或抽样装配）。
+DEFAULT_PANEL_BUDGET_MB = 8192.0
+
+
+def panel_budget_mb() -> float:
+    """当前预算（可用 `MOSS_SCREEN_MAX_PANEL_MB` 显式放宽）。"""
+    try:
+        value = float(os.environ.get("MOSS_SCREEN_MAX_PANEL_MB", ""))
+    except (TypeError, ValueError):
+        return DEFAULT_PANEL_BUDGET_MB
+    return value if value > 0 else DEFAULT_PANEL_BUDGET_MB
+
+
+def estimate_panel_mb(days: Sequence[str],
+                      universe: int = ASSUMED_UNIVERSE,
+                      fields: int = DEFAULT_FIELD_COUNT) -> float:
+    """估算**整条筛选链**的峰值内存（MB）。
+
+    式子 = 固定开销 + 面板项（格 × 字段 × 8 B）+ 流程项（格 × 1200 B）。
+    系数对**分阶段实测**校准，并且刻意留了余量（估算 ≥ 实测，实测见文件顶部表格）：
+
+    | 场景 | 交易日 | 字段 | 实测峰值 | 本式估算 |
+    |---|---:|---:|---:|---:|
+    | 2024 起 / 按需 | 663 | 17 | 5,406 MB | 5,998 MB |
+    | 2024 起 / 全量 | 663 | 43 | 5,925 MB | 6,698 MB |
+
+    ⚠️ 与上一版的关键差别：**流程项必须计进去**。只算面板会得出"17 个字段
+    只要 2.4 GB"这种结论，而实测整条链是 5.4 GB —— 低估正是护栏里危险的方向。
+    """
+    cells = len(days) * max(1, int(universe))
+    panel = cells * max(1, int(fields)) * _SCREEN_MB_PER_CELL_PER_FIELD
+    workflow = cells * _SCREEN_MB_PER_CELL
+    return _SCREEN_BASE_MB + panel + workflow
+
+
+def guard_panel_budget(days: Sequence[str], *,
+                       universe: int = ASSUMED_UNIVERSE,
+                       fields: int = DEFAULT_FIELD_COUNT) -> str:
+    """区间太长/字段太多就**提前拒绝**，返回一句体检说明。
+
+    为什么需要这道闸：筛选跑在子进程里，OOM 只死子进程、服务没事 ——
+    但用户要等几十分钟才发现任务没了。提前几秒拒绝比"跑到一半被杀"有用得多
+    （这是 screen_runner 隔离设计的延伸，不是替代）。
+    """
+    estimate = estimate_panel_mb(days, universe, fields)
+    budget = panel_budget_mb()
+    if estimate > budget:
+        raise ValueError(
+            f"规模太大：整条筛选链预计占用约 {estimate / 1024:.1f} GB，"
+            f"超过预算 {budget / 1024:.1f} GB"
+            f"（{len(days)} 个交易日 × 约 {universe} 只 × {fields} 个字段）。"
+            f"实测参考：663 个交易日（2024 年起）≈ 7.6 分钟 / 5.4 GB；"
+            f"约 4 年是 8 GB 预算的上限；2590 个交易日（2015 年起）≈ 19 GB。"
+            f"可选：缩短区间、少选几个因子、打开「股票池过滤」（按 20 日均成交额"
+            f"剔除最差的 30%，列同比例变少），或用环境变量 "
+            f"MOSS_SCREEN_MAX_PANEL_MB 显式放宽预算"
+            f"（例如 2015 年起需要 20480，且机器要有 20 GB 以上空闲内存）。")
+    return (f"内存预算体检：{len(days)} 个交易日 × {fields} 个字段 ≈ 预计峰值 "
+            f"{estimate:.0f} MB（预算 {budget:.0f} MB；含面板与筛选流程两部分）")
 
 
 def _screen_config_from_request(body: Any) -> Any:
@@ -85,6 +205,7 @@ def _screen_config_from_request(body: Any) -> Any:
         train_ratio=body.train_ratio,
         target_count=body.target_count,
         n_groups=body.n_groups,
+        exclude_st=body.exclude_st,
         neutralize_mv=body.neutralize)
 
 
@@ -107,7 +228,21 @@ def run_request(payload: dict) -> dict:
     if len(days) < 40:
         raise ValueError(f"{start}~{end} 缓存里只有 {len(days)} 个交易日，"
                          f"至少需要 40 天才能做 IC 检验")
-    panels = build_panels(days)
+    # **按需装配**：只装这次真正用到的字段（35 个因子实际只需要 17 个，
+    # 而不是 43 个；`bak_daily` / `stk_limit` / `suspend_d` 整个数据集都不再读）。
+    # 实测收益：装配 15.3s → 5.4s，峰值内存同比例下降，且结果**逐位一致**
+    # （见 docs/QUANT_M2_FACTORS.md §9）。
+    from src.quant.liquidity import LiquidityFilter
+    from src.quant.panel_needs import needs_for_screening
+
+    liquidity = LiquidityFilter(enabled=bool(body.liquidity_filter),
+                                drop_pct=float(body.liquidity_drop_pct))
+    needs = needs_for_screening(body.factors or None,
+                                neutralize_mv=body.neutralize,
+                                liquidity=liquidity.enabled)
+    # 区间 × 字段数 一起进护栏：字段少了，能安全跑的区间就长了
+    head = guard_panel_budget(days, fields=needs.field_count)
+    panels = build_panels(days, needs=needs, liquidity=liquidity)
     if not panels.codes:
         raise ValueError("面板为空：请确认已下载 daily / daily_basic 数据")
     factors = compute_factors(panels, keys=body.factors or None)
@@ -117,13 +252,42 @@ def run_request(payload: dict) -> dict:
     # 这类错误 Python 会立刻报出来，但只有**真的跑一次**才会暴露 ——
     # 所以下面 `_screen_config_from_request` 有专门的单测守着。
     config = _screen_config_from_request(body)
-    result = run_screen(panels, factors, config=config)
+
+    # ST 剔除（历史名称口径）：只有"开关打开 **且** 数据在"才生成掩码。
+    # 缺数据时 screen() 会在 notes 里如实写"本次未剔除"，而不是假装剔了。
+    st_mask = None
+    st_available = False
+    if config.exclude_st:
+        from src.quant.st_status import StStatus
+
+        status = StStatus.load()
+        st_available = status.available
+        if st_available:
+            st_mask = status.mask(panels.dates, panels.codes)
+
+    # 股票池过滤的逐日掩码（True = 当日剔除）。**与 ST 掩码分开传**：
+    # 两个来源要各自出现在结果说明里 —— 合并之后说明会指鹿为马
+    # （实测：把并集说成"已剔除 ST：13.46%"，而其中绝大部分是流动性过滤）。
+    pool_mask = panels.exclusion_mask()
+
+    result = run_screen(panels, factors, config=config, st_mask=st_mask,
+                        pool_mask=pool_mask)
     out = result.as_dict()
+    out["notes"] = [
+        head,
+        f"面板按需装配：{needs.field_count} 个字段 / "
+        f"{len(needs.datasets)} 个数据集（全量为 "
+        f"{DEFAULT_FIELD_COUNT} 个字段 / 10 个数据集）",
+        *out.get("notes", []),
+    ]
     out.update({
         "start": days[0], "end": days[-1], "trading_days": len(days),
         "universe_size": len(panels.codes), "panels_gaps": panels.gaps,
         "elapsed_seconds": round(time.perf_counter() - started, 1),
         "peak_memory_mb": round(_peak_memory_mb(), 0),
+        "exclude_st": config.exclude_st, "st_available": st_available,
+        "panel_fields": sorted(panels.loaded),
+        "liquidity_filter": liquidity.enabled,
         "config": body.model_dump(),
     })
     return out
@@ -169,6 +333,7 @@ def run_single_request(payload: dict) -> dict:
         t_plus_1=body.t_plus_1,
         respect_price_limits=body.respect_price_limits,
         respect_suspension=body.respect_suspension,
+        respect_st=body.respect_st,
         train_ratio=body.train_ratio,
         costs=CostConfig(
             commission_rate=body.commission_rate,
@@ -176,13 +341,22 @@ def run_single_request(payload: dict) -> dict:
             stamp_tax_rate=body.stamp_tax_rate,
             transfer_fee_rate=body.transfer_fee_rate,
             slippage_bps=body.slippage_bps))
-    result = run_single_backtest(panels, code, config=config, name=body.name)
+    # ST 状态只在真的要用时读（本地小文件，但没必要给每次回测都加一步 I/O）
+    st_status = None
+    if body.respect_st:
+        from src.quant.st_status import StStatus
+
+        st_status = StStatus.load()
+    result = run_single_backtest(panels, code, config=config, name=body.name,
+                                 st_status=st_status)
     out = result.as_dict()
     out.update({
         "start": days[0], "end": days[-1], "trading_days": len(days),
         "panels_gaps": panels.gaps, "panel_origins": panels.origins[:12],
         "elapsed_seconds": round(time.perf_counter() - started, 1),
         "peak_memory_mb": round(_peak_memory_mb(), 0),
+        "respect_st": bool(body.respect_st),
+        "st_available": bool(st_status is not None and st_status.available),
     })
     if body.auto_save:
         from src.quant.strategy_store import StrategyError, save_from_result

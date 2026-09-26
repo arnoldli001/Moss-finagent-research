@@ -20,7 +20,7 @@ import { api, ConceptSuggestion } from "../api";
  */
 export function BoardPicker({
   value, onChange, autoValue = [], disabled = false, width = 220,
-  placeholder = "关联板块(可选) 如 PCB概念",
+  placeholder = "关联板块(可选) 如 PCB概念", listId,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -32,6 +32,16 @@ export function BoardPicker({
   disabled?: boolean;
   width?: number;
   placeholder?: string;
+  /**
+   * 原生 `<datalist>` 的 id（用户口径 2026-09-23）：调用方把**用户以前配过的板块名**
+   * 挂在那个 datalist 上，浏览器就会在本框给历史配置做自动补全。
+   *
+   * 为什么不并进下面那个自研下拉：那个查的是**概念库**（Tushare 名录，几万条），
+   * 语料是"全集"；这里要提示的是"**你用过什么**"，语料是"用户自己的历史"，
+   * 两者来源与刷新时机都不同。用原生 datalist 搭在同一个 input 上，
+   * 互不干扰、也不用再写一套下拉。
+   */
+  listId?: string;
 }) {
   const [keyword, setKeyword] = useState("");
   const [options, setOptions] = useState<ConceptSuggestion[]>([]);
@@ -133,6 +143,7 @@ export function BoardPicker({
           value={keyword}
           disabled={disabled}
           spellCheck={false}
+          list={listId}
           placeholder={boards.length ? "继续添加板块…" : placeholder}
           title="支持概念名联想（数据来自 Tushare 同花顺指数名录）；关联板块决定「板块情绪」与「板块涨幅排行」两个维度是否计分"
           onChange={(event) => {

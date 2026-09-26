@@ -19,6 +19,10 @@ from src.infrastructure.repositories.intraday_profile_sqlite_repo import (
     IntradayProfileSqliteRepository,
 )
 from src.infrastructure.repositories.macro_repo import MacroRepository
+from src.infrastructure.repositories.news_cache_sqlite_repo import (
+    NewsCacheSqliteRepository,
+    NewsCacheRepository,
+)
 from src.infrastructure.repositories.postgres_repo import PostgresRepository
 
 _BACKENDS = ("sqlite", "postgres")
@@ -76,4 +80,19 @@ def build_intraday_profile_repository(
             "请使用SQLite或补充PostgreSQL实现（表结构见 intraday_profile_sqlite_repo）。"
         )
     return IntradayProfileSqliteRepository(settings.sqlite_path)
+
+
+def build_news_cache_repository(settings: Settings) -> NewsCacheRepository:
+    """构建新闻/快讯缓存仓储（Demo仅SQLite；新闻为增强链路）。"""
+    backend = settings.data_backend.strip().lower()
+    if backend not in _BACKENDS:
+        raise ConfigError(
+            f"未知DATA_BACKEND={settings.data_backend!r}，可选：{', '.join(_BACKENDS)}"
+        )
+    if backend == "postgres":
+        raise ConfigError(
+            "新闻缓存仓储暂仅支持 DATA_BACKEND=sqlite；"
+            "请使用SQLite或补充PostgreSQL实现（表结构见 news_cache_sqlite_repo）。"
+        )
+    return NewsCacheSqliteRepository(settings.sqlite_path)
 

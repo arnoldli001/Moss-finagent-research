@@ -18,6 +18,10 @@
 隐藏页签 ≠ 禁止访问。真正的门槛在每个业务端点自己身上
 （本项目的做法是 `MOSS_TENANCY_ENFORCE` + 能力码，见设计 §4）。
 这一点必须写清楚，否则将来有人会以为"前端藏了就安全了"。
+
+例外是 `ADMIN_ONLY_VIEWS`（目前只有 `scheduler`）：那几项**多一道**
+"非管理员不下发"的规则，因为对应的路由本身已经挂了 `require_admin`
+（两道门，见该常量的说明）。它们不是"体验层"，而是规则层。
 """
 
 from __future__ import annotations
@@ -44,6 +48,10 @@ router = APIRouter(prefix="/api/v1/me", tags=["me"])
 #: 到那时只改这张表，不动售卖口径。
 VIEW_FEATURE: dict[str, str] = {
     "research": "research",
+    # ⚠️ `scheduler` / `metrics` 在**本表**（页签清单）里，但**不在**
+    # `platform/config.py` 的 `FEATURES`（可售卖项）里。两张表刻意分开 ——
+    # 这正是分开的理由：它们是**页签**，但不是能勾选的**套餐项**。
+    # 可见性由 `ADMIN_ONLY_VIEWS` 写死（见下）。
     "scheduler": "scheduler",
     "metrics": "metrics",
     "backtest": "backtest",
@@ -52,13 +60,48 @@ VIEW_FEATURE: dict[str, str] = {
     # 量化交易页：三个子功能**任意一个**开启即显示整页
     # （用户买了做T就该能进这一页；至于页内哪些子面板可用，看子权限）
     "intraday": "quant.intraday",
-    # 舆情情报页：`intel.radar` 是主入口 —— 开它才显示「情报雷达」页签。
-    # 另外两项（`intel.brief` / `intel.alerts`）是**页内**能力，
-    # 由 `require_feature` 在各自路由上单独把关，不各占一个顶层页签。
-    "intel": "intel.radar",
+    # 舆情情报：**两个顶级页签共用一个售卖项**（`intel.hot`）。
+    # 用户口径（2026-09-25）："删除一级目录'情报中心'，把二级页签
+    # '热点&研报小作文'、'投资日历'改为一级目录"，权限矩阵里
+    # "新增对'热点&研报小作文'的权限管理"（同时删掉原「情报雷达」
+    # 与「盘前简报」）。
+    # 两者本来就同源 —— 同一份公开信息，"现在在说什么"与
+    # "接下来会发生什么"两种看法；拆成两个售卖项只会让矩阵变长。
+    "intel-hot": "intel.hot",
+    "intel-calendar": "intel.hot",
+    # 事件告警：**页内能力**，不占顶级页签（前端由铃铛 / Toast / 独立页承载）
+    "alerts": "intel.alerts",
 }
 #: 量化交易页的"任一开启即显示"集合
 QUANT_ANY: tuple[str, ...] = ("quant.intraday", "quant.select", "quant.auction")
+
+#: **管理员专属页签**：无论功能权限矩阵怎么配，都不下发给非管理员。
+#:
+#: ## 为什么是"写死"而不是"矩阵里的默认值"
+#:
+#: 用户口径（2026-09-25）：
+#:
+#:     "默认只有管理员有运行指标、调度管理的权限，
+#:      不用加在功能权限设置的选项里"
+#:     "写死默认管理员有这两个权限，其他用户都没这个权限且不可选择"
+#:
+#: 所以这两项**不在** `FEATURES` 里（权限矩阵根本渲染不出来，也就无从勾选），
+#: 可见性只由本集合决定。为什么不只靠 `configs/platform_tiers.json` 的默认值
+#: （那里 vip/trial 的 `scheduler` / `metrics` 本来也都是 `false`）：
+#: 那是**可改的默认值**，不是一条规则 —— 只要它们在矩阵里露过面，
+#: 管理员勾一下就发出去了，而「调度管理」能手动触发作业
+#: （`snapshot_industry_watchlist` 一点 = 4 次完整研究图，
+#: 见 `src/scheduler/registry.py`）。这类"能触发内部作业"的能力属于
+#: **运维面**，不该作为可售卖套餐项下发给客户。
+#:
+#: ⚠️ 用户在 2026-09-25 明确说了"可以不删除"—— 所以
+#: `configs/platform_tiers.json` 里的这两个键**保留**，
+#: 只是已不被任何判据读取（删了反而要在多处解释"为什么没有"）。
+#:
+#: 与 `src/api/routes/scheduler.py` 的 `require_admin` 是**两道**门：
+#: 这里管"看不看得见"，那里管"调不调得动" —— 缺了后者，藏起来的页签
+#: 用一条 `curl` 就能绕过（本文件开头「只是体验层」那段说的就是这件事）。
+ADMIN_ONLY_VIEWS: frozenset[str] = frozenset({"scheduler", "metrics"})
 
 
 def feature_enabled_for_tier(tier: str, feature: str) -> bool:
@@ -104,8 +147,24 @@ async def my_features(request: Request) -> dict:
     plan = store.plan(tenant_id)
 
     enabled = {k: bool(plan.features.get(k, False)) for k in FEATURES}
+    # 管理员身份用既有的那一个判据（`admin.py` 的 `ADMIN_TIER`），
+    # 不在这里再写一遍字面量：两份判据迟早会分叉，而分叉的那一侧就是漏网之门。
+    # 延迟导入的写法与 `login_gate._session_cookie_name` 一致（避免路由模块互相 import）。
+    from src.api.routes.admin import ADMIN_TIER
+
+    is_admin = str(tenant_id).strip().lower() == ADMIN_TIER
     visible: list[str] = []
     for view, feature in VIEW_FEATURE.items():
+        if view in ADMIN_ONLY_VIEWS:
+            # ⚠️ **不能**走下面的 `enabled.get(feature)` 判据。
+            # `enabled` 是按 `FEATURES` 构造的，而管理员专属的两项
+            # （scheduler / metrics）**已经不在 `FEATURES` 里** ——
+            # 一查就是 False，结果连管理员都看不到「运行指标」和「调度管理」。
+            # 这正是把它们移出 `FEATURES` 时必须一起改的地方：
+            # 少改这一处，表现是"管理员自己少了两个页签"。
+            if is_admin:
+                visible.append(view)
+            continue
         if view == "intraday":
             if any(enabled.get(f, False) for f in QUANT_ANY):
                 visible.append(view)
@@ -120,6 +179,9 @@ async def my_features(request: Request) -> dict:
         "feature_labels": dict(FEATURES),
         # ★ 前端**照着这个渲染页签**，而不是自己判断哪个 features 对应哪个页签
         "visible_views": visible,
+        # 管理员专属页签（供前端标注"这里为什么少了一页"，而不是静默消失）
+        "admin_only_views": sorted(ADMIN_ONLY_VIEWS),
+        "is_admin": is_admin,
         "quant_views": {k: enabled.get(k, False) for k in QUANT_ANY},
         "resources": plan.resources,
         # 加购单价随套餐一起下发（前端暂不展示，但账单/商务后台要用）。
@@ -131,4 +193,4 @@ async def my_features(request: Request) -> dict:
     }
 
 
-__all__ = ["QUANT_ANY", "VIEW_FEATURE", "router"]
+__all__ = ["ADMIN_ONLY_VIEWS", "QUANT_ANY", "VIEW_FEATURE", "router"]

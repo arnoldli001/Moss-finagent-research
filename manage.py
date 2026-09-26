@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -29,6 +30,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -177,7 +179,25 @@ def get_cmdline(pid: int) -> str | None:
 
 
 def health_signature(port: int) -> str | None:
-    """请求 /health，返回 service 签名；非本项目或无响应返回 None。"""
+    """判断该端口上的服务是不是**本项目**，是则返回 service 签名。
+
+    两条证据，任一成立即可：
+
+    ① `/api/v1/health`（深度健康检查，返回 `service` 字段）；
+    ② `/api/v1/health/live`（**免鉴权**的 0 I/O 存活探针）。
+
+    为什么必须加 ②（2026-09-23 加公网试点实例时踩到）：`/api/v1/health`
+    会返回模型配置与数据源状态，属于内部拓扑，所以公网环境把它纳入了
+    **登录门槛** → 未登录访问返回 **401**。如果只认 ①，那么在这台机器上
+    `manage.py status` 会把一个**完全正常**的试点实例报成"被其他程序占用"，
+    而 `manage.py stop` 会**拒绝停止它**（"非本项目实例"）——
+    一个纯粹因为"健康检查需要登录"导致的运维故障，且症状指向完全错误的方向。
+
+    ② 之所以也能当签名：`/api/v1/health/live` 精确返回
+    `{"ok": true, "ts": ...}`，只有本项目的这个端点长这样；
+    再叠加 `diagnose_port` 里的**命令行**证据（`uvicorn src.api.main:app`），
+    两把钥匙同时要对上才会动手杀进程。
+    """
     try:
         with urllib.request.urlopen(
             f"http://127.0.0.1:{port}/api/v1/health", timeout=1.0
@@ -186,7 +206,17 @@ def health_signature(port: int) -> str | None:
         svc = body.get("service")
         return svc if isinstance(svc, str) else None
     except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
-        return None
+        pass
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/v1/health/live", timeout=1.0
+        ) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if body.get("ok") is True and "ts" in body:
+            return SERVICE_SIGNATURE
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
+        pass
+    return None
 
 
 def diagnose_port(port: int) -> dict[str, object]:
@@ -374,8 +404,13 @@ def _write_pid(name: str, pid: int) -> Path:
 
 def _spawn_daemon(
     name: str, cmd: list[str] | str, cwd: Path, *, shell: bool = False,
+    env: dict[str, str] | None = None,
 ) -> int:
-    """后台启动子进程，返回 PID；日志与 PID 文件落 data/run/。"""
+    """后台启动子进程，返回 PID；日志与 PID 文件落 data/run/。
+
+    `env` 给定时**叠加**到当前环境上（不是替换）—— 用于把 `--env dev` 的
+    隔离路径传给子进程。不传则完全继承（保持原有行为）。
+    """
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     log_path = RUN_DIR / f"{name}.log"
     # 后台守护：新进程组让 Ctrl+C 只打当前前台，不误伤服务；
@@ -388,6 +423,8 @@ def _spawn_daemon(
         "cwd": str(cwd), "stdout": log_fh, "stderr": subprocess.STDOUT,
         "creationflags": flags,
     }
+    if env:
+        popen_kwargs["env"] = {**os.environ, **env}
     if shell:
         popen_kwargs["shell"] = True
     if os.name != "nt":
@@ -397,8 +434,331 @@ def _spawn_daemon(
     return proc.pid
 
 
+#: dev 环境的隔离根目录（相对项目根）。刻意与生产完全分开：
+#: 生产用 data/moss_finagent.db（实测 6.4GB）+ data/quant（31GB），
+#: 调试若共用同一份，"改配置/写库"就直接作用于线上了。
+DEV_ROOT = ROOT / "data" / "dev"
+
+#: 对外试点实例的**约定端口**。
+#:
+#: 为什么必须与 dev 分开端口：两个实例各自用独立的库
+#: （`data/dev/moss_dev.db` vs `data/pilot/moss_pilot.db`），
+#: 而 SQLite 的单写者限制只约束**同一个库**，所以可以并存 ——
+#: 本地继续用 8100 调试，同时对外开 8110 让客户登录。
+#:
+#: 但有一条**必须记住**：`--replace` 与 `stop` 是按**命令行**枚举本项目
+#: 全部后端进程的（见 `list_our_backend_pids` 里"端口外孤儿会占住
+#: -wal/-shm 导致 disk I/O error"那段血案记录）。所以它们会**连另一个
+#: 实例一起停掉**。跨端口并存时不要用 `--replace`。
+PILOT_BACKEND_PORT = 8110
+
+
+def _env_choices() -> tuple[str, ...]:
+    """`--env` 的合法取值，**以 `src.core.config.ENVS` 为唯一权威**。
+
+    为什么要绕这一下而不是直接 `from src.core.config import ENVS`：
+    `manage.py` 要求"依赖没装好时也能给出可执行的提示"，所以顶层不做
+    重量级导入。这里做一次防御性导入，拿不到就用兜底值 ——
+    兜底值只在"连配置模块都 import 不了"时生效，而那种情况下
+    启动本来就会失败，所以不会掩盖任何问题。
+    """
+    try:
+        from src.core.config import ENVS
+
+        return tuple(ENVS)
+    except Exception:  # noqa: BLE001 见 docstring
+        return ("dev", "test", "pilot", "prod")
+
+
+@contextlib.contextmanager
+def _temporary_environ(overrides: dict[str, str]):
+    """临时把 `overrides` 写进 `os.environ`，退出时**逐键还原**。
+
+    为什么需要它：`Settings()`（pydantic-settings）在**实例化那一刻**
+    从 `os.environ` + `.env` 读值，没有"传入一份 env 字典"的入口。
+    而启动自检必须针对**即将生效**的那份环境（`--env` 注入后的），
+    否则 `--env prod/pilot` 的目标环境规则整段不执行 —— 实测就是这么失效的
+    （见 `_prepare_environment` 里的说明）。
+
+    还原要精确到"原本不存在"与"原本存在"的差别：只 `pop` 会误删父进程
+    本来就有的变量，只赋值又会把父进程的值污染成注入值。
+    """
+    missing = object()
+    saved: dict[str, object] = {}
+    for key, value in overrides.items():
+        saved[key] = os.environ.get(key, missing)
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, old in saved.items():
+            if old is missing:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(old)
+
+
+#: 对外试点（pilot）的数据根目录。**必须与 dev 和生产都分开** ——
+#: 这一条不只是"整洁"：pilot 里是**客户的真实账号**，
+#: 与调试数据混在一起意味着一次 `reset`/清库就把客户删了。
+#: `assert_environment_consistency` 会强制路径里含 "pilot" 字样。
+PILOT_ROOT = ROOT / "data" / "pilot"
+
+
+def dev_isolation_env() -> dict[str, str]:
+    """`--env dev` 的隔离环境变量：数据/调度/审计/通知通道全部改道。
+
+    设计要点（见 docs/PLATFORM_MULTI_TENANCY_DESIGN.md §8.7.5）：
+    - **复用现成开关**：`MOSS_SQLITE_PATH` 本来就是"让任务跑在副本上"的口子，
+      不需要新造机制；`SCHEDULER_DIR`/`LLM_AUDIT_DIR` 同理。
+    - **禁用定时任务**：否则调试实例会跑 `quant_data_sync`（16:40），
+      与生产**同时写 31GB 行情仓库**。用 scheduler 的隔离目录 + 显式开关双保险。
+    - **通知通道默认走 console**：dev 里验证码直接打日志，省掉 SMTP 配置；
+      这一条在 prod 会被自检拦下（§8.7.2）。
+
+    ## ★ 但**已经配好 SMTP 时不要覆盖它**（实测踩到的坑）
+
+    原来这里**无条件**写 `MOSS_NOTIFY_CHANNEL=console`。后果是：
+    用户 `.env` 里明明配好了真实 QQ 邮箱凭据（`ALERT_SMTP_USER` +
+    `ALERT_SMTP_AUTH_CODE`），却因为 dev 隔离被强制降级成"打日志"——
+    界面上点「发送验证码」提示**已发送**，而用户**永远收不到邮件**，
+    服务端也没有任何报错（`ConsoleNotifier` 返回 ok=True）。
+
+    症状极具误导性：提示成功 + 日志里能看到验证码 → 看起来像"邮件被邮箱
+    拦了"，实际根本没发。排查成本很高。
+
+    正确做法：**有真实凭据就让真实凭据生效**，只在没有任何凭据时才回退
+    console（那才是"省掉 SMTP 配置"的原意）。显式设了
+    `MOSS_NOTIFY_CHANNEL` 则一律尊重（让人能强制指定）。
+    """
+    root = str(DEV_ROOT)
+    env = {
+        "MOSS_ENV": "dev",
+        "MOSS_SQLITE_PATH": f"{root}/moss_dev.db",
+        "SCHEDULER_DIR": f"{root}/scheduler",
+        "LLM_AUDIT_DIR": f"{root}/audit",
+        # ⚠️ 这里原来设 `"MOSS_SCHEDULER_ENABLED": "0"`，**已删除**。
+        # 那个变量全仓库零处读取（`grep MOSS_SCHEDULER_ENABLED` 只有写入处），
+        # 所以它从来没关掉过任何东西，`CronScheduler` 照旧无条件启动 ——
+        # 实测该实例跑了 25 个任务。留一个"设了但不生效"的开关比没有开关更糟：
+        # 它会让人以为某个风险已经被防住了，而实际没有。
+        # 真正的约束是"同一份 data/ 只能有一个写者"，那条写在启动横幅里。
+    }
+    explicit = str(os.environ.get("MOSS_NOTIFY_CHANNEL", "")).strip().lower()
+    has_smtp = bool(str(os.environ.get("ALERT_SMTP_USER", "")).strip()
+                    and str(os.environ.get("ALERT_SMTP_AUTH_CODE", "")).strip())
+    if explicit:
+        env["MOSS_NOTIFY_CHANNEL"] = explicit
+    elif not has_smtp:
+        # 没有任何真实凭据 → 回退 console（dev 便利，验证码打日志）
+        env["MOSS_NOTIFY_CHANNEL"] = "console"
+    else:
+        print("📧 dev 隔离实例：检测到真实 SMTP 凭据，验证码将**真实发送邮件**"
+              "（不再只打日志）。若想改回打日志：设 MOSS_NOTIFY_CHANNEL=console",
+              file=sys.stderr)
+    return env
+
+
+def pilot_isolation_env() -> dict[str, str]:
+    """`--env pilot` 的隔离环境变量：对外试点，**数据与 dev/生产彻底分开**。
+
+    与 `dev_isolation_env` 的区别（这不是"复制一份改个路径"）：
+
+    | | dev | pilot |
+    |---|---|---|
+    | 数据目录 | `data/dev/` | `data/pilot/` |
+    | 谁能访问 | 只应本机 | **客户（公网，经 Cloudflare）** |
+    | 通知通道 | 无凭据时打日志 | **必须有真实 SMTP 凭据**（自检强制） |
+    | 登录门槛 | 关（本地调试方便） | **自动强制**（`LoginGateMiddleware`，见 `is_public`） |
+    | 定时任务 | 关 | 关（理由见下） |
+
+    ★ **定时任务同样关闭**，理由是实测过的具体冲突而不是"保守起见"：
+    调度任务会写 `data/quant`（31GB 行情仓库）。本机已经有一个主实例在跑
+    同一批任务，两个调度器同时写同一个仓库会造成重复下载与行级竞争。
+    所以试点的定位是"**只读行情 + 独立账号库**"，行情数据由既有实例刷新。
+    这条限制写在启动输出里，别让它变成"客户说数据没更新"才被发现。
+
+    ★ **`MOSS_TENANCY_ENFORCE` 故意不在这里设置**：多租户中间件只认
+    Bearer 令牌、不认会话 Cookie，打开它会让所有浏览器请求 401
+    （连登录页都打不开）。pilot 的访问控制由 `LoginGateMiddleware` 承担。
+    自检里对"pilot 上打开了 TENANCY_ENFORCE"是**报错**而不是放行 ——
+    见 `assert_environment_consistency` 里的说明。
+    """
+    root = str(PILOT_ROOT)
+    return {
+        "MOSS_ENV": "pilot",
+        "MOSS_PILOT_SINGLE_INSTANCE_ACK": "1",
+        "MOSS_SQLITE_PATH": f"{root}/moss_pilot.db",
+        "SCHEDULER_DIR": f"{root}/scheduler",
+        "LLM_AUDIT_DIR": f"{root}/audit",
+        "MOSS_AUDIT_DIR": f"{root}/access_audit",
+        # ⚠️ 原来这里的 `"MOSS_SCHEDULER_ENABLED": "0"` **已删除**：零处读取，
+        # 从来没关掉过任何任务（实测本实例跑了 25 个）。理由同 `dev_isolation_env`
+        # 里那段注释 —— 一个"设了但不生效"的开关会伪造安全感。
+        # 真要按实例裁剪任务，用 `MOSS_SCHEDULER_DENY`（按任务名，默认不拒任何东西）。
+        # ★ 前端资源指向**冻结副本**，不指向 dev 正在用的 `web/dist`。
+        #   否则本地 `npm run build` 一跑，客户刷新就拿到那份还没验过的界面。
+        #   同步方式见 `manage.py ship-frontend`：
+        #     验证（dev 8100）→ ship-frontend → 客户刷新即见。
+        "MOSS_WEB_DIST": str(ROOT / "web" / "dist-pilot"),
+    }
+
+
+#: 后端**必备**的第三方依赖（缺一个都会让某条业务链静默降级）。
+#:
+#: 目前只列了会让"看起来像数据/文件丢失"的那几个：
+#:   - `lightgbm` + `sklearn`：`moss_selector` 的模型是 LightGBM 模型，
+#:     `joblib.load` 在反序列化时要 `import lightgbm`。缺了它 → 6 个模型文件
+#:     全部加载失败被跳过 → `load_model_set` 抛「没有可用的模型文件」→
+#:     界面报"模型丢了"并自动重训（2026-09-23 实际踩到）。
+_RUNTIME_REQUIRED = ("lightgbm", "sklearn")
+
+
+def missing_runtime_dependencies() -> list[str]:
+    """当前解释器缺哪些必备依赖（导入探测，不装东西）。"""
+    missing: list[str] = []
+    for module in _RUNTIME_REQUIRED:
+        try:
+            __import__(module)
+        except Exception:  # noqa: BLE001 任何导入失败都算缺
+            missing.append(module)
+    return missing
+
+
+def _prepare_environment(env_name: str | None) -> tuple[dict[str, str], int]:
+    """解析 `--env`：返回 (要注入子进程的环境变量, 退出码)。退出码非 0 表示拒绝启动。
+
+    四件事，顺序不能换：
+      1. 归一化环境名；
+      2. dev 时生成隔离路径；
+      3. **在起进程之前**跑自检 —— 配置不自洽就别启动；
+      4. **依赖自检** —— 解释器缺 lightgbm 时拒绝启动（否则会伪装成"模型丢失"）。
+    """
+    # 延迟导入：manage.py 要能在没装依赖时也给出友好提示
+    try:
+        from src.core.config import (
+            ENVS,
+            Settings,
+            assert_environment_consistency,
+        )
+    except Exception as exc:  # noqa: BLE001 依赖缺失时给可执行的提示
+        print(f"❌ 无法加载配置模块（请先 uv sync）：{exc}", file=sys.stderr)
+        return {}, 1
+
+    name = str(env_name or os.environ.get("MOSS_ENV") or "dev").strip().lower()
+    if name == "production":
+        name = "prod"
+    if name not in ENVS:
+        print(f"❌ --env={env_name!r} 非法，可选：{' / '.join(ENVS)}", file=sys.stderr)
+        return {}, 1
+
+    extra: dict[str, str] = {"MOSS_ENV": name}
+    if name == "dev":
+        extra = dev_isolation_env()
+    elif name == "pilot":
+        extra = pilot_isolation_env()
+
+    # 自检用"即将生效的环境变量"，而不是当前进程的（否则 --env 白给）
+    effective = {**os.environ, **extra}
+    # ★★ 这里必须**真的把 effective 装进 os.environ** 再构造 Settings。
+    #
+    # 原来是 `Settings()` 直接用**父进程**的环境变量构造，只把 `effective`
+    # 传给 `environ=` 参数当"标志位视图"。后果（2026-09-23 实测复现）：
+    #
+    #   父 shell 里没有 MOSS_ENV  →  Settings().env == "dev"
+    #   → settings.is_pilot / is_prod 都是 False
+    #   → 目标环境的那一组规则**整段不执行**
+    #   → problems == []  → "自检通过"
+    #
+    # 也就是说 `manage.py start --env prod`（或 pilot）**从来没跑过生产自检**，
+    # 而它打印的还是"自检通过"。自检之所以存在，就是为了防止
+    # "以为连的是测试、实际连的是生产"——结果它自己在这种调用方式下
+    # 完全空转，而且**没有任何迹象**（这正是最难发现的一类失效）。
+    #
+    # `environ=` 参数仍然传（保留纯函数语义与既有测试），
+    # 但 Settings 本身必须从 effective 构造，两边看到的才是同一份配置。
+    with _temporary_environ(extra):
+        try:
+            settings = Settings()
+        except Exception as exc:  # noqa: BLE001 配置非法（如环境名写错）直接拒绝
+            print(f"❌ 配置加载失败，拒绝启动：{exc}", file=sys.stderr)
+            return extra, 1
+
+    problems = assert_environment_consistency(settings, environ=effective)
+    if problems:
+        print(f"❌ 环境自检未通过（MOSS_ENV={name}），**拒绝启动**：", file=sys.stderr)
+        for item in problems:
+            print(f"   - {item}", file=sys.stderr)
+        print("   参考：docs/PLATFORM_MULTI_TENANCY_DESIGN.md §8.7.2", file=sys.stderr)
+        return extra, 1
+
+    missing = missing_runtime_dependencies()
+    if missing:
+        print("❌ 依赖自检未通过，**拒绝启动**：当前解释器缺少 "
+              f"{'、'.join(missing)}", file=sys.stderr)
+        print(f"   当前解释器：{sys.executable}", file=sys.stderr)
+        print("   这会让 moss_selector 的模型**全部加载失败**（joblib 反序列化要 "
+              "import lightgbm），界面表现是「moss_selector/models 下没有可用的"
+              "模型文件」并反复自动重训 —— 但模型文件其实一直都在。", file=sys.stderr)
+        print("   修法：用项目虚拟环境启动（Windows）：", file=sys.stderr)
+        print(r"     .\.venv\Scripts\python.exe manage.py start --replace --daemon",
+              file=sys.stderr)
+        print("   或用 uv：uv run python manage.py start --replace --daemon",
+              file=sys.stderr)
+        return extra, 1
+
+    if name == "dev":
+        DEV_ROOT.mkdir(parents=True, exist_ok=True)
+        print(f"🔧 dev 隔离实例：数据目录 {DEV_ROOT}（不触碰生产库）", file=sys.stderr)
+    elif name == "pilot":
+        PILOT_ROOT.mkdir(parents=True, exist_ok=True)
+        print("=" * 68, file=sys.stderr)
+        print("🌐 **对外试点实例（pilot）** —— 客户可经公网访问，但它不是生产：",
+              file=sys.stderr)
+        print(f"   · 数据目录：{PILOT_ROOT}（与 dev / 本机库彻底分开）",
+              file=sys.stderr)
+        print("   · 登录门槛：**已自动强制**（除登录/注册/存活探针外都要会话）",
+              file=sys.stderr)
+        print("   · 单实例：SQLite 单写者，**不要**起第二个副本；"
+              "重启期间对外不可用", file=sys.stderr)
+        # ⚠️ 这行原来印的是"**已关闭** —— 行情由既有实例刷新"。
+        # 那是**假的**，而且骗了很久：`MOSS_SCHEDULER_ENABLED` 这个环境变量
+        # 全仓库**从来没有任何地方读它**（`grep` 只有写入处，零处读取），
+        # 而 `src/api/main.py` 里 `CronScheduler(...).start()` 是**无条件**执行的。
+        # 实测：试点实例上跑了 25 个定时任务，含 `quant_data_sync`
+        # （`data/pilot/scheduler/runs.jsonl` 里有它的成功记录）。
+        #
+        # 后果不是"少跑几个任务"，而是**反向的**：横幅说关着，于是没人会想到
+        # 两个实例正在同写 `data/quant/warehouse.db`。实测 09-23/09-24 两个实例
+        # 的 `quant_data_sync` 有 **17 对时间区间重叠**。
+        #
+        # 所以这里改为**印真实状态**，并且说清真正的约束（单写者），而不是
+        # 继续复述一个已经不成立的设计假设。
+        print("   · 定时任务：**已启用**（进程内调度，无条件启动）——"
+              " 见下方「单写者」约束：同一份 data/ 只能有一个实例在跑任务",
+              file=sys.stderr)
+        print(f"   · 建议端口：--port {PILOT_BACKEND_PORT}"
+              f"（与 dev 的 8100 并存；两实例各用独立的库）", file=sys.stderr)
+        print("   · ⚠️ **不要用 --replace**：它按命令行枚举本项目**全部**后端正"
+              "进程，会把正在跑的 dev/主实例一起停掉", file=sys.stderr)
+        print("   · 不承诺 SLA；多租户 DataClass 平面尚未与会话打通"
+              "（见设计文档 §13.8）", file=sys.stderr)
+        print("=" * 68, file=sys.stderr)
+    elif name == "prod":
+        print("🔒 prod 环境：自检通过", file=sys.stderr)
+    return extra, 0
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     host, port = args.host, int(args.port)
+
+    # ---- 环境解析与自检（必须最先做，且失败即拒绝启动）----
+    # 为什么先做：环境标记决定"用什么库、要不要强制鉴权、数据落到哪"。
+    # 配置不自洽时**拒绝启动**而不是打警告 —— 警告会被日志淹没，
+    # 启动失败是唯一 100% 会被看见的提示（与 rls.py "让漏配表现为失败" 同源）。
+    extra_env, rc = _prepare_environment(getattr(args, "env", None))
+    if rc != 0:
+        return rc
 
     # 前端端口（如需）
     if args.with_frontend and not port_open("127.0.0.1", DEFAULT_FRONTEND_PORT):
@@ -453,12 +813,34 @@ def cmd_start(args: argparse.Namespace) -> int:
     uvicorn_cmd = [
         sys.executable, "-m", "uvicorn", "src.api.main:app",
         "--host", host, "--port", str(port),
+        # ★★ `--timeout-keep-alive` 必须显式调大，**不能**吃 uvicorn 的默认 5 秒。
+        #
+        # 症状（实测，2026-09-23 管理员点「直接开号 → 创建」）：浏览器只报
+        # `TypeError: Failed to fetch`，而服务端日志里**根本没有这条请求**
+        # —— 也就是说请求在到达应用之前就没了，看起来像"后端没启动"，
+        # 于是往"服务没运行/端口不对"方向白查很久。
+        #
+        # 真实原因：uvicorn 默认 5 秒空闲就主动关 keep-alive 连接，而浏览器
+        # 的空闲连接复用窗口更长（通常 60~300 秒）。两边计时器交错时会出现
+        # "浏览器刚把请求写到一个服务端正在关闭的 socket 上"的竞态，服务端
+        # 直接关连接 → 浏览器报 `ERR_EMPTY_RESPONSE`。
+        #   · **GET/HEAD 会被浏览器静默重试**，所以看起来"刷页面没问题"；
+        #   · **POST/PATCH/PUT 不会自动重试**（非幂等），于是只有写操作暴露
+        #     —— 恰好就是管理后台那些按钮。
+        #   · 后端刚重启过时最严重：所有旧连接同时变成半开连接，一次全炸。
+        #
+        # 65 秒 > 浏览器常见空闲复用窗口，让**服务端**的连接在浏览器放弃它
+        # 之前一直有效，竞态窗口消失。这是一个后端配置问题，不该指望前端兜底。
+        "--timeout-keep-alive", "65",
     ]
     if args.reload:
         uvicorn_cmd.append("--reload")
 
     if args.daemon:
-        pid = _spawn_daemon("backend", uvicorn_cmd, ROOT)
+        # 名字与日志按 env 区分：否则 `manage.py logs` 会把两个实例的输出混在一起
+        pid = _spawn_daemon(
+            "backend" if extra_env.get("MOSS_ENV") != "dev" else "backend-dev",
+            uvicorn_cmd, ROOT, env=extra_env)
         # 等待端口就绪（最多 ~10s）
         for _ in range(50):
             if port_open("127.0.0.1", port):
@@ -474,7 +856,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     # 前台模式（开发最常用，Ctrl+C 退出）
     print(f"▶ 启动后端 http://{host}:{port}（前台运行，Ctrl+C 停止）…")
     try:
-        subprocess.run(uvicorn_cmd, cwd=str(ROOT), check=False)
+        subprocess.run(uvicorn_cmd, cwd=str(ROOT), check=False,
+                       env={**os.environ, **extra_env})
     except KeyboardInterrupt:
         print("\n已停止。")
     return 0
@@ -566,6 +949,15 @@ def cmd_status(_args: argparse.Namespace) -> int:
                     f"status={h.get('status')} ollama={gw.get('ollama')} "
                     f"deepseek={gw.get('deepseek')}"
                 )
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401:
+                    # 公网环境（prod/pilot）把 /health 纳入了登录门槛，
+                    # 这是**预期行为**而不是故障 —— 不能说成"未返回"，
+                    # 否则运维会去查一个根本不存在的启动问题。
+                    extra = ("（已强制登录门槛：深度健康检查 /health 需登录；"
+                             "进程存活正常，存活探针见 /api/v1/health/live）")
+                else:
+                    extra = f"（/health 返回 HTTP {exc.code}）"
             except (urllib.error.URLError, OSError, json.JSONDecodeError, ValueError):
                 extra = "（/health 未在 10 秒内返回：可能仍在预热，稍后再试）"
             rows.append(("后端 API", DEFAULT_BACKEND_PORT, "本项目运行中", extra))
@@ -575,6 +967,18 @@ def cmd_status(_args: argparse.Namespace) -> int:
     else:
         rows.append(("后端 API", DEFAULT_BACKEND_PORT, "未运行",
                      "python manage.py start"))
+    # 对外试点实例（独立端口 + 独立库，可与 dev 并存）。
+    # 不加这一行的话，`manage.py status` 对一个正在给客户提供服务的实例
+    # 完全无感 —— 运维会以为"只有一个实例在跑"。
+    if port_open("127.0.0.1", PILOT_BACKEND_PORT):
+        p_info = diagnose_port(PILOT_BACKEND_PORT)
+        rows.append((
+            "对外试点", PILOT_BACKEND_PORT,
+            "本项目运行中" if p_info["is_ours"] else "被其他程序占用",
+            f"客户可经公网访问（单实例，无 HA）｜"
+            f"启动：python manage.py start --env pilot --port {PILOT_BACKEND_PORT}"
+            if p_info["is_ours"] else f"PID={p_info.get('pid')}",
+        ))
     # 前端
     rows.append((
         "前端 dev", DEFAULT_FRONTEND_PORT,
@@ -642,6 +1046,51 @@ def cmd_build(_args: argparse.Namespace) -> int:
     ).returncode
 
 
+def cmd_ship_frontend(_args: argparse.Namespace) -> int:
+    """把 `web/dist` 的构建**同步**到对外试点用的 `web/dist-pilot`。
+
+    ## 为什么要有这一步（而不是让 pilot 直接用 web/dist）
+
+    `StaticFiles` 每次请求都从磁盘读，而 dev 与 pilot 跑的是同一个 checkout。
+    如果 pilot 直接用 `web/dist`，那么本地 `npm run build` 一跑完，
+    **客户刷新一下就是那份还没验过的界面** —— 调试前端时这等于把半成品
+    推给客户，而且没有"回滚到上一版界面"的手段。
+
+    所以对外实例指向 `web/dist-pilot`（见 `pilot_isolation_env` 里的
+    `MOSS_WEB_DIST`），发布流程变成显式一步：
+
+        1. `python manage.py build`            # 构建到 web/dist
+        2. 在 dev（8100）上验一遍
+        3. `python manage.py ship-frontend`    # 同步到 dist-pilot（本命令）
+        4. 客户刷新即可见
+
+    ## 为什么"先清空再复制"而不是覆盖式复制
+
+    构建产物带**内容哈希文件名**（`index-abc123.js`）。覆盖式复制会留下
+    历史版本的 `index-*.js`/`*.css`，目录越来越大、审计时也分不清
+    "线上到底是哪一份"。先删后拷保证 `dist-pilot` 与本次构建**逐文件一致**。
+    """
+    src = WEB_DIR / "dist"
+    dst = WEB_DIR / "dist-pilot"
+    if not (src / "index.html").exists():
+        print(f"❌ {src} 里没有 index.html —— 先跑 `python manage.py build`",
+              file=sys.stderr)
+        return 1
+    try:
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst)
+    except OSError as exc:
+        print(f"❌ 同步失败：{exc}", file=sys.stderr)
+        return 1
+    files = sum(1 for _ in dst.rglob("*") if _.is_file())
+    print(f"✅ 已同步 {files} 个文件 → {dst}")
+    print("   对外试点实例（8110）直接读该目录，**无需重启**；"
+          "客户刷新即可看到本次界面。")
+    print("   回滚：把上一版 dist 重新 ship 一次即可（建议每次发布前留副本）。")
+    return 0
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     """Celery worker + beat（生产/分布式调度，需 Redis）。
 
@@ -675,6 +1124,186 @@ def cmd_worker(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n已停止。")
     return 0
+
+
+def cmd_vacuum(args: argparse.Namespace) -> int:
+    """回收 SQLite 空闲页（`VACUUM`）。
+
+    ## 为什么需要它
+
+    2026-09-25 数据库审计实测：主库 6.32GB 中 **3.96GB（63%）是 freelist
+    空闲页** —— 保留清理删掉了行、页被标记为空闲，但 `auto_vacuum=0`
+    意味着**文件永不缩小**。"清理了"不等于"磁盘回来了"。
+
+    ## 为什么必须手动、必须先停服
+
+    1. `VACUUM` 会重写整个库，期间持有**排他锁**，所有读写全部阻塞
+       （6GB 级库是分钟级）；
+    2. 需要**约等于库大小的临时空间**（与库同目录）；
+    3. 这是唯一会让正在服务的实例整段不可用的操作，所以**不放进每日作业**。
+
+    ## 安全措施
+
+    - 默认要求确认（`--yes` 跳过）；
+    - 执行前检查是否还有本项目后端在跑，**不让 VACUUM 与写操作并发**；
+    - 先 `wal_checkpoint(TRUNCATE)`，否则 `.db-wal` 可能仍占着空间。
+    """
+    from src.core.config import get_settings
+    from src.infrastructure.retention_service import vacuum_sync
+
+    settings = get_settings()
+    db_path = str(settings.sqlite_path)
+    before = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+    print(f"目标库：{db_path}（{before / 1024 ** 3:.2f} GB）")
+
+    pids = list_our_backend_pids()
+    if pids:
+        print(f"❌ 检测到本项目后端仍在运行（PID {pids}）—— 请先执行："
+              f"python manage.py stop")
+        print("   VACUUM 需要排他锁；与正在写库的实例并发会互相阻塞，")
+        print("   且耗时长到看起来像服务卡死。")
+        return 1
+
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(db_path))).free
+    if free < before * 1.2:
+        print(f"❌ 同一磁盘可用空间不足：需约 {before * 1.2 / 1024 ** 3:.2f} GB"
+              f"（库大小 + 余量），当前 {free / 1024 ** 3:.2f} GB。")
+        print("   VACUUM 的临时文件与库同目录，空间不足会失败。")
+        return 1
+
+    if not args.yes:
+        print("VACUUM 会重写整个库，期间库不可用（分钟级）。")
+        if input("确认继续？输入 yes：").strip().lower() not in ("y", "yes"):
+            print("已取消。")
+            return 0
+
+    print("正在 VACUUM（可能要几分钟）…")
+    outcome = vacuum_sync(settings)
+    if not outcome.get("ok"):
+        print(f"❌ 失败：{outcome.get('error')}")
+        return 1
+    print(f"✅ 完成：{outcome['before'] / 1024 ** 3:.2f} GB → "
+          f"{outcome['after'] / 1024 ** 3:.2f} GB"
+          f"（回收 {outcome['freed'] / 1024 ** 3:.2f} GB）")
+    return 0
+
+
+#: 值守事件流水（JSONL）。每一条 = 一次"发现后端不在 → 重启"的现场记录。
+#:
+#: ## 为什么必须有它（2026-09-26 实测事故）
+#:
+#: 对外实例（8110）**被静默终止过一次**：端口无监听、进程全无，
+#: 而 `backend.log` 尾部只到最后一个 `200 OK`，没有任何异常或退出痕迹；
+#: Windows 事件日志在同一时间窗内也没有崩溃/关机记录。
+#: 也就是说它既不是崩的、也不是正常关停的 —— 是被外部强杀的。
+#:
+#: 强杀（`taskkill /F`、Job Object 关闭、OOM killer 之类）**不会走 lifespan**，
+#: 所以"事后从日志找原因"这条路本身就是断的。唯一的出路是**当时就把现场记下来**：
+#: 最后一次活动时刻、当时的 PID、端口状态。下次再发生，这份流水能直接告诉
+#: 我们"死在哪一刻、当时还有没有进程"，而不是靠推测。
+INCIDENT_LOG = RUN_DIR / "backend_incidents.jsonl"
+
+
+def _record_incident(event: str, **fields: object) -> None:
+    """追加一条值守事件（失败只警告，绝不影响值守本身）。"""
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        row = {"at": datetime.now().isoformat(timespec="seconds"),
+               "event": event, **fields}
+        with INCIDENT_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001 记不上账不该让值守失败
+        print(f"⚠️ 值守事件写入失败：{exc}", file=sys.stderr)
+
+
+def cmd_ensure(args: argparse.Namespace) -> int:
+    """**值守**：后端不在就拉起来；在就什么都不做。
+
+    ## 为什么需要它（以及它**不是**什么）
+
+    它不是高可用、不做负载均衡、不管数据库迁移。它只回答一个问题：
+    "对外那个端口上，我们的进程还在吗？不在就起回来。"
+
+    2026-09-26 的静默终止事故说明：**没有值守时，服务消失是无声的** ——
+    客户先发现"打不开"，我们才发现"进程没了"，而且日志里查不到任何原因
+    （强杀不走 lifespan，什么都不留）。有了它，同样的事故变成
+    "一分钟内自动恢复 + 流水里留一条现场"。
+
+    ## 判据（三条，顺序不能换）
+
+    1. 端口**没被占用** → 直接重启（这是最常见的形态：进程整棵树消失）。
+    2. 端口被**本项目**实例占用 → 什么都不做（这是绝大多数 tick 的路径，
+       必须零副作用：不重启、不写日志、不改 pid 文件）。
+    3. 端口被**别的程序**占用 → **拒绝启动**并记一条事件。
+
+       ⚠️ 绝不能在这里"先杀掉再起"：`kill_pid_tree` 是硬杀，会打断别的
+       业务程序；而且端口被非本项目占用时，我们根本不知道对方是什么。
+       宁可让值守报错让人来看。
+
+    ## 为什么不做"健康检查失败就重启"
+
+    因为 `/health` 在冷启动、仓库统计生成时会**几十秒**才回（`cmd_status`
+    的注释记过这条实测），把"慢"判成"死"会导致值守自己反复重启一个
+    正在正常工作的实例 —— 那是把可用性问题变成自己制造的故障。
+    所以判据只看**端口有没有人听**：进程死了端口必然空，这个判据不会误报。
+    """
+    port = args.port
+    env = args.env or "pilot"
+    info = diagnose_port(port)
+
+    if info.get("occupied") and info.get("is_ours"):
+        if args.verbose:
+            print(f"✅ {port} 上本项目实例运行中（PID={info.get('pid')}），无需处理。")
+        return 0
+
+    if info.get("occupied"):
+        # 非本项目占用：拒绝，并留下现场
+        _record_incident(
+            "foreign_port_owner", port=port,
+            pid=info.get("pid"), cmdline=str(info.get("cmdline") or "")[:200])
+        print(f"❌ 端口 {port} 被**其他程序**占用（PID={info.get('pid')}），"
+              f"值守拒绝启动。命令行：{info.get('cmdline')}", file=sys.stderr)
+        return 2
+
+    # 端口空 → 起回来。先把"最后一次活动"记下来，这是判断死亡时刻的唯一线索。
+    last_activity = ""
+    log_path = RUN_DIR / f"{args.name}.log"
+    if log_path.exists():
+        last_activity = datetime.fromtimestamp(
+            log_path.stat().st_mtime).isoformat(timespec="seconds")
+    _record_incident("restart", port=port, env=env,
+                     last_activity=last_activity,
+                     reason="端口无监听（进程已消失）")
+
+    code = _ensure_restart(env=env, port=port, name=args.name)
+    if code == 0:
+        _record_incident("restart_ok", port=port)
+        print(f"✅ 值守已重启 {env} 实例（{port}）。上次活动：{last_activity or '未知'}")
+    else:
+        _record_incident("restart_failed", port=port, exit_code=code)
+        print(f"❌ 值守重启失败（退出码 {code}），详见 {INCIDENT_LOG}", file=sys.stderr)
+    return code
+
+
+def _ensure_restart(*, env: str, port: int, name: str) -> int:
+    """值守专用重启：**复用 `cmd_start`**，不重新拼一遍 uvicorn 命令。
+
+    为什么必须复用（而不是在这里自己 `_spawn_daemon`）：
+    启动后端要同时做对一整套事 —— 环境自检、隔离环境变量（pilot 的
+    `MOSS_SQLITE_PATH` / `MOSS_WEB_DIST` / 单实例 ack）、端口占用判定、
+    `--timeout-keep-alive 65`、日志与 pid 文件命名、就绪等待、失败回滚。
+    自己再拼一份，早晚会漏（本项目已有"两处各拼一遍必然漂移"的多次记录）。
+
+    `--replace` 一律**不传**：它在端口已被占用的场景才有用，而本函数只在
+    "端口空"时被调用；更关键的是它按命令行枚举本项目**全部**后端进程，
+    会把正在跑的另一个实例（dev 8100）一起停掉。
+    """
+    args = argparse.Namespace(
+        env=env, host="127.0.0.1", port=port,
+        reload=False, daemon=True, with_frontend=False,
+        replace=False, auto_port=False,
+    )
+    return cmd_start(args)
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -823,6 +1452,18 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_start = sub.add_parser("start", help="启动后端（默认127.0.0.1:8100）")
+    p_start.add_argument(
+        # ⚠️ choices 必须与 `src.core.config.ENVS` 一致。这里曾经写死
+        # `["dev","test","prod"]`，加了 pilot 之后 `--env pilot` 直接被
+        # argparse 拦下（"invalid choice"），而自检那时还看不到它 ——
+        # 表现为"新环境明明加好了却起不来"，且报错指向 argparse 而不是配置。
+        "--env", choices=list(_env_choices()), default=None,
+        help="运行环境（默认取 MOSS_ENV，未设则 dev）。"
+             "prod 会跑启动自检并拒绝不自洽配置；"
+             "dev 会把数据/调度/审计改道到 data/dev/ 且禁用定时任务；"
+             "pilot = **对外试点**：客户可访问，登录门槛自动强制、"
+             "必须有真实 SMTP 凭据、数据改道到 data/pilot/，"
+             "但单实例、无高可用、不承诺 SLA")
     p_start.add_argument("--host", default="127.0.0.1")
     p_start.add_argument("--port", type=int, default=DEFAULT_BACKEND_PORT)
     p_start.add_argument("--reload", action="store_true", help="开发热重载")
@@ -841,6 +1482,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="查看服务与依赖状态")
     p_status.set_defaults(func=cmd_status)
 
+    p_ensure = sub.add_parser(
+        "ensure",
+        help="值守：后端不在就拉起来（配计划任务每分钟跑一次）")
+    p_ensure.add_argument("--env", choices=list(_env_choices()), default="pilot",
+                          help="要值守的环境（默认 pilot）")
+    p_ensure.add_argument("--port", type=int, default=PILOT_BACKEND_PORT,
+                          help=f"要值守的端口（默认 {PILOT_BACKEND_PORT}）")
+    p_ensure.add_argument("--name", default="backend",
+                          help="日志名（与 start 的命名一致，默认 backend）")
+    p_ensure.add_argument("--verbose", action="store_true",
+                          help="正常时也打印一行（默认静默，避免计划任务刷日志）")
+    p_ensure.set_defaults(func=cmd_ensure)
+
     p_doctor = sub.add_parser(
         "doctor", help="体检/自愈本地 SQLite（陈旧 -wal/-shm 导致 disk I/O error）")
     p_doctor.set_defaults(func=cmd_doctor)
@@ -857,6 +1511,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_build = sub.add_parser("build", help="构建前端到 web/dist")
     p_build.set_defaults(func=cmd_build)
 
+    p_ship = sub.add_parser(
+        "ship-frontend",
+        help="把 web/dist 的**已验证**构建同步到对外试点实例（web/dist-pilot）")
+    p_ship.set_defaults(func=cmd_ship_frontend)
+
     p_worker = sub.add_parser(
         "worker", help="Celery worker+beat（生产调度，需Redis；演示模式无需启动）")
     p_worker.add_argument("--daemon", action="store_true", help="后台运行")
@@ -872,6 +1531,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_logs.add_argument("--lines", type=int, default=200, help="打印尾部行数")
     p_logs.add_argument("-f", "--follow", action="store_true", help="跟随新日志")
     p_logs.set_defaults(func=cmd_logs)
+
+    p_vacuum = sub.add_parser(
+        "vacuum",
+        help="回收 SQLite 空闲页（**必须先停服**；会重写整个库）")
+    p_vacuum.add_argument(
+        "--yes", action="store_true",
+        help="跳过确认（脚本化时用）")
+    p_vacuum.set_defaults(func=cmd_vacuum)
     return parser
 
 

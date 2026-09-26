@@ -249,6 +249,45 @@ def test_upsert_watch_adds_and_updates_without_duplicates(yaml_path) -> None:
     assert [item.code for item in config.watchlist] == ["300308", "600110"]
 
 
+def test_upsert_watch_prepend_puts_new_code_on_top(yaml_path) -> None:
+    """`prepend=True` 把新票放最前（用户 2026-09-23：「新加自选股要放在顶部」）。
+
+    ⚠️ 默认（不传 prepend）**必须保持追加**：上一条测试钉的就是这个语义，
+    而批量加自选（`add_watch_many`）依赖"按入参顺序"。
+    """
+    upsert_watch(WatchConfig(code="300308", name="中际旭创"), yaml_path)
+    upsert_watch(WatchConfig(code="600110", name="诺德股份"), yaml_path)
+    config = upsert_watch(WatchConfig(code="002436", name="兴森科技"), yaml_path,
+                          prepend=True)
+    assert [item.code for item in config.watchlist] == [
+        "002436", "300308", "600110"], "新加的票必须在顶部"
+
+
+def test_upsert_watch_prepend_does_not_jump_ahead_of_pinned(yaml_path) -> None:
+    """新票进"非置顶组"的头部 —— **不得插到置顶项前面**。
+
+    `sort_watch_items()` 的契约是"置顶项永远在最前"。若把新票硬插到 `index 0`，
+    用户显式钉住的票会被挤到第二行，那是对"置顶"这个动作的静默推翻。
+    """
+    upsert_watch(WatchConfig(code="600519", name="贵州茅台", pinned=True), yaml_path)
+    upsert_watch(WatchConfig(code="300308", name="中际旭创"), yaml_path)
+    config = upsert_watch(WatchConfig(code="002436", name="兴森科技"), yaml_path,
+                          prepend=True)
+    assert [item.code for item in config.watchlist] == [
+        "600519", "002436", "300308"], "置顶项仍在最前，新票紧随其后"
+
+
+def test_upsert_watch_prepend_moves_existing_code_to_top(yaml_path) -> None:
+    """重复加已在池里的票：**去重 + 置顶**，不是留两个或原地不动。"""
+    upsert_watch(WatchConfig(code="300308", name="中际旭创"), yaml_path)
+    upsert_watch(WatchConfig(code="600110", name="诺德股份"), yaml_path)
+    config = upsert_watch(WatchConfig(code="600110", name="诺德股份"), yaml_path,
+                          prepend=True)
+    codes = [item.code for item in config.watchlist]
+    assert codes == ["600110", "300308"]
+    assert codes.count("600110") == 1, "按代码去重，不得留两条"
+
+
 def test_remove_watch_is_idempotent(yaml_path) -> None:
     config = remove_watch("300308", yaml_path)
     assert config.watchlist == []
@@ -444,9 +483,11 @@ class _FakeGateway:
         self.calls: list[dict] = []
 
     async def complete(self, tier, system, prompt, *, agent_id="", trace_id="",
-                       json_mode=False, use_cache=True, cancel_token=None):
+                       json_mode=False, use_cache=True, cache_ttl_hours=None,
+                       cancel_token=None):
         self.calls.append({
-            "tier": tier, "prompt": prompt, "use_cache": use_cache})
+            "tier": tier, "prompt": prompt, "use_cache": use_cache,
+            "cache_ttl_hours": cache_ttl_hours})
         content = self._contents[min(len(self.calls) - 1, len(self._contents) - 1)]
         return _FakeResponse(content)
 
@@ -508,14 +549,54 @@ def test_news_retries_after_invalid_json() -> None:
     assert len(gateway.calls) == 2
 
 
-def test_news_bypasses_gateway_cache_by_default() -> None:
-    """默认 use_cache=False：避免网关把「空返回」缓存24h形成毒缓存。"""
+def test_news_uses_gateway_cache_by_default() -> None:
+    """默认走网关缓存（2026-09-21 改）。
+
+    原来默认 `use_cache=False`，理由是"网关会把空返回缓存 24h 形成毒缓存"——
+    那个 bug 已修（`gateway.py` 空响应既不命中也不写入）。继续关着会让
+    本模块唯一的落盘复用失效：它没有任何自有持久化，冷启动必然全部重算。
+    """
     import asyncio
 
     gateway = _FakeGateway([_VALID_JSON])
     analyzer = _analyzer(gateway)
     asyncio.run(analyzer.analyze(code="300308"))
-    assert gateway.calls[0]["use_cache"] is False
+    assert gateway.calls[0]["use_cache"] is True
+
+
+def test_news_force_bypasses_gateway_cache() -> None:
+    """`force=True`（前端强制刷新）必须把 use_cache 一路关掉。
+
+    这是本模块最容易出错的地方：只清进程内缓存是**不够**的 ——
+    磁盘缓存里还留着上次的答案，前端会看到"点了强制刷新但数据没变"。
+    """
+    import asyncio
+
+    gateway = _FakeGateway([_VALID_JSON, _VALID_JSON])
+    analyzer = _analyzer(gateway)
+    asyncio.run(analyzer.analyze(code="300308"))
+    assert gateway.calls[0]["use_cache"] is True, "常规路径应复用缓存"
+
+    gateway.calls.clear()
+    asyncio.run(analyzer.analyze(code="300308", force=True))
+    assert gateway.calls, "force 应真的重算，而不是命中缓存直接返回"
+    assert gateway.calls[0]["use_cache"] is False, "force 必须穿透到网关缓存"
+
+
+def test_news_passes_configured_gateway_cache_ttl() -> None:
+    """磁盘 TTL 来自配置，且默认比进程内 TTL 长（跨重启复用才有意义）。"""
+    import asyncio
+
+    from src.intraday.config import IntradayConfig
+
+    config = IntradayConfig()
+    assert config.factors.news.gateway_cache_ttl_hours == 6.0
+    assert config.factors.news.gateway_cache_ttl_hours * 3600 > config.data.news_cache_ttl
+
+    gateway = _FakeGateway([_VALID_JSON])
+    analyzer = _analyzer(gateway)
+    asyncio.run(analyzer.analyze(code="300308"))
+    assert gateway.calls[0]["cache_ttl_hours"] == 6.0
 
 
 def test_news_uses_configured_tier() -> None:
@@ -599,7 +680,10 @@ def test_service_add_and_remove_watch(tmp_dir) -> None:
     reset_config_cache()
     service = IntradayService(backend=None, config_path=path)
     config = service.add_watch("600110", name="诺德股份", boards=["PET铜箔"])
-    assert [item.code for item in config.watchlist] == ["300308", "600110"]
+    # ⚠️ 单只「加自选」是**置顶**语义（用户 2026-09-23：「新加自选股，
+    #    要放在自选股池的顶部」）—— 所以新票在第一位，原有 300308 退到后面。
+    #    这条断言原先写的是 `["300308", "600110"]`（追加），随需求变更已更新。
+    assert [item.code for item in config.watchlist] == ["600110", "300308"]
     assert service.config.watch("600110").name == "诺德股份"
     # 板块名（中文）经 YAML 落盘再读回后必须仍然绑定：这是前端「加自选」时
     # 让「板块情绪/板块排行」两个维度能计入总分的唯一入口。
@@ -609,6 +693,85 @@ def test_service_add_and_remove_watch(tmp_dir) -> None:
     config = service.remove_watch("300308")
     assert [item.code for item in config.watchlist] == ["600110"]
     assert "# ============ 推送 ============" in open(path, encoding="utf-8").read()
+
+
+def test_stock_binding_survives_remove_and_reload(tmp_dir) -> None:
+    """**回归（2026-09-23）**：删了自选再加回来，关联板块/海外映射要自动还原。
+
+    用户原话："加自选股时，输入关联板块、海外映射板块后，应该把关联和映射数据
+    配置保存到数据库里，后续不管删除自选还是新加自选，都可以自动加载之前的配置，
+    当有手动输入关联板块或海外映射时，配置再跟随刷新。"
+
+    背景：这两项原本**只**存在 `configs/intraday.yaml` 的自选条目内部，
+    `remove_watch` 整条删掉就一起没了。现在另存一份到 `dim_intraday_profile`
+    的 `boards_json` / `overseas_json` 两列 —— 该表的行**不会因为删自选而消失**，
+    于是"删了再加"能天然还原。
+    """
+    from src.infrastructure.repositories.intraday_profile_sqlite_repo import (
+        IntradayProfileSqliteRepository,
+    )
+    from src.intraday.service import IntradayService
+
+    path = os.path.join(tmp_dir, "intraday.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(SAMPLE_YAML)
+    reset_config_cache()
+    repo = IntradayProfileSqliteRepository(os.path.join(tmp_dir, "profile.db"))
+    service = IntradayService(backend=None, config_path=path, profile_repo=repo)
+
+    # ① 加自选并配好板块/映射 → 立刻落库（内存热map 同步更新）
+    service.add_watch("600110", name="诺德股份",
+                      boards=["PET铜箔"], overseas=["usNVDA"])
+    assert service.binding_for("600110") == (["PET铜箔"], ["usNVDA"])
+    assert repo.get_binding("600110") == (["PET铜箔"], ["usNVDA"])
+
+    # ② 删掉自选 → 绑定**必须留着**（这正是"删了再加还能回来"的关键）
+    service.remove_watch("600110")
+    assert [item.code for item in service.config.watchlist] == ["300308"]
+    assert repo.get_binding("600110") == (["PET铜箔"], ["usNVDA"])
+
+    # ③ 重新加回来、**不传** boards/overseas → 自动还原上次的配置
+    config = service.add_watch("600110", name="诺德股份")
+    assert config.board_names("600110") == ["PET铜箔"]
+    assert config.overseas_for("600110") == ["usNVDA"]
+    assert config.boards_bound("600110") is True
+
+    # ④ 手动输入 → 配置**跟随刷新**（覆盖旧绑定）
+    config = service.add_watch("600110", name="诺德股份",
+                               boards=["新板块"], overseas=["usAMD"])
+    assert config.board_names("600110") == ["新板块"]
+    assert config.overseas_for("600110") == ["usAMD"]
+    assert repo.get_binding("600110") == (["新板块"], ["usAMD"])
+
+    # ⑤ 模拟**重启**：新 service + 同一份库 → `warm_bindings()` 热加载后立刻可读
+    restarted = IntradayService(backend=None, config_path=path, profile_repo=repo)
+    assert restarted.warm_bindings() == 1
+    assert restarted.binding_for("600110") == (["新板块"], ["usAMD"])
+    assert restarted.all_bindings()["600110"] == (["新板块"], ["usAMD"])
+    # 没配过的票 → 空（不能把"没配过"当成"配了个空的"）
+    assert restarted.binding_for("300308") == ([], [])
+
+
+def test_stock_binding_survives_weight_profile_save(tmp_dir) -> None:
+    """**权重档案存一次，不能把关联板块/海外映射清空**。
+
+    两套数据同表不同列：`boards_json`/`overseas_json` **刻意不在** `_COLUMNS` 里，
+    于是权重档案的 `ON CONFLICT DO UPDATE SET` 碰不到它们。若哪天有人图省事
+    把这两列塞进 `_COLUMNS`，这条测试会立刻响 —— 那意味着用户每次改权重都会
+    丢掉自己配的板块绑定，而且**毫无提示**。
+    """
+    import asyncio
+
+    from src.domain.intraday.models import IntradayProfile
+    from src.infrastructure.repositories.intraday_profile_sqlite_repo import (
+        IntradayProfileSqliteRepository,
+    )
+
+    repo = IntradayProfileSqliteRepository(os.path.join(tmp_dir, "profile.db"))
+    repo.set_binding("600110", ["PET铜箔"], ["usNVDA"])
+    asyncio.run(repo.upsert(IntradayProfile(
+        code="600110", name="诺德股份", weights={"box": 1.0})))
+    assert repo.get_binding("600110") == (["PET铜箔"], ["usNVDA"])
 
 
 def test_add_watch_resolves_name_from_directory(tmp_dir, monkeypatch) -> None:
@@ -633,7 +796,8 @@ def test_add_watch_resolves_name_from_directory(tmp_dir, monkeypatch) -> None:
     config = service.add_watch("603083", name="")
     assert service.config.watch("603083").name == "剑桥科技"
     assert 'name: "剑桥科技"' in open(path, encoding="utf-8").read()
-    assert [item.code for item in config.watchlist] == ["300308", "603083"]
+    # 同上：单只加自选置顶（原断言为 ["300308", "603083"]，按新需求更新）
+    assert [item.code for item in config.watchlist] == ["603083", "300308"]
 
 
 def test_add_watch_does_not_store_code_as_name(tmp_dir, monkeypatch) -> None:

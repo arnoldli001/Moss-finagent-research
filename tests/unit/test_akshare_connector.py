@@ -131,3 +131,82 @@ def test_stock_both_sources_fail_raises(monkeypatch):
 def test_sina_symbol_prefix():
     assert AkshareConnector._sina_symbol("601088") == "sh601088"
     assert AkshareConnector._sina_symbol("000001") == "sz000001"
+
+
+# ==================== 新浪回退路径的两个静默错误（实测回归） ====================
+#
+# 实测（2026-09-22）踩到两个都**不报错**的问题，用户只会看到"数据少了一截/量柱高 100 倍"：
+#   1. 区间过滤把 boolean Series 拿去 reindex：先按起点过滤再按止点过滤，
+#      第二个掩码带着原表 RangeIndex，未对齐位置一律 False →
+#      2020-01-01~2026-09-22 的查询被静默截断成 2020-01-02~2025-12-31；
+#   2. 新浪成交量单位是**股**（实测 600036 同日 43,342,069 ↔ 腾讯 433,421 手 = 100 倍），
+#      不换算就是 100 倍级静默误差。
+# 下面两条用例把修复钉死（都用假 akshare，不联网）。
+
+
+class _FakeSinaAk:
+    """假 akshare：东财必失败，新浪返回一段跨 2025/2026 的全历史帧。"""
+
+    def __init__(self, dates: list[str] | None = None) -> None:
+        self.dates = dates or [
+            "2019-12-31", "2020-01-02", "2020-01-03",
+            "2025-12-31", "2026-01-05", "2026-09-22",
+        ]
+
+    def stock_zh_a_hist(self, symbol, period, start_date, end_date):
+        raise ConnectionError("Remote end closed connection without response")
+
+    def stock_zh_a_daily(self, symbol, adjust):
+        return pd.DataFrame({
+            "date": self.dates,
+            "open": [10.0] * len(self.dates),
+            "high": [11.0] * len(self.dates),
+            "low": [9.0] * len(self.dates),
+            "close": [10.5] * len(self.dates),
+            "volume": [43_342_069.0] * len(self.dates),
+            "amount": [1_770_009_799.0] * len(self.dates),
+        })
+
+
+def test_sina_range_filter_keeps_2026_rows(monkeypatch):
+    """区间过滤必须保住 2026 的行（修复前会被 reindex 静默截断在 2025-12-31）。"""
+    monkeypatch.setitem(sys.modules, "akshare", _FakeSinaAk())
+    df = AkshareConnector()._load_dataframe(
+        "stock_close:600036", "2020-01-01", "2026-09-22")
+    dates = [str(d) for d in df["日期"]]
+    assert dates == ["2020-01-02", "2020-01-03", "2025-12-31",
+                     "2026-01-05", "2026-09-22"]
+    assert max(dates) == "2026-09-22"
+
+
+def test_sina_volume_converted_to_lots(monkeypatch):
+    """新浪 volume 是股 → 统一折成手（÷100），避免与东财/腾讯/Tushare 差 100 倍。"""
+    monkeypatch.setitem(sys.modules, "akshare", _FakeSinaAk())
+    df = AkshareConnector()._load_dataframe("stock_close:600036", None, None)
+    assert df["volume"].iloc[0] == pytest.approx(433_420.69)
+    # 中文列名也写一份，下游 daily_bars_from_points 的别名表两种都能命中
+    assert df["成交量"].iloc[0] == pytest.approx(433_420.69)
+    # 成交额单位本来就是元，**不得**被换算
+    assert df["amount"].iloc[0] == pytest.approx(1_770_009_799.0)
+    points = df_to_data_points(df, "stock_close:600036", "AkShare", "x")
+    assert points[0].extra["volume"] == pytest.approx(433_420.69)
+
+
+def test_index_and_etf_range_filter_also_keeps_latest(monkeypatch):
+    """指数/ETF 走 _filter_frame_dates，同样不能把最新一段丢掉。"""
+    class _FakeIndexAk:
+        def stock_zh_index_daily(self, symbol):
+            return pd.DataFrame({
+                "date": ["2019-12-31", "2020-01-02", "2025-12-31", "2026-09-22"],
+                "open": [1.0] * 4, "high": [1.0] * 4,
+                "low": [1.0] * 4, "close": [1.0] * 4,
+                "volume": [17_786_387_600.0] * 4,
+            })
+
+    monkeypatch.setitem(sys.modules, "akshare", _FakeIndexAk())
+    df = AkshareConnector()._load_dataframe(
+        "index_close:000300", "2020-01-01", "2026-09-22")
+    dates = [str(d) for d in df["日期"]]
+    assert dates == ["2020-01-02", "2025-12-31", "2026-09-22"]
+    # 指数新浪 volume 同样是股 → 折手
+    assert df["volume"].iloc[-1] == pytest.approx(177_863_876.0)

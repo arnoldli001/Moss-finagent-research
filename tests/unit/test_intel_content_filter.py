@@ -223,3 +223,56 @@ def test_filter_items_cleans_kept_items_in_place() -> None:
     assert not kept[0]["title"].startswith("#")
     assert "[玫瑰]" not in kept[0]["summary"]
     assert "玫瑰" not in kept[0]["summary"]
+
+
+# ======================================================================
+# ★ 分析师名 / 券商名**不能**让条目被丢掉（用户 2026-09-25）
+# ======================================================================
+
+#: 用户点名要盯的分析师（`alert_rules.ANALYST_WATCHLIST`）与真实券商名。
+#: ⚠️ 这里**故意不 import** 那份名单：本用例要断言的是"这几个**具体字面词**
+#: 不会触发任何过滤规则"，从被测模块拿名单会让用例跟着名单一起变，
+#: 失去"名单里的人不能被过滤掉"这层意思。
+_WATCHED_NAMES = ("孙潇雅", "赵宇阳", "武超则", "陈果", "刘晨明", "洪灏",
+                  "中泰证券", "天风证券", "国金证券")
+
+
+def test_analyst_and_broker_names_survive_cleaning() -> None:
+    """★ 用户口径："这些名字**不能被本地大模型过滤掉**"。
+
+    模型那一路由抽取侧的逐字校验管；**规则这一路也要钉住** ——
+    内容过滤在流水线最前面，它若因为"人/机构名"丢掉整条，
+    后面的名字识别再准也拿不到东西，而表现只是"今天没弹窗"。
+
+    这里同时断言"清洗**不改动**这些名字"：名字被剥字（哪怕少一个字）
+    会让逐字校验失效，而那种失败看起来像"模型没抽到"。
+    """
+    for name in _WATCHED_NAMES:
+        body = f"{name}认为该环节供需格局改善，建议关注龙头企业。" * 3
+        r = clean(f"【{name}】最新观点", body)
+        assert r.keep, f"含 {name} 的条目被丢掉了（reason={r.reason}）"
+        assert name in r.title or name in r.text
+        assert name in f"{r.title} {r.text}"
+
+
+def test_analyst_name_alone_does_not_invalidate_an_item() -> None:
+    """只有一个人名、没有任何市场信号词的长条目**照样留下**（不误杀）。"""
+    body = ("孙潇雅在路演中提到该公司的产能布局与客户结构，"
+            "并回答了投资者关于交付节奏的问题。" * 3)
+    r = clean("路演纪要", body)
+    assert r.keep
+    assert "孙潇雅" in r.text
+
+
+def test_broker_byline_is_not_stripped_by_the_byline_rule() -> None:
+    """`【中泰证券】` **不是**星球署名，不能被 `_BYLINE` 剥掉。
+
+    `_BYLINE` 只认 `调研 / 纪要 / 投研` 结尾的群名（`WD调研`、`群纪要`…）。
+    券商名的结尾是"证券"，两者本来不冲突 —— 这条用例把边界钉住：
+    哪天有人"顺手"把 `证券` 加进署名形态，机构名就会在清洗阶段消失，
+    而前端那句"机构：中泰证券"会静默变空。
+    """
+    r = strip_noise("【中泰证券】汽车行业周报：销量超预期")
+    assert "中泰证券" in r
+    # 对照：真正的星球署名仍然要被剥掉（这条规则本身没坏）
+    assert "WD调研" not in strip_noise("WD调研：半导体设备再强调")

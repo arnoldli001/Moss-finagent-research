@@ -15,10 +15,11 @@ def _settings(**over) -> Settings:
     return Settings(**over)
 
 
-def _point(indicator: str = "CPI", value: float = 2.1, period: str = "2026-08-01") -> DataPoint:
+def _point(indicator: str = "CPI", value: float = 2.1, period: str = "2026-08-01",
+           source: str = "AkShare") -> DataPoint:
     return DataPoint(
         indicator=indicator, value=value, period_date=period,
-        source_name="AkShare", source_url="https://x",
+        source_name=source, source_url="https://x",
     )
 
 
@@ -84,15 +85,22 @@ class FakePGConn:
         return "INSERT 0 1"
 
     async def fetchval(self, sql: str, *params):
-        # DELETE ... RETURNING CTE：按indicator+区间从内存表移除并回计数
+        # DELETE ... RETURNING CTE：按indicator+区间 或 按source_name 移除并回计数
         if sql.startswith("WITH deleted AS (DELETE"):
-            indicator = params[0]
-            doomed = [
-                k for k, r in self._table.items()
-                if r["indicator"] == indicator
-                and (len(params) < 2 or (r["period_date"] or "") >= params[1])
-                and (len(params) < 3 or (r["period_date"] or "") <= params[2])
-            ]
+            if "source_name = $1" in sql:
+                source_name = params[0]
+                doomed = [
+                    k for k, r in self._table.items()
+                    if r["source_name"] == source_name
+                ]
+            else:
+                indicator = params[0]
+                doomed = [
+                    k for k, r in self._table.items()
+                    if r["indicator"] == indicator
+                    and (len(params) < 2 or (r["period_date"] or "") >= params[1])
+                    and (len(params) < 3 or (r["period_date"] or "") <= params[2])
+                ]
             for k in doomed:
                 self._table.pop(k, None)
             return len(doomed)
@@ -255,6 +263,12 @@ class FakeInnerRepo:
         self.points = []
         return n
 
+    async def delete_points_by_source(self, source_name):
+        keep = [p for p in self.points if p.source_name != source_name]
+        n = len(self.points) - len(keep)
+        self.points = keep
+        return n
+
     async def close(self):
         pass
 
@@ -384,5 +398,60 @@ async def test_cache_invalidated_on_delete():
     await cached.delete_points("CPI")
     # 缓存键被扫描删除
     assert not any(k.startswith("moss_finagent:dp:CPI:") for k in fake_redis._store)
+
+
+# ---------- delete_points_by_source（源退役/坏点清理） ----------
+
+async def test_sqlite_delete_points_by_source_spares_other_sources(tmp_dir):
+    """按来源删只动那一家的行：同一 indicator 下新源的好数据必须留下。
+
+    这是"模拟源退役"的关键性质 —— 若按 indicator 删，会把已经换成真实源的
+    同名指标数据一起删掉。
+    """
+    repo = MacroRepository(f"{tmp_dir}/purge.db")
+    await repo.save_points([
+        _point("ind:消费行业PE(TTM)", 28.0, "2026-09-01", source="模拟产业数据(Demo)"),
+        _point("ind:消费行业PE(TTM)", 16.82, "2026-09-24", source="中证指数官网行业估值"),
+        _point("ind:白酒批价(元/瓶)", 920.0, "2026-09-01", source="模拟产业数据(Demo)"),
+    ], "purge_test")
+
+    deleted = await repo.delete_points_by_source("模拟产业数据(Demo)")
+    assert deleted == 2
+
+    left = await repo.query_points("ind:消费行业PE(TTM)")
+    assert [(p.value, p.source_name) for p in left] == [
+        (16.82, "中证指数官网行业估值")]
+    assert await repo.query_points("ind:白酒批价(元/瓶)") == []
+    # 幂等：再删一次为 0，不报错
+    assert await repo.delete_points_by_source("模拟产业数据(Demo)") == 0
+
+
+async def test_postgres_delete_points_by_source_with_fake_pool(monkeypatch):
+    repo = PostgresRepository("postgresql://u:p@h/db")
+    _patch_fake_pg_pool(monkeypatch)
+    await repo.save_points([
+        _point("CPI", 2.1, "2026-08-01", source="模拟产业数据(Demo)"),
+        _point("CPI", 2.0, "2026-07-01", source="AkShare"),
+    ], "t")
+
+    assert await repo.delete_points_by_source("模拟产业数据(Demo)") == 1
+    rows = await repo.query_points("CPI")
+    assert [r.source_name for r in rows] == ["AkShare"]
+
+
+async def test_cache_invalidated_on_delete_by_source():
+    """按来源删同样是跨指标的，必须清空查询缓存，否则仍读到已删的旧行。"""
+    inner = FakeInnerRepo()
+    inner.points = [
+        _point("CPI", 2.1, "2026-08-01", source="模拟产业数据(Demo)"),
+        _point("PPI", 1.1, "2026-08-01", source="AkShare"),
+    ]
+    fake_redis = FakeRedis()
+    cached = CachedRepository(inner, "redis://x")
+    cached._client = fake_redis
+
+    await cached.query_points("CPI")  # 回填缓存
+    assert await cached.delete_points_by_source("模拟产业数据(Demo)") == 1
+    assert not any(k.startswith("moss_finagent:dp:") for k in fake_redis._store)
     await cached.query_points("CPI")  # 穿透到底层（空列表不再回填）
     assert inner.query_calls == 2

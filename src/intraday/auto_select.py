@@ -1,9 +1,9 @@
-"""自动选股：从候选池里挑出"日K买入信号 + 分时打分高"的票，按综合分排序取前 N。
+"""自动选股：从候选池里挑出"日K多方条件 + 分时打分高"的票，按综合分排序取前 N。
 
 ## 用户口径（2026-09-17）
 
-> 遍历热门股前 50 和昨日涨停股、昨日成交额前 200 的股。当日 K 出现买入信号、
-> 且日内分时多指标合成打分大于 40 分 → 提示低吸，自动加入自选，**最多 6 个**，
+> 遍历热门股前 50 和昨日涨停股、昨日成交额前 200 的股。当日 K 出现多方条件、
+> 且日内分时多指标合成打分大于 40 分 → 提示回踩，自动加入自选，**最多 6 个**，
 > 选分时和日K打分都高的股，排序给出前 6 个。
 
 ## 为什么不能"把 250 只票全跑一遍"
@@ -14,7 +14,7 @@
 1. **候选池**（几乎零成本，本地仓库 + 一次批量快照）：
    三组并集去重 —— 热门股前 50（按近 N 日成交额）、昨日涨停股、昨日成交额前 200；
 2. **两段打分**：
-   - **粗筛**（便宜）：只算"日K是否触发买入信号"与"分时快速打分"，
+   - **粗筛**（便宜）：只算"日K是否触发多方条件"与"分时快速打分"，
      先按分时 + 日K 的可得信号排序，截到 `prescreen_size`（默认 30）；
    - **精算**（贵）：只对粗筛留下的票跑完整日K + 分时打分，产出最终排序。
 
@@ -24,7 +24,7 @@
 ## 时间窗与频率（不要每时每刻都算）
 
 只在**交易日的 9:25–9:40 与 14:45–15:00** 触发，每分钟一次 —— 这两个窗口是
-低吸决策最关键的时段（开盘定方向、尾盘定隔夜）。其余时间算出来的结果既没人看，
+回踩决策最关键的时段（开盘定方向、尾盘定隔夜）。其余时间算出来的结果既没人看，
 又会持续占用数据源。
 """
 
@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 #: 用户要求：最多自动加入 6 只
 DEFAULT_TOP_N = 6
-#: 分时打分门槛（用户口径：> 40 分才提示低吸）
+#: 分时打分门槛（用户口径：> 40 分才提示回踩）
 DEFAULT_MIN_INTRADAY_SCORE = 40.0
 #: 粗筛后进入精算的票数上限（控制单轮耗时）
 DEFAULT_PRESCREEN_SIZE = 30
@@ -162,7 +162,7 @@ class AutoSelector:
 
     Args:
         pool_provider: 提供候选池（`async (hot, amount) -> dict[code, list[str]]`）
-        daily_scorer: 日K打分（`async (code) -> (score, [买入信号]) | None`）
+        daily_scorer: 日K打分（`async (code) -> (score, [多方条件]) | None`）
         intraday_scorer: 分时打分（`async (code) -> score | None`）
         top_n / min_intraday_score / prescreen_size: 见模块常量说明
     """
@@ -224,18 +224,18 @@ class AutoSelector:
                 code=code, name=pool[code][0] if pool[code] else "",
                 daily_score=daily_score, intraday_score=float(intraday_score),
                 buy_signals=list(signals), groups=list(pool[code][1:]))
-            # 双条件：日K有买入信号 AND 分时 > 阈值
+            # 双条件：日K有多方条件 AND 分时 > 阈值
             has_buy = bool(signals)
             meets_intraday = item.intraday_score >= self.min_intraday
             if has_buy and meets_intraday:
                 item.combined = self.combine(item.daily_score, item.intraday_score)
-                item.reason = (f"日K买入信号 {'/'.join(signals)}；"
+                item.reason = (f"日K多方条件 {'/'.join(signals)}；"
                                f"分时 {item.intraday_score:.0f} 分")
                 result.selected.append(item)
             else:
                 missing = []
                 if not has_buy:
-                    missing.append("无日K买入信号")
+                    missing.append("无日K多方条件")
                 if not meets_intraday:
                     missing.append(f"分时 {item.intraday_score:.0f} < {self.min_intraday:.0f}")
                 item.reason = "、".join(missing)
@@ -436,7 +436,7 @@ class WatchlistAutoSelector(AutoSelector):
         return score, signals
 
     async def _score_intraday(self, code: str) -> float | None:
-        """分时多指标合成打分（0~100，与面板上「低吸」同一口径）。"""
+        """分时多指标合成打分（0~100，与面板上「回踩」同一口径）。"""
         snapshot = await self._service.snapshot(code, light=True)
         if snapshot is None:
             return None

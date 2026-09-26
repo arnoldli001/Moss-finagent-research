@@ -52,11 +52,8 @@ class MicroAnalysisAgent(AnalysisAgentBase):
     context_max_periods = 60
 
     system_prompt = (
-        "你是资深股票分析师。基于给定的个股数据点与本地计算的估值参考，"
-        "进行个股深度研究。护城河评估必须覆盖品牌/技术/成本/网络效应/转换成本"
-        "五个维度并逐项打分（0-10）。要求：\n"
-        "1. 估值判断以本地计算参考为准，禁止另编数值；\n"
-        "2. 输出仅为研究参考，不构成投资建议。"
+        "资深股票分析师。依据个股数据点与本地估值参考做个股深度研究。估值以本地计算为准，"
+        "禁止另编数值。护城河须逐项覆盖品牌/技术/成本/网络效应/转换成本五维并打分(0-10)。"
     )
 
     def __init__(self, gateway, agent_id: str = "A10_micro",
@@ -139,19 +136,14 @@ class MicroAnalysisAgent(AnalysisAgentBase):
         return data
 
     def _requirements(self, payload: AnalysisPayload) -> str:
-        answer_rule = (
-            f"conclusion首句必须直接回答用户问题「{payload.user_query[:80]}」"
-            "（问是否价值洼地/值得持有时，必须依据valuation_calc给出明确观点："
-            "历史低位+基本面支撑→洼地信号；历史偏高→谨慎；数据不足才允许不明确）；"
-            if payload.user_query else
-            "个股综合研判（150字内）；"
-        )
         return (
-            "请输出JSON对象，字段：\n"
-            f'- "conclusion": {answer_rule}估值结论必须与valuation_calc一致（200字内）\n'
-            '- "confidence": "high"|"medium"|"low"\n'
-            '- "moat_scores": {"brand": 0-10, "technology": 0-10, "cost": 0-10, '
-            '"network_effect": 0-10, "switching_cost": 0-10}\n'
-            '- "key_points": 3-5条要点\n'
-            '- "risks": 主要个股风险1-3条'
+            "输出JSON：\n"
+            '- "conclusion": 首句直接答问，估值结论须与valuation_calc一致'
+            "（问洼地/持有：历史低位+基本面→洼地信号，历史偏高→谨慎，"
+            "数据不足→不明确），200字内\n"
+            '- "confidence": high|medium|low\n'
+            '- "moat_scores": {"brand":0-10,"technology":0-10,"cost":0-10,'
+            '"network_effect":0-10,"switching_cost":0-10}\n'
+            '- "key_points": 3-5条\n'
+            '- "risks": 1-3条'
         )

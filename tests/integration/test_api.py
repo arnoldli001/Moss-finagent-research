@@ -288,29 +288,49 @@ async def test_agents_meta_endpoint(client):
 
 
 async def test_scheduler_jobs_list_and_manual_trigger(client):
+    """作业清单 / 手动触发 / 运行记录 / 日报的机制。
+
+    ⚠️ 调度路由自 2026-09-26 起是**管理员专属**（`require_admin`，见
+    `tests/unit/test_scheduler_admin_gate.py`）。这条测试考的是作业执行机制，
+    不是鉴权，所以用 FastAPI 的依赖覆盖把门槛短路掉。
+
+    为什么不是 `monkeypatch.setattr(scheduler, "require_admin", fake)`：
+    路由级 `Depends(require_admin)` 在**构造路由时**就抓住了那个函数对象，
+    之后再改模块属性不会影响已经建好的依赖 —— 那种写法会**静默无效**
+    （测试照样 401 失败，但看不出是覆盖没生效）。
+    """
     state, http = client
-    async with http:
-        resp = await http.get("/api/v1/scheduler/jobs")
-        jobs = resp.json()["jobs"]
-        names = {j["name"] for j in jobs}
-        assert {"snapshot_macro", "snapshot_industry_watchlist",
-                "run_log_cleanup"} <= names
-        macro = next(j for j in jobs if j["name"] == "snapshot_macro")
-        assert len(macro["cron"].split()) == 5 and macro["paused"] is False
+    from src.api.main import app
+    from src.api.routes.admin import require_admin
 
-        run = await http.post("/api/v1/scheduler/jobs/snapshot_macro/run")
-        assert run.status_code == 202
-        record = run.json()["run"]
-        assert record["status"] == "success"
-        assert record["trigger"] == "manual"
+    app.dependency_overrides[require_admin] = lambda: "test-admin"
+    try:
+        async with http:
+            resp = await http.get("/api/v1/scheduler/jobs")
+            jobs = resp.json()["jobs"]
+            names = {j["name"] for j in jobs}
+            assert {"snapshot_macro", "snapshot_industry_watchlist",
+                    "run_log_cleanup"} <= names
+            macro = next(j for j in jobs if j["name"] == "snapshot_macro")
+            assert len(macro["cron"].split()) == 5 and macro["paused"] is False
 
-        runs = await http.get("/api/v1/scheduler/runs")
-        assert any(r["run_id"] == record["run_id"] for r in runs.json()["runs"])
+            run = await http.post("/api/v1/scheduler/jobs/snapshot_macro/run")
+            assert run.status_code == 202
+            record = run.json()["run"]
+            assert record["status"] == "success"
+            assert record["trigger"] == "manual"
 
-        summary = await http.get("/api/v1/scheduler/runs/summary")
-        assert summary.json()["success"] >= 1
+            runs = await http.get("/api/v1/scheduler/runs")
+            assert any(r["run_id"] == record["run_id"]
+                       for r in runs.json()["runs"])
 
-        assert (await http.post("/api/v1/scheduler/jobs/nope/run")).status_code == 404
+            summary = await http.get("/api/v1/scheduler/runs/summary")
+            assert summary.json()["success"] >= 1
+
+            assert (await http.post(
+                "/api/v1/scheduler/jobs/nope/run")).status_code == 404
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
 
 
 async def test_metrics_endpoint_shape(client):

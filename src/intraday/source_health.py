@@ -31,34 +31,41 @@ from src.core.errors import (
 )
 
 # 各源能力（用于排序先验与前端展示的口径说明）
+#
+# ⚠️ 2026-09 变更：QMT 已从链首降为链尾兜底（终端失去行情权限）。
+# 顺序先验由 `IntradayDataProvider._ordered_sources` 从配置读取，
+# 这里的表只负责**展示口径**，不参与排序决策。
 SOURCE_CAPABILITIES: dict[str, dict[str, Any]] = {
-    "qmt": {
-        "label": "迅投QMT",
-        "kind": "本机终端",
-        "realtime": True,
-        "fields": "五档盘口/逐笔/1m-60m/前复权日线",
-        "note": "需 XtMiniQmt 运行登录；L2 需券商单独开通",
-    },
     "tencent": {
         "label": "腾讯行情",
         "kind": "公网HTTP",
         "realtime": True,
-        "fields": "快照(含PE/PB)/分时/分钟K",
-        "note": "免 token，作为 QMT 的第一备用",
+        "fields": "快照(含PE/PB)/分时/分钟K(1m-60m，320根/次)",
+        "note": "免 token，当前链首主源；实测快照87ms/分钟K86ms/分时78ms",
     },
     "sina": {
         "label": "新浪财经",
         "kind": "公网HTTP",
         "realtime": True,
-        "fields": "逐笔成交/概念板块快照",
-        "note": "免 token，逐笔兜底",
+        "fields": "逐笔成交(聚合为分钟bar)/概念板块快照",
+        "note": "免 token，逐笔兜底（最慢，但通道独立于腾讯/东财）",
     },
     "eastmoney": {
         "label": "东方财富",
         "kind": "公网HTTP",
         "realtime": True,
-        "fields": "分钟K/板块分钟",
-        "note": "本机网络被阻断（实测 RemoteDisconnected），仅在冷却后偶尔重试",
+        "fields": "分钟K(1m-60m，长序列)/分时/板块分钟",
+        "note": "本机网络按 TLS SNI 阻断 push2*/push2his，且阻断会漂移"
+                "（可从只断 SNI 升级到连 IP 直连也断）；见 src/core/eastmoney_direct.py",
+    },
+    "qmt": {
+        "label": "迅投QMT",
+        "kind": "本机终端",
+        "realtime": True,
+        "fields": "五档盘口/逐笔/1m-60m/前复权日线",
+        "note": "需 XtMiniQmt 运行登录 **且券商开通行情权限**；"
+                "本机已失去权限且短期无法恢复，故默认关闭并排在**链尾**"
+                "（data.qmt_enabled=false）",
     },
     "tushare": {
         "label": "Tushare Pro",

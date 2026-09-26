@@ -117,32 +117,77 @@ def test_backfill_drains_everything_below_the_watermark(
     assert "hash-100" in got, "回填没有一路追下去"
 
 
-def test_cursor_advances_monotonically_backwards(
+def test_watermark_only_ever_moves_older(
         root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """水位线每轮都往**更老**推进，且最终追平到空。
+    """水位线**只能往更老走，绝不前移** —— 这是丢数据事故的直接防线。
 
-    数据量要够大：若总量只有 200 条就会在循环上限之后才追平，
-    那测的就不是"能追平"而是"跑得够多轮"。
+    ⚠️ 本用例替换了原来的 `test_cursor_advances_monotonically_backwards`。
+    老断言要求"每轮都取到更老的内容、最终**追平到空**"，那是纯回填时代的行为。
+
+    现在每轮都会**重新取一遍「现在 → 水位线」这一段**（`fresh_floor = watermark`），
+    所以 `new_count` 不会再掉到 0 —— "追平到空"这个性质**本身已经不成立**了。
+    为什么必须重取：情报流是**每次请求现拼、不落库**的，靠水位线跳过已取内容
+    会让那段内容**永远不会出现在页面上**（2026-09-25 实测 `counts` 里
+    `research_note` 直接归零，用户报障"前端看不到 1 条知识星球信息"）。
+
+    仍然必须成立、而且更要命的不变式是：**水位线只能变老**。
+    它一旦前移，被跨过的那段就被标成"已处理"而实际从没取过 —— 永久静默丢内容。
     """
     _fake_backend(monkeypatch, total=500)
     _set_wm(root, _ts(5))
 
-    seq = []
-    for _ in range(40):
+    seen: list[str] = []
+    for _ in range(12):
         r = M.fetch_incremental(root=root, max_fetch=200, max_pages=5)
-        seq.append((r.new_count, r.watermark))
-        if r.new_count == 0:
-            break
+        seen.append(r.watermark)
         _set_wm(root, r.watermark)
 
-    assert seq[-1][0] == 0, f"没有追平，共 {len(seq)} 轮: {seq[-4:]}"
-    # 水位线索引单调不减（时间单调变老）
-    def idx_of(w: str) -> int:
-        return next((i for i in range(2000) if _ts(i) == w), -1)
+    # `_ts(i)`：i 越大越**老**（见 test_first_run_without_watermark_keeps_newest），
+    # 所以"只往更老走"等价于时间戳字符串**单调不增**。
+    assert seen == sorted(seen, reverse=True), f"水位线出现了前移: {seen}"
+    # ⚠️ 这里**刻意不**断言"水位线必须推进"。水位线只在**新鲜段被完整覆盖**
+    # 之后才会往更老挪（`caught_up` 为真才跑回填）—— 本用例的合成数据里
+    # "现在 → 水位线"这一段超过单轮 200 条的上限，所以它**应当原地不动**：
+    # 宁可不回填，也不把没取到的那段标成"已处理"。这正是要守的不变式。
 
-    idx = [idx_of(w) for _, w in seq]
-    assert -1 not in idx, f"出现无法映射的水位线: {idx}"
-    assert idx == sorted(idx), f"水位线没有单调往老推进: {idx}"
+
+def test_empty_middle_page_is_retried_instead_of_stopping_paging(
+        root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ 翻页途中某一页为空 → **重试**，而不是本轮提前收工。
+
+    ## 为什么这条必须单独钉（2026-09-26，单轮上限提到 100 之后）
+
+    一轮要翻 4 页（`MAX_FETCH_PER_RUN` 100 / `PAGE_SIZE` 30），而上游空页
+    约 1/6 —— 于是"一轮里**至少撞到一次**空页"的概率约 1-(5/6)^4 ≈ **52%**。
+
+    撞上时原实现的处理是 `caught_up = True`（把空页当成"翻到底了"），于是：
+
+      · 这一轮**只取到前几页**，剩下的新鲜内容要等下一轮才出现；
+      · 多出来的额度会被阶段 B 用**16 天前的回填内容**填满
+        —— 那些内容落在 3 天时效窗口之外，白取一趟（实测：一轮的 100 条里
+        混进了 09-08 的条目，时间跨度被拉成 17 天）。
+    """
+    calls = {"n": 0}
+    _fake_backend(monkeypatch, newest=0, total=400)
+    real = S.fetch_topics
+
+    def flaky(*, limit: int = 30, end_time: str | None = None):
+        calls["n"] += 1
+        # 第 2 次调用（第 2 页）返回一次空页，其余正常。
+        if calls["n"] == 2:
+            return []
+        return real(limit=limit, end_time=end_time)
+
+    monkeypatch.setattr(S, "fetch_topics", flaky)
+    _set_wm(root, _ts(0))
+
+    r = M.fetch_incremental(root=root, max_fetch=100, max_pages=8)
+
+    assert len(r.topics) >= 90, (
+        f"只取到 {len(r.topics)} 条 —— 中途空页让本轮提前收工了（没有重试）")
+    # 而且不该混进"16 天前"那种回填内容：这批的时间跨度应落在最新那一段内
+    oldest = min(t.created_at for t in r.topics)
+    assert oldest >= _ts(140), f"混进了更早的回填内容：{oldest}"
 
 
 def test_watermark_unchanged_when_nothing_fetched(
@@ -158,6 +203,75 @@ def test_watermark_unchanged_when_nothing_fetched(
 
     assert r.new_count == 0
     assert r.watermark == _ts(5), "空结果不应改动水位线"
+
+
+def test_empty_newest_page_is_retried_not_treated_as_caught_up(
+        root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """**最新页偶发为空时，不能当成"已追平"**（2026-09-26 用户报障）。
+
+    ## 这一支漏掉时的表现（用户原话："券商作文 原来的信息丢那里去了"）
+
+        第一页（无 end_time）返回空 → 原实现置 `caught_up = True`
+        → 立刻转去回填水位线那一段（当时水位线在 **16 天前**）
+        → 那 30 条全部落在 3 天时效窗口之外被丢弃
+        → 页面上「券商作文」**整块消失**，缺口文案还写着
+          "券商作文最近 3 天无更新（已归档 N 条过期内容）"—— 与事实相反
+
+    数据源空页是**偶尔**发生的（阶段 B 里记过实测：同一请求连调 6 次，
+    第 5 次返回 0 条、第 6 次又 30 条），所以用户看到的是
+    "刷几次，这块内容时有时无"。这里锁住三件事：**要重试**、
+    **最终拿到的必须是最新那一页**、**不能拿 16 天前的内容冒充**。
+    """
+    # 第一次调用（最新页）返回空，之后正常 —— 模拟一次抖动。
+    state = {"first": True}
+    real = S.fetch_topics
+    _fake_backend(monkeypatch, newest=0, total=200)
+    fake = S.fetch_topics
+
+    def flaky(*, limit: int = 30, end_time: str | None = None):
+        if end_time is None and state["first"]:
+            state["first"] = False
+            return []                   # 抖动：最新页空
+        return fake(limit=limit, end_time=end_time)
+
+    monkeypatch.setattr(S, "fetch_topics", flaky)
+    # 水位线取"比最新旧 40 分钟"：这样阶段 A 的第一页不会一上来就撞到
+    # 水位线（撞到就 `caught_up`，测不出"重试后拿到的是最新页"）。
+    _set_wm(root, _ts(40))
+
+    r = M.fetch_incremental(root=root, max_fetch=30, max_pages=5)
+
+    assert r.topics, "抖动一次就把整块内容丢了（没有重试）"
+    assert r.upstream_empty is False
+    # 修复后：重试拿到最新页 → 这 30 条是 `_ts(0)` 起往回的 30 条（最早 `_ts(29)`）。
+    # 修复前：空页被当成追平 → 转去 `end_time=_ts(40)` 回填 → 最早会是 `_ts(69)`，
+    #         即界面上少了最近 40 分钟的全部内容。
+    assert min(t.created_at for t in r.topics) >= _ts(29), \
+        "重试后拿到的必须是最新那一段，不能退去回填更早的内容"
+    assert real is not None             # 保留导入，避免 lint 误报未使用
+
+
+def test_upstream_empty_is_reported_and_does_not_backfill(
+        root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """重试后仍为空：**如实报缺口**，且**不去回填**（回填必然落在窗口外）。
+
+    ⚠️ 不能退化成"券商作文最近 3 天无更新"——那句的意思是
+    "看过了、确实没有新的"，与"这一趟没拿到"是两件事。
+    """
+    monkeypatch.setattr(S, "fetch_topics", lambda **kw: [])
+    _set_wm(root, "2026-09-09T00:00:00.000+0800")
+
+    r = M.fetch_incremental(root=root, max_fetch=30, max_pages=5)
+
+    assert r.topics == []
+    assert r.upstream_empty is True
+    assert r.truncated is True, "没取到必须标数据不完整，否则界面静默少一块"
+    assert "未取到" in r.gap_note or "返回空" in r.gap_note, \
+        f"缺口文案没说真话：{r.gap_note!r}"
+    assert "最近 3 天无更新" not in r.gap_note, \
+        "把『没拿到』说成『没有新的』—— 用户会以为这个来源停了"
+    assert r.watermark == "2026-09-09T00:00:00.000+0800", \
+        "空结果不得改动水位线"
 
 
 def test_truncated_when_hitting_fetch_cap(
@@ -197,9 +311,18 @@ def test_no_duplicates_within_one_run(
     assert len(hashes) == len(set(hashes)), "同一批内出现重复条目"
 
 
-def test_cross_run_has_no_overlap(
+def test_cross_run_repeats_only_the_fresh_segment(
         root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """两轮之间不得整页级重复。"""
+    """两轮之间**会**重复"最新那一段" —— 这是刻意的，不是 bug。
+
+    ⚠️ 本用例替换了原来的 `test_cross_run_has_no_overlap`。老断言要求
+    "两轮之间整页级不重复"，前提是"取过的内容已经落库了"。**这条链路不落库**：
+    情报流每次请求现拼，上一轮取到的内容没有存在任何地方，跳过它 = 让它
+    永远不出现在页面上（2026-09-25 实测 `counts` 里 `research_note` 归零）。
+
+    所以这里断言的是**水位线不前移**（真正的不变式），而不是零重复；
+    重复只允许发生在"新鲜段"，且由 `content_hash` 在批内去重。
+    """
     _fake_backend(monkeypatch, total=200)
     _set_wm(root, _ts(2))
 
@@ -207,10 +330,12 @@ def test_cross_run_has_no_overlap(
     _set_wm(root, first.watermark)
     second = M.fetch_incremental(root=root, max_fetch=30, max_pages=5)
 
-    overlap = ({t.content_hash for t in first.topics}
-               & {t.content_hash for t in second.topics})
-    # 边界那条允许重复一次（end_time 含边界），但不能是整页级
-    assert len(overlap) <= 1, f"两轮之间重复 {len(overlap)} 条"
+    assert second.watermark <= first.watermark, \
+        f"第二轮把水位线前移了：{first.watermark} → {second.watermark}"
+    # 批内仍然不许有重复（那是真 bug）
+    for r in (first, second):
+        hashes = [t.content_hash for t in r.topics]
+        assert len(hashes) == len(set(hashes)), "同一批内出现重复条目"
 
 
 def test_first_run_without_watermark_keeps_newest(

@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>Moss 投研平台 · 舆情情报中心（效果图 · 静态稿）</title>
+<style>
+:root{
+  --bg:#06090f; --panel:#101722; --panel2:#141d2b;
+  --line:#1e2a3a; --line2:#2a3a4f;
+  --tx:#e8eef6; --tx2:#9fb0c6; --tx3:#6b7f99;
+  --up:#ff4d4f; --down:#00c48c; --warn:#ffa940; --info:#3b82f6; --pur:#a855f7;
+  --hot:#ff8f1f;
+  --c5:#00c48c; --c4:#84cc16; --c3:#facc15; --c2:#fb923c; --c1:#ef4444;
+  --mono:"SF Mono",Consolas,"Cascadia Mono",Menlo,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:13px;line-height:1.6;-webkit-font-smoothing:antialiased}
+.wrap{display:flex;min-height:100vh}
+
+.side{width:216px;flex:0 0 216px;background:linear-gradient(180deg,#0a0f17,#080c13);border-right:1px solid var(--line);padding:14px 0;position:sticky;top:0;height:100vh;overflow-y:auto}
+.brand{display:flex;align-items:center;gap:9px;padding:4px 16px 15px;border-bottom:1px solid var(--line);margin-bottom:9px}
+.logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#3b82f6,#a855f7);display:grid;place-items:center;font-weight:800;font-size:13px;color:#fff}
+.brand b{font-size:14px} .brand small{display:block;color:var(--tx3);font-size:10px;letter-spacing:1.2px;font-weight:400}
+.grp{padding:9px 16px 4px;color:var(--tx3);font-size:10px;letter-spacing:1.4px;font-weight:700}
+.nav{display:flex;align-items:center;gap:9px;padding:7px 16px;color:var(--tx2);border-left:2px solid transparent;cursor:pointer;position:relative}
+.nav:hover{background:#0e141e;color:var(--tx)}
+.nav.on{background:linear-gradient(90deg,rgba(59,130,246,.16),transparent);border-left-color:var(--info);color:#fff;font-weight:600}
+.nav .ic{width:15px;text-align:center}
+.nav .cnt{margin-left:auto;background:#1b2534;color:var(--tx2);font-size:10px;padding:0 6px;border-radius:9px;font-family:var(--mono)}
+.nav .cnt.hot{background:rgba(255,77,79,.16);color:var(--up);border:1px solid rgba(255,77,79,.4)}
+.nav.new::after{content:"NEW";position:absolute;right:12px;top:50%;transform:translateY(-50%);background:rgba(255,143,31,.16);color:var(--hot);border:1px solid rgba(255,143,31,.4);font-size:8.5px;font-weight:800;padding:0 4px;border-radius:3px}
+
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.top{display:flex;align-items:center;gap:11px;padding:11px 20px;background:rgba(12,17,25,.93);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:30}
+.page-title{font-size:15px;font-weight:700}
+.page-title span{color:var(--tx3);font-weight:400;font-size:12px;margin-left:8px}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:11px;border:1px solid var(--line2);background:#0e141e;color:var(--tx2);white-space:nowrap}
+.pill .dot{width:5px;height:5px;border-radius:50%;background:var(--down)}
+.pill.hot{border-color:rgba(255,143,31,.45);color:var(--hot);background:rgba(255,143,31,.07)}
+.pill.warnb{border-color:rgba(255,169,64,.45);color:var(--warn);background:rgba(255,169,64,.07)}
+.pill.okb{border-color:rgba(0,196,140,.45);color:var(--down);background:rgba(0,196,140,.07)}
+.spacer{flex:1}
+.btn{padding:5px 12px;border-radius:6px;border:1px solid var(--line2);background:#131b27;color:var(--tx);cursor:pointer;font-size:12px}
+.btn.hot{background:linear-gradient(135deg,#d97706,#f59e0b);border-color:#f59e0b;color:#1a1205;font-weight:700}
+.avatar{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#334155,#475569);display:grid;place-items:center;font-size:11px;font-weight:700}
+.content{padding:15px 20px 40px;display:flex;flex-direction:column;gap:13px}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.card-h{display:flex;align-items:center;gap:9px;padding:10px 14px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#121a26,#0f1620)}
+.card-h b{font-size:12.5px} .card-h .sub{color:var(--tx3);font-size:11px}
+.card-b{padding:13px 14px}
+.sec-title{font-size:12.5px;font-weight:700;color:var(--tx2);letter-spacing:.4px;display:flex;align-items:center;gap:8px;margin-top:3px}
+.sec-title::after{content:"";flex:1;height:1px;background:var(--line)}
+
+.kpis{display:grid;grid-template-columns:repeat(7,1fr);gap:10px}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:11px 13px;position:relative;overflow:hidden}
+.kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:2px;background:var(--info)}
+.kpi.h::before{background:var(--hot)} .kpi.w::before{background:var(--warn)}
+.kpi.u::before{background:var(--up)} .kpi.d::before{background:var(--down)}
+.kpi .lab{color:var(--tx3);font-size:10.5px;letter-spacing:.4px}
+.kpi .val{font-size:21px;font-weight:800;font-family:var(--mono);line-height:1.25;margin-top:2px}
+.kpi .val small{font-size:12px;font-weight:600;color:var(--tx2);margin-left:2px}
+.kpi .fo{font-size:10.5px;color:var(--tx3)}
+.up-t{color:var(--up)} .dn-t{color:var(--down)} .wn-t{color:var(--warn)} .hot-t{color:var(--hot)}
+
+.cols{display:grid;grid-template-columns:1fr 336px;gap:13px;align-items:start}
+.cols3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:13px;align-items:start}
+.cols2{display:grid;grid-template-columns:1fr 1fr;gap:13px;align-items:start}
+
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--tx3);font-weight:600;font-size:10.5px;letter-spacing:.5px;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap;background:#0d131d}
+td{padding:9px 10px;border-bottom:1px solid #141d29;vertical-align:middle}
+tbody tr:hover{background:#111927}
+.nm{font-weight:600} .code{font-family:var(--mono);color:var(--tx3);font-size:11px}
+.sum{color:var(--tx2);font-size:11.5px;max-width:270px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.stock{display:flex;align-items:center;gap:8px}
+.stock .av{width:24px;height:24px;border-radius:6px;background:#1b2534;display:grid;place-items:center;font-size:10px;font-weight:700;color:var(--tx2);font-family:var(--mono);flex:0 0 24px}
+
+.tag{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10.5px;border:1px solid;line-height:1.55;white-space:nowrap}
+.tag.bull{color:var(--up);border-color:rgba(255,77,79,.4);background:rgba(255,77,79,.09)}
+.tag.bear{color:var(--down);border-color:rgba(0,196,140,.4);background:rgba(0,196,140,.09)}
+.tag.neu{color:var(--tx2);border-color:var(--line2);background:#151d29}
+.tag.ind{color:var(--info);border-color:rgba(59,130,246,.35);background:rgba(59,130,246,.08)}
+.tag.hot{color:var(--hot);border-color:rgba(255,143,31,.4);background:rgba(255,143,31,.08)}
+.tag.pur{color:var(--pur);border-color:rgba(168,85,247,.4);background:rgba(168,85,247,.08)}
+.tag.fact{color:var(--down);border-color:rgba(0,196,140,.4);background:rgba(0,196,140,.08)}
+
+.src{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;white-space:nowrap}
+.src i{width:7px;height:7px;border-radius:2px;display:block}
+.src.off i{background:#22c55e} .src.rep i{background:#3b82f6}
+.src.med i{background:#a855f7} .src.self i{background:#6b7f99}
+.src.rum i{background:#ef4444}
+
+.cred{display:flex;align-items:center;gap:7px}
+.cred .ring{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-family:var(--mono);font-size:11.5px;font-weight:800;flex:0 0 30px}
+.cred .meta{font-size:9.5px;color:var(--tx3);line-height:1.3}
+.cred .meta b{display:block;font-size:10.5px;font-weight:700}
+.c5{background:radial-gradient(circle,#0d2b21,#0a1f18);color:var(--c5);border:2px solid var(--c5)}
+.c4{background:radial-gradient(circle,#1c2a10,#141f0c);color:var(--c4);border:2px solid var(--c4)}
+.c3{background:radial-gradient(circle,#2e2a0c,#221f09);color:var(--c3);border:2px solid var(--c3)}
+.c2{background:radial-gradient(circle,#33210f,#26180b);color:var(--c2);border:2px solid var(--c2)}
+.c1{background:radial-gradient(circle,#33100f,#260c0b);color:var(--c1);border:2px solid var(--c1)}
+
+.heat{display:flex;align-items:center;gap:7px}
+.heat b{font-family:var(--mono);font-size:12.5px;width:26px;text-align:right}
+.bar{height:6px;border-radius:3px;background:#1a2433;overflow:hidden;min-width:40px;flex:1}
+.bar i{display:block;height:100%;border-radius:3px}
+.metric{display:inline-flex;align-items:baseline;gap:5px;font-family:var(--mono);font-size:11.5px}
+.metric b{color:var(--tx);font-weight:700}
+.metric s{color:var(--tx3);text-decoration:none;font-size:10.5px}
+
+.tl{display:flex;flex-direction:column;position:relative}
+.tl-row{display:flex;gap:10px;padding:6px 0;position:relative}
+.tl-row .tm{font-family:var(--mono);font-size:10.5px;color:var(--tx3);width:40px;flex:0 0 40px;text-align:right;padding-top:1px}
+.tl-row .dotc{width:9px;height:9px;border-radius:50%;flex:0 0 9px;margin-top:5px;background:var(--c5);position:relative;z-index:2}
+.tl-row .dotc.wait{background:#2a3a4f} .tl-row .dotc.run{background:var(--warn);box-shadow:0 0 0 3px rgba(255,169,64,.2)}
+.tl-row .bd{flex:1;min-width:0}
+.tl-row .bd b{font-size:11.5px;display:block}
+.tl-row .bd span{font-size:10.5px;color:var(--tx3)}
+.tl::before{content:"";position:absolute;left:44px;top:8px;bottom:8px;width:1px;background:var(--line2);z-index:1}
+
+.alert{border:1px solid var(--line2);border-radius:9px;padding:11px 13px;background:linear-gradient(160deg,#141d2b,#101722);position:relative;overflow:hidden;margin-bottom:10px}
+.alert::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px}
+.alert.res::before{background:var(--pur)} .alert.warn2::before{background:var(--warn)}
+.alert.fact::before{background:var(--down)} .alert.low::before{background:var(--c1)}
+.alert-h{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
+.alert-h b{font-size:13px}
+.alert-b{color:var(--tx2);font-size:11.5px;margin-bottom:7px}
+.alert-f{display:flex;align-items:center;gap:14px;font-size:10.5px;color:var(--tx3);flex-wrap:wrap}
+.evid{display:flex;gap:5px;flex-wrap:wrap}
+.evid span{padding:1px 6px;border-radius:4px;background:#182231;border:1px solid var(--line2);font-size:10px;color:var(--tx2)}
+
+.popup{background:#0d1420;border:1px solid rgba(0,196,140,.45);border-radius:11px;padding:12px 14px;box-shadow:0 12px 34px rgba(0,0,0,.6)}
+.popup.warnp{border-color:rgba(255,169,64,.45)}
+.popup-h{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.popup-h .ic3{width:22px;height:22px;border-radius:6px;background:rgba(0,196,140,.16);display:grid;place-items:center;font-size:12px;flex:0 0 22px}
+.popup.warnp .ic3{background:rgba(255,169,64,.16)}
+.popup-h b{font-size:12.5px;flex:1}
+.popup-h .x{color:var(--tx3);font-size:14px;cursor:pointer}
+.popup p{font-size:11.5px;color:var(--tx2);margin-bottom:8px}
+.popup .pop-f{display:flex;gap:7px;margin-top:9px}
+.popup .pop-f .btn{flex:1;text-align:center;padding:4px 0;font-size:11px}
+
+.okbox{background:rgba(0,196,140,.06);border:1px solid rgba(0,196,140,.28);border-left:3px solid var(--down);border-radius:7px;padding:9px 12px;font-size:11.5px;color:var(--tx2)}
+.note{background:rgba(59,130,246,.06);border:1px solid rgba(59,130,246,.28);border-left:3px solid var(--info);border-radius:7px;padding:9px 12px;font-size:11.5px;color:var(--tx2)}
+.warnbox{background:rgba(255,169,64,.06);border:1px solid rgba(255,169,64,.3);border-left:3px solid var(--warn);border-radius:7px;padding:9px 12px;font-size:11.5px;color:var(--tx2)}
+.purbox{background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.3);border-left:3px solid var(--pur);border-radius:7px;padding:9px 12px;font-size:11.5px;color:var(--tx2)}
+.gauge{display:flex;flex-direction:column;gap:9px}
+.gr{display:flex;align-items:center;gap:9px;font-size:11.5px}
+.gr .lb{width:76px;color:var(--tx2)} .gr .bx{flex:1;height:7px;border-radius:4px;background:#1a2433;overflow:hidden}
+.gr .bx i{display:block;height:100%;border-radius:4px} .gr .vv{width:48px;text-align:right;font-family:var(--mono);color:var(--tx)}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--line);padding:0 6px;background:#0d131d;overflow-x:auto}
+.tab{padding:9px 13px;font-size:12px;color:var(--tx3);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
+.tab.on{color:#fff;border-bottom-color:var(--hot);font-weight:600}
+.tabbar{display:flex;gap:7px;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:5px}
+.tb{display:flex;align-items:center;gap:7px;padding:7px 15px;border-radius:6px;font-size:12.5px;color:var(--tx2);cursor:pointer;font-weight:600}
+.tb.on{background:linear-gradient(135deg,#233044,#1b2534);color:#fff;box-shadow:inset 0 0 0 1px var(--line2)}
+.tb .n{background:#1b2534;color:var(--tx3);font-size:10.5px;font-family:var(--mono);padding:0 6px;border-radius:9px}
+.tb.on .n{background:rgba(255,143,31,.18);color:var(--hot)}
+.subpane{display:none} .subpane.on{display:block}
+.strip{display:flex;gap:18px;padding:8px 14px;background:#0b1017;border-top:1px solid var(--line);font-size:11px;color:var(--tx3);flex-wrap:wrap}
+.strip b{color:var(--tx2)}
+.disclaimer{margin-top:6px;padding:8px 12px;border:1px dashed var(--line2);border-radius:7px;color:var(--tx3);font-size:11px;text-align:center}
+.pane{display:none} .pane.on{display:flex;flex-direction:column;gap:13px}
+.mono-s{font-family:var(--mono);font-size:11px;color:var(--tx3)}
+table.mini td,table.mini th{padding:6px 8px}
+.formula{font-family:var(--mono);font-size:11.5px;line-height:2;color:var(--tx2)}
+.formula em{color:var(--hot);font-style:normal;font-weight:700}
+.formula i{color:var(--tx3);font-style:normal}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <aside class="side">
+    <div class="brand"><div class="logo">M</div><div><b>Moss 投研</b><small>FINAGENT</small></div></div>
+
+    <div class="grp">投研分析</div>
+    <div class="nav"><span class="ic">◈</span>AI 投研工作台</div>
+    <div class="nav"><span class="ic">◆</span>板块主线挖掘</div>
+    <div class="nav"><span class="ic">◇</span>资金流监控</div>
+    <div class="nav"><span class="ic">▣</span>ETF 份额监控</div>
+
+    <div class="grp">量化</div>
+    <div class="nav"><span class="ic">▤</span>因子与回测</div>
+    <div class="nav"><span class="ic">▥</span>量化选股</div>
+    <div class="nav"><span class="ic">▧</span>集合竞价选股</div>
+    <div class="nav"><span class="ic">▨</span>做 T 辅助</div>
+
+    <div class="grp">舆情情报</div>
+    <div class="nav on new"><span class="ic">◎</span>情报雷达 <span class="cnt">86</span></div>
+    <div class="nav"><span class="ic">▦</span>盘前简报</div>
+    <div class="nav new"><span class="ic">⚠</span>事件告警中心 <span class="cnt hot">7</span></div>
+
+    <div class="grp">平台</div>
+    <div class="nav"><span class="ic">◫</span>我的自选池</div>
+    <div class="nav"><span class="ic">⚙</span>调度与任务</div>
+    <div class="nav"><span class="ic">☰</span>审计与合规</div>
+    <div class="nav"><span class="ic">◍</span>用户管理</div>
+  </aside>
+
+  <main class="main">
+    <header class="top">
+      <div class="page-title">情报雷达<span>公开信息聚合 · 统计量 · 公式参考</span></div>
+      <span class="pill"><span class="dot"></span>交易日 · 交易中</span>
+      <span class="pill hot"><span class="dot"></span>静默采集 · 无弹窗</span>
+      <span class="pill okb">仅信息参考 · 不构成投资建议</span>
+      <span class="pill">上次采集 12:05:02（5.8s）</span>
+      <div class="spacer"></div>
+      <button class="btn">历史归档</button>
+      <button class="btn hot">↻ 立即采集</button>
+      <div class="avatar">A</div>
+    </header>
+
+    <div class="content">
+
+      <!-- ============ 页 1：情报雷达 ============ -->
+      <div class="pane on">
+        <div class="okbox">
+          <b>本平台只做三件事：聚合公开信息 · 输出统计量 · 公开计算公式。</b>
+          不含证券投资咨询，不推荐具体证券，不给出买卖时机与目标价。
+          页面中"偏多/偏空"<b>仅为对第三方原文语气的归类统计</b>，不是平台判断。
+          交易日 08:05 起每 2 小时采集一次（Token 直采，零窗口弹出），至 15:15 收尾。
+        </div>
+
+        <div class="tabbar">
+          <div class="tb on">情报流 <span class="n">86</span></div>
+          <div class="tb">舆情热度监控 <span class="n">7</span></div>
+          <div class="tb">投资日历 <span class="n">23</span></div>
+        </div>
+
+        <div class="kpis">
+          <div class="kpi h"><div class="lab">今日情报条数</div><div class="val">86<small>条</small></div><div class="fo">研报 41 · 自媒体 45</div></div>
+          <div class="kpi w"><div class="lab">高可信度（≥80）</div><div class="val wn-t">19<small>条</small></div><div class="fo">占 22.1%</div></div>
+          <div class="kpi u"><div class="lab">待处理事件</div><div class="val up-t">7<small>个</small></div><div class="fo">共振 2 · 其他 5</div></div>
+          <div class="kpi"><div class="lab">多源共振</div><div class="val hot-t">2<small>个</small></div><div class="fo">半导体 · 煤炭</div></div>
+          <div class="kpi"><div class="lab">研报热度</div><div class="val wn-t">74<small>/100</small></div><div class="fo">环比 +9</div></div>
+          <div class="kpi d"><div class="lab">平均可信度</div><div class="val">68.4</div><div class="fo">较昨日 +2.1</div></div>
+          <div class="kpi" style="--info:var(--pur)"><div class="lab">未来 7 日事件</div><div class="val" style="color:var(--pur)">23<small>项</small></div><div class="fo">解禁 8 · 披露 9 · 宏观 3 · 海外 3</div></div>
+        </div>
+
+        <div class="cols">
+          <div>
+            <!-- 子页签 A -->
+            <div class="subpane on">
+              <div class="card">
+                <div class="card-h">
+                  <b>情报流</b><span class="sub">2026-09-25 · 按可信度降序</span>
+                  <div class="spacer"></div>
+                  <span class="pill hot">抽取 qwen3:8b + 云端复核</span>
+                </div>
+                <div class="tabs">
+                  <div class="tab on">全部 86</div>
+                  <div class="tab">高可信 ≥80 · 19</div>
+                  <div class="tab">多源共振 · 2</div>
+                  <div class="tab">券商研报 · 41</div>
+                  <div class="tab">自媒体 · 45</div>
+                  <div class="tab">仅官方 · 6</div>
+                  <div class="tab">低可信 &lt;50 · 11</div>
+                </div>
+                <table>
+                  <thead><tr>
+                    <th style="width:50px">时间</th>
+                    <th style="width:80px">来源</th>
+                    <th>标题 / 摘要</th>
+                    <th style="width:100px">关联标的</th>
+                    <th style="width:62px">原文倾向</th>
+                    <th style="width:126px">可信度</th>
+                    <th style="width:42px">共振</th>
+                  </tr></thead>
+                  <tbody>
+                    <tr>
+                      <td class="code">10:12</td>
+                      <td><span class="src off"><i></i>交易所公告</span></td>
+                      <td class="sum" style="color:var(--tx)">中芯国际：关于先进制程产线扩产的进展公告，新增产能预计明年一季度投产</td>
+                      <td><div class="stock"><div class="av">688</div><div><div class="nm">中芯国际</div><div class="code">688981.SH</div></div></div></td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td><div class="cred"><div class="ring c5">94</div><div class="meta"><b>官方披露</b>来源94+内容35+佐证8</div></div></td>
+                      <td><span class="tag pur">⭐3</span></td>
+                    </tr>
+                    <tr>
+                      <td class="code">08:41</td>
+                      <td><span class="src rep"><i></i>券商研报</span></td>
+                      <td class="sum">半导体设备行业深度：国产化率加速提升，设备与材料端订单能见度延续至明年</td>
+                      <td><span class="tag ind">半导体设备</span></td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td><div class="cred"><div class="ring c5">88</div><div class="meta"><b>持牌机构研报</b>来源84+内容27</div></div></td>
+                      <td><span class="tag pur">⭐3</span></td>
+                    </tr>
+                    <tr>
+                      <td class="code">09:33</td>
+                      <td><span class="src med"><i></i>财经媒体</span></td>
+                      <td class="sum">储能招标量超预期，海外大储订单落地节奏加快，产业链排产环比改善</td>
+                      <td><div class="stock"><div class="av">300</div><div><div class="nm">宁德时代</div><div class="code">300750.SZ</div></div></div></td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td><div class="cred"><div class="ring c4">79</div><div class="meta"><b>权威财经媒体</b>来源74+内容27</div></div></td>
+                      <td><span class="tag neu">—</span></td>
+                    </tr>
+                    <tr>
+                      <td class="code">11:07</td>
+                      <td><span class="src self"><i></i>自媒体</span></td>
+                      <td class="sum">传某大厂明年资本开支上修三成，产业链朋友说已在催货，具体数字待确认</td>
+                      <td><div class="stock"><div class="av">688</div><div><div class="nm">寒武纪</div><div class="code">688256.SH</div></div></div></td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td><div class="cred"><div class="ring c2">52</div><div class="meta"><b>自媒体 · 未核实</b>来源54（上限）</div></div></td>
+                      <td><span class="tag neu">—</span></td>
+                    </tr>
+                    <tr>
+                      <td class="code">13:22</td>
+                      <td><span class="src self"><i></i>自媒体</span></td>
+                      <td class="sum">港口库存连续三周累积，长协价下调预期升温，动力煤旺季不旺讨论增多</td>
+                      <td><span class="tag ind">煤炭</span></td>
+                      <td><span class="tag bear">偏空</span></td>
+                      <td><div class="cred"><div class="ring c3">66</div><div class="meta"><b>自媒体 · 多源印证</b>来源54+内容18+佐证12</div></div></td>
+                      <td><span class="tag pur">⭐2</span></td>
+                    </tr>
+                    <tr>
+                      <td class="code">14:05</td>
+                      <td><span class="src rum"><i></i>未证实</span></td>
+                      <td class="sum">群内截图称某公司将被纳入重要指数，无公告支撑，来源不可追溯</td>
+                      <td><div class="stock"><div class="av">002</div><div><div class="nm">立讯精密</div><div class="code">002475.SZ</div></div></div></td>
+                      <td><span class="tag neu">中性</span></td>
+                      <td><div class="cred"><div class="ring c1">31</div><div class="meta"><b>不可追溯</b>来源28（上限）</div></div></td>
+                      <td><span class="tag neu">—</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="strip">
+                  <span>共 <b>86</b> 条</span>
+                  <span>去重折叠 <b>23</b> 条重复转载</span>
+                  <span>幻觉拦截 <b>4</b> 条（无原文依据）</span>
+                  <span style="margin-left:auto">⚠️ 内容均为第三方观点，<b>可靠性已分级标注</b>，不代表本平台观点</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 子页签 B -->
+            <div class="subpane">
+              <div class="card">
+                <div class="card-h">
+                  <b>板块提及量与热度指标</b>
+                  <span class="sub">只给计数与分位，不给方向结论</span>
+                  <div class="spacer"></div>
+                  <span class="pill">覆盖 7 个板块</span>
+                </div>
+                <div class="tabs">
+                  <div class="tab on">全部 7</div>
+                  <div class="tab">提及量异动 · 3</div>
+                  <div class="tab">共振 · 2</div>
+                </div>
+                <table>
+                  <thead><tr>
+                    <th>板块</th>
+                    <th style="width:112px">热度分</th>
+                    <th style="width:152px">今日提及 / 20日均值</th>
+                    <th style="width:62px">环比</th>
+                    <th style="width:72px">原文倾向</th>
+                    <th style="width:68px">可信度</th>
+                    <th style="width:80px">共振</th>
+                  </tr></thead>
+                  <tbody>
+                    <tr>
+                      <td class="nm">半导体设备</td>
+                      <td><div class="heat"><div class="bar"><i style="width:92%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b>92</b></div></td>
+                      <td><div class="metric"><b>27 篇</b><s>/ 9 篇</s></div></td>
+                      <td class="code up-t">+200%</td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td class="code">90.2</td>
+                      <td><span class="tag pur">⭐3</span></td>
+                    </tr>
+                    <tr>
+                      <td class="nm">AI 算力</td>
+                      <td><div class="heat"><div class="bar"><i style="width:78%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b>78</b></div></td>
+                      <td><div class="metric"><b>18 篇</b><s>/ 15 篇</s></div></td>
+                      <td class="code up-t">+20%</td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td class="code">72.0</td>
+                      <td><span class="tag neu">指标不一致</span></td>
+                    </tr>
+                    <tr>
+                      <td class="nm">新能源</td>
+                      <td><div class="heat"><div class="bar"><i style="width:71%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b>71</b></div></td>
+                      <td><div class="metric"><b>14 篇</b><s>/ 11 篇</s></div></td>
+                      <td class="code up-t">+27%</td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td class="code">79.0</td>
+                      <td><span class="tag neu">—</span></td>
+                    </tr>
+                    <tr>
+                      <td class="nm">消费电子</td>
+                      <td><div class="heat"><div class="bar"><i style="width:64%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><b>64</b></div></td>
+                      <td><div class="metric"><b>8 篇</b><s>/ 9 篇</s></div></td>
+                      <td class="code dn-t">−11%</td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td class="code">74.5</td>
+                      <td><span class="tag neu">—</span></td>
+                    </tr>
+                    <tr>
+                      <td class="nm">有色金属</td>
+                      <td><div class="heat"><div class="bar"><i style="width:49%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><b>49</b></div></td>
+                      <td><div class="metric"><b>6 篇</b><s>/ 6 篇</s></div></td>
+                      <td class="code">0%</td>
+                      <td><span class="tag bull">偏多</span></td>
+                      <td class="code">70.0</td>
+                      <td><span class="tag neu">—</span></td>
+                    </tr>
+                    <tr>
+                      <td class="nm">煤炭</td>
+                      <td><div class="heat"><div class="bar"><i style="width:41%;background:linear-gradient(90deg,#64748b,#38bdf8)"></i></div><b>41</b></div></td>
+                      <td><div class="metric"><b>25 篇</b><s>/ 8 篇</s></div></td>
+                      <td class="code up-t">+213%</td>
+                      <td><span class="tag bear">偏空</span></td>
+                      <td class="code">66.0</td>
+                      <td><span class="tag pur">⭐2</span></td>
+                    </tr>
+                    <tr>
+                      <td class="nm">房地产</td>
+                      <td><div class="heat"><div class="bar"><i style="width:35%;background:linear-gradient(90deg,#64748b,#38bdf8)"></i></div><b>35</b></div></td>
+                      <td><div class="metric"><b>4 篇</b><s>/ 5 篇</s></div></td>
+                      <td class="code dn-t">−20%</td>
+                      <td><span class="tag bear">偏空</span></td>
+                      <td class="code">61.0</td>
+                      <td><span class="tag neu">—</span></td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="strip">
+                  <span>热度分 = 条目可信度按板块求和后线性归一到 0–100</span>
+                  <span>提及量异动 <b>3</b> 个（环比 ≥ +200%）</span>
+                  <span>口径见下方「自研公式与参数」</span>
+                </div>
+              </div>
+
+              <div class="cols2" style="margin-top:13px">
+                <div class="card">
+                  <div class="card-h"><b>来源结构与可信度分层</b></div>
+                  <div class="card-b" style="display:flex;flex-direction:column;gap:9px">
+                    <div class="gr"><span class="lb">官方披露</span><div class="bx"><i style="width:7%;background:linear-gradient(90deg,#00c48c,#22c55e)"></i></div><span class="vv">6 条</span></div>
+                    <div class="gr"><span class="lb">券商研报</span><div class="bx"><i style="width:48%;background:linear-gradient(90deg,#22c55e,#84cc16)"></i></div><span class="vv">41 条</span></div>
+                    <div class="gr"><span class="lb">财经媒体</span><div class="bx"><i style="width:20%;background:linear-gradient(90deg,#84cc16,#facc15)"></i></div><span class="vv">17 条</span></div>
+                    <div class="gr"><span class="lb">自媒体</span><div class="bx"><i style="width:24%;background:linear-gradient(90deg,#facc15,#fb923c)"></i></div><span class="vv">20 条</span></div>
+                    <div class="gr"><span class="lb">未证实</span><div class="bx"><i style="width:3%;background:linear-gradient(90deg,#fb923c,#ef4444)"></i></div><span class="vv">2 条</span></div>
+                    <div class="note" style="margin-top:3px">
+                      <b>可信度分层：</b>≥80 <b>19</b> 条 · 65–79 <b>28</b> 条 · 50–64 <b>28</b> 条 · &lt;50 <b>11</b> 条
+                    </div>
+                  </div>
+                </div>
+                <div class="card">
+                  <div class="card-h"><b>采集时间分布（今日）</b><span class="sub">每 2 小时一次</span></div>
+                  <div class="card-b" style="display:flex;flex-direction:column;gap:8px">
+                    <div class="gr"><span class="lb">08:05</span><div class="bx"><i style="width:32%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><span class="vv">9 条</span></div>
+                    <div class="gr"><span class="lb">10:05</span><div class="bx"><i style="width:50%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><span class="vv">14 条</span></div>
+                    <div class="gr"><span class="lb">12:05</span><div class="bx"><i style="width:75%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><span class="vv">21 条</span></div>
+                    <div class="gr"><span class="lb">14:05</span><div class="bx"><i style="width:100%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><span class="vv">28 条</span></div>
+                    <div class="gr"><span class="lb">15:15</span><div class="bx"><i style="width:50%;background:linear-gradient(90deg,#64748b,#38bdf8)"></i></div><span class="vv">14 条</span></div>
+                    <div class="okbox" style="margin-top:3px">
+                      午后 14:05 条数最多（研报集中发布），该时段事件扫描加密到每 3 分钟。
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- ============ 子页签 C：投资日历 ============ -->
+            <div class="subpane">
+              <div class="card">
+                <div class="card-h">
+                  <b>投资日历 · 未来事件轴</b>
+                  <span class="sub">只呈现「已公布的日程」与「覆盖范围统计」，不含方向判断</span>
+                  <div class="spacer"></div>
+                  <span class="pill okb">来源：交易所 / 巨潮 / 东财 / 美联储</span>
+                </div>
+                <div class="tabs">
+                  <div class="tab on">全部 23</div>
+                  <div class="tab">限售解禁 · 8</div>
+                  <div class="tab">财报披露 · 9</div>
+                  <div class="tab">国内宏观 · 3</div>
+                  <div class="tab">海外/议息 · 3</div>
+                  <div class="tab">已改期 · 2</div>
+                </div>
+                <table>
+                  <thead><tr>
+                    <th style="width:88px">日期</th>
+                    <th style="width:96px">类型</th>
+                    <th>事件</th>
+                    <th style="width:150px">覆盖范围</th>
+                    <th style="width:96px">确定性</th>
+                    <th style="width:66px">证据</th>
+                  </tr></thead>
+                  <tbody>
+                    <tr>
+                      <td class="code">09-25 <span style="color:var(--c5)">今天</span></td>
+                      <td><span class="tag" style="color:var(--c3);border-color:rgba(250,204,21,.4);background:rgba(250,204,21,.08)">限售解禁</span></td>
+                      <td class="sum" style="color:var(--tx)">限售股解禁日 · 当日可流通</td>
+                      <td><div class="metric"><b>40 家</b><s>/ 591 亿</s></div><div class="mono-s" style="font-size:10px">半导体 6 · 医药 5</div></td>
+                      <td><span class="tag fact">规则确定</span></td>
+                      <td class="code">东财</td>
+                    </tr>
+                    <tr>
+                      <td class="code">09-28 <span style="color:var(--tx3)">周一</span></td>
+                      <td><span class="tag" style="color:var(--c3);border-color:rgba(250,204,21,.4);background:rgba(250,204,21,.08)">限售解禁</span></td>
+                      <td class="sum">限售股解禁日</td>
+                      <td><div class="metric"><b>40 家</b><s>/ 591 亿</s></div><div class="mono-s" style="font-size:10px">半导体 6 · 医药 5</div></td>
+                      <td><span class="tag fact">规则确定</span></td>
+                      <td class="code">东财</td>
+                    </tr>
+                    <tr>
+                      <td class="code">09-30 <span style="color:var(--hot)">节前最后交易日</span></td>
+                      <td><span class="tag ind">海外财报</span></td>
+                      <td class="sum">美光科技（MU）美东时间发布 2026 四季报及年报</td>
+                      <td><div class="metric"><b>存储 / 半导体</b></div></td>
+                      <td><span class="tag neu">公司公告日程</span></td>
+                      <td class="code">百度股市通</td>
+                    </tr>
+                    <tr>
+                      <td class="code">09-30</td>
+                      <td><span class="tag ind">海外财报</span></td>
+                      <td class="sum">捷普（JBL）美东时间盘前发布 2026 四季报及年报</td>
+                      <td><div class="metric"><b>消费电子 / 代工</b></div></td>
+                      <td><span class="tag neu">公司公告日程</span></td>
+                      <td class="code">百度股市通</td>
+                    </tr>
+                    <tr>
+                      <td class="code">10-01 <span style="color:var(--tx3)">休市</span></td>
+                      <td><span class="tag neu">休市</span></td>
+                      <td class="sum">国庆节休市（10-01 ~ 10-07，10-08 恢复交易）</td>
+                      <td><div class="metric"><b>全市场</b></div></td>
+                      <td><span class="tag fact">交易所公告</span></td>
+                      <td class="code">交易日历</td>
+                    </tr>
+                    <tr>
+                      <td class="code">10-09 <span style="color:var(--tx3)">周五</span></td>
+                      <td><span class="tag ind">国内宏观</span></td>
+                      <td class="sum">统计局发布 CPI / PPI（9 月数据）</td>
+                      <td><div class="metric"><b>全市场</b></div><div class="mono-s" style="font-size:10px">上期 PPI −1.8%</div></td>
+                      <td><span class="tag fact">统计局日程表</span></td>
+                      <td class="code">统计局</td>
+                    </tr>
+                    <tr>
+                      <td class="code">10-13 <span style="color:var(--tx3)">周二</span></td>
+                      <td><span class="tag hot">财报披露</span></td>
+                      <td class="sum">有研新材 三季报预约披露</td>
+                      <td><div class="metric"><b>600206</b><s>· 有色金属</s></div></td>
+                      <td><span class="tag" style="color:var(--warn);border-color:rgba(255,169,64,.4);background:rgba(255,169,64,.08)">公司预约 · 可改期</span></td>
+                      <td class="code">东财</td>
+                    </tr>
+                    <tr>
+                      <td class="code">10-14</td>
+                      <td><span class="tag hot">财报披露</span></td>
+                      <td class="sum">川投能源 / 金盘科技 三季报预约披露 <span class="tag" style="color:var(--warn);border-color:rgba(255,169,64,.4);background:rgba(255,169,64,.08);font-size:9.5px">已改期 1 次</span></td>
+                      <td><div class="metric"><b>2 家</b><s>· 公用事业 / 电力设备</s></div></td>
+                      <td><span class="tag" style="color:var(--warn);border-color:rgba(255,169,64,.4);background:rgba(255,169,64,.08)">公司预约 · 可改期</span></td>
+                      <td class="code">东财</td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="strip">
+                  <span>未来 7 日 <b>23</b> 项</span>
+                  <span>已改期 <b>2</b> 家（改期本身是提示项）</span>
+                  <span>数据源：<b>akshare 既有接口 + 静态 YAML</b>（未新增付费源）</span>
+                  <span style="margin-left:auto">⚠️ 日程可能变更，请以交易所与公司公告为准</span>
+                </div>
+              </div>
+
+              <!-- 影响范围映射（合规核心：只给范围，不给方向） -->
+              <div class="cols2" style="margin-top:13px">
+                <div class="card">
+                  <div class="card-h">
+                    <b>影响范围映射 · 限售解禁（09-28）</b>
+                    <span class="sub">申万二级行业口径 · 只统计覆盖，不判断方向</span>
+                  </div>
+                  <table class="mini">
+                    <thead><tr>
+                      <th>行业（申万二级）</th><th style="width:64px">家数</th>
+                      <th style="width:96px">解禁市值</th><th style="width:118px">占该行业流通市值</th>
+                    </tr></thead>
+                    <tbody>
+                      <tr><td>半导体</td><td class="code">6</td><td class="code">112 亿</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:64%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b style="font-size:11px">3.2%</b></div></td></tr>
+                      <tr><td>医药生物</td><td class="code">5</td><td class="code">88 亿</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:44%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b style="font-size:11px">2.2%</b></div></td></tr>
+                      <tr><td>电力设备</td><td class="code">4</td><td class="code">64 亿</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:30%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><b style="font-size:11px">1.5%</b></div></td></tr>
+                      <tr><td>有色金属</td><td class="code">3</td><td class="code">41 亿</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:22%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><b style="font-size:11px">1.1%</b></div></td></tr>
+                      <tr><td>其他 26 家</td><td class="code">22</td><td class="code">286 亿</td><td class="code" style="color:var(--tx3)">—</td></tr>
+                    </tbody>
+                  </table>
+                  <div class="strip">
+                    <span>行业分类：<b>申万二级</b>（不用"概念板块"—— 概念归类是人为的，映射会带判断色彩）</span>
+                    <span>口径：解禁市值 ÷ 该行业流通市值</span>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <div class="card-h">
+                    <b>财报披露密集度（三季报）</b>
+                    <span class="sub">已预约家数 ÷ 行业公司总数</span>
+                  </div>
+                  <table class="mini">
+                    <thead><tr>
+                      <th>行业</th><th style="width:74px">已预约</th><th style="width:74px">行业总数</th><th style="width:110px">密集度</th>
+                    </tr></thead>
+                    <tbody>
+                      <tr><td>电子</td><td class="code">187</td><td class="code">421</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:89%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b style="font-size:11px">44.4%</b></div></td></tr>
+                      <tr><td>医药生物</td><td class="code">168</td><td class="code">472</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:71%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b style="font-size:11px">35.6%</b></div></td></tr>
+                      <tr><td>电力设备</td><td class="code">142</td><td class="code">358</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:79%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><b style="font-size:11px">39.7%</b></div></td></tr>
+                      <tr><td>机械设备</td><td class="code">131</td><td class="code">512</td><td><div class="heat"><div class="bar" style="height:5px"><i style="width:51%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><b style="font-size:11px">25.6%</b></div></td></tr>
+                    </tbody>
+                  </table>
+                  <div class="okbox" style="margin:0">
+                    <b>这一栏的实际用法：</b>密集度高的行业，未来两周<b>信息密度会上升</b>
+                    —— 是安排研究时间的依据，不是买卖依据。
+                  </div>
+                </div>
+              </div>
+
+              <div class="warnbox" style="margin-top:13px">
+                <b>合规边界（本页固定展示）</b><br/>
+                投资日历只做两件事：① 呈现<b>已公布的日程安排</b>；② 统计事件的<b>覆盖范围</b>
+                （多少家、分布在哪些行业、占比多少）。<br/>
+                · <b>不含</b>方向判断（利好/利空）、<b>不含</b>目标价、<b>不含</b>买卖时点；<br/>
+                · 行业映射使用<b>申万分类</b>，不使用"概念板块"（后者是人为归类，会带判断色彩）；<br/>
+                · <b>不给个股标注历史胜率</b> —— 那等于变相的买卖建议；<br/>
+                · 日程可能变更，请以交易所与公司公告为准。
+              </div>
+            </div>
+
+            <!-- 自研公式与参数 -->
+            <div class="card" style="margin-top:13px;border-color:var(--line2)">
+              <div class="card-h" style="background:linear-gradient(180deg,#1a1526,#141020)">
+                <b style="color:var(--pur)">自研因子与参数 · 可自行复算</b>
+                <span class="sub">核心交付物：口径公开，使用者可代入自己的数据独立计算</span>
+                <div class="spacer"></div>
+                <span class="pill" style="border-color:rgba(168,85,247,.45);color:var(--pur)">非预测 · 非建议</span>
+              </div>
+              <div class="card-b">
+                <div class="cols2">
+                  <div>
+                    <div class="sec-title">可信度评分</div>
+                    <div class="formula" style="margin-top:9px">
+                      可信度 = min(100, <em>来源分</em> + 0.35×内容分 + 独立佐证×4)<br/>
+                      <i># 来源分同时是不可突破的上限</i><br/>
+                      <i># 目的：低质来源堆量也刷不上去</i>
+                    </div>
+                    <table class="mini" style="margin-top:9px">
+                      <thead><tr><th>来源</th><th style="width:52px">来源分</th></tr></thead>
+                      <tbody>
+                        <tr><td>监管/交易所/公告</td><td class="code">94</td></tr>
+                        <tr><td>持牌机构研报</td><td class="code">84</td></tr>
+                        <tr><td>权威财经媒体</td><td class="code">74</td></tr>
+                        <tr><td>财经自媒体</td><td class="code">54</td></tr>
+                        <tr><td>股吧/论坛/截图</td><td class="code">38</td></tr>
+                        <tr><td>未证实内容</td><td class="code">28</td></tr>
+                      </tbody>
+                    </table>
+                  </div>
+                  <div>
+                    <div class="sec-title">热度与异动</div>
+                    <div class="formula" style="margin-top:9px">
+                      热度分 = Σ(条目可信度) <i>按板块归一</i><br/>
+                      环比 = 今日提及量 / 20日均值 − 1<br/>
+                      异动阈值 = 环比 ≥ <em>+200%</em> 且 提及量 ≥ <em>10</em><br/>
+                      分位 = 近 <em>6 年</em> 同日指标的百分位
+                    </div>
+                    <div class="note mono-s" style="margin-top:9px;line-height:1.9">
+                      全部为<b style="color:var(--tx2)">描述性统计</b>：回答"多少条、比平时多多少"，
+                      <b>不回答</b>"会不会涨"。
+                    </div>
+                    <div class="warnbox" style="margin-top:9px">
+                      <b>为什么只给统计量：</b>把「主观评价词」换成「提及量 27 次 / 均值 9 次」，
+                      使用者获得的信息<b>不减反增</b> —— 因为判断阈值由他自己定。
+                    </div>
+                  </div>
+                  <div>
+                    <div class="sec-title">共振判定</div>
+                    <div class="formula" style="margin-top:9px">
+                      1. 按事件轴聚类 <i># 同事件多帖算1源</i><br/>
+                      2. 统计独立来源数 <i># 转载不计</i><br/>
+                      3. 校验方向一致性 <i># 不一致→指标不一致</i><br/>
+                      4. 加权可信度 ≥<em>65</em> 且 独立源 ≥<em>2</em> → ⭐2<br/>
+                      5. ≥<em>3</em> 个类型（含平台指标）→ ⭐3
+                    </div>
+                    <div class="okbox" style="margin-top:9px">
+                      <b>必须查重的理由：</b>同一份信息被当成三份独立证据，共振就是假的。
+                      本项目主线挖掘模块已就此事写明过风险，此处复用同一口径。
+                    </div>
+                  </div>
+                  <div>
+                    <div class="sec-title">日历因子 · 影响范围</div>
+                    <div class="formula" style="margin-top:9px">
+                      覆盖家数 = COUNT(受影响标的)<br/>
+                      行业分布 = GROUP BY <em>申万二级</em> <i># 不用概念板块</i><br/>
+                      占比 = 事件规模 ÷ 该行业流通市值<br/>
+                      密集度 = 已预约家数 ÷ 行业公司总数<br/>
+                      确定性 = <em>规则确定</em> | <em>公司预约·可改期</em>
+                    </div>
+                    <div class="mono-s" style="margin-top:9px;line-height:1.9">
+                      <b style="color:var(--tx2)">「确定性」这一项是日历独有的</b>：<br/>
+                      · 解禁日由交易所规则确定，<b>不会变</b>；<br/>
+                      · 财报披露日是<b>公司预约</b>，会改期 —— 所以界面把
+                      「已改期 N 次」单独标出来，<b>改期本身就是一条提示</b>。
+                    </div>
+                    <div class="warnbox" style="margin-top:9px">
+                      <b>为什么不做"事件→涨跌"映射：</b>那是预测，属投资建议范畴。
+                      这里只回答「哪些标的被覆盖、覆盖多重」，<b>方向由使用者自行判断</b>。
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="strip">
+                <span>因子版本 <b class="mono-s">intel-score v1.0 / calendar v1.0</b></span>
+                <span>参数文件 <b class="mono-s">configs/intel_score.yaml · configs/calendar_official.yaml</b></span>
+                <span>每次改动进审计链</span>
+                <span style="margin-left:auto">使用者可<b>自行代入自己的数据</b>复算全部指标，结果以自己计算为准</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:13px">
+            <div class="card">
+              <div class="card-h"><b>今日任务时间轴</b><span class="sub">交易日</span></div>
+              <div class="card-b">
+                <div class="tl">
+                  <div class="tl-row"><span class="tm">08:05</span><span class="dotc"></span><div class="bd"><b>盘中研报采集 · 第1次</b><span>5.8s · 新增 9 条</span></div></div>
+                  <div class="tl-row"><span class="tm">08:10</span><span class="dotc"></span><div class="bd"><b>盘前预测 <span class="tag hot" style="font-size:9px">8:30前</span></b><span>已完成 08:14 · 昨收 + 隔夜</span></div></div>
+                  <div class="tl-row"><span class="tm">08:15</span><span class="dotc"></span><div class="bd"><b>盘前新闻</b><span>已完成 08:26 · 62s</span></div></div>
+                  <div class="tl-row"><span class="tm">08:25</span><span class="dotc"></span><div class="bd"><b>盘前简报（汇总）</b><span>已完成 08:27 · 38s</span></div></div>
+                  <div class="tl-row"><span class="tm">08:28</span><span class="dotc"></span><div class="bd"><b>盘前研报热度</b><span>已完成 08:29 · 41s</span></div></div>
+                  <div class="tl-row"><span class="tm">09:15</span><span class="dotc run"></span><div class="bd"><b>事件扫描</b><span>每 5 分钟 · 运行中</span></div></div>
+                  <div class="tl-row"><span class="tm">10:05</span><span class="dotc"></span><div class="bd"><b>盘中研报采集 · 第2次</b><span>9.1s · 新增 14 条</span></div></div>
+                  <div class="tl-row"><span class="tm">12:05</span><span class="dotc"></span><div class="bd"><b>盘中研报采集 · 第3次</b><span>5.8s · 新增 21 条</span></div></div>
+                  <div class="tl-row"><span class="tm">14:05</span><span class="dotc wait"></span><div class="bd"><b>盘中研报采集 · 第4次</b><span>等待中</span></div></div>
+                  <div class="tl-row"><span class="tm">15:05</span><span class="dotc wait"></span><div class="bd"><b>日终快照</b><span>等待中</span></div></div>
+                  <div class="tl-row"><span class="tm">15:15</span><span class="dotc wait"></span><div class="bd"><b>收盘研报采集（收尾）</b><span>等待中</span></div></div>
+                  <div class="tl-row"><span class="tm">15:45</span><span class="dotc wait"></span><div class="bd"><b>舆情日报归档</b><span>等待中</span></div></div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-h"><b>多源共振 <span class="tag pur">新</span></b></div>
+              <div class="card-b" style="display:flex;flex-direction:column;gap:9px">
+                <div class="purbox">
+                  <b style="color:var(--pur)">⭐3 · 强共振 · 半导体设备</b><br/>
+                  交易所公告 + 券商研报×2 + 主线挖掘指标，<b>三类来源指向同一板块</b>，加权可信度 <b>90.2</b>
+                </div>
+                <div class="note">
+                  <b>⭐2 · 中共振 · 煤炭</b><br/>
+                  25 条内容提及（原文偏空）+ ETF 份额 5 日 −12.4%，<b>两组数据同向</b>，加权可信度 66.0
+                </div>
+                <div class="warnbox">
+                  <b class="wn-t">⚡ 指标不一致 · AI 算力</b><br/>
+                  原文提及方向偏多，同时拥挤度指标处于近 6 年 <b>87 分位</b>。
+                  两个指标取值不一致，<b>故不计入共振</b>。此处仅陈述取值。
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-h"><b>与平台指标交叉统计</b><span class="sub">两个页签共用</span></div>
+              <div class="card-b" style="display:flex;flex-direction:column;gap:8px">
+                <div class="purbox">内容提及 ∩ 主线挖掘指标 → <b style="color:var(--pur)">半导体设备（共振 ⭐3）</b></div>
+                <div class="warnbox">内容提及 ∩ 拥挤度高位 → <b class="wn-t">AI 算力（87 分位，指标不一致）</b></div>
+                <div class="note">内容提及 ∩ ETF 份额减少 → <b class="dn-t">煤炭（5 日 −12.4%）</b></div>
+                <div class="mono-s" style="color:var(--tx3);line-height:1.8">
+                  以上为<b style="color:var(--tx2)">多个指标取值同向/反向的统计事实</b>，
+                  不含操作含义。指标定义见各自页面。
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 页 2：盘前简报 ============ -->
+      <div class="pane">
+        <div class="okbox">
+          <b>四项盘前任务均已于 08:30 前完成</b> ——
+          盘前预测 <b>08:14</b> · 盘前新闻 <b>08:26</b> · 盘前简报汇总 <b>08:27</b> · 盘前研报热度 <b>08:29</b>。
+          全部基于 <b>上一交易日收盘 + 隔夜信息</b>。
+        </div>
+
+        <div class="cols2">
+          <div class="card">
+            <div class="card-h"><b>① 盘前新闻</b><span class="sub">隔夜要闻 + 外盘 + 公告</span><div class="spacer"></div><span class="pill">08:26 完成 · 62s</span></div>
+            <div class="card-b" style="display:flex;flex-direction:column;gap:9px">
+              <div class="note"><b>美股科技板块收涨</b> <span class="mono-s">来源：权威财经媒体 · 可信度 74</span><br/>纳指 +1.2%，费城半导体指数 +2.1%。</div>
+              <div class="note"><b>两家公司披露回购计划</b> <span class="mono-s">来源：交易所公告 · 可信度 94</span><br/>合计上限 18 亿元，均已在盘前完成披露。</div>
+              <div class="note"><b>动力煤夜盘下跌 1.8%</b> <span class="mono-s">来源：权威财经媒体 · 可信度 74</span><br/>与同日内容提及方向一致。</div>
+            </div>
+            <div class="strip"><span>条目 <b>23</b> 条</span><span>高可信 <b>9</b> 条</span><span>已过滤 2 个月前旧研报 <b>4</b> 篇</span></div>
+          </div>
+
+          <div class="card">
+            <div class="card-h"><b>② 盘前研报热度</b><span class="sub">券商研报 + 自媒体内容</span><div class="spacer"></div><span class="pill">08:29 完成 · 41s</span></div>
+            <div class="card-b" style="display:flex;flex-direction:column;gap:9px">
+              <div class="gr"><span class="lb">综合热度</span><div class="bx"><i style="width:74%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><span class="vv">74</span></div>
+              <div class="gr"><span class="lb">半导体</span><div class="bx"><i style="width:92%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><span class="vv">92</span></div>
+              <div class="gr"><span class="lb">AI 算力</span><div class="bx"><i style="width:78%;background:linear-gradient(90deg,#f59e0b,#ef4444)"></i></div><span class="vv">78</span></div>
+              <div class="gr"><span class="lb">新能源</span><div class="bx"><i style="width:71%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><span class="vv">71</span></div>
+              <div class="gr"><span class="lb">有色</span><div class="bx"><i style="width:49%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><span class="vv">49</span></div>
+              <div class="gr"><span class="lb">煤炭</span><div class="bx"><i style="width:41%;background:linear-gradient(90deg,#64748b,#38bdf8)"></i></div><span class="vv">41</span></div>
+              <div style="display:flex;gap:8px;margin-top:2px">
+                <span class="tag bull">原文偏多 31</span><span class="tag bear">原文偏空 12</span><span class="tag neu">中性 18</span>
+              </div>
+            </div>
+            <div class="strip"><span>研报 <b>41</b> 篇</span><span>自媒体 <b>45</b> 条</span><span>平均可信度 <b>68.4</b></span></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-h"><b>③ 盘前预测</b><span class="sub">基于上一交易日收盘 + 隔夜信息</span><div class="spacer"></div><span class="pill">08:14 完成 · 45s</span></div>
+          <div class="card-b">
+            <div class="note" style="margin-bottom:11px">
+              <b>数据基准（界面固定显示）：</b>
+              收盘数据取 <b>2026-09-24（上一交易日）收盘</b>；隔夜信息取
+              <b>2026-09-24 15:00 → 本日 08:10</b> 的美股 / 外盘商品 / 盘后公告 / 新增研报。
+              <b>不含本日盘中数据</b>（生成时本日尚未开盘），本日盘中变化由「事件告警」实时跟踪。
+            </div>
+            <div class="cols3">
+              <div>
+                <div class="sec-title">隔夜信息增量 <span class="mono-s">相对昨收基准</span></div>
+                <div style="display:flex;flex-direction:column;gap:8px;margin-top:9px">
+                  <div class="note"><b>半导体设备</b> <span class="mono-s">新增 3 条</span><br/><span class="mono-s">费半 +2.1% · 交易所公告 ×1 · 券商研报 ×2；可信度 90.2</span></div>
+                  <div class="note"><b>煤炭</b> <span class="mono-s">新增 4 条</span><br/><span class="mono-s">动力煤夜盘 −1.8% · 内容提及 ×3；可信度 66.0</span></div>
+                  <div class="note"><b>AI 算力</b> <span class="mono-s">新增 2 条</span><br/><span class="mono-s">券商研报 ×2；同时拥挤度指标处于 87 分位</span></div>
+                </div>
+                <div class="warnbox" style="margin-top:9px">
+                  <b>本块只做事实陈述</b>：列出「新增了哪些信息、来自哪里、可信度多少」。
+                  <b>不含方向判断、不含买卖时点</b>。
+                </div>
+              </div>
+              <div>
+                <div class="sec-title">研报口径统计 <span class="mono-s">可信度加权 · 非篇数</span></div>
+                <table class="mini" style="margin-top:9px">
+                  <thead><tr><th>板块</th><th>原文偏多</th><th>原文偏空</th><th>可信度</th></tr></thead>
+                  <tbody>
+                    <tr><td>半导体设备</td><td class="code up-t">27 篇</td><td class="code">3 篇</td><td class="code">90.2</td></tr>
+                    <tr><td>新能源</td><td class="code up-t">14 篇</td><td class="code">5 篇</td><td class="code">79.0</td></tr>
+                    <tr><td>煤炭</td><td class="code up-t">6 篇</td><td class="code dn-t">19 篇</td><td class="code">66.0</td></tr>
+                    <tr><td>AI 算力</td><td class="code up-t">18 篇</td><td class="code">8 篇</td><td class="code">72.0</td></tr>
+                  </tbody>
+                </table>
+                <div class="mono-s" style="margin-top:9px;line-height:1.8;color:var(--tx3)">
+                  口径：统计第三方内容中<b style="color:var(--tx2)">提及该板块的篇数与原文语气分布</b>，
+                  由分类模型按原文打标，<b style="color:var(--warn)">不代表本平台观点</b>。
+                </div>
+              </div>
+              <div>
+                <div class="sec-title">输入完整度</div>
+                <div class="gauge" style="margin-top:9px">
+                  <div class="gr"><span class="lb">昨日收盘</span><div class="bx"><i style="width:88%;background:linear-gradient(90deg,#22c55e,#84cc16)"></i></div><span class="vv">88%</span></div>
+                  <div class="gr"><span class="lb">隔夜美股</span><div class="bx"><i style="width:100%;background:linear-gradient(90deg,#00c48c,#22c55e)"></i></div><span class="vv">100%</span></div>
+                  <div class="gr"><span class="lb">外盘商品</span><div class="bx"><i style="width:100%;background:linear-gradient(90deg,#00c48c,#22c55e)"></i></div><span class="vv">100%</span></div>
+                  <div class="gr"><span class="lb">盘后公告</span><div class="bx"><i style="width:96%;background:linear-gradient(90deg,#00c48c,#22c55e)"></i></div><span class="vv">96%</span></div>
+                  <div class="gr"><span class="lb">新增研报</span><div class="bx"><i style="width:100%;background:linear-gradient(90deg,#00c48c,#22c55e)"></i></div><span class="vv">100%</span></div>
+                </div>
+                <div class="warnbox" style="margin-top:9px">昨日收盘 88%：<b>2 个板块</b>数据缺失，已记 <span class="mono-s">degraded</span>，<b>未用估算值补齐</b>。</div>
+              </div>
+            </div>
+          </div>
+          <div class="strip">
+            <span>盘前预测 <b>08:14</b></span><span>盘前新闻 <b>08:26</b></span><span>研报热度 <b>08:29</b></span>
+            <span>全部早于 <b>08:30</b> ✓</span>
+            <span style="margin-left:auto">硬超时 <b>08:28</b>，超时自动降级并标记「输入不完整」</span>
+          </div>
+        </div>
+
+        <!-- ④ 今日日历（投资日历并入盘前简报） -->
+        <div class="card">
+          <div class="card-h">
+            <b>④ 今日日历</b><span class="sub">2026-09-25（周五）· 含未来 7 日与本周变更</span>
+            <div class="spacer"></div>
+            <span class="pill" style="border-color:rgba(168,85,247,.45);color:var(--pur)">06:00 已同步</span>
+          </div>
+          <div class="card-b">
+            <div class="cols3">
+              <div>
+                <div class="sec-title">今日事件 <span class="mono-s">1 项</span></div>
+                <div style="display:flex;flex-direction:column;gap:8px;margin-top:9px">
+                  <div class="warnbox">
+                    <b class="wn-t">限售股解禁</b> <span class="tag fact" style="font-size:9.5px">规则确定</span><br/>
+                    <span class="mono-s">40 家 · 解禁市值 591 亿 · 半导体 6 家 / 医药 5 家</span>
+                  </div>
+                  <div class="note" style="font-size:11px">
+                    今日无宏观发布、无公司预约披露。下一交易日 <b>09-28</b> 另有解禁 40 家 / 591 亿。
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div class="sec-title">未来 7 日 <span class="mono-s">23 项</span></div>
+                <div style="display:flex;flex-direction:column;gap:6px;margin-top:9px">
+                  <div class="mono-s" style="line-height:2;color:var(--tx2)">
+                    <b style="color:var(--tx)">09-28</b> 解禁 40 家 · 591 亿<br/>
+                    <b style="color:var(--tx)">09-30</b> 海外财报 美光(MU) · 捷普(JBL)　<span class="hot-t">节前最后交易日</span><br/>
+                    <b style="color:var(--tx)">10-01</b> 国庆休市（至 10-07，10-08 复市）<br/>
+                    <b style="color:var(--tx)">10-09</b> 统计局 CPI / PPI<br/>
+                    <b style="color:var(--tx)">10-13</b> 有研新材 三季报预约披露
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div class="sec-title">本周变更 <span class="mono-s">改期 2 家</span></div>
+                <div style="display:flex;flex-direction:column;gap:8px;margin-top:9px">
+                  <div class="warnbox">
+                    <b class="wn-t">川投能源</b> 披露日 <b>10-14</b>（一次变更）<br/>
+                    <span class="mono-s">原预约 10-11 → 10-14</span>
+                  </div>
+                  <div class="warnbox">
+                    <b class="wn-t">金盘科技</b> 披露日 <b>10-14</b>（一次变更）<br/>
+                    <span class="mono-s">原预约 10-12 → 10-14</span>
+                  </div>
+                  <div class="note" style="font-size:11px">
+                    <b>改期本身是提示项</b> —— 一家公司把披露日往后挪，
+                    比"它哪天披露"更值得注意。
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="strip">
+            <span>日历同步 <b>06:00</b>（早于全部盘前任务）</span>
+            <span>数据源 akshare 既有接口 + <b>静态 YAML</b>（统计局 / FOMC 日程）</span>
+            <span style="margin-left:auto">只呈现已公布日程与覆盖范围，不含方向判断</span>
+          </div>
+        </div>
+
+        <div class="okbox" style="border-color:rgba(0,196,140,.3)">
+          <b>合规边界（本页固定展示）</b><br/>
+          本平台<b>只提供公开信息的聚合、统计与公式计算结果</b>，用于研究与信息参考：<br/>
+          · <b>不提供</b>证券投资咨询，不推荐具体证券，不给出买卖时机或目标价；<br/>
+          · 页面中"偏多/偏空"<b>仅为对第三方原文语气的统计归类</b>，不是本平台的判断或建议；<br/>
+          · 投资日历只呈现<b>已公布的日程安排</b>与<b>覆盖范围统计</b>，不含方向判断；<br/>
+          · 所有指标由规则与模型计算得出，<b>因子与参数公开，使用者可自行复算</b>；<br/>
+          · 数据可能存在缺失或错误，请以交易所与公司公告为准。
+        </div>
+
+        <div class="disclaimer">⚠️ 以上信息来自互联网公开资料与第三方研报，仅供参考，不构成投资建议。投资有风险，入市需谨慎，盈亏自负。</div>
+      </div>
+
+      <!-- ============ 页 3：事件告警中心 ============ -->
+      <div class="pane">
+        <div class="okbox">
+          <b>本中心的定位：告诉你「某条公开信息已出现」，而不是告诉你「该怎么做」。</b>
+          每条都可回溯来源与可信度；文案中不含"建议/关注/看多/看空/目标价"等表述。
+        </div>
+
+        <div class="cols">
+          <div>
+            <div class="card">
+              <div class="card-h"><b>事件流</b><span class="sub">按可信度降序 · 今日 7 条未处理</span>
+                <div class="spacer"></div>
+                <span class="pill warnb">弹窗：仅 ⭐3 与高可信</span>
+              </div>
+              <div class="tabs">
+                <div class="tab on">全部 18</div><div class="tab">共振 2</div><div class="tab">指标不一致 1</div>
+                <div class="tab">低可信 4</div><div class="tab">未处理 7</div>
+              </div>
+              <div class="card-b">
+
+                <div class="alert fact">
+                  <div class="alert-h">
+                    <span class="tag fact">信息事件</span>
+                    <b>半导体设备：三类来源指向同一板块</b>
+                    <span class="tag pur">⭐3 强共振</span>
+                    <div class="spacer"></div><span class="mono-s">10:14</span>
+                  </div>
+                  <div class="alert-b">平台监测到：交易所公告披露先进制程扩产进展；同日 2 篇券商研报提及该板块；平台「板块主线挖掘」指标同步触发。<b>此处仅陈述三类来源同向这一事实。</b></div>
+                  <div class="alert-f">
+                    <span>加权可信度 <b class="mono-s" style="color:var(--c5)">90.2</b></span>
+                    <span>关联 <span class="tag ind">半导体设备</span></span>
+                    <span class="evid"><span>交易所公告</span><span>券商研报 ×2</span><span>主线挖掘指标</span></span>
+                    <div class="spacer"></div><span class="tag hot">已弹窗</span>
+                  </div>
+                </div>
+
+                <div class="alert warn2">
+                  <div class="alert-h">
+                    <span class="tag" style="color:var(--warn);border-color:rgba(255,169,64,.45);background:rgba(255,169,64,.1)">指标不一致</span>
+                    <b>AI 算力：提及方向与拥挤度指标取值不一致</b>
+                    <div class="spacer"></div><span class="mono-s">14:08</span>
+                  </div>
+                  <div class="alert-b">平台监测到：第三方内容提及方向偏多（热度 78），同时板块拥挤度指标处于近 6 年 <b>87 分位</b>。两个指标取值不一致，<b>故不计入共振</b>。分位定义与历史序列可在「板块拥挤度」页查看。</div>
+                  <div class="alert-f">
+                    <span>加权可信度 <b class="mono-s" style="color:var(--c4)">72.0</b></span>
+                    <span>关联 <span class="tag ind">AI 算力</span></span>
+                    <span class="evid"><span>内容提及</span><span>板块拥挤度指标</span></span>
+                    <div class="spacer"></div><span class="tag neu">未处理</span>
+                  </div>
+                </div>
+
+                <div class="alert res">
+                  <div class="alert-h">
+                    <span class="tag pur">信息事件</span>
+                    <b>煤炭：内容提及量异动，且 ETF 份额同向变动</b>
+                    <span class="tag pur">⭐2 中共振</span>
+                    <div class="spacer"></div><span class="mono-s">13:24</span>
+                  </div>
+                  <div class="alert-b">平台监测到：今日提及 <b>25 篇</b>（20 日均值 8 篇，环比 +213%），其中 19 篇原文语气偏空；同期 ETF 份额 5 日累计 <b>−12.4%</b>。<b>此处仅陈述两组数据同向变动。</b></div>
+                  <div class="alert-f">
+                    <span>加权可信度 <b class="mono-s" style="color:var(--c4)">66.0</b></span>
+                    <span>关联 <span class="tag ind">煤炭</span></span>
+                    <span class="evid"><span>内容提及 ×25</span><span>ETF 份额</span></span>
+                    <div class="spacer"></div><span class="tag neu">未处理</span>
+                  </div>
+                </div>
+
+                <div class="alert low">
+                  <div class="alert-h">
+                    <span class="tag" style="color:var(--c1);border-color:rgba(239,68,68,.45);background:rgba(239,68,68,.1)">低可信</span>
+                    <b>未证实内容：某公司或纳入重要指数（无可追溯来源）</b>
+                    <div class="spacer"></div><span class="mono-s">14:05</span>
+                  </div>
+                  <div class="alert-b">平台监测到：群内截图流传该说法，无公告支撑，来源不可追溯。已按规则标为<b>存疑</b>并<b>不触发弹窗</b>，仅留档。试用档账号<b>不返回</b>此类条目。</div>
+                  <div class="alert-f">
+                    <span>加权可信度 <b class="mono-s" style="color:var(--c1)">31.0</b></span>
+                    <span>关联 <span class="tag ind">消费电子</span></span>
+                    <span class="evid"><span>未证实内容</span></span>
+                    <div class="spacer"></div><span class="tag neu">不弹窗</span>
+                  </div>
+                </div>
+
+              </div>
+              <div class="strip">
+                <span>今日 <b>18</b> 条</span><span>已弹窗 <b>3</b> 条</span><span>抑制弹窗 <b>15</b> 条</span>
+                <span style="margin-left:auto">弹窗规则：⭐3 共振或可信度 ≥65，其余仅入中心</span>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:13px">
+            <div class="card">
+              <div class="card-h"><b>弹窗样式（示例）</b><span class="sub">右下角气泡</span></div>
+              <div class="card-b" style="display:flex;flex-direction:column;gap:11px">
+                <div class="popup">
+                  <div class="popup-h"><div class="ic3">⭐</div><b>信息事件 · 强共振</b><span class="x">✕</span></div>
+                  <p><b style="color:var(--tx)">半导体设备：三类来源指向同一板块</b><br/>交易所公告 + 券商研报 ×2 + 主线挖掘指标</p>
+                  <div style="display:flex;gap:8px;font-size:10.5px;color:var(--tx3)">
+                    <span>可信度 <b style="color:var(--c5)">90.2</b></span><span>10:14</span><span class="tag ind">半导体设备</span>
+                  </div>
+                  <div class="pop-f"><div class="btn">查看依据</div><div class="btn">稍后处理</div></div>
+                </div>
+
+                <div class="popup warnp">
+                  <div class="popup-h"><div class="ic3">⚡</div><b>指标不一致</b><span class="x">✕</span></div>
+                  <p><b style="color:var(--tx)">AI 算力：提及方向与拥挤度取值不一致</b><br/>提及偏多 · 拥挤度 87 分位</p>
+                  <div style="display:flex;gap:8px;font-size:10.5px;color:var(--tx3)">
+                    <span>可信度 <b style="color:var(--c4)">72.0</b></span><span>14:08</span><span class="tag ind">AI 算力</span>
+                  </div>
+                  <div class="pop-f"><div class="btn">查看依据</div><div class="btn">稍后处理</div></div>
+                </div>
+
+                <div class="note" style="font-size:11px">
+                  弹窗文案统一为<b>「某条公开信息已出现」</b>的事实通知；
+                  按钮是<b>"查看依据"</b> —— 列出的是<b>来源大类与可信度构成</b>，
+                  <b>不暴露具体数据源</b>（详见下方「来源保密」说明）。
+                </div>
+                <div class="purbox" style="font-size:11px">
+                  <b style="color:var(--pur)">来源保密（平台核心资产）</b><br/>
+                  接口响应中<b>不存在</b> <span class="mono-s">source_url / group_id / author / 采集器名</span>；
+                  前端只显示来源<b>大类</b>（官方 / 研报 / 媒体 / 自媒体 / 未证实），
+                  <b>不显示</b>具体机构名、媒体名或账号。<br/>
+                  <span class="mono-s">原因：来源本身可被复制 —— 暴露即失去信息差壁垒。</span>
+                </div>
+                <div class="warnbox">
+                  <b>弹窗抑制（防打扰）：</b>同一事件 <b>2 小时</b>内不重复弹；可信度 &lt;65 不弹；
+                  非交易时段仅 ⭐3 弹。今日实际弹窗 <b>3</b> 次，抑制 <b>15</b> 次。
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-h"><b>共振判定规则</b></div>
+              <div class="card-b" style="display:flex;flex-direction:column;gap:8px">
+                <div class="formula">
+                  1. 按事件轴聚类 <i># 同事件多帖算1源</i><br/>
+                  2. 统计独立来源数 <i># 转载不计</i><br/>
+                  3. 校验方向一致性 <i># 不一致→指标不一致</i><br/>
+                  4. 加权可信度 ≥<em>65</em> 且 独立源 ≥<em>2</em> → ⭐2<br/>
+                  5. ≥<em>3</em> 个类型（含平台指标）→ ⭐3
+                </div>
+                <div class="okbox">
+                  <b>为什么必须查重：</b>同一份信息被当成三份独立证据，共振就是假的。
+                  本项目主线挖掘模块已就此写明风险 —— 同一口径在这里复用。
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ============ 页 4：调度与任务 ============ -->
+      <div class="pane">
+        <div class="okbox">
+          全部定时任务声明于 <span class="mono-s" style="color:var(--tx)">src/scheduler/registry.py</span>（cron 单一事实源），
+          交易日判定复用 <span class="mono-s" style="color:var(--tx)">src/core/trading_session.py</span>；
+          新增任务已并入 <b>JOB_REGISTRY</b>，前端与 Celery Beat 自动生成视图。
+        </div>
+
+        <div class="card">
+          <div class="card-h"><b>新增任务清单</b><span class="sub">舆情情报链路</span><div class="spacer"></div><span class="pill hot">8 个新 JobSpec</span></div>
+          <table>
+            <thead><tr>
+              <th style="width:158px">任务</th><th style="width:132px">cron</th><th style="width:66px">周期</th>
+              <th>说明</th><th style="width:88px">上次运行</th><th style="width:64px">耗时</th><th style="width:68px">状态</th>
+            </tr></thead>
+            <tbody>
+              <tr><td class="nm">intel_zsxq_collect</td><td class="code">5 8,10,12,14 * * 1-5</td><td>2 小时</td><td>盘中研报采集（Token 直采，静默）</td><td class="code">12:05:02</td><td class="code">5.8s</td><td><span class="tag bull">成功</span></td></tr>
+              <tr><td class="nm">intel_zsxq_collect_close</td><td class="code">15 15 * * 1-5</td><td>日</td><td><b>收盘后收尾采集</b> —— 补齐当日全部内容</td><td class="code">—</td><td class="code">—</td><td><span class="tag neu">待运行</span></td></tr>
+              <tr><td class="nm">intel_premarket_forecast</td><td class="code">10 8 * * 1-5</td><td>日</td><td><b>盘前预测</b> —— 上一交易日收盘 + 隔夜信息，硬超时 08:28</td><td class="code">08:14:22</td><td class="code">45s</td><td><span class="tag bull">成功</span></td></tr>
+              <tr><td class="nm">intel_premarket_news</td><td class="code">15 8 * * 1-5</td><td>日</td><td><b>盘前新闻</b>（外盘 + 公告 + 要闻）</td><td class="code">08:26:11</td><td class="code">62s</td><td><span class="tag bull">成功</span></td></tr>
+              <tr><td class="nm">intel_premarket_brief</td><td class="code">25 8 * * 1-5</td><td>日</td><td><b>盘前简报汇总</b>（合并其余项）</td><td class="code">08:27:33</td><td class="code">38s</td><td><span class="tag bull">成功</span></td></tr>
+              <tr><td class="nm">intel_premarket_heat</td><td class="code">28 8 * * 1-5</td><td>日</td><td><b>盘前研报热度</b>（研报 + 自媒体聚合打分）</td><td class="code">08:29:04</td><td class="code">41s</td><td><span class="tag hot">准点</span></td></tr>
+              <tr><td class="nm">intel_event_scan</td><td class="code">*/5 9-11,13-14 * * 1-5</td><td>5 分钟</td><td>事件扫描（信息事件 / 指标不一致）</td><td class="code">14:10:00</td><td class="code">3.1s</td><td><span class="tag bull">成功</span></td></tr>
+              <tr><td class="nm">intel_resonance_check</td><td class="code">*/15 * * * 1-5</td><td>15 分钟</td><td><b>多源共振判定</b>（含平台指标交叉统计）</td><td class="code">14:00:00</td><td class="code">2.4s</td><td><span class="tag bull">成功</span></td></tr>
+            </tbody>
+          </table>
+          <div class="strip">
+            <span>全部任务受交易日闸门控制</span>
+            <span>非交易日自动跳过并记 <b>skipped</b></span>
+            <span>失败重试 3 次后告警</span>
+            <span style="margin-left:auto">运行记录落 <span class="mono-s">data/scheduler/*.jsonl</span></span>
+          </div>
+        </div>
+
+        <div class="cols2">
+          <div class="card">
+            <div class="card-h"><b>交易日时间轴（完整）</b></div>
+            <div class="card-b">
+              <div class="tl">
+                <div class="tl-row"><span class="tm">08:05</span><span class="dotc"></span><div class="bd"><b>盘中研报采集 · 第1次</b><span>覆盖隔夜与早间研报</span></div></div>
+                <div class="tl-row"><span class="tm">08:10</span><span class="dotc"></span><div class="bd"><b>盘前预测</b><span class="tag hot" style="font-size:9px">昨收 + 隔夜 · 一次跑完</span></div></div>
+                <div class="tl-row"><span class="tm">08:15</span><span class="dotc"></span><div class="bd"><b>盘前新闻</b><span>外盘 + 公告 + 要闻</span></div></div>
+                <div class="tl-row"><span class="tm">08:25</span><span class="dotc"></span><div class="bd"><b>盘前简报汇总</b><span>依赖前三项产物</span></div></div>
+                <div class="tl-row"><span class="tm">08:28</span><span class="dotc"></span><div class="bd"><b>盘前研报热度</b><span class="tag hot" style="font-size:9px">08:30 前最后一项</span></div></div>
+                <div class="tl-row"><span class="tm">09:15</span><span class="dotc"></span><div class="bd"><b>事件扫描启动</b><span>每 5 分钟，至 11:30</span></div></div>
+                <div class="tl-row"><span class="tm">10:05</span><span class="dotc"></span><div class="bd"><b>盘中研报采集 · 第2次</b><span>—</span></div></div>
+                <div class="tl-row"><span class="tm">11:30</span><span class="dotc"></span><div class="bd"><b>午间休市</b><span>事件扫描暂停，采集继续</span></div></div>
+                <div class="tl-row"><span class="tm">12:05</span><span class="dotc"></span><div class="bd"><b>盘中研报采集 · 第3次</b><span>午间研报集中发布</span></div></div>
+                <div class="tl-row"><span class="tm">13:00</span><span class="dotc"></span><div class="bd"><b>下午事件扫描恢复</b><span>每 5 分钟，至 15:00</span></div></div>
+                <div class="tl-row"><span class="tm">14:05</span><span class="dotc"></span><div class="bd"><b>盘中研报采集 · 第4次</b><span>当日情报峰值时段</span></div></div>
+                <div class="tl-row"><span class="tm">15:00</span><span class="dotc"></span><div class="bd"><b>收盘</b><span>—</span></div></div>
+                <div class="tl-row"><span class="tm">15:05</span><span class="dotc"></span><div class="bd"><b>日终快照 / 涨停竞价采集</b><span>平台既有任务</span></div></div>
+                <div class="tl-row"><span class="tm">15:15</span><span class="dotc"></span><div class="bd"><b>收盘研报采集（收尾）</b><span>补齐当日全部内容</span></div></div>
+                <div class="tl-row"><span class="tm">15:45</span><span class="dotc"></span><div class="bd"><b>舆情日报归档</b><span>落库 + 生成留痕</span></div></div>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;flex-direction:column;gap:13px">
+            <div class="card">
+              <div class="card-h"><b>关键设计取舍</b></div>
+              <div class="card-b" style="display:flex;flex-direction:column;gap:9px">
+                <div class="note">
+                  <b>盘前预测的数据基准：昨日收盘 + 隔夜信息</b><br/>
+                  输入 = <b>上一交易日收盘</b>（结构 / 资金 / 拥挤度等指标）
+                  ＋ <b>隔夜增量</b>（美股 / 外盘商品 / 盘后公告 / 新增研报）。
+                  <b>不含本日盘中数据</b>，界面固定显示基准日期。
+                </div>
+                <div class="okbox">
+                  <b>为什么 15:15 还要采一次？</b><br/>
+                  收盘后的内容是<b>次日盘前预测与简报的主要输入</b>。不采这一次，
+                  次日 08:05 那次要在 20 分钟内交出全部内容，压力集中且容易超时。
+                </div>
+                <div class="warnbox">
+                  <b>超时保护：</b>所有盘前任务硬超时 <b>08:28</b>，超时则标注
+                  「<b>输入不完整</b>」并列出缺失项，<b>不用估算值补齐</b>。
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-h"><b>非交易日与非交易时段行为</b></div>
+              <div class="card-b" style="display:flex;flex-direction:column;gap:8px">
+                <div class="gr"><span class="lb">周末</span><div class="bx"><i style="width:100%;background:#334155"></i></div><span class="vv">全跳过</span></div>
+                <div class="gr"><span class="lb">法定节假日</span><div class="bx"><i style="width:100%;background:#334155"></i></div><span class="vv">全跳过</span></div>
+                <div class="gr"><span class="lb">午休</span><div class="bx"><i style="width:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><span class="vv">仅采集</span></div>
+                <div class="gr"><span class="lb">盘后 15:00 后</span><div class="bx"><i style="width:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6)"></i></div><span class="vv">仅⭐3弹</span></div>
+                <div class="note">交易日判定复用 <span class="mono-s">trading_session.session_state()</span>；
+                  节假日依赖日历表，缺失时按工作日兜底并记 <span class="mono-s">degraded</span>。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="disclaimer">
+        ⚠️ 以上信息来自互联网公开资料与第三方研报，仅供参考，<b>不构成投资建议</b>。
+        本平台不提供证券投资咨询服务，不推荐具体证券，不给出买卖时机与目标价。
+        投资有风险，入市需谨慎，盈亏自负。
+        <br/>本页为前端效果图（静态稿），所有数据均为演示样例，非真实抓取结果。
+      </div>
+
+    </div>
+  </main>
+</div>
+</body>
+</html>

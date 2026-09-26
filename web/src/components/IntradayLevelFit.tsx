@@ -153,7 +153,7 @@ export default function IntradayLevelFitPanel({
                 <td className="num mono">{rate(metrics?.in_sample_rate)}</td>
                 <td className="num mono">{rate(metrics?.walk_forward_rate)}</td>
                 <td className="muted-text">
-                  触及低吸后、{metrics?.horizon_bars ?? 24} 根 bar 内先到高抛且不破止损
+                  触及回踩后、{metrics?.horizon_bars ?? 24} 根 bar 内先到冲高且不破止损
                   = 成功；只统计"触及过"的样本（不触及不计入分母）
                 </td>
               </tr>
@@ -178,8 +178,8 @@ export default function IntradayLevelFitPanel({
                   <td className="num mono" colSpan={2}>{rate(metrics.best_achievable_rate)}</td>
                   <td className="muted-text">
                     {metrics.best_achievable_lines.length >= 4
-                      ? `最优组合：低吸 −${metrics.best_achievable_lines[0].toFixed(2)}% / `
-                        + `高抛 +${metrics.best_achievable_lines[1].toFixed(2)}% / `
+                      ? `最优组合：回踩 −${metrics.best_achievable_lines[0].toFixed(2)}% / `
+                        + `冲高 +${metrics.best_achievable_lines[1].toFixed(2)}% / `
                         + `止损 −${metrics.best_achievable_lines[2].toFixed(1)}%（`
                         + `${metrics.best_achievable_lines[3].toFixed(0)} 次触及）`
                       : "该窗口内能达到的最高成功率"}
@@ -194,14 +194,14 @@ export default function IntradayLevelFitPanel({
 
           <div className="weight-editor-chips">
             <span className="stat-chip">
-              <em>拟合低吸</em>
+              <em>拟合回踩</em>
               {lowPct === null ? "—" : `−${lowPct.toFixed(2)}%`}
               {lineOf(lowPct, -1) !== null && (
                 <span className="mono muted-text"> ≈ {lineOf(lowPct, -1)?.toFixed(2)}</span>
               )}
             </span>
             <span className="stat-chip">
-              <em>拟合高抛</em>
+              <em>拟合冲高</em>
               {highPct === null ? "—" : `+${highPct.toFixed(2)}%`}
               {lineOf(highPct, 1) !== null && (
                 <span className="mono muted-text"> ≈ {lineOf(highPct, 1)?.toFixed(2)}</span>

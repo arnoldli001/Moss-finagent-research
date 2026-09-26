@@ -194,13 +194,25 @@ class WarehouseConfig:
                 return cls(url=url, dialect="mysql",
                            description=f"MySQL {host}:{port}/{database}")
 
-        for key in ("MOSS_QUANT_SQLITE", "MOSS_SQLITE_PATH"):
-            value = os.environ.get(key)
-            if value and value.strip():
-                path = Path(value.strip())
-                path.parent.mkdir(parents=True, exist_ok=True)
-                return cls(url=f"sqlite:///{path.as_posix()}", dialect="sqlite",
-                           description=f"SQLite {path}（环境变量 {key}）{note}")
+        # ⚠️ 这里**只认 quant 专属开关** `MOSS_QUANT_SQLITE`。
+        #
+        # 曾经还认通用的 `MOSS_SQLITE_PATH`，那是**应用库**（fact_*/告警/做T权重档案）的开关：
+        # `manage.py --env dev`（且 `--env` 缺省就是 dev）会把它指到
+        # `data/dev/moss_dev.db` 做隔离，防止调试实例写生产数据。
+        # 但行情仓是另一份 15~31 GiB 的**只读行情数据**，应用库隔离不该把它一起带跑 ——
+        # 实测后果（2026-09-23 用户报障）：dev 实例下股票字典只剩 4 条
+        # （`data/dev/moss_dev.db` 里只有按需补录过的那几只），
+        # "输入中文名 / 拼音首字母联想"整段失效（汇成真空 301392、大亚圣象 000910 都"识别不了"），
+        # 资金流/流通市值/换手率这些同样读行情仓的字段也一起变空。
+        #
+        # 真要把行情仓指到别处，用 **quant 专属**的 `MOSS_QUANT_SQLITE`（语义明确、
+        # 不会与应用库的隔离互相影响）；上面的 `MOSS_QUANT_DB_URL`/`QUANT_DB_URL` 同理。
+        quant_sqlite = os.environ.get("MOSS_QUANT_SQLITE")
+        if quant_sqlite and quant_sqlite.strip():
+            path = Path(quant_sqlite.strip())
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return cls(url=f"sqlite:///{path.as_posix()}", dialect="sqlite",
+                       description=f"SQLite {path}（环境变量 MOSS_QUANT_SQLITE）{note}")
 
         override = pick("SQLITE")
         if override:

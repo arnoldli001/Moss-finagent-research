@@ -14,11 +14,13 @@
 | `fina_indicator_vip` | `fina_indicator_vip` | 报告期 | **全市场财务横截面（PIT 骨架）** |
 | `index_daily` | `index_daily` | 交易日 | 相对强度 RS 的基准 |
 | `stock_basic` | `stock_basic` | static | 名录/行业/上市日期 |
+| `namechange` | `namechange` | static | **历史名称（ST/*ST 判定）** |
 | `trade_cal` | `trade_cal` | static | 交易日历（决定要拉哪些分区） |
 """
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,7 @@ from src.quant.tushare_source import (
     FINA_MAP,
     LIMIT_MAP,
     MONEYFLOW_MAP,
+    NAME_CHANGE_MAP,
     TushareClient,
     normalize,
     to_code,
@@ -63,6 +66,22 @@ DAILY_DATASETS: dict[str, tuple[str, dict[str, str]]] = {
 }
 
 INDEX_CODES = ("000001.SH", "000300.SH", "399001.SZ", "399006.SZ", "000905.SH")
+
+
+def _year_windows(start: str, end: str) -> list[tuple[str, str]]:
+    """把 `[start, end]` 切成按自然年的窗口（用于按公告日区间拉取的接口）。
+
+    端点做了裁剪（首年从 `start` 起、末年到 `end` 止），所以不会多拉数据。
+    """
+    first, last = int(start[:4]), int(end[:4])
+    if last < first:
+        return [(start, end)]
+    windows: list[tuple[str, str]] = []
+    for year in range(first, last + 1):
+        low = start if year == first else f"{year}0101"
+        high = end if year == last else f"{year}1231"
+        windows.append((low, high))
+    return windows
 
 
 @dataclass
@@ -156,6 +175,64 @@ class TushareDownloader:
             store.write("static", normalized)
         return store.read("static")
 
+    # ---------- 历史名称（ST 判定） ----------
+
+    async def namechange(self, start: str = "20060101",
+                         end: str | None = None, *,
+                         force: bool = False) -> SyncResult:
+        """拉取全部历史名称变更 → `namechange/static` 分区。
+
+        供 `st_status.StStatus` 判定"某只票在某一天是不是 ST"。
+
+        ## 为什么按**公告日**分年拉
+
+        `namechange` 的 `start_date/end_date` 参数过滤的是 **ann_date**
+        （窗口内公告的变更，即使生效日落在窗口之外 —— 实测窗口
+        `20140101~20140131` 返回了一条 `start_date=20140305` 的记录）。
+        所以按公告日逐年拉取即可覆盖全量，分年只是为了让单次响应小、
+        失败重试便宜。每只票至少有一行（初始名称），实测全市场约 1.5 万行。
+
+        ## 为什么是 static 分区（而不是按交易日）
+
+        名称是**每只票一条时间轴**，不是每日横截面。跨年窗口可能返回
+        同一条记录（年份边界上的公告），所以写完前按
+        `(ts_code, start_date, name)` 去重。
+        """
+        store = self.store("namechange")
+        end = end or time.strftime("%Y%m%d")
+        entry = store.manifest().get("static", {})
+        if (store.has("static") and not force
+                and entry.get("start", "") <= start
+                and entry.get("end", "") >= end):
+            return SyncResult(dataset="namechange", requested=0,
+                              skipped=["static(已覆盖)"],
+                              rows=int(entry.get("rows", 0)))
+
+        frames: list[pd.DataFrame] = []
+        windows = _year_windows(start, end)
+        for low, high in windows:
+            frame = await self.client.acall(
+                "namechange", start_date=low, end_date=high,
+                fields="ts_code,name,start_date,end_date,ann_date,change_reason")
+            if frame is not None and len(frame):
+                frames.append(frame)
+        if not frames:
+            logger.warning("namechange 在 %s~%s 返回空表", start, end)
+            return SyncResult(dataset="namechange", requested=len(windows),
+                              failed={"all": "返回空表"})
+
+        combined = pd.concat(frames, ignore_index=True)
+        normalized = normalize(combined, NAME_CHANGE_MAP)
+        normalized = normalized.assign(code=to_code(normalized["ts_code"]))
+        normalized = normalized.drop_duplicates(
+            subset=["ts_code", "start_date", "name"]).reset_index(drop=True)
+        store.write("static", normalized,
+                    meta={"start": start, "end": end,
+                          "rows": int(len(normalized))})
+        return SyncResult(dataset="namechange", requested=len(windows),
+                          fetched=[f"{low}~{high}" for low, high in windows],
+                          rows=int(len(normalized)))
+
     # ---------- 按交易日的数据集 ----------
 
     async def sync_daily(self, dataset: str, days: list[str], *,
@@ -239,6 +316,7 @@ class TushareDownloader:
         periods: list[str] | None = None,
         include_index: bool = True,
         include_fina: bool = True,
+        include_namechange: bool = True,
         force: bool = False,
         days: list[str] | None = None,
         progress: Any = None,
@@ -277,5 +355,13 @@ class TushareDownloader:
                 progress(f"下载 fina_indicator_vip（{len(periods)} 个报告期）")
             report.results["fina_indicator_vip"] = await self.sync_fina(
                 periods, force=force)
+
+        if include_namechange:
+            # 历史名称：ST 剔除的数据源。**必须跟随区间下载**，
+            # 否则"剔除 ST"这个开关会因为缺数据而静默降级为不剔除。
+            if progress:
+                progress("下载 namechange（历史名称，ST 判定用）")
+            report.results["namechange"] = await self.namechange(
+                start, end, force=force)
 
         return report

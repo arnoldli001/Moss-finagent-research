@@ -23,7 +23,7 @@
 
 ⚠️ **`research_note` 是唯一真单点**：知识星球没有等价替代（研报小作文
 是它的独有内容）。token 过期时用财新要闻**降级兜底**，并明确标注
-"研究笔记来源当前不可用" —— 不假装还有。
+"券商作文来源当前不可用" —— 不假装还有。
 
 ### ② 免费优先：能免费获取与分析的就免费
 
@@ -37,8 +37,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Final
+from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 

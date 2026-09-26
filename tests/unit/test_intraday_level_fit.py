@@ -33,7 +33,7 @@ def _bars(days: int, *, amplitude_pct: float, trend_pct: float = 0.0,
 
     `cycles_per_day` 默认 2.4 ≈ 每 20 根 bar 一个来回 —— 这是**日内做T**该有的
     形态（一天里有若干次可交易的小波段）。周期太长（例如一天一个来回）时，
-    靠近日终的低点根本来不及在高抛线附近卖出，成功率自然低 —— 那是市场形态，
+    靠近日终的低点根本来不及在冲高线附近卖出，成功率自然低 —— 那是市场形态，
     不是代码问题，所以测试里用"有多次来回"的形态来验证口径。
     """
     rng = np.random.default_rng(seed)
@@ -106,7 +106,7 @@ def test_oscillating_stock_can_reach_high_hit_rate() -> None:
 
     这条断言是整套拟合的地基：如果连"明显来回振荡"的票都做不出高成功率，
     那问题在成功率口径本身（例如把未触及的 bar 也算进分母）。
-    同时用它钉住一个**真实存在**的权衡：同样的低吸/高抛，止损贴得太近
+    同时用它钉住一个**真实存在**的权衡：同样的回踩/冲高，止损贴得太近
     （2.2% vs 5.0%）会把成功率从 100% 打到 40% 出头 —— 这正是"止损位置"
     必须参与拟合、而不能拍一个固定百分比的原因。
     """
@@ -135,9 +135,9 @@ def test_success_rate_ignores_bars_that_never_touch() -> None:
 
 
 def test_one_way_trend_has_low_success_or_no_edge() -> None:
-    """单边下跌日：低吸买进去只会更低 → 拟合不应给出高成功率。
+    """单边下跌日：回踩买进去只会更低 → 拟合不应给出高成功率。
 
-    造 10 天连续 -4%/日 的下跌：任何"低吸"都会继续被埋。
+    造 10 天连续 -4%/日 的下跌：任何"回踩"都会继续被埋。
     """
     dataset = _dataset(_bars(10, amplitude_pct=0.6, trend_pct=-4.0))
     stat = evaluate_levels(
@@ -147,7 +147,7 @@ def test_one_way_trend_has_low_success_or_no_edge() -> None:
 
 
 def test_low_line_must_be_below_high_line() -> None:
-    """线序非法（低吸 ≥ 高抛 / 止损在低吸上方）时直接判不可用，不给"成功率"。"""
+    """线序非法（回踩 ≥ 冲高 / 止损在回踩上方）时直接判不可用，不给"成功率"。"""
     dataset = _dataset(_bars(10, amplitude_pct=2.0))
     assert evaluate_levels(
         dataset=dataset, low_pct=1.5, high_pct=1.5, stop_pct=2.2,
@@ -185,7 +185,7 @@ def test_fit_produces_traceable_lines_and_two_rates() -> None:
     assert payload["low_anchors"] and payload["high_anchors"]
     assert payload["feature_means"] and payload["feature_stds"]
     assert len(payload["features"]) == len(FEATURE_KEYS)
-    # 拟合线必须有序：低吸 < 高抛 < 止损
+    # 拟合线必须有序：回踩 < 冲高 < 止损
     assert metrics["in_sample_touches"] > 0
 
 

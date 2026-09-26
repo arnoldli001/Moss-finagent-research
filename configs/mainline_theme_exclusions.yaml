@@ -1,0 +1,120 @@
+# 主线题材剔除清单（由 `scripts/build_theme_exclusions.py` **自动生成**）
+#
+# ## 谁会被写进这份清单
+#
+#     剔除 = 20 日胜率 <= 40%  **且** 已走满的 20 日窗口 >= 3 个
+#
+# 胜率 = 该题材**已走满**的 20 日窗口里「窗口末收盘 > 信号日收盘」的比例
+# （统计档位：strong/medium/weak）。
+# 「已走满的 20 日窗口 + 期末收盘 vs 信号日收盘」这一步与「回测收益展示」
+# 面板是同一处实现，但**档位范围**刻意不同：面板只看 strong/medium
+# （它的注释写明「弱信号不进入本面板」），而池级取舍要看这个题材
+# **产生过的全部信号** —— 只会反复报弱信号且从不兑现的题材同样在占位置。
+# 门槛是**严格大于**：恰好等于门槛也算不达标。
+#
+# ⚠️ **判不准的不在这里**：一条 20 日窗口都没走满的（新概念）、
+# 或窗口少于 3 个的，都留在池内继续攒证据 —— 见文件末尾的 watching。
+# 把「判不出」当成「不通过」，等于让系统永远看不到刚冒头的新题材。
+#
+# ## 生效方式（池级剔除）
+#
+# 与 `sector_blacklist.yaml` **同一套语义**：不在打分池 → 不打分 →
+# 不产生告警 → 不再同步行情。`store.boards()` 每次现读本文件（按 mtime 失效），
+# 所以改完**不需要重启**，下一轮打分即生效。
+#
+# ## 怎么改 / 怎么恢复某个题材
+#
+# **不要手工编辑本文件** —— 下次生成会覆盖。要改就改生成脚本的参数：
+#   python scripts/build_theme_exclusions.py --threshold 0.45 --min-samples 5
+#   python scripts/build_theme_exclusions.py --keep 886015.TI   # 单独放过一个
+#
+# 本次：池内 138 个 → 剔除 16 个、留 122 个（其中 18 个在观察名单）。
+
+version: 1
+generated_at: "2026-09-25T20:53:21+08:00"
+as_of: "20260924"
+rule:
+  metric: win_rate_20d
+  threshold: 0.4
+  min_samples: 3
+  levels: [strong, medium, weak]
+counts:
+  pool: 138
+  excluded: 16
+  kept: 122
+  watching: 18
+#
+# `codes:` 是**唯一**被代码读取的键（`load_theme_exclusions` 复用
+# sector_blacklist 的解析器），每行后面挂的是判定依据，供人核对。
+codes:
+  # 胜率 0% · 已走满 6 个窗口 · 20 日均实际收益 -7.47
+  # 胜率 17% · 已走满 6 个窗口 · 20 日均实际收益 -2.74
+  # 胜率 20% · 已走满 5 个窗口 · 20 日均实际收益 -3.0
+  # 胜率 24% · 已走满 21 个窗口 · 20 日均实际收益 -0.54
+  # 胜率 25% · 已走满 4 个窗口 · 20 日均实际收益 -10.69
+  # 胜率 25% · 已走满 4 个窗口 · 20 日均实际收益 -0.02
+  # 胜率 25% · 已走满 4 个窗口 · 20 日均实际收益 -0.86
+  # 胜率 33% · 已走满 12 个窗口 · 20 日均实际收益 0.13
+  # 胜率 33% · 已走满 3 个窗口 · 20 日均实际收益 -0.37
+  # 胜率 33% · 已走满 3 个窗口 · 20 日均实际收益 -1.45
+  # 胜率 38% · 已走满 8 个窗口 · 20 日均实际收益 -1.09
+  # 胜率 38% · 已走满 8 个窗口 · 20 日均实际收益 0.13
+  # 胜率 38% · 已走满 8 个窗口 · 20 日均实际收益 -3.25
+  # 胜率 38% · 已走满 8 个窗口 · 20 日均实际收益 1.4
+  # 胜率 38% · 已走满 13 个窗口 · 20 日均实际收益 4.38
+  # 胜率 39% · 已走满 23 个窗口 · 20 日均实际收益 1.04
+  - { code: "885825.TI", name: "冰雪产业", win_rate_20d: 0.0000, done_20d: 6, signals: 6, alerts: 6, avg_ret_20d: -7.47 }
+  - { code: "886004.TI", name: "虚拟电厂", win_rate_20d: 0.1667, done_20d: 6, signals: 6, alerts: 7, avg_ret_20d: -2.74 }
+  - { code: "885838.TI", name: "眼科医疗", win_rate_20d: 0.2000, done_20d: 5, signals: 5, alerts: 5, avg_ret_20d: -3.00 }
+  - { code: "886015.TI", name: "创新药", win_rate_20d: 0.2381, done_20d: 21, signals: 21, alerts: 34, avg_ret_20d: -0.54 }
+  - { code: "885402.TI", name: "智能医疗", win_rate_20d: 0.2500, done_20d: 4, signals: 4, alerts: 4, avg_ret_20d: -10.69 }
+  - { code: "885642.TI", name: "跨境电商", win_rate_20d: 0.2500, done_20d: 4, signals: 4, alerts: 5, avg_ret_20d: -0.02 }
+  - { code: "885930.TI", name: "工业母机", win_rate_20d: 0.2500, done_20d: 4, signals: 4, alerts: 4, avg_ret_20d: -0.86 }
+  - { code: "885845.TI", name: "生物疫苗", win_rate_20d: 0.3333, done_20d: 12, signals: 12, alerts: 13, avg_ret_20d: 0.13 }
+  - { code: "885879.TI", name: "流感", win_rate_20d: 0.3333, done_20d: 3, signals: 3, alerts: 3, avg_ret_20d: -0.37 }
+  - { code: "885913.TI", name: "医美概念", win_rate_20d: 0.3333, done_20d: 3, signals: 4, alerts: 4, avg_ret_20d: -1.45 }
+  - { code: "885537.TI", name: "3D打印", win_rate_20d: 0.3750, done_20d: 8, signals: 8, alerts: 9, avg_ret_20d: -1.09 }
+  - { code: "885710.TI", name: "锂电池概念", win_rate_20d: 0.3750, done_20d: 8, signals: 9, alerts: 11, avg_ret_20d: 0.13 }
+  - { code: "885856.TI", name: "仿制药一致性评价", win_rate_20d: 0.3750, done_20d: 8, signals: 8, alerts: 11, avg_ret_20d: -3.25 }
+  - { code: "886085.TI", name: "AI眼镜", win_rate_20d: 0.3750, done_20d: 8, signals: 8, alerts: 12, avg_ret_20d: 1.40 }
+  - { code: "885946.TI", name: "传感器", win_rate_20d: 0.3846, done_20d: 13, signals: 13, alerts: 26, avg_ret_20d: 4.38 }
+  - { code: "885927.TI", name: "CRO概念", win_rate_20d: 0.3913, done_20d: 23, signals: 23, alerts: 39, avg_ret_20d: 1.04 }
+
+# 观察名单：**仍在池内**，只是暂时判不准。只作台账，代码不读这一段。
+watching:
+  # 没有任何已走满的 20 日窗口，胜率判不出来（新题材）
+  - { code: "885564.TI", name: "无人机", win_rate_20d: null, done_20d: 0, signals: 0, alerts: 0, avg_ret_20d: null }
+  # 没有任何已走满的 20 日窗口，胜率判不出来（新题材）
+  - { code: "885876.TI", name: "网红经济", win_rate_20d: null, done_20d: 0, signals: 0, alerts: 0, avg_ret_20d: null }
+  # 没有任何已走满的 20 日窗口，胜率判不出来（新题材）
+  - { code: "886060.TI", name: "短剧游戏", win_rate_20d: null, done_20d: 0, signals: 0, alerts: 0, avg_ret_20d: null }
+  # 没有任何已走满的 20 日窗口，胜率判不出来（新题材）
+  - { code: "886099.TI", name: "AI智能体", win_rate_20d: null, done_20d: 0, signals: 0, alerts: 0, avg_ret_20d: null }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "885615.TI", name: "体育产业", win_rate_20d: 0.0000, done_20d: 1, signals: 1, alerts: 2, avg_ret_20d: -5.48 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "885700.TI", name: "军工", win_rate_20d: 0.0000, done_20d: 1, signals: 1, alerts: 1, avg_ret_20d: -6.57 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "885957.TI", name: "东数西算(算力)", win_rate_20d: 0.0000, done_20d: 1, signals: 1, alerts: 1, avg_ret_20d: -0.05 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "886019.TI", name: "AIGC概念", win_rate_20d: 0.0000, done_20d: 1, signals: 1, alerts: 1, avg_ret_20d: -1.68 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "886108.TI", name: "AI应用", win_rate_20d: 0.0000, done_20d: 1, signals: 1, alerts: 2, avg_ret_20d: -2.80 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "886111.TI", name: "玻璃基板", win_rate_20d: 0.0000, done_20d: 1, signals: 1, alerts: 2, avg_ret_20d: -40.67 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "886067.TI", name: "低空经济", win_rate_20d: 1.0000, done_20d: 1, signals: 1, alerts: 2, avg_ret_20d: 11.35 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "886076.TI", name: "军工信息化", win_rate_20d: 1.0000, done_20d: 1, signals: 1, alerts: 1, avg_ret_20d: 6.17 }
+  # 已走满窗口只有 1 个（少于 3 个），胜率不可信
+  - { code: "886100.TI", name: "DeepSeek概念", win_rate_20d: 1.0000, done_20d: 1, signals: 1, alerts: 3, avg_ret_20d: 9.87 }
+  # 已走满窗口只有 2 个（少于 3 个），胜率不可信
+  - { code: "885692.TI", name: "地下管网", win_rate_20d: 0.0000, done_20d: 2, signals: 2, alerts: 2, avg_ret_20d: -2.71 }
+  # 已走满窗口只有 2 个（少于 3 个），胜率不可信
+  - { code: "886002.TI", name: "机器视觉", win_rate_20d: 0.0000, done_20d: 2, signals: 3, alerts: 3, avg_ret_20d: -1.76 }
+  # 已走满窗口只有 2 个（少于 3 个），胜率不可信
+  - { code: "886012.TI", name: "宠物经济", win_rate_20d: 0.5000, done_20d: 2, signals: 2, alerts: 2, avg_ret_20d: -0.41 }
+  # 已走满窗口只有 2 个（少于 3 个），胜率不可信
+  - { code: "886021.TI", name: "国企改革", win_rate_20d: 1.0000, done_20d: 2, signals: 2, alerts: 3, avg_ret_20d: 2.38 }
+  # 已走满窗口只有 2 个（少于 3 个），胜率不可信
+  - { code: "886112.TI", name: "MLCC概念", win_rate_20d: 1.0000, done_20d: 2, signals: 3, alerts: 3, avg_ret_20d: 9.59 }

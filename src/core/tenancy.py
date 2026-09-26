@@ -94,6 +94,14 @@ class Principal:
 
     user_id: str
     tenant_id: str
+    #: 会话标识（**sessionId 级隔离的锚点**，见
+    #: `docs/PLATFORM_MULTI_TENANCY_DESIGN.md` §8.6.11.4）。
+    #:
+    #: 为什么是一等字段而不是"塞进 groups"：
+    #: 会话态（当前查看的池 / 未保存的草稿 / WS 订阅集合）必须按会话隔离，
+    #: 而"同一用户的另一个会话该看不到它"这条规则要在仓储与缓存层可判。
+    #: 默认空串 = 未经过会话认证的身份（如 `system_scope` 的后台任务）。
+    session_id: str = ""
     roles: frozenset[Role] = field(default_factory=frozenset)
     clearance: DataClass = DataClass.PUBLIC
     wall_group: WallGroup = WallGroup.PLATFORM
@@ -126,6 +134,23 @@ class Principal:
         """降权副本：给后台任务/子进程用，避免把高权限身份带出去。"""
         return replace(self, roles=frozenset(self.roles),
                        clearance=DataClass.PUBLIC)
+
+    def with_session(self, session_id: str) -> Principal:
+        """派生一个带会话标识的副本（**不可变**，不改原对象）。
+
+        由接入层在验证 `session_id` 有效后调用 —— 这样"会话已校验"这件事
+        在类型上就带着走，业务代码不需要也不应该自己拼。
+        """
+        return replace(self, session_id=str(session_id or ""))
+
+    def session_audit_fields(self) -> dict[str, str]:
+        """带会话的审计字段（在 `audit_fields()` 之外**单独**提供）。
+
+        为什么不让 `audit_fields()` 直接加 `session_id`：
+        那是审计链的哈希输入，改动会让**历史链的复算口径变化**。
+        需要会话维度的调用点（登录/改密/找回）显式调这个，兼顾兼容与可追溯。
+        """
+        return {**self.audit_fields(), "session_id": self.session_id}
 
     def audit_fields(self) -> dict[str, str]:
         """进审计日志的最小字段集。**不含任何业务数据**。"""

@@ -265,6 +265,14 @@ class NewsParams(BaseModel):
     # 中位 53.7 秒/次 —— 全是白烧算力。开启后：TTL 到期照常抓一次新闻（本来也要抓），
     # 内容指纹没变就直接复用，不调 LLM。
     reuse_when_unchanged: bool = True
+    # 网关**磁盘**缓存的存活小时数（LLM 层跨进程复用；与 data.news_cache_ttl
+    # 那个进程内 TTL 是两回事）。
+    #
+    # 为什么可以比进程内 TTL 长得多：prompt 里已经含了**新闻正文**，
+    # 所以"新闻没变 → 结论照样成立"；真正让结论失效的是新闻变化，
+    # 而那会改变 prompt 文本、自然换 key。默认 6 小时覆盖盘中反复刷新与当天重启，
+    # 又不会拿昨天的情绪判今天的盘。设 0 表示"不落盘、只走进程内缓存"。
+    gateway_cache_ttl_hours: float = Field(default=6.0, ge=0.0, le=720.0)
 
 
 class IndexVolumeParams(BaseModel):
@@ -358,9 +366,9 @@ class LevelFitConfig(BaseModel):
 
       - **输入 = 7 个客观维度**（用户点名的那 7 个）：筹码量能结构、箱体/压力位、
         缠论结构、VWAP偏离、布林带、MACD、KDJ/RSI；
-      - **输出 = 三条价位线**（低吸/高抛/止损），以「ATR 倍数」为尺度；
-      - **训练目标**：过去 `sessions`（默认 10）个交易日中，先触及**低吸线**、
-        且在 `horizon_bars`（默认24根=2小时）内先到**高抛线**、且**全程不破止损**的
+      - **输出 = 三条价位线**（回踩/冲高/止损），以「ATR 倍数」为尺度；
+      - **训练目标**：过去 `sessions`（默认 10）个交易日中，先触及**回踩线**、
+        且在 `horizon_bars`（默认24根=2小时）内先到**冲高线**、且**全程不破止损**的
         比例（`target_hit_rate`，默认 0.80）；同时要求**够得着**（触及样本数下限）。
       - **一票一拟合**：每只票用自己的历史拟合，参数按 (代码, 交易日) 缓存。
 
@@ -383,7 +391,7 @@ class LevelFitConfig(BaseModel):
     target_hit_rate: float = Field(default=0.80, ge=0.3, le=1.0)
     # 判定"够得着"的最少触及样本数：样本太少时成功率没有统计意义
     min_touch_samples: int = Field(default=20, ge=5, le=2000)
-    # 一轮做T的双边摩擦成本（%）：低吸~高抛的价差至少要覆盖它，否则拟合会
+    # 一轮做T的双边摩擦成本（%）：回踩~冲高的价差至少要覆盖它，否则拟合会
     # 收敛到"线挨着线、天天触发但全是手续费"
     round_trip_cost_pct: float = Field(default=0.20, ge=0.0, le=2.0)
     # 三条线的搜索网格（分位数，基于该票自己的 |波动| 经验分布）
@@ -417,7 +425,7 @@ class CharacterParams(BaseModel):
     # 偏离分母的 ATR 倍数：现价相对 VWAP 偏离达到 该倍数×日ATR 时给满分。
     # 0.35 ≈ 半日波动量级 —— 再大的偏离通常属于趋势日，不该指望回归。
     atr_scale: float = Field(default=0.35, gt=0.0, le=5.0)
-    # 是否按股性自动推荐权重模板（前端「按股性推荐」按钮的数据来源）
+    # 是否按股性自动预填权重模板（前端「按股性预填」按钮的数据来源）
     suggest_weights: bool = True
 
 
@@ -459,9 +467,9 @@ class DailyParams(BaseModel):
     flat_ratio: float = Field(default=0.1, gt=0, le=0.5)
     # 长下影线/实体倍数
     tail_shadow_x: float = Field(default=2.0, ge=1, le=10)
-    # 涨停低吸市值上限（亿元）
+    # 涨停回踩市值上限（亿元）
     limit_cap_yi: float = Field(default=300.0, gt=0, le=100000)
-    # 涨停低吸换手率下限（%）
+    # 涨停回踩换手率下限（%）
     turnover_min: float = Field(default=3.0, ge=0, le=100)
     # 涨停回调/新屠龙刀调整窗口（天）
     pullback_days_min: int = Field(default=3, ge=1, le=30)
@@ -477,7 +485,7 @@ class DailyParams(BaseModel):
     lookback_days: int = Field(default=250, ge=60, le=2000)
     # 涨停判定容差（%）：收盘涨幅 ≥ (10% - 容差) 视为涨停（主板10cm）
     limit_up_tolerance: float = Field(default=0.3, ge=0, le=2)
-    # 低吸：回调期间阴线跌破情绪释放点的判定容差
+    # 回踩：回调期间阴线跌破情绪释放点的判定容差
     emotion_tolerance_pct: float = Field(default=0.5, ge=0, le=5)
 
     @model_validator(mode="after")
@@ -518,13 +526,29 @@ class DataParams(BaseModel):
     valuation_cache_ttl: int = Field(default=3600, ge=0, le=86400)
     news_cache_ttl: int = Field(default=600, ge=0, le=86400)
     request_timeout: float = Field(default=12.0, gt=0.0, le=60.0)
+    # 数据源优先级（逐个尝试，全部失败则报数据缺口，绝不使用模拟数据）。
+    #
+    # **2026-09 变更：QMT 放到最后**。本机 QMT 终端已失去行情权限
+    # （`127.0.0.1:58610` 拒连），且**短期内无法恢复**，所以它排在链尾。
+    #
+    # ⚠️ 为什么顺序本身要写对，而不是只靠 `qmt_enabled=false` 关掉：
+    # `health.rank` 只对"已有 ≥3 次样本"的源重排（样本不足时**照抄配置顺序**
+    # 当先验），所以**配置顺序就是默认顺序**。把它写在最前、再靠开关关掉，
+    # 等于把"链尾"这个意图藏进另一个开关里 —— 一旦有人只改
+    # `qmt_enabled=true` 而没同时改顺序，它就会顶到链首，每次取数先白等一次
+    # 连接超时（实测 4~5s）。写在最后则两种情况都安全：
+    # 关着 → 不参与；打开且真有权限 → 兜底。
     intraday_sources: list[str] = Field(
-        default_factory=lambda: ["qmt", "tencent", "eastmoney", "sina"])
+        default_factory=lambda: ["tencent", "sina", "eastmoney", "qmt"])
     # 数据源失败冷却（秒）：某源失败后在该窗口内直接跳过，不再逐个试探。
     # 没有冷却时「QMT未启动」会让每次快照都白等 4~5s 的 xtquant 连接超时，
     # 东财被阻断时还会走完整个分页重试（实测首个快照因此被拖到 54s）。
     # 与项目 ConnectorRouter 的失败冷却口径一致。
     source_cooldown_seconds: int = Field(default=300, ge=0, le=3600)
+    # QMT 数据源开关（默认关闭）。置 True 后 `_ordered_sources` 才把 "qmt"
+    # 纳入候选（位置由上面的 `intraday_sources` 决定，现在是**链尾**）。
+    # 保留开关而不是删代码：将来行情权限恢复时改这一个布尔值即可兜底。
+    qmt_enabled: bool = False
 
 
 class SessionParams(BaseModel):
@@ -537,27 +561,45 @@ class SessionParams(BaseModel):
 
 class LevelParams(BaseModel):
     stop_loss_pct: float = Field(default=1.0, gt=0.0, le=20.0)
-    # 止损距离的**波动率自适应**倍数：最终距离取 max(低吸线×stop_loss_pct%, 该倍数×ATR)。
+    # 止损距离的**波动率自适应**倍数：最终距离取 max(回踩线×stop_loss_pct%, 该倍数×ATR)。
     # 实测（2026-09-16）：300308 日线 ATR=52.8（占价 5.8%），而固定 1% 的止损距离
     # 只有 9 元，任何噪声都能打穿 → 早盘低位反复报"已跌破止损"。
     # 0 = 只用固定百分比口径。
     atr_stop_mult: float = Field(default=0.5, ge=0.0, le=5.0)
-    # 低吸线的**兜底距离**（×ATR）：当箱体下沿/布林下轨都跑到现价上方时（跳空高开、
-    # 强势股上冲），低吸线按"现价下方 该倍数×ATR"给一个**真实可触及**的位置。
+    # 回踩线的**兜底距离**（×ATR）：当箱体下沿/布林下轨都跑到现价上方时（跳空高开、
+    # 强势股上冲），回踩线按"现价下方 该倍数×ATR"给一个**真实可触及**的位置。
     # 为什么不能用"现价下方一个贴线带宽"当替身：贴线判定是 price ≤ low_buy×(1+band)，
-    # 两者相乘≈现价，低吸信号会被彻底做死（实测当日 0 次触发）。
+    # 两者相乘≈现价，回踩信号会被彻底做死（实测当日 0 次触发）。
     dip_fallback_atr: float = Field(default=0.3, ge=0.0, le=3.0)
     take_profit_buffer_pct: float = Field(default=0.0, ge=-10.0, le=10.0)
     touch_band_pct: float = Field(default=0.3, gt=0.0, le=5.0)
+    # ---- 推送去重的「重新武装」阈值（%）----
+    #
+    # 用户口径（2026-09-25）："股价触及当日冲高线或回踩线才通知，
+    # 不是一直循环刷信息。" 所以同一天同一只票同一方向**默认只通知一次**。
+    #
+    # `0`（默认）= 不重新武装：一天一次，最可预测，也最不可能刷屏。
+    # >0 = 价格离开上次通知价超过该百分比后再次触及，算**新的一次**。
+    #      想收"回踩 → 反弹走远 → 再回踩"这第二次机会时再打开。
+    #
+    # ⚠️ 为什么默认关掉（这是本参数唯一容易搞反的地方）：
+    # 打开它意味着"震荡行情里一天可能通知多次" —— 一只日内振幅 3% 的票，
+    # 在 0.5% 阈值下贴线反复穿越能重新武装好几次，又变成用户投诉的那种刷屏。
+    # 默认必须是"少发、可预测"；要多收是用户的显式选择，不是我们的默认。
+    #
+    # ⚠️ 若设成大于 0，它必须**大于** `touch_band_pct`（0.3%）：那个定义
+    # "多近算触及"，若重新武装阈值比它还小，价格刚出带就被重新武装，
+    # 等于没有去重 —— 贴着线抖动照样刷屏。默认 0.5% 在两者之间留出余量。
+    notify_rearm_pct: float = Field(default=0.0, ge=0.0, le=10.0)
     blend_boll_bands: bool = True
     # VWAP偏离极值：|z|≥该值时视为「价格触及关键档位」的等效条件
     # （对应需求「价格触及设定的箱体边界/VWAP极值」中的后者）
     vwap_extreme_z: float = Field(default=1.5, gt=0.0, le=6.0)
-    # 低吸线~高抛线的最小档位差（占现价%）：
+    # 回踩线~冲高线的最小档位差（占现价%）：
     # 做T一轮的双边成本约 佣金0.05% + 印花税0.05% + 滑点0.1% ≈ 0.2%，
     # 档位差若只有零点几%，信号再准也会被摩擦成本吃光；默认要求至少1.5%。
     min_band_pct: float = Field(default=1.5, ge=0.0, le=10.0)
-    # 档位差上限：防止箱体过宽（如20日振幅25%）时低吸/高抛线离现价太远而永不触发
+    # 档位差上限：防止箱体过宽（如20日振幅25%）时回踩/冲高线离现价太远而永不触发
     max_band_pct: float = Field(default=8.0, gt=0.0, le=40.0)
 
     @model_validator(mode="after")
@@ -641,7 +683,23 @@ class WatchConfig(BaseModel):
 class NotifyConfig(BaseModel):
     enabled: bool = True
     push_solid_only: bool = True
+    #: 通知后静默多久（分钟）—— 窗口内无论重算多少次都不再发。
+    #: 与 `daily_max_per_code` 是两个独立闸门，见 `notify_dedup` 模块。
     cooldown_minutes: int = Field(default=30, ge=0, le=1440)
+    #: ★ **每只票每日通知上限**（所有方向合计）。
+    #:
+    #: 用户口径（2026-09-25）："一天最多单个票发4次。"
+    #: 按**票**计而不是按（票, 方向）计 —— 否则"回踩 4 次 + 冲高 4 次"
+    #: 就是 8 封，与"单个票 4 次"不符。`0` = 不限制。
+    #:
+    #: ⚠️ 它必须与 `cooldown_minutes` 一起看：两者谁先到就按谁拦。
+    #: 若把上限设成 100、冷却设成 5，等于放开了刷屏（一天几十封）。
+    daily_max_per_code: int = Field(default=4, ge=0, le=200)
+    #: 当日节流总开关。关掉后冷却与每日上限都不生效（仅排查用）。
+    #:
+    #: ⚠️ 默认必须是 `True`：这正是用户报障要修的那个刷屏问题，
+    #: 关掉它就会退回"价格停在触发带内就每分钟重算重发"。
+    daily_cap_enabled: bool = True
     feishu_webhook_env: str = "FEISHU_WEBHOOK_URL"
     dingtalk_webhook_env: str = "DINGTALK_WEBHOOK_URL"
     wecom_webhook_env: str = "WECOM_WEBHOOK_URL"
@@ -665,7 +723,7 @@ class CodeOverride(BaseModel):
             levels:
               stop_loss_pct: 2.0
               atr_stop_mult: 0.8                  # 止损距离 = max(2%, 0.8×ATR)
-              min_band_pct: 2.0                   # 低吸~高抛最小档位差
+              min_band_pct: 2.0                   # 回踩~冲高最小档位差
 
     字段名写错会**直接报配置错误**（不是静默忽略）：面板会显示"配置解析失败，
     已回退默认参数"，避免"改了却没生效"这种最难查的问题。
@@ -843,7 +901,7 @@ class IntradayConfig(BaseModel):
                 updated["daily_thresholds"] = Thresholds.model_validate(
                     {**self.daily_thresholds.model_dump(), **thresholds},
                     context=partial)
-            # 日线模式没有「低吸档位」，levels 只在分时口径下有意义
+            # 日线模式没有「回踩档位」，levels 只在分时口径下有意义
             return self.model_copy(deep=True, update=updated)
         merged_weights = {**self.weights.model_dump(),
                           **{k: float(v) for k, v in (weights or {}).items()}}
@@ -1148,13 +1206,37 @@ def save_watchlist(
 
 
 def upsert_watch(
-    item: WatchConfig, path: str | Path | None = None,
+    item: WatchConfig, path: str | Path | None = None, *,
+    prepend: bool = False,
 ) -> IntradayConfig:
-    """新增或更新一只自选标的（按代码去重，保留其余标的的顺序）。"""
+    """新增或更新一只自选标的（按代码去重，保留其余标的的顺序）。
+
+    `prepend=True` 时把新票放到**非置顶组的最前面**（用户 2026-09-23 要求：
+    「新加自选股，要放在自选股池的顶部」），`False`（默认）保持原有的**追加**语义。
+
+    ## 为什么默认仍是追加，而不是直接把追加改成置顶
+
+    1. **置顶项的优先权不能让新票插队**：`sort_watch_items()` 的契约是
+       "置顶项永远在最前"，所以新票只能进"非置顶组"的头部 ——
+       插到 `index 0` 会把用户显式钉住的票挤到第二行。
+    2. **批量加自选（`add_watch_many`）不该用这个**：一次加 20 只时，
+       逐只 prepend 会把入参顺序**整体倒过来**（最后一只排最前）。
+       批量走的是 `save_watchlist`，顺序按入参。
+    3. 默认值保持追加，是为了不动既有调用方与既有测试的语义 ——
+       需要置顶的地方（前端单只「加自选」）显式传 `prepend=True`。
+    """
     config = load_intraday_config(path)
     items = [existing for existing in config.watchlist
              if existing.code != item.code]
-    items.append(item)
+    if prepend:
+        # 插到最后一个置顶项之后；没有置顶项就是列表最前
+        last_pinned = -1
+        for index, existing in enumerate(items):
+            if getattr(existing, "pinned", False):
+                last_pinned = index
+        items.insert(last_pinned + 1, item)
+    else:
+        items.append(item)
     return save_watchlist(items, path)
 
 

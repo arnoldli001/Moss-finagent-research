@@ -54,7 +54,10 @@ from src.core.errors import (
 logger = logging.getLogger(__name__)
 
 CASE_TABLE = "quant_strategy_case"
-DEFAULT_TIMEOUT = 25
+#: 单次 HTTP 抓取超时（秒）。名字里带 `HTTP` 是刻意的：本模块原叫
+#: `HTTP_TIMEOUT`，与 `quant/quant_select_worker.py` 的同名子进程超时
+#: （1800 s）撞车，量纲与用途都不同。
+HTTP_TIMEOUT = 25
 USER_AGENT = "MossFinAgent-Research/0.1 (+local research; respects robots)"
 
 DISCLAIMER = ("以下为**网络公开分享的策略案例**，仅作线索，未经本项目复现验证。"
@@ -171,7 +174,7 @@ class StrategyCase:
 # ==================================================================
 
 
-def _http_get(url: str, *, timeout: int = DEFAULT_TIMEOUT,
+def _http_get(url: str, *, timeout: int = HTTP_TIMEOUT,
               accept: str = "") -> bytes:
     headers = {"User-Agent": USER_AGENT}
     if accept:

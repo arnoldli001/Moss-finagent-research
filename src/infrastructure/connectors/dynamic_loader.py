@@ -74,6 +74,33 @@ class DynamicConnectorLoader:
             for name, conn in self._loaded.items()
         ]
 
+    def covering(self, indicator: str) -> list[str]:
+        """返回**已声明支持该指标**的连接器类名（空列表 = 没人管这个指标）。
+
+        A19 的幂等守卫用它：该指标已经有能用的连接器时就不该再花钱生成一遍。
+
+        ⚠️ **按 `get_capabilities()["indicators"]` 精确比对，不能改用
+        `supports()`**。生成出来的连接器的 `supports` 往往写成**前缀正则**
+        （实测 `comm_gold_price` 是 `^comm:.*$`），那是给路由用的宽松判据 ——
+        拿它做"是否已覆盖"会让 `comm:y` 也算命中 `comm:gold_price` 的连接器，
+        于是任何同前缀的新指标都**永远不会被生成**，而且不报错。
+        （这个坑是先写错、被 `test_code_engineer_rejects_unsafe_code` 逮到的。）
+        """
+        target = (indicator or "").strip()
+        if not target:
+            return []
+        hits: list[str] = []
+        for conn in self._loaded.values():
+            try:
+                declared = conn.get_capabilities().get("indicators") or []
+            except Exception:  # noqa: BLE001 能力描述坏掉不该影响其它连接器
+                logger.debug("连接器能力描述读取失败: %s", conn.__class__.__name__,
+                             exc_info=True)
+                continue
+            if target in declared:
+                hits.append(conn.__class__.__name__)
+        return hits
+
     def _load_file(self, py_file: Path) -> BaseConnector | None:
         module_name = f"dyn_{py_file.stem}"
         spec = importlib.util.spec_from_file_location(module_name, str(py_file))

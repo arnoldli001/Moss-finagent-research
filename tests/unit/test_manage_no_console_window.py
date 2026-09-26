@@ -100,9 +100,15 @@ def _manage_source() -> str:
 
 
 def test_foreground_uvicorn_keeps_console() -> None:
-    """前台 uvicorn 是给用户看日志的，绝不能加 _NO_CONSOLE。"""
+    """前台 uvicorn 是给用户看日志的，绝不能加 _NO_CONSOLE。
+
+    这里断言的是"不含 creationflags"，**不锁死参数列表的完整写法** ——
+    后来加了 `env=`（把 `--env dev` 的隔离路径传给子进程）属于合法扩展，
+    它不影响"前台保留控制台"这一意图。锁死整串会让每次合理扩展都要改测试，
+    那是测试在阻碍重构而不是保护行为。
+    """
     src = _manage_source()
-    assert "subprocess.run(uvicorn_cmd, cwd=str(ROOT), check=False)\n" in src
+    assert "subprocess.run(uvicorn_cmd, cwd=str(ROOT), check=False" in src
     assert "subprocess.run(uvicorn_cmd, cwd=str(ROOT), check=False, creationflags" not in src
 
 

@@ -34,7 +34,16 @@ function tone(value: number | null | undefined): string {
 
 type Tab = "sector" | "stock";
 
-/** 入榜类别 → 徽标样式（让"为什么这只票在榜上"一眼可见） */
+/**
+ * 入榜类别 → 徽标样式（让"为什么这只票在榜上"一眼可见）。
+ *
+ * ⚠️ 早期还有「昨日涨停」一类（涨停股无论资金流排第几都保送入榜），
+ * 2026-09-22 已取消 —— 那会把一个**排序榜**变成"排序 + 打板池"的混合体，
+ * 从榜上读不出"钱到底流向了哪里"。涨停股若资金流真靠前，会自然出现在
+ * 净流入榜里（凭数据挣位置，不靠身份保送）。
+ * 这里保留 "group-limit" 的样式定义只作历史兜底：万一有旧缓存数据带
+ * `rank_group="昨日涨停"`，仍能正常渲染而不是掉成灰底。
+ */
 const GROUP_CLASS: Record<string, string> = {
   "昨日涨停": "group-limit",
   "净流入前10": "group-in",
@@ -134,13 +143,23 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
     return picked.slice(0, 20);
   }, [board, tab, direction]);
 
+  /**
+   * 自选个股（**只在"个股"页签**；板块那一侧沿用原来的"加入监控"逻辑）。
+   *
+   * 后端已把它从 `stock_rank` 里分离出来（见 `FlowBoard.stock_watch` 的说明），
+   * 所以这里不再按 `rank_group === "自选"` 从榜单里挑 —— 那样后端一改名
+   * 这一节就会静默变空。旧后端没有该字段时按空数组处理，不会白屏。
+   */
+  const stockWatch = useMemo(() => board?.stock_watch ?? [], [board]);
+
   const chartEntities = useMemo(() => {
     const pool = [...(board?.sectors ?? []), ...(board?.stocks ?? [])];
     const byCode = new Map(pool.map((entity) => [entity.code, entity]));
     // 加入监控但这次榜单没带的（例如刚加入还没轮到取历史）也要能画
     [...watch.sector, ...watch.stock].forEach((item) => {
       if (!byCode.has(item.code)) {
-        const found = [...(board?.sector_rank ?? []), ...(board?.stock_rank ?? [])]
+        const found = [...(board?.sector_rank ?? []), ...(board?.stock_rank ?? []),
+                       ...(board?.stock_watch ?? [])]
           .find((entity) => entity.code === item.code);
         if (found) byCode.set(item.code, found);
       }
@@ -149,6 +168,24 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
       .map((code) => byCode.get(code))
       .filter((entity): entity is FlowEntity => Boolean(entity && entity.series.length));
   }, [board, selected, watch]);
+
+  /**
+   * 图例里是否**所有线都已被隐藏** —— 「全显 / 全不显示」那个按钮的判据。
+   *
+   * ⚠️ 必须贴着 `chartEntities` 逐条判，**不能用 `hidden.size`**：
+   * `hidden` 只在"逐条切换"与"全不显示"两处写入，**从不随选择变化清理**。
+   * 于是「隐藏几条 → 清空选择 → 另选几条」之后，`hidden` 里仍留着上一批的
+   * 代码：`hidden.size > 0` 但当前一条都没被隐藏。按 `hidden.size` 判会让按钮
+   * 显示成「全显」而点下去什么都不变（用户只会以为按钮坏了），
+   * 按当前实体逐条判则不存在这种错位。
+   *
+   * 副作用：这也让按钮的语义始终是"当前画布上所有线的显示/隐藏"，
+   * 与用户看到的东西一致 —— 而不是"历史上有没有点过隐藏"。
+   */
+  const allHidden = useMemo(
+    () => chartEntities.length > 0
+      && chartEntities.every((entity) => hidden.has(entity.code)),
+    [chartEntities, hidden]);
 
   const toggle = (code: string) => {
     setSelected((current) => {
@@ -220,6 +257,94 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
     }
   };
 
+  /**
+   * 名称单元格：**名称 + 代码**。
+   *
+   * ⚠️ 板块的 `code` 就是板块名（`service._rank_sectors` 等处都是
+   * `FlowEntity(kind="sector", code=name, name=name)` —— 榜单层拿不到东财
+   * `BKxxxx.DC` 真代码），所以照直渲染会出现「电子 电子」这种重复。
+   * 这里只在**两者不同**时才补代码；个股侧不受影响（代码与名称本就不同）。
+   */
+  const nameCell = (row: FlowEntity, showGroup = false) => (
+    <td className="factor-name">
+      <button className="flow-pick"
+              onClick={() => toggle(row.code)}
+              title="勾选/取消：叠加到下方走势图">
+        {row.name || row.code}
+      </button>
+      {showGroup && row.rank_group && (
+        <span className={`flow-group ${GROUP_CLASS[row.rank_group] ?? "group-other"}`}
+              title={`本票入榜口径：${row.rank_group}`}>
+          {row.rank_group}
+        </span>
+      )}
+      {row.code && row.code !== row.name && (
+        <span className="mono muted-text"> {row.code}</span>
+      )}
+    </td>
+  );
+
+  /**
+   * 个股行（自选节与个股排行**共用**同一个渲染器）。
+   *
+   * 抽出来是因为两处列完全一样，只有"要不要显示入榜类别徽标"不同 ——
+   * 自选段的身份由所在段落表达，再挂一个「自选」徽标是重复信息。
+   * 各写一份的话，以后改列（比如加一列）必然漏改一处。
+   */
+  const renderStockRow = (row: FlowEntity, showGroup = true) => {
+    const watched = watch.stock.some((item) => item.code === row.code);
+    return (
+      <tr key={row.code}
+          className={selected.has(row.code) ? "row-active" : ""}>
+        {nameCell(row, showGroup)}
+        <td className="num mono">
+          {row.circ_mv ? `${(row.circ_mv / 1e8).toFixed(1)}亿` : "—"}
+        </td>
+        <td className="num mono" style={{ color: tone(row.change_pct) }}>
+          {row.change_pct === null || row.change_pct === undefined
+            ? "—"
+            : `${row.change_pct >= 0 ? "+" : ""}${row.change_pct.toFixed(2)}%`}
+        </td>
+        <td className="muted-text">{row.limitup_reason || "—"}</td>
+        <td className="num">
+          <button className="btn-ghost tiny"
+                  onClick={() => watched
+                    ? void removeWatch("stock", row.code)
+                    : void addWatch("stock", row.code, row.name)}
+                  title={watched ? "从监控列表移除" : "加入监控列表（下次打开仍在）"}>
+            {watched ? "−" : "＋"}
+          </button>
+        </td>
+      </tr>
+    );
+  };
+
+  /** 板块行（列结构与个股不同：窗口均值 + 当日净额）。 */
+  const renderSectorRow = (row: FlowEntity) => {
+    const watched = watch.sector.some((item) => item.code === row.code);
+    return (
+      <tr key={row.code}
+          className={selected.has(row.code) ? "row-active" : ""}>
+        {nameCell(row)}
+        <td className="num mono" style={{ color: tone(row.net_avg) }}>
+          {yi(row.net_avg)}
+        </td>
+        <td className="num mono" style={{ color: tone(row.today_net) }}>
+          {yi(row.today_net)}
+        </td>
+        <td className="num">
+          <button className="btn-ghost tiny"
+                  onClick={() => watched
+                    ? void removeWatch("sector", row.code)
+                    : void addWatch("sector", row.code, row.name)}
+                  title={watched ? "从监控列表移除" : "加入监控列表（下次打开仍在）"}>
+            {watched ? "−" : "＋"}
+          </button>
+        </td>
+      </tr>
+    );
+  };
+
   return (
     <div className="fundflow-root">
       <div className="fundflow-head">
@@ -270,6 +395,39 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
 
       <div className="fundflow-body">
         <aside className="fundflow-side">
+          {/* 自选个股单列一节（**不占**下面排行榜的名额）。
+              放在排行榜**之前**：用户自己挑的票优先级高于系统榜。 */}
+          {tab === "stock" && stockWatch.length > 0 && (
+            <div className="flow-block">
+              <h3>
+                我的自选
+                <span className="muted-text">
+                  （{stockWatch.length} 只 · 不占下方排行名额）
+                </span>
+              </h3>
+              <table className="audit-table compact-table flow-table">
+                <thead>
+                  <tr>
+                    <th>名称</th>
+                    <th className="num" title="流通市值（腾讯盘中快照优先，缺失回落到本地仓库日频值）">
+                      流通市值
+                    </th>
+                    <th className="num" title="今日涨幅（腾讯盘中实时；取不到留空，不用旧值冒充）">
+                      今日涨幅
+                    </th>
+                    <th title="涨停原因（东财涨停池的行业/题材归类，含连板数）；非涨停股为空">
+                      涨停原因
+                    </th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {stockWatch.map((row) => renderStockRow(row))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           <div className="flow-block">
             <h3>
               {tab === "sector" ? "板块资金流排行" : "个股资金流排行"}
@@ -318,60 +476,8 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
                     </td>
                   </tr>
                 )}
-                {rank.map((row) => {
-                  const watched = watch[row.kind ?? tab]
-                    .some((item) => item.code === row.code);
-                  return (
-                    <tr key={row.code}
-                        className={selected.has(row.code) ? "row-active" : ""}>
-                      <td className="factor-name">
-                        <button className="flow-pick"
-                                onClick={() => toggle(row.code)}
-                                title="勾选/取消：叠加到下方走势图">
-                          {row.name || row.code}
-                        </button>
-                        {tab === "stock" && row.rank_group && (
-                          <span className={`flow-group ${GROUP_CLASS[row.rank_group] ?? "group-other"}`}
-                                title={`本票入榜口径：${row.rank_group}`}>
-                            {row.rank_group}
-                          </span>
-                        )}
-                        <span className="mono muted-text"> {row.code}</span>
-                      </td>
-                      {tab === "stock" ? (
-                        <>
-                          <td className="num mono">
-                            {row.circ_mv ? `${(row.circ_mv / 1e8).toFixed(1)}亿` : "—"}
-                          </td>
-                          <td className="num mono" style={{ color: tone(row.change_pct) }}>
-                            {row.change_pct === null || row.change_pct === undefined
-                              ? "—"
-                              : `${row.change_pct >= 0 ? "+" : ""}${row.change_pct.toFixed(2)}%`}
-                          </td>
-                          <td className="muted-text">{row.limitup_reason || "—"}</td>
-                        </>
-                      ) : (
-                        <>
-                          <td className="num mono" style={{ color: tone(row.net_avg) }}>
-                            {yi(row.net_avg)}
-                          </td>
-                          <td className="num mono" style={{ color: tone(row.today_net) }}>
-                            {yi(row.today_net)}
-                          </td>
-                        </>
-                      )}
-                      <td className="num">
-                        <button className="btn-ghost tiny"
-                                onClick={() => watched
-                                  ? void removeWatch(row.kind ?? tab, row.code)
-                                  : void addWatch(row.kind ?? tab, row.code, row.name)}
-                                title={watched ? "从监控列表移除" : "加入监控列表（下次打开仍在）"}>
-                          {watched ? "−" : "＋"}
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
+                {rank.map((row) => (tab === "stock" ? renderStockRow(row)
+                                                     : renderSectorRow(row)))}
               </tbody>
             </table>
           </div>
@@ -405,7 +511,10 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
                   return (
                     <li key={code}>
                       <span>{name}</span>
-                      <span className="mono muted-text"> {code}</span>
+                      {/* 板块的 code 就是名称，两者相同时不重复渲染（同 nameCell） */}
+                      {code && code !== name && (
+                        <span className="mono muted-text"> {code}</span>
+                      )}
                       <button className={already ? "btn-ghost tiny done" : "btn-ghost tiny"}
                               disabled={busy === key || already}
                               onClick={() => void addWatch(searchKind, code, name)}
@@ -463,8 +572,14 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
             ))}
             {chartEntities.length > 0 && (
               <>
-                <button className="btn-ghost tiny" onClick={() => setHidden(new Set())}>
-                  全显
+                <button className="btn-ghost tiny"
+                        onClick={() => setHidden(allHidden
+                          ? new Set()
+                          : new Set(chartEntities.map((entity) => entity.code)))}
+                        title={allHidden
+                          ? `显示全部 ${chartEntities.length} 条线`
+                          : `隐藏全部 ${chartEntities.length} 条线（再点一下全部恢复）`}>
+                  {allHidden ? "全显" : "全不显示"}
                 </button>
                 <button className="btn-ghost tiny"
                         onClick={() => setSelected(new Set())}>清空选择</button>

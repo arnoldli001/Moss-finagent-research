@@ -81,8 +81,13 @@ class FlowEntity:
     # 最近一日净额（用于排行展示"最新一日"）
     latest_net: float | None = None
     latest_date: str = ""
-    # ---- 个股榜的三类来源（2026-09-17 用户口径）----
-    #: 该票属于哪一类：昨日涨停 / 净流入前10 / 净流出前10 / 自选 / 其他
+    # ---- 个股榜的来源（2026-09-22 口径：纯排序，不再保送涨停股）----
+    #: 该票属于哪一类：净流入前10 / 净流出前10 / 自选 / 其他
+    #:
+    #: ⚠️ 早期还有「昨日涨停」一类（涨停股无论资金流排第几都保送入榜），
+    #: 2026-09-22 已取消 —— 它把一个**排序榜**变成了"排序 + 打板池"的混合体，
+    #: 榜上读不出"钱到底流向了哪里"。涨停股若资金流真靠前，会自然出现在
+    #: 净流入榜里。前端按字符串兜底显示，新增/减少类别都不需要改前端。
     rank_group: str = ""
     #: 涨停原因（东财涨停池的"所属行业"，仅涨停股有；取不到留空）
     limitup_reason: str = ""
@@ -123,6 +128,10 @@ class FlowBoard:
     # 榜单（按口径排序）
     sector_rank: list[FlowEntity] = field(default_factory=list)
     stock_rank: list[FlowEntity] = field(default_factory=list)
+    #: 用户自选个股（**不占** `stock_rank` 的名额，前端单列一节）。
+    #: 2026-09-22 之前自选混在 `stock_rank` 里，实测把 `top=10` 的净流入榜
+    #: 挤到只剩 2 只 —— 手动加了几只票，排行榜就不成其为榜。
+    stock_watch: list[FlowEntity] = field(default_factory=list)
     # 用户选择（含榜单外的自定义加入项）的走势数据
     sectors: list[FlowEntity] = field(default_factory=list)
     stocks: list[FlowEntity] = field(default_factory=list)
@@ -140,6 +149,7 @@ class FlowBoard:
             "session_label": self.session_label,
             "sector_rank": [item.to_dict() for item in self.sector_rank],
             "stock_rank": [item.to_dict() for item in self.stock_rank],
+            "stock_watch": [item.to_dict() for item in self.stock_watch],
             "sectors": [item.to_dict() for item in self.sectors],
             "stocks": [item.to_dict() for item in self.stocks],
             "source_notes": list(self.source_notes),

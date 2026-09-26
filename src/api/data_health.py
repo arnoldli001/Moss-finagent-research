@@ -32,8 +32,28 @@ logger = logging.getLogger(__name__)
 # 缓存 5 分钟 → 连续打开页面/多标签页不再重复付这份成本（实测首次 4.5 秒、命中 0ms）。
 _CACHE_TTL = 300.0
 _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-# 仓库统计的落盘缓存（读 14GB SQLite，实测 6~28 秒）：请求永远读缓存秒回
-_WAREHOUSE_STATS_FILE = Path("data/quant/warehouse_stats.json")
+#: 仓库统计的落盘缓存（读 14GB SQLite，实测 6~28 秒）：请求永远读缓存秒回
+#:
+#: ⚠️ **路径必须可被重定向**（`MOSS_HEALTH_CACHE_DIR`），否则测试会写坏生产缓存。
+#: 2026-09-23 实测事故：`test_data_health_survives_broken_warehouse` 把
+#: `MOSS_DB_URL` 设成一个假的不可达 MySQL（`nobody@127.0.0.1:1/none`），
+#: 调 `invalidate_cache(include_disk=True)` **删掉生产缓存**，再
+#: `build_data_health(force=True)` 把这个"仓库不可用(mysql)"的结论**写进
+#: `data/quant/warehouse_stats.json`**。后果：只要跑一次测试，正在运行的服务
+#: 就会在接下来 10 分钟里把本地 14GB 的 SQLite 仓库报成"MySQL 不可用"，
+#: 而选股/健康度/同步判定全都据此降级 —— 静默、且看起来像环境坏了。
+#: 现在 `tests/conftest.py` 有一条 autouse fixture 把它指到临时目录。
+_HEALTH_CACHE_DIR = os.environ.get("MOSS_HEALTH_CACHE_DIR", "data/quant")
+
+
+def _warehouse_stats_file() -> Path:
+    return Path(_HEALTH_CACHE_DIR) / "warehouse_stats.json"
+
+
+def _tushare_stats_file() -> Path:
+    return Path(_HEALTH_CACHE_DIR) / "tushare_stats.json"
+
+
 _WAREHOUSE_TTL = 600.0
 _WAREHOUSE_REFRESHING = False
 # Tushare 分区覆盖的落盘缓存：`coverage()` 要遍历 3.5 万个分区目录做 stat，
@@ -41,7 +61,6 @@ _WAREHOUSE_REFRESHING = False
 # 于是首个 /health 请求要等两三分钟（用户看到"运维页一直转圈"）。
 # 分区覆盖是小时级信息，没有理由让请求路径去遍历目录 —— 同一套
 # "读缓存秒回 + 后台刷新" 口径（与 _warehouse_health 一致）。
-_TUSHARE_STATS_FILE = Path("data/quant/tushare_stats.json")
 _TUSHARE_TTL = 1800.0
 _TUSHARE_REFRESHING = False
 
@@ -233,7 +252,7 @@ def _warehouse_health(root: str = "data/quant/tushare",
 def _read_tushare_stats() -> tuple[float, dict[str, Any]] | None:
     """读 Tushare 分区覆盖的落盘缓存；缺失/损坏返回 None。"""
     try:
-        raw = _TUSHARE_STATS_FILE.read_text(encoding="utf-8")
+        raw = _tushare_stats_file().read_text(encoding="utf-8")
     except OSError:
         return None
     try:
@@ -248,15 +267,15 @@ def _read_tushare_stats() -> tuple[float, dict[str, Any]] | None:
 
 def _write_tushare_stats(status: dict[str, Any]) -> None:
     """原子写：预热线程与请求线程可能同时写，别让读方看到半个 JSON。"""
-    tmp = _TUSHARE_STATS_FILE.with_suffix(
-        _TUSHARE_STATS_FILE.suffix + f".tmp{os.getpid()}")
+    tmp = _tushare_stats_file().with_suffix(
+        _tushare_stats_file().suffix + f".tmp{os.getpid()}")
     try:
-        _TUSHARE_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _tushare_stats_file().parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(
             json.dumps({**status, "_cached_at": time.time()},
                        ensure_ascii=False, indent=1),
             encoding="utf-8")
-        os.replace(tmp, _TUSHARE_STATS_FILE)
+        os.replace(tmp, _tushare_stats_file())
     except OSError as exc:  # noqa: BLE001 写不进缓存不影响返回
         logger.debug("Tushare 统计缓存写入失败：%s", brief(exc, BRIEF_TIGHT))
         try:
@@ -288,7 +307,7 @@ def _refresh_tushare_stats_async(root: str, universe: str) -> None:
 def _read_warehouse_stats() -> tuple[float, dict[str, Any]] | None:
     """读落盘缓存 → (写入时间戳, 内容)；不存在/损坏返回 None。"""
     try:
-        payload = json.loads(_WAREHOUSE_STATS_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(_warehouse_stats_file().read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     stamp = float(payload.pop("_cached_at", 0) or 0)
@@ -297,8 +316,8 @@ def _read_warehouse_stats() -> tuple[float, dict[str, Any]] | None:
 
 def _write_warehouse_stats(status: dict[str, Any]) -> None:
     try:
-        _WAREHOUSE_STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _WAREHOUSE_STATS_FILE.write_text(
+        _warehouse_stats_file().parent.mkdir(parents=True, exist_ok=True)
+        _warehouse_stats_file().write_text(
             json.dumps({**status, "_cached_at": time.time()},
                        ensure_ascii=False, indent=1),
             encoding="utf-8")
@@ -384,15 +403,26 @@ def build_data_health(runtime: Any, *, force: bool = False,
 
 
 def _build_data_health_uncached(runtime: Any, *, force: bool = False) -> dict[str, Any]:
+    tushare = _tushare_health(force=force)
+    warehouse = _warehouse_health(force=force)
     return {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "capability_matrix": _static_capability_matrix(),
         "intraday_sources": _intraday_source_health(runtime),
-        "tushare": _tushare_health(force=force),
-        "warehouse": _warehouse_health(force=force),
+        "tushare": tushare,
+        "warehouse": warehouse,
+        "sync_gap": _sync_gap(tushare, warehouse),
         "notes": [
-            "做T实时链路按实测速度排序：QMT（本机终端，中位 0ms）优先，"
-            "腾讯（54ms）为第一备用，新浪逐笔兜底；东财在本机网络被阻断。",
+            "做T实时链路按实测速度排序：腾讯（公网，快照 52ms / 分时 85ms / "
+            "分钟K 95ms）为链首，新浪逐笔兜底，东财在本机被 TLS SNI 阻断，"
+            "迅投QMT 默认关闭且排在**链尾**。",
+            "迅投QMT 默认关闭（QMT_ENABLED=0）且位于链尾：本机终端已失去行情权限"
+            "且短期内无法恢复，放在任何位置之前都只会贡献一次必然失败的 xtquant "
+            "连接等待（实测 4~5s）。将来权限恢复时置 QMT_ENABLED=1 并把 "
+            "configs/intraday.yaml 的 data.qmt_enabled 设为 true 即可在链尾兜底。",
+            "日线链：AkShare → 腾讯 → Tushare → baostock → 本地CSV → [QMT开关]。"
+            "停更的本地 QMT 导出 CSV 已退到在线源之后（它停在 2026-08-31，"
+            "排在前面会把更新的在线源挡在门外）；QMT 在**全链最末**。",
             "Tushare 只有 EOD 数据（当日 15:00~16:00 后入库），"
             "盘中调用返回空表，因此不参与做T实时链路，仅作盘后校验与因子源。",
             "回测取数优先走本地仓库（索引命中 5~20ms/截面），"
@@ -404,6 +434,43 @@ def _build_data_health_uncached(runtime: Any, *, force: bool = False) -> dict[st
     }
 
 
+def _sync_gap(tushare: dict[str, Any], warehouse: dict[str, Any]) -> dict[str, Any]:
+    """比较「分区 / 仓库 / 应该有」三层，给出同步缺口判定。
+
+    ## 为什么放在这里、且**不新增任何 I/O**
+
+    2026-09-23 事故：`stk_limit` 分区已是 20260922、仓库还停在 20260917，
+    而页面上这两列**各自都很正常**，缺口只在它们之间 —— 所以加一层显式比较。
+
+    两份输入都已经是**落盘缓存**（`tushare_stats.json` / `warehouse_stats.json`），
+    所以这一步只是内存里的字符串比较。⚠️ 这也意味着判定用的日期可能与真实值
+    相差一个缓存周期（各 30/10 分钟）—— 对"是否同步"这种小时级判断完全够用，
+    但**不能**拿它当"此刻一定如此"的证据。
+    """
+    from src.quant.freshness import latest_complete_trade_date
+    from src.quant.sync_gap import (
+        build_sync_gap,
+        last_check,
+        partition_last_map,
+        warehouse_last_map,
+    )
+
+    try:
+        expected = latest_complete_trade_date()
+    except Exception as exc:  # noqa: BLE001 判不了就说不判定
+        logger.info("同步缺口：交易日历不可用（%s）", brief(exc, BRIEF_TIGHT))
+        expected = ""
+    gap = build_sync_gap(
+        expected=expected,
+        partition_last=partition_last_map(tushare),
+        warehouse_last=warehouse_last_map(warehouse),
+    )
+    # 附上「启动自检做过没有」：自检成功的日志是 INFO，而 uvicorn 默认把它挡住，
+    # 于是"没消息"与"没运行"分不清。放进载荷才能在页面上确认它确实跑了。
+    gap["startup_check"] = last_check()
+    return gap
+
+
 def invalidate_cache(*, include_disk: bool = False) -> None:
     """清空健康度缓存（测试/运维用）。
 
@@ -412,8 +479,8 @@ def invalidate_cache(*, include_disk: bool = False) -> None:
     """
     _CACHE.clear()
     if include_disk:
-        for path, label in ((_WAREHOUSE_STATS_FILE, "仓库统计"),
-                            (_TUSHARE_STATS_FILE, "Tushare统计")):
+        for path, label in ((_warehouse_stats_file(), "仓库统计"),
+                            (_tushare_stats_file(), "Tushare统计")):
             try:
                 path.unlink(missing_ok=True)
             except OSError as exc:  # noqa: BLE001 删不掉不影响内存缓存已清空

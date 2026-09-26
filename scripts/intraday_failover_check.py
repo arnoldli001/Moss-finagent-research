@@ -38,7 +38,7 @@ import httpx  # noqa: E402
 from src.core.exceptions import DataFetchError  # noqa: E402
 from src.intraday.config import load_intraday_config  # noqa: E402
 from src.intraday.sources import IntradayDataProvider  # noqa: E402
-from src.core.errors import BRIEF_DEFAULT
+from src.core.errors import BRIEF_DEFAULT, brief
 
 CODE = "600519"
 PERIOD = "5m"

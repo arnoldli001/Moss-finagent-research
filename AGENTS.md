@@ -6,7 +6,23 @@
 ## 环境配置
 - 本地运行Ollama（模型以 configs/models.yaml 为准：qwen2.5:1.5b-instruct-q4_K_M、qwen3:8b-q4_K_M）
 - 存储默认SQLite零依赖；PostgreSQL/Redis为可选（DATA_BACKEND=postgres / REDIS_CACHE_ENABLED=true）
-- 本地行情：迅投QMT极简模式(XtMiniQmt)+xtquant（全量日线见 scripts/download_qmt_data.py），不可用时回退本地CSV/AkShare
+- 本地行情：**2026-09-23 起 QMT 排在所有链路的「最后一位」且默认关闭**。原因：本机
+  QMT 终端失去行情权限、不再运行（`127.0.0.1:58610` 拒连），且**短期内无法恢复** ——
+  放在任何位置之前都只会贡献一次必然失败的 xtquant 连接等待（实测 4~5s）。
+  - 现行日线链：AkShare → 腾讯 → Tushare → baostock → 本地CSV → **[QMT 开关]（最末）**
+  - 现行分钟/分时/快照链：腾讯 → 新浪 → 东财 → **[QMT 开关]（最末）**
+  - ⚠️ **顺序与开关表达同一个意图**，两处都要改对：`configs/intraday.yaml` 的
+    `data.intraday_sources` 把 `qmt` 写在**最后**、`data.qmt_enabled: false`。
+    因为 `health.rank` 在样本 <3 次时**照抄配置顺序**当先验，所以"配置顺序 =
+    默认顺序" —— 只改开关不改顺序，QMT 仍会顶到链首。
+  - 将来权限恢复：`QMT_ENABLED=1` + `data.qmt_enabled: true` 即可在链尾兜底
+  - 全市场全量下载：`scripts/download_market_data.py`（**取代** `scripts/download_qmt_data.py`，
+    落盘到项目自己的 `data/quant/prices*/`，不再依赖 QMT 私有目录）
+  - 东财可用性依赖 `MOSS_EM_DIRECT`（TLS SNI 阻断规避，可写 `.env`）；
+    但该阻断会漂移，**东财只能当链尾备用**，见 `src/core/eastmoney_direct.py`
+  - ⚠️ 竞价链的 `DataConfig.fallback` 已从 `"qmt"` 改为 `"none"`：竞价逐秒序列
+    **没有免费替代源**（QMT tick 需权限、eltdx 只有盘中实时、Tushare 无竞价过程），
+    如实登记"当前无备源"，不要留一个永远失败的 `"qmt"`
 - 核心推理调用DeepSeek-V4-Flash API（DEEPSEEK_API_KEY 经环境变量注入）
 
 ## 架构规范

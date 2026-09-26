@@ -272,7 +272,13 @@ export type AffectedStock = {
 
 export type Alert = {
   alert_id: string;
-  alert_key: string;
+  /**
+   * ⚠️ 列表响应里**没有** `alert_key` / `content_key` / `tenant_id`。
+   *
+   * 它们是服务端去重键与多租户内部标识，前端零引用，却在 95 条里占了
+   * 好几 KB —— 而隧道实测只有 ~51 KB/s，每个没人读的字段都是从用户
+   * 等待时间里扣的（见 `alerts.py` 的 `_ALERT_LIST_DROP`）。
+   */
   event_id: string;
   alert_type: "risk" | "opportunity";
   alert_level: "high" | "medium" | "low";
@@ -310,8 +316,12 @@ export type Alert = {
   trigger_time: string;
   expire_time: string;
   status: "active" | "read" | "expired";
-  tenant_id: string;
-  disclaimer: string;
+  /**
+   * ⚠️ 列表响应里**不存在**（服务端为省带宽去掉了每条重复的 91 字节文案）。
+   * 详情接口 `/alerts/{id}` 仍有。UI 用的是设置接口的
+   * `settings.disclaimer`，见 `AlertDetail` 的 `disclaimer` prop。
+   */
+  disclaimer?: string;
 };
 
 export type MarketEvent = {
@@ -1598,23 +1608,62 @@ function sleep(ms: number): Promise<void> {
  * ⚠️ **不要改成 `/api/v1/health`**。那个聚合健康检查会连 Ollama（2s 超时）、
  * 校验审计链、聚合数据源健康度，正常也要 0.3~2.5 秒。拿它当探针，
  * 服务只是"忙"就会被判成"死"，于是对着一个好好的后端弹"无法连接服务器"。
+ *
+ * ## 为什么要合并并发 + 极短缓存（2026-09-26 用户报障）
+ *
+ * 这个探针**默认要等满 3 秒才返回 false**。而网络一抖动时它会被同时
+ * 触发很多次：每个失败的请求都来问一次、`ServerStatusBanner` 的 15 秒
+ * 轮询也在问。实测日志里能看到 `health/live` 连发七八次 —— 每一次都是
+ * 一个可能要等 3 秒的请求，叠起来就是用户看到的"正在检查登录状态"停十秒。
+ *
+ * 探针问的是一个**全局、单一**的事实（"后端进程还在吗"），所以：
+ *   - 并发调用**共享同一个 in-flight 请求**（不是发 N 个）；
+ *   - 结果**缓存 2.5 秒** —— 同一秒内问十遍和问一遍是同一个问题。
+ *
+ * 另外：浏览器已经明确说断网（`navigator.onLine === false`）时直接返回
+ * false，**不发请求**。这是唯一在离线时 100% 正确的短路。
  */
+const PING_TTL_MS = 2500;
+let pingInFlight: Promise<boolean> | null = null;
+let pingCached: { at: number; ok: boolean } | null = null;
+
 export async function pingServer(timeoutMs = 3000): Promise<boolean> {
-  try {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
-    const r = await fetch("/api/v1/health/live",
-                          { signal: ac.signal, cache: "no-store" });
-    clearTimeout(timer);
-    return r.ok;
-  } catch {
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
     return false;
   }
+  if (pingCached && performance.now() - pingCached.at < PING_TTL_MS) {
+    return pingCached.ok;
+  }
+  if (pingInFlight) return pingInFlight;
+
+  pingInFlight = (async () => {
+    let ok = false;
+    try {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), timeoutMs);
+      const r = await fetch("/api/v1/health/live",
+                            { signal: ac.signal, cache: "no-store" });
+      clearTimeout(timer);
+      ok = r.ok;
+    } catch {
+      ok = false;
+    } finally {
+      pingInFlight = null;
+      pingCached = { at: performance.now(), ok };
+    }
+    return ok;
+  })();
+  return pingInFlight;
 }
 
 /** 网络层失败 → 用户可读错误。内部细节（运维指令）只在 localhost 出现，
  * 公网用户只见"服务暂时不可用/请联系管理员"（见 errors.ts）。 */
 async function networkError(url: string): Promise<ApiError> {
+  // 浏览器已知离线：不必花 3 秒去证实一件已经确定的事。
+  // （`pingServer` 内部也会短路，这里只是把话说得更直白。）
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return makeNetworkError(url, false);
+  }
   const alive = await pingServer();
   return makeNetworkError(url, alive);
 }
@@ -1757,7 +1806,17 @@ export type LoginResult = {
   must_change_password: boolean;
 };
 
-/** `/auth/me` 的返回：身份 + **脱敏**联系方式。 */
+/** `/auth/me` 的返回：身份 + **脱敏**联系方式。
+ *
+ * 联系方式是后端 `AuthService.contacts()` 的**分组**形状
+ * （按 email/phone 分桶，值只有掩码），不是一个扁平数组 ——
+ * 早先这里写成了 `{channel,value,verified}[]`，与接口实际返回不符。
+ */
+export type MeContacts = {
+  email: Array<{ masked: string; verified: boolean; primary: boolean }>;
+  phone: Array<{ masked: string; verified: boolean; primary: boolean }>;
+};
+
 export type MeResult = {
   user_id: string;
   username: string;
@@ -1766,7 +1825,7 @@ export type MeResult = {
   applied_tier: string;
   valid_until: string;
   session_id: string;
-  contacts: Array<{ channel: string; value: string; verified: boolean }>;
+  contacts: MeContacts;
 };
 
 export type SessionInfo = {
@@ -1777,6 +1836,27 @@ export type SessionInfo = {
   created_at: string;
   last_seen_at: string;
   valid: boolean;
+};
+
+/** `/auth/login-mode` 的返回：本 IP 登录要不要图形码。 */
+export type LoginMode = {
+  require_captcha: boolean;
+  allowed: boolean;
+  reason: string;
+  retry_after: number;
+};
+
+/** `/auth/bootstrap` 的返回：**一次往返**答完开机探测需要的全部信息。
+ *
+ * `me` / `user` 由同一份服务端载荷派生（`user` 只是 `me` 的子集字段），
+ * 所以两者不会出现"头像有名字、资料页没名字"这种不一致。
+ */
+export type BootstrapResult = MeResult & {
+  authenticated: boolean;
+  /** 本次是否由"记住我"换来了新会话（用于埋点/诊断）。 */
+  renewed: boolean;
+  user: AuthUser | Record<string, never>;
+  login_mode: LoginMode;
 };
 
 /** 图形验证码挑战（图片 + 一次性令牌）。 */
@@ -1833,6 +1913,20 @@ export const authApi = {
   /** 用"记住我"Cookie 静默换新会话（关掉浏览器再打开免密）。 */
   refresh: () => mutate<{ ok: boolean; user: AuthUser }>(
     "/api/v1/auth/refresh"),
+
+  /**
+   * **开机探测（首选）**：一次往返回答"我是谁 + 要不要图形码"。
+   *
+   * 为什么不用 `/me` + `/refresh` + `/me` 那条老链：每一次往返在公网
+   * 都要 0.4~2 秒（实测，还会偶发 502），三次串行就是十秒级的
+   * "正在检查登录状态"。服务端在这里已经做完"会话优先、否则静默续期"，
+   * 客户端只需要读一个布尔值。
+   *
+   * `authenticated:false` 是**正常结论**（该登录了），不是错误 ——
+   * 所以它不抛异常，调用方别用 try/catch 判登录态。
+   */
+  bootstrap: () => request<BootstrapResult>(
+    "/api/v1/auth/bootstrap", { retrySafe: true }),
 
   logout: (allDevices = false) => mutate<{ ok: boolean; message: string }>(
     `/api/v1/auth/logout?all_devices=${allDevices ? "true" : "false"}`),
@@ -1986,6 +2080,13 @@ export type MyFeatures = {
   features: Record<string, boolean>;
   feature_labels: Record<string, string>;
   visible_views: string[];
+  /**
+   * 管理员专属页签（目前只有 `scheduler`）：非管理员**永远不在**
+   * `visible_views` 里。前端拿它做说明文案，而不是自己再判一遍权限。
+   */
+  admin_only_views?: string[];
+  /** 当前会话是不是管理员（服务端判据，不用前端自己比对 tier 字面量）。 */
+  is_admin?: boolean;
   quant_views: Record<string, boolean>;
   resources: Record<string, number>;
   pricing: Record<string, number>;
@@ -2019,7 +2120,74 @@ export type MonitorTenant = {
   top_paths: Array<[string, number]>;
   limits: Record<string, number>;
   llm_tokens: number;
+  /** 本月 LLM 费用（元）。与 `usage.tokens_month` 同一份审计、同一次读取。 */
+  llm_cost: {
+    cny: number;
+    calls: number;
+    tokens: number;
+    /** 占本月总费用的比例（%） */
+    share_pct: number;
+    /** false = **还没量到**（不是"花了 0 元"）。 */
+    measured: boolean;
+  };
   usage: TenantUsage;
+};
+
+/** 一个功能的 LLM 费用（前端页面 / 后台作业 / 命令行脚本）。 */
+export type MonitorCostFeature = {
+  key: string;
+  label: string;
+  cny: number;
+  calls: number;
+  tokens: number;
+  /** 占本月总费用的比例（%） */
+  share_pct: number;
+  /** 是不是**前端页面**（false = 平台自身开销：定时作业/脚本/管理台）。 */
+  page_feature: boolean;
+  /**
+   * 归属依据：`page` 按请求路径（精确）/ `agent` 按 Agent 名（推断）/
+   * `mixed` 两者都有 / `unknown` 判不出来。
+   * 界面必须显示它 —— "精确"与"推断"对账目的可信度完全不同。
+   */
+  basis: "page" | "agent" | "mixed" | "unknown";
+};
+
+export type MonitorCostTenant = {
+  tenant_id: string;
+  cny: number;
+  calls: number;
+  tokens: number;
+  users: number;
+  /** 归属来源：session（会话）/ principal（令牌）/ unknown（老行）。 */
+  sources: string[];
+  share_pct: number;
+};
+
+/** LLM 费用汇总（运维页「花费」区的全部数据）。 */
+export type MonitorCost = {
+  /** 本窗口（本月）总费用，元。 */
+  total_cny: number;
+  today_cny: number;
+  calls: number;
+  calls_today: number;
+  tokens_in: number;
+  tokens_out: number;
+  paid_calls: number;
+  free_calls: number;
+  unknown_provider_calls: number;
+  /** 用了**未登记价格**的模型名的调用次数（金额按兜底价估算）。 */
+  unpriced_calls: number;
+  unpriced_models: Array<[string, number]>;
+  prices_loaded: string[];
+  fallback_price: { input_cache_miss: number; output: number };
+  by_feature: MonitorCostFeature[];
+  by_tenant: MonitorCostTenant[];
+  by_day: Array<{ day: string; cny: number; calls: number }>;
+  window_label: string;
+  since: string;
+  /** false = 读不到审计：**不能**显示成"0 元"。 */
+  readable?: boolean;
+  basis_notes: string[];
 };
 
 export type MonitorPayload = {
@@ -2030,6 +2198,8 @@ export type MonitorPayload = {
   by_tenant: MonitorTenant[];
   by_path: Array<{ path: string; calls: number; errors: number;
                   avg_ms: number; p95_ms: number }>;
+  /** LLM 费用：汇总 + 按功能 + 按租户 + 按天趋势。 */
+  llm_cost: MonitorCost;
   /** 配额口径与局限（直接渲染，不让人猜数字怎么来的）。 */
   quota_basis: {
     day_start: string;
@@ -2268,6 +2438,22 @@ export const api = {
       "/api/v1/alerts/scan", { method: "POST" }),
   scanLatest: () => request<ScanState>("/api/v1/alerts/scan/latest"),
   alertSettings: () => request<AlertSettings>("/api/v1/alerts/settings"),
+
+  /**
+   * **一次往返**取齐事件告警首屏要的全部东西（列表 + 设置）。
+   *
+   * 原来首屏发两条（`/alerts` + `/alerts/settings`）。本机无所谓，
+   * 但隧道实测只有 ~51 KB/s、单次往返 0.4~2 秒 —— 每少一条就少一次
+   * 往返与队头等待。用于"登录成功就预加载"（见 `alertsCache.preloadAlerts`）。
+   */
+  alertsBootstrap: (params: { limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return request<{ alerts: Alert[]; total: number; unread: number;
+                     settings: AlertSettings }>(
+      `/api/v1/alerts/bootstrap${suffix}`, { retrySafe: true });
+  },
 
   // ---- 做T辅助 ----
   /**
@@ -2699,6 +2885,11 @@ export type QuantScreenRequest = {
   horizon: number; min_ic: number; min_icir: number;
   corr_threshold: number; train_ratio: number; target_count: number;
   neutralize: boolean;
+  /** 剔除 ST（历史名称口径）。默认关闭：它会改变截面构成。 */
+  exclude_st?: boolean;
+  /** 股票池过滤：按 20 日均成交额每日剔除最差的 30%。默认关闭。 */
+  liquidity_filter?: boolean;
+  liquidity_drop_pct?: number;
 };
 
 export type QuantScreenJob = {
@@ -2718,6 +2909,8 @@ export type QuantSingleRequest = {
   train_ratio?: number;
   t_plus_1?: boolean; respect_price_limits?: boolean;
   respect_suspension?: boolean;
+  /** ST 期间不买入（历史名称口径）。 */
+  respect_st?: boolean;
   commission_rate?: number; min_commission?: number;
   stamp_tax_rate?: number; transfer_fee_rate?: number; slippage_bps?: number;
   auto_save?: boolean;

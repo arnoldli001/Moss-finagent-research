@@ -62,8 +62,9 @@ jobs:
             tests/unit/test_tenancy.py -q
 
       # 代码卫生门禁：把「同一口径多处各写一遍」这类漂移变成 CI 断言。
+      # 7 项：语法 / 截断分层 / 硬编码路径 / 时段权威 / ruff / 同名不同值 / 定时炸弹测试。
       # 检查项与理由见 scripts/verify_cleanup.py 的 docstring。
-      - name: 代码卫生（魔鬼数字 / 截断分层 / 时段权威 / 同名不同值）
+      - name: 代码卫生（魔鬼数字 / 截断分层 / 时段权威 / 同名不同值 / 定时炸弹测试）
         run: uv run python scripts/verify_cleanup.py
 
       - name: 共享口径单一权威

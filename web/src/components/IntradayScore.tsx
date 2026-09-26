@@ -9,17 +9,17 @@ import { IntradayScoreCard, IntradaySignal } from "../api";
  */
 
 const ZONE_TEXT: Record<string, { label: string; cls: string }> = {
-  strong_buy_zone: { label: "偏多低吸区", cls: "zone-strong-buy" },
+  strong_buy_zone: { label: "偏多回踩区", cls: "zone-strong-buy" },
   buy_zone: { label: "偏多试仓区", cls: "zone-buy" },
   neutral: { label: "震荡区间", cls: "zone-neutral" },
   sell_zone: { label: "偏空试减区", cls: "zone-sell" },
-  strong_sell_zone: { label: "偏空高抛区", cls: "zone-strong-sell" },
+  strong_sell_zone: { label: "偏空冲高区", cls: "zone-strong-sell" },
 };
 
 const STRENGTH_TEXT: Record<string, string> = {
   solid: "实心三角 · 正式信号",
   hollow: "空心三角 · 软提示",
-  forced_exit: "止损 · 强制卖出警告",
+  forced_exit: "止损线触发（风控提示）",
   none: "无信号",
 };
 
@@ -155,7 +155,7 @@ export default function IntradayScore({
           <span className="muted-text signal-reason">{signal?.reason ?? "—"}</span>
           {signal?.pushed && <span className="push-badge">已推送</span>}
           {signal?.blocked_by_stop_loss && (
-            <span className="push-badge stop-badge">止损硬约束生效</span>
+            <span className="push-badge stop-badge">止损线约束生效</span>
           )}
         </div>
       </div>

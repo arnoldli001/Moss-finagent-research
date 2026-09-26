@@ -61,6 +61,23 @@ _ADDABLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("character_profile_json", "TEXT NOT NULL DEFAULT '{}'"),
     ("template", "TEXT NOT NULL DEFAULT ''"),
     ("note", "TEXT NOT NULL DEFAULT ''"),
+    # ---- 个股「关联板块 / 海外映射」绑定（用户口径 2026-09-23）----
+    # 用户原话："加自选股时，输入关联板块、海外映射板块后，应该把关联和映射数据配置
+    # 保存到数据库里，后续不管删除自选还是新加自选，都可以自动加载之前的配置。"
+    #
+    # ⚠️ 为什么挂在**张这张表**（而不是自选表或新表）：
+    #   ① 两者都是"**按个股**存的做T用户偏好"，这张表本来就是那个位置
+    #      （PRAGMA 补列机制就是为"字段会长大的档案"准备的）；
+    #   ② 更关键：这张表的行**不会因为删自选而消失** —— 自选池在
+    #      `configs/intraday.yaml`（`remove_watch` 只改 YAML），而档案行只在
+    #      用户主动"删除该股档案"时才删。所以"删了自选再加回来"能天然还原配置。
+    #   ③ 与权重档案同库（`settings.sqlite_path`），不引入第二处持久化。
+    #
+    # ⚠️ 这两列**不在 `_COLUMNS` 里** —— 于是权重档案的 upsert 走
+    #    `ON CONFLICT DO UPDATE SET` 时**碰不到它们**：用户在权重编辑面板里
+    #    存一次权重，不会把关联板块/海外映射清空。这是刻意的，别把它们塞进 `_COLUMNS`。
+    ("boards_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("overseas_json", "TEXT NOT NULL DEFAULT '[]'"),
 )
 
 _COLUMNS = ("code", "name", "weights_json", "daily_weights_json",
@@ -73,6 +90,11 @@ def _dump(payload: dict) -> str:
     return json.dumps(payload or {}, ensure_ascii=False, sort_keys=True)
 
 
+def _dump_list(values: list[str]) -> str:
+    """`list[str]` → JSON 数组列（**不排序**：关联板块/映射的顺序由用户决定，保序）。"""
+    return json.dumps(list(values or []), ensure_ascii=False)
+
+
 def _load(raw: object) -> dict:
     """JSON 列 → dict（脏数据返回空 dict 并告警，不让一行坏数据打断整个列表）。"""
     if not raw:
@@ -83,6 +105,28 @@ def _load(raw: object) -> dict:
         logger.warning("权重档案含无法解析的JSON列，已按空处理：%s", str(raw)[:120])
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _load_list(raw: object) -> list[str]:
+    """JSON 数组列 → `list[str]`（脏数据按空列表处理并告警，与 `_load` 同纪律）。
+
+    只保留非空字符串并去重，避免历史脏数据把空串喂进绑定链路。
+    """
+    if not raw:
+        return []
+    try:
+        value = json.loads(str(raw))
+    except (TypeError, ValueError):
+        logger.warning("个股绑定含无法解析的JSON列，已按空处理：%s", str(raw)[:120])
+        return []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if text and text not in out:
+            out.append(text)
+    return out
 
 
 def _now() -> str:
@@ -116,6 +160,76 @@ class IntradayProfileStore:
         """写入/读取路径幂等同步：进程内只做一次 PRAGMA（避免每查必扫表结构）。"""
         if not self._synced:
             self._schema_sync()
+
+    # ---- 个股「关联板块 / 海外映射」绑定（同步原语）----
+    #
+    # 为什么这几个是**同步**的，而权重档案那套走 `asyncio.to_thread`：
+    #   ① 它们是**单行** upsert / select，实测亚毫秒级，跨线程的开销比工作本身还大；
+    #   ② 调用点 `IntradayService.add_watch` 本身就是**同步**方法（路由直接调用），
+    #      而它必须在返回前就把绑定写下去 —— 见那里的说明。
+    # 权重档案的 list/upsert 会做 JSON 序列化与全表扫描，仍留在异步端口那边。
+
+    @staticmethod
+    def _clean(values: object) -> list[str]:
+        """归一化绑定值：去空白、去重、保序（写库前统一走这里）。"""
+        out: list[str] = []
+        for item in (values or ()):          # type: ignore[union-attr]
+            text = str(item).strip()
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    def set_binding(self, code: str, boards: object = (),
+                    overseas: object = ()) -> None:
+        """写入（或覆盖）某只票的关联板块/海外映射绑定。
+
+        只动这两列 + `updated_at`，**不碰权重/阈值/档位** —— 权重编辑与绑定
+        互不干扰。行不存在时新建一条（其余列吃 DDL 默认值）。
+        """
+        self._sync_once()
+        payload = (_dump_list(self._clean(boards)),
+                   _dump_list(self._clean(overseas)))
+        with self._connect() as conn:
+            conn.execute(
+                f"INSERT INTO {TABLE} (code, boards_json, overseas_json, updated_at) "
+                f"VALUES (?, ?, ?, ?) "
+                f"ON CONFLICT(code) DO UPDATE SET "
+                f"boards_json=excluded.boards_json, "
+                f"overseas_json=excluded.overseas_json, "
+                f"updated_at=excluded.updated_at",
+                (str(code).strip().zfill(6), payload[0], payload[1], _now()))
+
+    def get_binding(self, code: str) -> tuple[list[str], list[str]]:
+        """某只票的 `(关联板块, 海外映射)`；没有行或没配过都是两个空列表。"""
+        self._sync_once()
+        with self._connect() as conn:
+            row = conn.execute(
+                f"SELECT boards_json, overseas_json FROM {TABLE} WHERE code = ?",
+                (str(code).strip().zfill(6),)).fetchone()
+        if row is None:
+            return [], []
+        return _load_list(row["boards_json"]), _load_list(row["overseas_json"])
+
+    def all_bindings(self) -> dict[str, tuple[list[str], list[str]]]:
+        """全部**已配过**的绑定 `{code: (boards, overseas)}`（启动时热加载用）。
+
+        只返回至少有一项的票 —— 没配过的行（绝大多数）不进内存映射，
+        于是这份热数据始终只有"用户真配过的那几十只"那么大。
+        """
+        self._sync_once()
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT code, boards_json, overseas_json FROM {TABLE} "
+                f"WHERE COALESCE(boards_json, '[]') NOT IN ('', '[]') "
+                f"   OR COALESCE(overseas_json, '[]') NOT IN ('', '[]')"
+            ).fetchall()
+        out: dict[str, tuple[list[str], list[str]]] = {}
+        for row in rows:
+            boards = _load_list(row["boards_json"])
+            overseas = _load_list(row["overseas_json"])
+            if boards or overseas:
+                out[str(row["code"])] = (boards, overseas)
+        return out
 
 
 class IntradayProfileSqliteRepository(IntradayProfileStore,

@@ -1,0 +1,23 @@
+{
+  "features": [
+    "six_dim.prosperity.raw.revenue_yoy"
+  ],
+  "survivors": [
+    "six_dim.prosperity.raw.revenue_yoy"
+  ],
+  "worst_auc": 0.5227480590138762,
+  "per_window": [
+    0.5297220947602475,
+    0.5477540139519266,
+    0.5227480590138762
+  ],
+  "windows": [
+    "旧",
+    "中",
+    "新"
+  ],
+  "auc_floor": 0.52,
+  "boot_floor": 0.5,
+  "horizon": 20,
+  "big": 0.1
+}

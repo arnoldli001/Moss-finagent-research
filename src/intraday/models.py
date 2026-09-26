@@ -74,9 +74,9 @@ class LevelSet(BaseModel):
     box_low: float
     box_position: float | None = Field(default=None, description="现价在箱体中的位置 0~1")
     box_span_days: int = 0
-    low_buy: float = Field(description="低吸线（箱体下沿，可融合布林下轨）")
-    high_sell: float = Field(description="高抛线（箱体上沿，可融合布林上轨）")
-    stop_loss: float = Field(description="止损位；跌破禁止一切低吸信号")
+    low_buy: float = Field(description="回踩线（箱体下沿，可融合布林下轨）")
+    high_sell: float = Field(description="冲高线（箱体上沿，可融合布林上轨）")
+    stop_loss: float = Field(description="止损位；跌破禁止一切回踩信号")
     stop_loss_pct: float
     stop_basis: str = Field(
         default="",
@@ -90,26 +90,26 @@ class LevelSet(BaseModel):
     atr: float | None = Field(default=None, description="日线ATR（波动幅度参考）")
 
     # ---- 组装口径（由 `impact.annotate_level_basis` 只补到**当前**档位对象上）----
-    # 为什么要有这几项：面板只显示「低吸 862.10」时，用户无法判断这条线是谁定的
+    # 为什么要有这几项：面板只显示「回踩 862.10」时，用户无法判断这条线是谁定的
     # —— 是箱体下沿、布林下轨，还是"箱体/布林都跑到现价上方"后的 ATR 兜底？
     # 三者的调整方式完全不同（前两者改不了，后者要动 dip_fallback_atr），
     # 说不清来源就只能靠猜。
     #
     # 刻意**不在 `compute_levels` 里填**：该函数还被 `replay_levels` 逐bar调用
     # （一次 240 根），给它挂这一组解释字段会让快照载荷无谓膨胀。
-    low_source: str = Field(default="", description="低吸线由谁决定（箱体下沿/布林下轨/ATR兜底）")
-    high_source: str = Field(default="", description="高抛线由谁决定（箱体上沿/布林上轨/高抛缓冲）")
+    low_source: str = Field(default="", description="回踩线由谁决定（箱体下沿/布林下轨/ATR兜底）")
+    high_source: str = Field(default="", description="冲高线由谁决定（箱体上沿/布林上轨/冲高缓冲）")
     band_width_pct: float | None = Field(default=None, description="实际档位差占现价%")
     band_clamped: str = Field(default="", description="档位差是否被 min/max 护栏夹过")
-    # 护栏前的原始位置：低吸线/高抛线在被 min/max_band_pct 夹过之前是多少。
+    # 护栏前的原始位置：回踩线/冲高线在被 min/max_band_pct 夹过之前是多少。
     # 没有它就会出现「先说这条线是布林下轨 902.35、线上却写着 898.63」的错位 ——
     # 用户拿这两个数一比就会怀疑面板在乱算。
-    pre_clamp_low: float | None = Field(default=None, description="档位差护栏前的低吸线")
-    pre_clamp_high: float | None = Field(default=None, description="档位差护栏前的高抛线")
+    pre_clamp_low: float | None = Field(default=None, description="档位差护栏前的回踩线")
+    pre_clamp_high: float | None = Field(default=None, description="档位差护栏前的冲高线")
     low_trigger_price: float | None = Field(
-        default=None, description="低吸触发的最高价 = 低吸线×(1+贴线带宽)")
+        default=None, description="回踩触发的最高价 = 回踩线×(1+贴线带宽)")
     high_trigger_price: float | None = Field(
-        default=None, description="高抛触发的最低价 = 高抛线×(1-贴线带宽)")
+        default=None, description="冲高触发的最低价 = 冲高线×(1-贴线带宽)")
     take_profit_buffer_pct: float | None = None
     dip_fallback_atr: float | None = None
     atr_stop_mult: float | None = None
@@ -150,7 +150,7 @@ class TriggerLevelDelta(BaseModel):
     """「改动前 → 改动后」一条价格线的变动（权重编辑面板的对照表直接用）。
 
     「改动前」取的是**当前表单口径被保存在的档案/全局参数**下这条线的位置。
-    需要说明的是：低吸/高抛/止损是**时刻量**（随 VWAP/布林/现价每分钟重算），
+    需要说明的是：回踩/冲高/止损是**时刻量**（随 VWAP/布林/现价每分钟重算），
     两份档位都基于同一份行情算出来，因此这里比的是「参数与阈值改动」的效果，
     不是"上一分钟那条线在哪"。
     """
@@ -187,7 +187,7 @@ class FactorImpactRow(BaseModel):
 class TriggerImpact(BaseModel):
     """把「参数 → 价格线 / 总分 → 是否出信号」摊开给用户看的一次性推导。
 
-    为什么需要它：档位（低吸/高抛/止损）与权重走的是**两条互不相干**的链路 ——
+    为什么需要它：档位（回踩/冲高/止损）与权重走的是**两条互不相干**的链路 ——
     权重决定总分（够不够格动手），档位决定价格线（价格到没到）。用户在权重编辑
     面板里拖滑杆时，最想知道的恰恰是这两件事的合成结果：**现在差多少才动手**。
     """
@@ -241,7 +241,7 @@ class ScoreCard(BaseModel):
     threshold_action: float
     threshold_hint: float
     zone: ScoreZone
-    verdict: str = Field(description="一句话结论（震荡区间/偏多低吸/偏空高抛…）")
+    verdict: str = Field(description="一句话结论（震荡区间/偏多回踩/偏空冲高…）")
     factors: list[FactorScore]
     weights_sum: float
     available_weight: float = Field(
@@ -266,7 +266,7 @@ class TradeSignal(BaseModel):
     total_score: float
     reason: str
     blocked_by_stop_loss: bool = Field(
-        default=False, description="是否被止损硬约束拦截（阻止低吸）")
+        default=False, description="是否被止损硬约束拦截（阻止回踩）")
     target_level: float | None = None
     pushed: bool = False
 
@@ -486,6 +486,16 @@ class IntradaySnapshot(BaseModel):
         default=None, description="所属指数量能（含全天预测量与量能比）")
     overseas: dict[str, Any] | None = Field(
         default=None, description="海外映射（美股隔夜 + 韩股盘中同步）")
+    cycle_decision: dict[str, Any] | None = Field(
+        default=None,
+        description=("**今日做T决策**（情绪周期 + 全市场量能）：周期阶段 stage、"
+                     "是否允许做T降本 t_allowed、是否禁止追高 no_chase、"
+                     "以及触发一票否决的逐条依据 gates；"
+                     "并附全市场量能那一段 `turnover` / `turnover_text` / "
+                     "`turnover_verdict`（用户口径 2026-09-23：「缩量XX亿不追高，"
+                     "放量XX亿可做T」）。"
+                     "用户口径 2026-09-23：这几条原来以「数据缺口」的形式堆在底部"
+                     "数据健康度里，现在提到顶部「市场环境」行右侧显示成一句决策。"))
     level_fit: dict[str, Any] | None = Field(
         default=None,
         description=("关键价位的神经网络拟合结果摘要（含 in-sample / 留一日两个成功率、"
@@ -521,6 +531,14 @@ class WatchItem(BaseModel):
     quote_ts: str = ""
     #: 是否置顶（置顶项永远排在最前；状态存在配置里，跨浏览器一致）
     pinned: bool = False
+    #: 估值结论（用户口径 2026-09-23）：自选列表里紧跟信号显示，例如
+    #: 「估值透支 / 估值合理偏贵 / 估值合理 / 上涨空间充足 / 数据不足」。
+    #: 原来是主区域整块「① 估值空间」面板，用户要求收成列表里的一个标签。
+    #: ⚠️ 这两个字段必须是**标量字符串**，不能是 dict：热缓存
+    #:    （`hot_cache._to_plain`）只保留叶子类型，dict 会被静默丢掉。
+    valuation_label: str = ""
+    #: 结论档位（ample/moderate/stretched/expensive/unknown），前端据此上色。
+    valuation_bucket: str = ""
 
 
 class NotifyResult(BaseModel):
@@ -551,7 +569,7 @@ class ThresholdStat(BaseModel):
     threshold: float
     direction: Literal["long", "short", "all"] = Field(
         default="long",
-        description="long=低吸侧(总分≥阈值) / short=高抛侧(总分≤-阈值) / all=全样基准")
+        description="long=回踩侧(总分≥阈值) / short=冲高侧(总分≤-阈值) / all=全样基准")
     signals: int
     hit_rate: float | None = None
     avg_forward_return_pct: float | None = None
@@ -600,6 +618,9 @@ class DailyBar(BaseModel):
     pct_chg: float | None = None
     amplitude: float | None = Field(default=None, description="振幅% = (高-低)/昨收")
     turnover: float | None = None
+    #: 主力资金净流入额（元；负值=净流出）。来自本地行情仓 `quant_moneyflow`，
+    #: **只供前端读数与区间统计**，不参与打分与信号（见 `intraday/day_extras.py`）。
+    net_mf: float | None = None
     # ---- 量柱标记（口径见 docs/INTRADAY_T_DESIGN.md 第11节）----
     is_high_volume: bool = False
     is_double_volume: bool = False
@@ -731,7 +752,7 @@ class ScorePoint(BaseModel):
     为什么要有它：用户最常问的一类问题是"价格明明摸到/跌破了那条线，为什么没有信号"。
     触发需要「价格触及档位」**且**「总分达标」两条同时满足，只给当前总分无法回答
     "触点那一刻是多少分"。有了这条序列，面板可以直接说：
-    「今日触及低吸线 56 次，触点处最高总分仅 +13（< 提示线 20）→ 未触发」。
+    「今日触及回踩线 56 次，触点处最高总分仅 +13（< 提示线 20）→ 未触发」。
     """
 
     ts: str
@@ -740,13 +761,13 @@ class ScorePoint(BaseModel):
 
 
 class LevelPoint(BaseModel):
-    """逐bar档位（低吸/高抛/止损随时间的真实取值）。
+    """逐bar档位（回踩/冲高/止损随时间的真实取值）。
 
     为什么必须逐bar给：档位是**时刻量**（随 VWAP/布林/现价每分钟重算）。图上只画
     一条横线（当前值）会产生两种误读，2026-09-16 用户实测都踩到了：
 
-    - "开盘就在低吸线以下，为什么没信号" —— 其实当刻低吸线低得多，价格一直在线**上方**；
-    - "该低吸的位置却触发止损" —— 其实是把后来的高位止损拿去判早盘的低点。
+    - "开盘就在回踩线以下，为什么没信号" —— 其实当刻回踩线低得多，价格一直在线**上方**；
+    - "该回踩的位置却触发止损" —— 其实是把后来的高位止损拿去判早盘的低点。
     """
 
     ts: str
@@ -781,36 +802,33 @@ class NiuLinePoint(BaseModel):
 
 
 class NiuLineSet(BaseModel):
-    """擒牛线档位线体系（日K做T主图）。
+    """擒牛线档位线体系（日K做T主图）—— **下发给前端的部分**。
 
-    两套同花顺公式按标的类别自动选（见 `src/intraday/niuline.py`）：
+    ## ⚠️ 这里刻意**不含**计算口径（用户口径 2026-09-23：核心机密）
 
-    - `variant="stock"`：个股版，CBX = `SUM(AMOUNT,N)/SUM(V,N)`（真实成交额均价）；
-    - `variant="index"`：指数/ETF/板块版，CBX = `SUM(C*V,N)/SUM(V,N)`（收盘价加权）。
+    曾经下发过这些字段，它们足以还原出整套公式：
 
-    NML/QRL/SMX 两套完全相同，**只有 CBX 分叉** —— 混用会让成本线系统性偏移。
+    - `variant`：个股口径 / 指数·ETF·板块口径；
+    - `reason`：为什么选了那个变体（如"默认按个股口径（AMOUNT/V）"）；
+    - `price_basis`：`amount` / `close_volume` —— 直接点名 CBX 用的是哪套均价；
+    - `cbx_scale`：CBX 的换算系数；
+    - `n` / `m`：公式参数（20 / 14）；
+    - `notes`：降级原因（"成交额不可用 → 退回指数口径"）；
+    - `lines[].note`：每一条线的公式描述（如"前20日最高价 + ATRV/2"）。
+
+    现在**只下发前端真正需要的东西**：五个档位的当期数值、线名 label、
+    以及逐 bar 的序列（画图用）。
+    计算口径仍然在 `src/intraday/niuline.py` 里按原样执行，
+    且判定结果会写进**服务端日志**（`logger.info`）便于排障 ——
+    只是不再离开服务进程。要看完整口径请直接读那个模块或日志，不要加回这里。
     """
 
     available: bool = True
-    #: stock=个股口径 / index=指数·ETF·板块口径
-    variant: Literal["stock", "index"] = "stock"
-    #: 为什么选了这个变体（可追溯，不猜）
-    reason: str = ""
-    #: 实际用的均价口径：amount=真实成交额 / close_volume=收盘价加权
-    price_basis: Literal["amount", "close_volume"] = "amount"
-    #: CBX 换算系数：个股口径下把"每手价"换成"每股"。
-    #: 本项目 volume 单位是**手**，故实测为 ~100；不换算 CBX 会比股价高两个
-    #: 数量级，"站稳/跌破"判据会整体反过来。指数口径恒为 1.0。
-    cbx_scale: float = 1.0
-    n: int = 20
-    m: int = 14
     #: 最后一根的五个值（前端状态条直接显示）
     latest: dict[str, float | None] = Field(default_factory=dict)
-    #: 线的展示元数据（label/note），由后端给出，前端不硬编码线名
+    #: 线的展示元数据：只有 `key` 与 `label`（**不含 note**，那会泄漏公式）
     lines: list[dict[str, str]] = Field(default_factory=list)
     points: list[NiuLinePoint] = Field(default_factory=list)
-    #: 口径说明与降级原因（如"成交额缺失 → 退回指数口径"）
-    notes: list[str] = Field(default_factory=list)
 
 
 class DailySnapshot(BaseModel):
@@ -839,7 +857,7 @@ class DailySnapshot(BaseModel):
         default_factory=list, description="S6 高量纪律 + 口诀命中的条目")
     # 日线做T的**加权决策总分**（七因子，与分时 ScoreCard 同一套算术）。
     # 与 buy_signals/sell_signals 是**并列**关系而非替代：
-    # 规则信号回答「满不满足某套战法形态」，加权总分回答「综合偏向低吸还是高抛」。
+    # 规则信号回答「满不满足某套战法形态」，加权总分回答「综合偏向回踩还是冲高」。
     scorecard: ScoreCard | None = None
     verdict: str = ""
     #: 擒牛线档位线（日K做T**主图**；原蜡烛K线已按用户要求下线）

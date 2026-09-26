@@ -17,6 +17,7 @@ import LoginScreen from "./components/LoginScreen";
 import MainlinePanel from "./components/MainlinePanel";
 import QuantTabContainer from "./components/QuantTabContainer";
 import ErrorBoundary from "./components/ErrorBoundary";
+import KeepAlive from "./components/KeepAlive";
 import MetricsPanel from "./components/MetricsPanel";
 import ReportView from "./components/ReportView";
 import SchedulerPanel from "./components/SchedulerPanel";
@@ -74,7 +75,10 @@ const ANALYSIS_TYPES = [
  */
 const HASH_VIEWS = [
   "research", "scheduler", "metrics", "backtest", "alerts", "intraday",
-  "mainline", "fundflow", "mypools", "intel",
+  "mainline", "fundflow", "mypools",
+  // 用户口径（2026-09-25）：删除一级「情报中心」，把它的两个子页签
+  // 提为一级。所以 hash 里出现的是这两项，而不再是 `intel`。
+  "intel-hot", "intel-calendar",
   "admin", "admin-monitor", "admin-tiers", "admin-perms",
 ] as const;
 
@@ -94,7 +98,8 @@ export default function App() {
   if (auth.phase === "anonymous" || !auth.user) {
     // `notice` 是"被退回登录页"的原因（如会话过期），如实显示 —— 否则用户会以为
     // 自己点错了按钮，而实际是掉线（见 web/src/unauthorized.ts 的说明）。
-    return <LoginScreen onLogin={auth.login} notice={auth.notice} />;
+    return <LoginScreen onLogin={auth.login} notice={auth.notice}
+                        loginMode={auth.loginMode} />;
   }
   return <Workbench auth={auth} />;
 }
@@ -129,7 +134,8 @@ function Workbench({ auth }: { auth: AuthApi }) {
   // （`view === "intraday"` 判高亮）。写成 `"quant"` 之类会编译不过或落空。
   const [view, setView] =
     useState<"research" | "scheduler" | "metrics" | "backtest" | "alerts"
-      | "intraday" | "mainline" | "fundflow" | "intel" | "admin"
+      | "intraday" | "mainline" | "fundflow"
+      | "intel-hot" | "intel-calendar" | "admin"
       | "admin-monitor" | "admin-tiers" | "admin-perms">(
       "intraday");
   // 管理员也可以切到"业务视图"看租户侧界面（他是平台身份，但业务功能同样开放）。
@@ -182,7 +188,8 @@ function Workbench({ auth }: { auth: AuthApi }) {
   }, []);
 
   // 事件告警：单一WS连接供铃铛未读数、Toast与告警面板共用
-  const { connected, unread, incoming, refreshUnread } = useAlertsWs();
+  // （同一条连接还带"情报流已就绪"的信令 `intelSeq` → 传给情报面板）
+  const { connected, unread, incoming, intelSeq, refreshUnread } = useAlertsWs();
   const [toasts, setToasts] = useState<Alert[]>([]);
   const [incomingTick, setIncomingTick] = useState(0);
   const [openAlertId, setOpenAlertId] = useState<string | null>(null);
@@ -202,6 +209,36 @@ function Workbench({ auth }: { auth: AuthApi }) {
 
   const dismissToast = useCallback((alertId: string) => {
     setToasts((prev) => prev.filter((t) => t.alert_id !== alertId));
+  }, []);
+
+  /**
+   * ★ 面板数据**保活预取**（用户报障 2026-09-26 第二次）。
+   *
+   * > "热点&研报小作文、事件告警 每次打开这个界面不能预加载到浏览器吗，
+   * >   切界面还是会有 2 秒延迟…界面打开的时候应该立即能加载到。"
+   *
+   * 上一轮加的 `localStorage` 缓存本身是对的，但**缓存是冷的**：
+   * 预加载原来只写在 `useAuth.login()` 里，而绝大多数访问是
+   * **带 remember-me Cookie 刷新页面**（走 `probe()`，从不预取）。
+   * 加上缓存有 TTL（告警 5 分钟 / 情报 10 分钟），放着就过期。
+   *
+   * 现在挂在**已登录**状态上：进页面就预取一次，之后每 4 分钟后台续期，
+   * 让缓存在用户停留期间**永不过期** —— 于是点面板就是"挂载即有内容"。
+   *
+   * 放在 `AppInner`（已登录分支）而不是 `App`：那个组件在未登录时会
+   * `return <LoginScreen/>`，此时预取毫无意义且会打 401。
+   */
+  useEffect(() => {
+    let stop: (() => void) | null = null;
+    let cancelled = false;
+    void import("./panelPrefetch").then(({ startPanelKeepAlive }) => {
+      if (cancelled) return;          // 组件已卸载：别留下没人清的定时器
+      stop = startPanelKeepAlive();
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
   }, []);
 
   const openAlert = useCallback((alert: Alert) => {
@@ -315,7 +352,8 @@ const running = task !== null && (task.status === "queued" || task.status === "r
 
   return (
     <div className={view === "intraday" || view === "fundflow"
-      || view === "mainline" || view === "intel" ? "app app-wide" : "app"}>
+      || view === "mainline" || view === "intel-hot"
+      || view === "intel-calendar" ? "app app-wide" : "app"}>
       <header className="header">
         {/* ★ 站名可点击回首页（用户口径 2026-09-23）。
             用 `<button>` 而不是 `<a href>`：本应用没有路由，用锚点会真的
@@ -397,14 +435,21 @@ const running = task !== null && (task.status === "queued" || task.status === "r
             <TL label="资金流监控" active={view === "fundflow"}
               show={showView("fundflow")}
               onClick={() => setView("fundflow")} />
-            {/* 情报中心：主入口是 `intel.radar`（页签可见性由服务端下发的
-                `visible_views` 决定，见 `my_features.py` 的 VIEW_FEATURE）。
-                「盘前简报」(intel.brief) 与「事件告警」(intel.alerts) 是
-                **页内能力**，不各占一个顶级页签 —— 否则顶栏会有三个
-                内容高度重叠的入口。 */}
-            <TL label="情报中心" active={view === "intel"}
-              show={showView("intel")}
-              onClick={() => setView("intel")} />
+            {/* ── 舆情情报：**两个顶级页签** ──
+                用户口径（2026-09-25）："删除当前的一级目录里的'情报中心'，
+                并将二级目录页签'热点&研报小作文'、'投资日历'改为一级目录"。
+
+                所以原来那个「情报中心」顶级页签没有了，它的两个子页签
+                各自成为一级入口。两者**共用同一个功能 key**（`intel.hot`）——
+                见 `my_features.py` 的 `VIEW_FEATURE`：一个售卖项可以对应
+                多个页签，它们本来就是同一份公开信息的两种看法
+                （"现在在说什么" vs "接下来会发生什么"）。 */}
+            <TL label="热点&研报小作文" active={view === "intel-hot"}
+              show={showView("intel-hot")}
+              onClick={() => setView("intel-hot")} />
+            <TL label="投资日历" active={view === "intel-calendar"}
+              show={showView("intel-calendar")}
+              onClick={() => setView("intel-calendar")} />
             {/* 事件告警不属于"售卖功能"：它是每个登录用户的基础能力 */}
             <TL label="事件告警" active={view === "alerts"}
               onClick={() => setView("alerts")} />
@@ -463,16 +508,20 @@ const running = task !== null && (task.status === "queued" || task.status === "r
           <MainlinePanel />
         ) : view === "fundflow" ? (
           <FundFlowPanel />
-        ) : view === "intel" ? (
-          <IntelPanel isAdmin={!!isAdmin} />
-        ) : view === "alerts" ? (
-          <AlertsPanel
-            incomingTick={incomingTick}
-            openAlertId={openAlertId}
-            onConsumeOpen={() => setOpenAlertId(null)}
-            onReadChanged={refreshUnread}
-        />
-      ) : (
+        ) : view === "intel-hot" || view === "intel-calendar"
+            || view === "alerts" ? (
+          // 这三个视图由下面**常驻的 `<KeepAlive>`** 承载（见那里的说明）。
+          // 这里返回 null：三元链的语义是"只渲染命中的那一个"，切走即卸载，
+          // 而这两个面板是用户反复来回切的，需要保活。
+          null
+        ) : (
+          <div className="error-box">
+            未知视图：{view}（请刷新页面；若持续出现请反馈）
+          </div>
+        )}
+      </ErrorBoundary>
+
+      {view === "research" && (
       <>
       <section className="submit-bar">
         <input
@@ -550,6 +599,37 @@ const running = task !== null && (task.status === "queued" || task.status === "r
       {task?.report && <ReportView markdown={task.report} />}
       </>
       )}
+
+      {/* ★ 保活面板（用户报障 2026-09-26 第二次：
+          "热点&研报小作文、事件告警 每次打开这个界面不能预加载到浏览器吗，
+           切界面还是会有 2 秒延迟…界面打开的时候应该立即能加载到"）。
+
+          ## 三个必须遵守的摆放约束
+
+          1. **不放三元链里** —— 放进去 `KeepAlive` 自己也会被卸载，
+             它的"曾可见过"标记一起归零，保活完全失效。
+          2. **不在上面那个 `ErrorBoundary` 里** —— 它带 `resetKey={view}`，
+             切页签会重置；常驻面板放进去，任何一次渲染错误都会把它们清掉，
+             那正好抵消了保活。
+          3. **各自包一个独立 ErrorBoundary** —— 这两个面板现在**同时挂载**
+             （新增的耦合面），一个崩了不该连累另一个。
+
+          `active` 决定显隐；首次切过去才真正挂载（惰性，见 KeepAlive）。 */}
+      <ErrorBoundary resetKey="intel" label="情报流">
+        <KeepAlive active={view === "intel-hot" || view === "intel-calendar"}>
+          <IntelPanel isAdmin={!!isAdmin} intelSeq={intelSeq}
+            section={view === "intel-calendar" ? "calendar" : "hot"} />
+        </KeepAlive>
+      </ErrorBoundary>
+      <ErrorBoundary resetKey="alerts" label="事件告警">
+        <KeepAlive active={view === "alerts"}>
+          <AlertsPanel
+            incomingTick={incomingTick}
+            openAlertId={openAlertId}
+            onConsumeOpen={() => setOpenAlertId(null)}
+            onReadChanged={refreshUnread}
+          />
+        </KeepAlive>
       </ErrorBoundary>
 
       <AlertToasts alerts={toasts} onDismiss={dismissToast} onOpen={openAlert} />

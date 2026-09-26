@@ -173,6 +173,8 @@ export function QuantSingleStockPanel() {
   const [tPlus1, setTPlus1] = useState(true);
   const [limits, setLimits] = useState(true);
   const [suspension, setSuspension] = useState(true);
+  // 默认与后端一致（respect_st=True）：ST 期间不买是更安全的近似
+  const [respectSt, setRespectSt] = useState(true);
   const [slippage, setSlippage] = useState(5);
   const [commission, setCommission] = useState(0.03);   // %
   const [stampTax, setStampTax] = useState(0.05);        // %
@@ -247,7 +249,7 @@ export function QuantSingleStockPanel() {
         stop_loss_pct: stopLoss / 100, take_profit_pct: takeProfit / 100,
         max_hold_days: maxHold, train_ratio: trainRatio,
         t_plus_1: tPlus1, respect_price_limits: limits,
-        respect_suspension: suspension,
+        respect_suspension: suspension, respect_st: respectSt,
         slippage_bps: slippage,
         commission_rate: commission / 100,
         stamp_tax_rate: stampTax / 100,
@@ -303,7 +305,7 @@ export function QuantSingleStockPanel() {
   return (
     <div className="quant-single-panel">
       <div className="warn-box">
-        单股票多因子条件策略回测（纯本地规则，无 LLM）：用 DSL 条件描述买卖点，
+        单股票多因子条件策略回测（纯本地规则，无 LLM）：用 DSL 条件描述进出场条件，
         逐日按 <b>t 日收盘信号 → t+1 日开盘成交</b>撮合，含 T+1、涨停不买/跌停不卖、
         停牌不交易、整手（100 股）、佣金/印花税/过户费/滑点。
         因子<b>按需计算</b>（只算条件里用到的）。
@@ -467,6 +469,12 @@ export function QuantSingleStockPanel() {
             <input type="checkbox" checked={suspension}
                    onChange={(e) => setSuspension(e.target.checked)}
                    disabled={running} /> 停牌不交易
+          </label>
+          <label className="muted-text"
+                 title="ST/*ST 期间不买入（按**当时的历史名称**判定，不是今天的名字）。默认勾选：实盘里很多账户本来就不允许买 ST；取消勾选可以看到「连 ST 一起买」的历史用于对照">
+            <input type="checkbox" checked={respectSt}
+                   onChange={(e) => setRespectSt(e.target.checked)}
+                   disabled={running} /> ST 期间不买
           </label>
           <label className="muted-text"
                  title="达标（样本外为正、交易笔数足够、自检通过）时自动存入策略库">

@@ -335,6 +335,136 @@ def test_refresh_without_cookie_is_401(client: TestClient) -> None:
 
 
 # ======================================================================
+# 开机探测 `/auth/bootstrap`：一次往返定登录态
+#
+# 为什么单独立一节：这是**公网首屏**唯一的认证请求。早先它是三次串行
+# 往返（`/me` 401 → `/refresh` → `/me`），公网单次 0.4~2 秒，于是
+# 用户看到"正在检查登录状态"停十秒（2026-09-26 报障）。
+# ======================================================================
+
+def test_bootstrap_reports_authenticated_with_live_session(
+    client: TestClient,
+) -> None:
+    """有会话时：一次请求直接给出身份 + 图形码判定，且**不轮换令牌**。"""
+    user_id = _register(client)
+    _activate(user_id)
+    _login(client, remember=True)
+    rt_before = client.cookies.get(COOKIE_REFRESH)
+
+    body = client.get("/api/v1/auth/bootstrap").json()
+
+    assert body["authenticated"] is True
+    assert body["renewed"] is False, "有有效会话时不该走续期"
+    assert body["username"] == USERNAME
+    assert body["session_id"], "必须带上当前会话 id"
+    assert EMAIL not in str(body), "接口不得返回明文邮箱"
+    assert body["login_mode"]["require_captcha"] is False
+    assert client.cookies.get(COOKIE_REFRESH) == rt_before, (
+        "有会话就轮换 remember token 会平白制造'重放'风险"
+        "（响应一丢，整条令牌家族被撤销）")
+
+
+def test_bootstrap_silently_resumes_without_session(client: TestClient) -> None:
+    """★ 需求核心：只剩"记住我"Cookie 时，**一次** bootstrap 就免密进入。
+
+    这一步等价于原来的 `/me`(401) → `/refresh` → `/me`(200) 三次往返。
+
+    ⚠️ 为什么用 `TestClient(client.app)` 新建一个客户端来模拟"关掉浏览器"：
+    `client.cookies.set()` 的默认 path 是 `/`，而 `moss_rt` 真实 path 是
+    `/api/v1/auth` —— 于是测试里会**同时存在两张同名 cookie**，
+    后续 `cookies.get("moss_rt")` 直接抛 `CookieConflict`。
+    那会看起来像"实现没换 cookie"，实际只是测试自己把 jar 搞脏了。
+    """
+    user_id = _register(client)
+    _activate(user_id)
+    _login(client, remember=True)
+    saved = client.cookies.get(COOKIE_REFRESH)
+    assert saved
+
+    fresh = TestClient(client.app)              # ← "关掉浏览器再打开"
+    fresh.cookies.clear()
+    fresh.cookies.set(COOKIE_REFRESH, saved, path=REFRESH_COOKIE_PATH)
+    response = fresh.get("/api/v1/auth/bootstrap")
+    body = response.json()
+
+    assert body["authenticated"] is True
+    assert body["renewed"] is True, "应报明本次是续期换来的会话"
+    assert body["username"] == USERNAME
+    header = " ".join(response.headers.get_list("set-cookie"))
+    assert COOKIE_SESSION in header, "续期后必须下发新的会话 Cookie"
+    # 续期轮换了令牌 → 下发的必须是**新的**那一张
+    assert saved not in header
+
+
+def test_bootstrap_without_any_cookie_is_not_authenticated(
+    client: TestClient,
+) -> None:
+    """什么都没带 → 明确回 `authenticated:false`，而不是 401。
+
+    这是前端敢用"不抛异常"写法的前提：未登录是**正常结论**。
+    """
+    response = client.get("/api/v1/auth/bootstrap")
+    assert response.status_code == 200, "未登录不该是错误码"
+    body = response.json()
+    assert body["authenticated"] is False
+    assert body["renewed"] is False
+    assert body["login_mode"]["require_captcha"] is False
+
+
+def test_bootstrap_replayed_token_is_not_authenticated_and_clears_cookies(
+    client: TestClient,
+) -> None:
+    """重放令牌 → 不进入应用，并**清掉 Cookie**，避免前端拿着废令牌反复试。"""
+    user_id = _register(client)
+    _activate(user_id)
+    _login(client, remember=True)
+    old = client.cookies.get(COOKIE_REFRESH)
+    assert old
+    # 正常轮换一次，让 old 变成"用过的旧令牌"
+    assert client.post("/api/v1/auth/refresh").status_code == 200
+
+    replay = TestClient(client.app)
+    replay.cookies.clear()
+    replay.cookies.set(COOKIE_REFRESH, old, path=REFRESH_COOKIE_PATH)
+    response = replay.get("/api/v1/auth/bootstrap")
+
+    assert response.json()["authenticated"] is False
+    cleared = " ".join(response.headers.get_list("set-cookie"))
+    assert f"{COOKIE_REFRESH}=" in cleared, "废令牌必须被清掉（下发删除指令）"
+    assert 'Max-Age=0' in cleared or 'max-age=0' in cleared
+
+
+def test_bootstrap_refresh_false_never_touches_remember_token(
+    client: TestClient,
+) -> None:
+    """`refresh=false` 时**只读**：即便有可续期的令牌也不换会话。
+
+    这条守的是"幂等只读"语义 —— 客户端如果想在不产生写操作的前提下
+    探一下登录态，必须真的没有写操作。
+    """
+    user_id = _register(client)
+    _activate(user_id)
+    _login(client, remember=True)
+    saved = client.cookies.get(COOKIE_REFRESH)
+
+    ro = TestClient(client.app)
+    ro.cookies.clear()
+    ro.cookies.set(COOKIE_REFRESH, saved, path=REFRESH_COOKIE_PATH)
+    response = ro.get("/api/v1/auth/bootstrap?refresh=false")
+
+    assert response.json()["authenticated"] is False
+    header = " ".join(response.headers.get_list("set-cookie"))
+    assert COOKIE_SESSION not in header, "只读模式不该下发任何新会话"
+    assert COOKIE_REFRESH not in header, "只读模式不该动 remember token"
+
+
+def test_bootstrap_disables_caching(client: TestClient) -> None:
+    """登录态**绝不能被缓存**（中间层/浏览器缓存住会串号）。"""
+    response = client.get("/api/v1/auth/bootstrap")
+    assert "no-store" in response.headers.get("cache-control", "")
+
+
+# ======================================================================
 # 会话自助：看设备 / 踢设备 / 登出
 # ======================================================================
 

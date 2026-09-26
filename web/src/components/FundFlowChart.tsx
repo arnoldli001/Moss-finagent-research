@@ -104,7 +104,13 @@ export default function FlowChart({
    * 纵向各自定标 —— 资金流(亿元) 与 价格(元)、量(股) 量纲差几个数量级，
    * 塞进同一根纵轴只会互相压扁（这也是用户说的"归一化或上下两幅图"里的后者）。
    */
-  const priceLines = useMemo(() => entities
+  /** 价格折线的配色：按实体顺序取用。**不复用涨跌色**（红涨绿跌）——
+ *  折线表达的是"这条线的身份"，不是"今天涨还是跌"；用涨跌色会让
+ *  同一条线在不同日子换颜色，反而看不出是哪只标的。 */
+const PRICE_COLORS = ["#4a9eff", "#d9a13b", "#2ea86e", "#d95c4a",
+                      "#a06cd5", "#22b8cf"];
+
+const priceLines = useMemo(() => entities
     .filter((entity) => !hidden.has(entity.code))
     .filter((entity) => entity.series.some((point) => point.close != null))
     .map((entity) => {
@@ -269,6 +275,19 @@ export default function FlowChart({
   const endDrag = () => { dragRef.current = null; };
 
   const ready = lines.length > 0 && domain !== null && dates.length > 0;
+
+  /**
+   * 图例里是否**所有线都被关掉**了（与"还没勾选任何实体"区分开）。
+   *
+   * 两种情况下 `lines` 都是空的、`ready` 都是 false，但用户该做的事完全相反：
+   * 一个要"去左边勾选"，另一个要"点「全显」恢复"。共用一句
+   * "左侧勾选板块/个股后…"会把已经勾好、只是把线全隐藏的人
+   * 指向一个他早就做完的动作上。
+   */
+  const allHidden = useMemo(
+    () => entities.length > 0
+      && entities.every((entity) => hidden.has(entity.code)),
+    [entities, hidden]);
   const hoverDate = hover ? dates[hover.index] : null;
 
   return (
@@ -298,7 +317,10 @@ export default function FlowChart({
 
       {!ready ? (
         <div className="empty-tip muted-text">
-          暂无可画的数据：左侧勾选板块/个股后，这里会叠加它们的资金流走势线。
+          {allHidden
+            ? `全部 ${entities.length} 条走势线已被隐藏 —— 点上方的图例或`
+              + "「全显」即可恢复（图例按钮现在是「全显」）。"
+            : "暂无可画的数据：左侧勾选板块/个股后，这里会叠加它们的资金流走势线。"}
         </div>
       ) : (
         <svg ref={svgRef}
@@ -429,31 +451,35 @@ export default function FlowChart({
                   </g>
                 ));
               })()}
-              {/* 蜡烛：多实体时用各自颜色描边（同一根轴上对比） */}
-              {priceLines.map((line) => line.points.map((point) => {
-                const index = dates.indexOf(point.date);
-                if (index < visible.start || index > visible.end) return null;
-                const slot = (W - PAD.left - PAD.right)
-                  / Math.max(1, visible.end - visible.start + 1);
-                const width = Math.max(1.5, Math.min(7, slot * 0.6));
-                const rising = point.close >= point.open;
-                const color = rising ? "#e06a5a" : "#2ea86e";   // 红涨绿跌（A股习惯）
-                const yOpen = yPrice(point.open);
-                const yClose = yPrice(point.close);
-                const top = Math.min(yOpen, yClose);
-                const height = Math.max(1, Math.abs(yClose - yOpen));
+              {/* ★ 价格：**连接成折线**（用户口径 2026-09-23：
+                  "板块资金流—资金流走势 下方坐标轴 关于价格的数据 要连接成折线"）。
+                  原来这里画蜡烛（high-low 细线 + 实心/空心矩形实体）。
+                  对**板块/指数**这类标的，开盘≈收盘，实体只有 1px 高，
+                  整排看起来就是"一条条小横杠"——既读不出趋势，也看不出拐点。
+                  改成收盘价折线后走势一眼可读；单日 OHLC 仍保留在点上的
+                  tooltip 里，信息一条没丢。 */}
+              {priceLines.map((line, li) => {
+                const color = PRICE_COLORS[li % PRICE_COLORS.length];
+                const pts = line.points
+                  .map((point) => ({ point, index: dates.indexOf(point.date) }))
+                  .filter(({ index }) => index >= visible.start
+                    && index <= visible.end);
+                if (pts.length === 0) return null;
                 return (
-                  <g key={`c-${line.entity.code}-${point.date}`}>
-                    <line x1={x(index)} x2={x(index)} y1={yPrice(point.high)}
-                          y2={yPrice(point.low)} stroke={color} strokeWidth="1" />
-                    <rect x={x(index) - width / 2} y={top} width={width}
-                          height={height} fill={rising ? color : "none"}
-                          stroke={color} strokeWidth="1">
-                      <title>{`${line.entity.name} ${point.date} 开${point.open} 高${point.high} 低${point.low} 收${point.close}`}</title>
-                    </rect>
+                  <g key={`p-${line.entity.code}`}>
+                    <polyline fill="none" stroke={color} strokeWidth="1.6"
+                      strokeLinejoin="round" strokeLinecap="round"
+                      points={pts.map(({ point, index }) =>
+                        `${x(index)},${yPrice(point.close)}`).join(" ")} />
+                    {pts.map(({ point, index }) => (
+                      <circle key={`pd-${point.date}`} cx={x(index)}
+                        cy={yPrice(point.close)} r="2" fill={color}>
+                        <title>{`${line.entity.name} ${point.date} 开${point.open} 高${point.high} 低${point.low} 收${point.close}`}</title>
+                      </circle>
+                    ))}
                   </g>
                 );
-              }))}
+              })}
             </g>
           )}
 

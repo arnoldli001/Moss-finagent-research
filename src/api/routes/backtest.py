@@ -19,6 +19,7 @@ from src.api.job_table import BACKTEST_RETENTION, purge_jobs
 from src.backtest.data import align_monthly, month_key
 from src.backtest.engine import CostConfig, result_to_dict, run_backtest
 from src.backtest.signals import TrendPEConfig
+from src.core.errors import brief
 from src.core.schemas import DataPoint
 
 router = APIRouter(prefix="/api/v1/backtest", tags=["backtest"])
@@ -130,7 +131,7 @@ async def _run_job(job: dict, runtime, body: BacktestRequest) -> None:
                 runtime.backend, indicator)
         except Exception as exc:  # noqa: BLE001 数据源失败转任务错误
             raise HTTPException(
-                status_code=502, detail=f"数据获取失败：{exc}") from exc
+                status_code=502, detail=f"数据获取失败：{brief(exc)}") from exc
 
         job["stage"] = "fetch_price"
         try:
@@ -138,7 +139,7 @@ async def _run_job(job: dict, runtime, body: BacktestRequest) -> None:
                 runtime.backend, quote_indicator)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
-                status_code=502, detail=f"数据获取失败：{exc}") from exc
+                status_code=502, detail=f"数据获取失败：{brief(exc)}") from exc
 
         pe_points = None
         pe_cached = False
@@ -149,7 +150,7 @@ async def _run_job(job: dict, runtime, body: BacktestRequest) -> None:
                     runtime.backend, f"PE(TTM):{code}")
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(
-                    status_code=502, detail=f"数据获取失败：{exc}") from exc
+                    status_code=502, detail=f"数据获取失败：{brief(exc)}") from exc
 
         job["stage"] = "aligning"
         bars = align_monthly(indicator_points, price_points, indicator, pe_points)
@@ -206,11 +207,14 @@ async def _run_job(job: dict, runtime, body: BacktestRequest) -> None:
         job["status"] = "done"
     except HTTPException as exc:
         job["status"] = "error"
-        job["error"] = str(exc.detail)
+        # detail 可能是结构化 dict（{"code","message"}），取其文案而非 str(dict)
+        d = exc.detail
+        job["error"] = (d.get("message", "") if isinstance(d, dict)
+                        else str(d))
         job["error_code"] = exc.status_code
     except Exception as exc:  # noqa: BLE001 兜底：任务内异常不逃逸
         job["status"] = "error"
-        job["error"] = f"回测执行异常：{exc}"
+        job["error"] = f"回测执行异常：{brief(exc)}"
         job["error_code"] = 500
     finally:
         job["stage"] = "done" if job["status"] == "done" else job["stage"]

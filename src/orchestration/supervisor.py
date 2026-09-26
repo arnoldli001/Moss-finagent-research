@@ -49,10 +49,20 @@ ALL_INSIGHT_AGENTS = ANALYSIS_AGENTS + INDUSTRY_AGENTS
 # 宏观问题只取与问法直接相关的词；行业命中后放开整组，以覆盖"细分环节"类提问
 TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
     "macro_core": ("美联储", "加息", "降息", "美股", "美债", "非农", "通胀", "PCE",
-                   "欧央行", "日本央行", "关税", "衰退", "利率决议", "鲍威尔", "就业数据"),
+                   "欧央行", "日本央行", "关税", "衰退", "利率决议", "鲍威尔", "就业数据",
+                   # 补齐（2026-09-26）：用户原话常常只用这些词，
+                   # 缺了它们会让"主题关键词为空 → 不拉任何新闻 → 信息层整体空跳过"。
+                   # 实测故障：问题里写了"美国说年内还会再加息一次"，
+                   # 但"加息"是"再加息"的子串、且没提"美联储"，
+                   # 旧实现按**精确词**匹配导致命中为空，A05/A06/A07 全部拿到零输入。
+                   "利率", "联邦基金", "FOMC", "货币政策", "缩表", "美债收益率",
+                   "美联储主席", "点阵图", "CPI", "核心CPI", "失业率", "就业",
+                   "经济数据", "加息预期", "降息预期", "美元", "美股三大指数"),
     "A13_tech": ("人工智能", "AI", "算力", "芯片", "半导体", "光模块", "CPO", "服务器",
                  "液冷", "PCB", "存储芯片", "消费电子", "数据中心", "国产替代", "先进封装",
-                 "HBM", "铜缆", "机器人", "大模型"),
+                 "HBM", "铜缆", "机器人", "大模型",
+                 # 补齐：用户说"AI产业链""产业链龙头"时也应命中科技组
+                 "产业链", "AI产业链"),
     "A14_consumer": ("消费", "白酒", "家电", "零售", "食品饮料", "免税", "旅游", "餐饮"),
     "A15_cyclical": ("煤炭", "有色", "钢铁", "化工", "石油", "原油", "铜价", "铝价",
                      "锂电", "航运", "天然气"),
@@ -116,7 +126,7 @@ _A_SHARE_LIQUIDITY_KEYWORDS = (
     "复盘", "明日", "后市", "股市", "上证", "创业板", "科创板", "双创",
     # —— 条件触发：短线/买卖/板块策略类问法 ——
     "短线", "买卖", "买入", "卖出", "加仓", "减仓", "建仓", "清仓",
-    "止损", "止盈", "低吸", "追涨", "轮动", "操作建议", "交易策略",
+    "止损", "止盈", "回踩", "追涨", "轮动", "操作建议", "交易策略",
 )
 
 
@@ -139,8 +149,13 @@ def append_liquidity_indicators(
         resolved += [i for i in _MARKET_LIQUIDITY_INDICATORS if i not in resolved]
         resolved += [i for i in _BOARD_LIQUIDITY_INDICATORS if i not in resolved]
     if any(kw.lower() in text for kw in _GLOBAL_LIQUIDITY_KEYWORDS):
-        if "fed:rate_prob:next" not in resolved:
-            resolved.append("fed:rate_prob:next")
+        # `fed:policy_range`（FRED 当前目标区间）是**可达**的那一个：
+        # 实测 CME（`fed:rate_prob:next` 的数据源）在本机网络 TCP 443 不通，
+        # 而 FRED 1.0~1.3s 可达且给到最新值（2026-09-25 区间 3.75%~4.00%）。
+        # 所以优先给 policy_range，rate_prob 作为补充（通了更好，不通也有兜底）。
+        for ind in ("fed:policy_range", "fed:rate_prob:next"):
+            if ind not in resolved:
+                resolved.append(ind)
     return list(dict.fromkeys(resolved))  # 保序去重（入参可能已含重复项）
 
 
@@ -172,17 +187,38 @@ def extract_topic_keywords(
     text = f"{target or ''} {query or ''}"
     low = text.lower()
     kws: list[str] = []
-    if analysis_type == "macro":
-        hit = [k for k in TOPIC_KEYWORDS["macro_core"] if k.lower() in low]
-        if hit:
+
+    def _add_macro() -> None:
+        hits = [k for k in TOPIC_KEYWORDS["macro_core"] if k.lower() in low]
+        if hits:
             # 加息相关报道常以"美联储/降息"表述，补充核心词提高召回
-            kws = list(dict.fromkeys(hit + ["美联储", "加息", "降息"]))
-    elif analysis_type == "industry":
-        routed = route_industry(text)
-        for aid in routed:
+            for k in list(dict.fromkeys(hits + ["美联储", "加息", "降息"])):
+                if k not in kws:
+                    kws.append(k)
+
+    def _add_industry() -> None:
+        """按问题文本路由行业组，命中即放开整组（覆盖"细分环节"类提问）。"""
+        for aid in route_industry(text):
             for k in TOPIC_KEYWORDS.get(aid, ()):  # type: ignore[arg-type]
                 if k not in kws:
                     kws.append(k)
+
+    if analysis_type == "macro":
+        _add_macro()
+    elif analysis_type == "industry":
+        _add_industry()
+    elif analysis_type in ("stock", "full"):
+        # ⚠️ 综合问题（full）**不能只按 analysis_type 取词**（2026-09-26 实测故障）：
+        # 用户问的是一句话里同时含美国加息 **和** A股AI产业链龙头的综合问题，
+        # LLM 规划器把它定成 analysis_type="macro"，于是旧的 if/elif 只走
+        # macro 分支、industry 组**根本没被评估**；又因为问题里写的是"再加息"
+        # 而没有"美联储"字样，macro 分支也命中为空 ——
+        # 最终 topic_keywords=[]，collect 节点据此**一个新闻都不拉**，
+        # A05/A06/A07 信息层拿到零输入全部空跳过，舆情/事件维度整体缺席。
+        #
+        # 既然问题文本本身既谈宏观又谈行业，这里就**两组都取**。
+        _add_macro()
+        _add_industry()
     return kws
 
 
@@ -264,6 +300,75 @@ def plan_run(
         "topic_keywords": auto_topic,
         "agents": agents + ["A17_recommend", "A18_audit"],
     }
+
+
+def _needs_code_suffix(indicator: str) -> bool:
+    """该指标是否必须带 6 位代码后缀才能被任何连接器支持。
+
+    依据 ``_CODE_SUFFIX_INDICATORS``（个股类指标）。裸名字（如 ``"PE(TTM)"``）
+    **没有任何连接器 supports** —— 连不上就是连不上，不是"数据缺失"。
+    """
+    bare = indicator.split(":", 1)[0]
+    return bare in _CODE_SUFFIX_INDICATORS
+
+
+def sanitize_indicators(
+    indicators: list[str], target: str, analysis_type: str,
+) -> tuple[list[str], list[str], list[str]]:
+    """修正 LLM 规划产出的指标契约，返回 (可用指标, 被丢弃, 被替换说明)。
+
+    修的是 2026-09-26 实测到的一个真实故障链：
+
+    用户问"请对当前A股**AI产业链各细分行业龙头**的估值及10月走势分析预测"，
+    LLM 规划器（light 层小模型）返回：
+
+        analysis_type = "macro", target = ""
+        indicators = [..., "stock_close", "PE(TTM)", "PB", "资产负债率", "流动比率"]
+
+    这些**裸个股指标**是契约违规 —— 个股指标必须拼 6 位代码
+    （``PE(TTM):300308``）。而 target 为空，下游补不出后缀，于是 A01 去 fetch
+    ``"PE(TTM)"``：**没有任何连接器 supports 它，瞬间 DataFetchError**。
+    用户看到的"AI产业链龙头估值数据缺失 / 估值无任何输入数据 / valuation_calc=数据不足"
+    全部源自这里 —— **本地库里明明躺着 82 只个股的 PE 与 80 只的 PB**（含最新交易日）。
+
+    两类处理：
+    1. **有 target 代码** → 补后缀（把 ``PE(TTM)`` 修成 ``PE(TTM):300308``）；
+    2. **无 target** → 丢弃裸指标，并**换成行业级估值**（申万截面 PE/PB），
+       因为"行业龙头的估值"在没有具体标的时，行业估值截面是唯一有数据可依的口径。
+       换掉而不是静默丢弃，是为了让分析层仍有估值素材、而不是空手（否则 A10
+       又会输出"估值数据不足"）。
+    """
+    code = target if re.fullmatch(r"\d{6}", target or "") else ""
+    usable: list[str] = []
+    dropped: list[str] = []
+    notes: list[str] = []
+    for ind in indicators:
+        if not _needs_code_suffix(ind):
+            usable.append(ind)
+            continue
+        # 已经带 6 位代码的指标**必须原样保留**：LLM 有时会在 query 里提到多只
+        # 个股并给出带后缀的指标，这时不能用 target 覆盖它 —— 那会把"分析 A 股"
+        # 悄悄改成"分析 target 那一只"（测试 `test_already_suffixed...` 守着这条）。
+        _, _, existing = ind.partition(":")
+        if re.fullmatch(r"\d{6}", existing):
+            usable.append(ind)
+            continue
+        if code:
+            fixed = f"{ind.split(':', 1)[0]}:{code}"
+            usable.append(fixed)
+            notes.append(f"{ind} → {fixed}（补标的代码）")
+            continue
+        dropped.append(ind)
+    if dropped:
+        # 无可解析标的时用行业估值截面兜底（这些指标有真实数据源与入库作业）
+        fallback = ["ind:sw_third_pe_ttm:all", "ind:sw_third_pb:all",
+                    "ind:sw_first_pe_ttm:all"]
+        added = [i for i in fallback if i not in usable]
+        usable += added
+        notes.append(
+            f"丢弃无标的的个股指标 {dropped}（缺 6 位代码，无连接器支持）"
+            f"，改用行业估值截面 {added}")
+    return usable, dropped, notes
 
 
 def _summary(output: AgentOutput) -> dict[str, Any]:
@@ -507,21 +612,34 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             except Exception:  # noqa: BLE001 LLM规划异常不阻断
                 llm_plan = None
         if llm_plan:
+            # 契约修正：LLM 常返回**裸个股指标**（"PE(TTM)"）且 target 为空，
+            # 而个股指标必须带 6 位代码后缀，否则没有任何连接器 supports 它 ——
+            # A01 会瞬间 DataFetchError，用户看到"估值数据缺失"。
+            # 详见 sanitize_indicators 的说明（2026-09-26 实测故障）。
+            requested = list(llm_plan["indicators"])
+            indicators, dropped, fix_notes = sanitize_indicators(
+                requested, llm_plan.get("target") or state.get("target", ""),
+                llm_plan["analysis_type"],
+            )
             topic_kw = extract_topic_keywords(
                 llm_plan["analysis_type"], llm_plan["target"], state["user_query"],
             )
             # LLM可能漏掉大盘流动性指标，按任务类型/问题关键词确定性补齐
             route_text = f"{llm_plan.get('target') or ''} {state['user_query']}"
             indicators = append_liquidity_indicators(
-                llm_plan["analysis_type"], route_text,
-                list(llm_plan["indicators"]),
+                llm_plan["analysis_type"], route_text, indicators,
             )
+            progress = ["Supervisor规划完成，开始数据采集…"]
+            if fix_notes:
+                progress = [f"规划修正：{n}" for n in fix_notes] + progress
+                logger.info("规划契约修正：%s", "；".join(fix_notes))
             return {
                 "plan": llm_plan["agents"],
                 "analysis_type": llm_plan["analysis_type"],
                 "target": llm_plan["target"] or state.get("target", ""),
                 "_planned_indicators": indicators,
                 "topic_keywords": topic_kw,
+                "progress": progress,
             }
         # 规则路由fallback
         plan = plan_run(state["analysis_type"], state["target"],

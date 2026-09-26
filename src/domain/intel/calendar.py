@@ -207,7 +207,12 @@ def fetch_earnings_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                 kind="earnings",
                 date=first[:10],
                 title=f"{row.get('股票简称')} 预约披露",
+                # `names` 与 `codes` **一一对应**：前端预览优先显示中文名。
+                # 用户口径（2026-09-25）："当前解禁股右侧未展开前的预览都是
+                # 6 位编码，必须转换成中文股票名。" —— 名字本来就在这一行里
+                # （标题就是用它拼的），没有理由让用户拿编码去别处查。
                 scope={"kind": "company", "codes": [code],
+                       "names": [str(row.get("股票简称") or "").strip()],
                        "industries": [], "company_count": 1},
                 certainty="scheduled",     # 公司预约，可改期
                 changes=changes,
@@ -243,6 +248,7 @@ def fetch_earnings_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                 date=first[:10],
                 title=f"{row.get('股票简称')} 预约披露",
                 scope={"kind": "company", "codes": [code],
+                       "names": [str(row.get("股票简称") or "").strip()],
                        "industries": [], "company_count": 1},
                 certainty="scheduled",
             ))
@@ -382,6 +388,12 @@ def fetch_unlock_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                             key=lambda s: (s.get("market_cap") or 0),
                             reverse=True)
             total = sum((s.get("market_cap") or 0) for s in stocks)
+            # ⚠️ `codes` 与 `names` **必须同源同序**：前端按 `names[i]` ↔ `codes[i]`
+            # 配对取值。两次独立推导列表（一次 `if s["code"]`、一次 `if s["name"]`）
+            # 只要有一只票缺名字就会整体错位一格 —— 那会把 A 公司的名字
+            # 安到 B 公司的代码上，比显示编码糟得多。所以先配对、再拆列。
+            listed = [(s["code"], s.get("name") or "")
+                      for s in stocks if s["code"]]
             events.append(CalendarEvent(
                 event_id=f"unlock_{d}",
                 kind="unlock",
@@ -391,7 +403,10 @@ def fetch_unlock_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                     "kind": "market",
                     "company_count": len(stocks),
                     "industries": [],
-                    "codes": [s["code"] for s in stocks if s["code"]],
+                    "codes": [code for code, _ in listed],
+                    # 与 `codes` 一一对应的中文名：预览直接用名字，
+                    # 不必让用户拿 6 位编码去别处查。
+                    "names": [name for _, name in listed],
                     # ★ 个股明细。**按市值倒序** —— 解禁影响最大的是最大的那几只，
                     # 用户展开先看到的应该是它们。
                     "stocks": stocks,
@@ -425,6 +440,7 @@ def fetch_unlock_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                 date=d,
                 title=f"{row.get('简称')} 解禁公告",
                 scope={"kind": "company", "codes": [code],
+                       "names": [str(row.get("简称") or "").strip()],
                        "industries": [], "company_count": 1},
                 # 公告是**公司披露**，解禁日以公告为准 —— 定为 scheduled
                 certainty="scheduled",

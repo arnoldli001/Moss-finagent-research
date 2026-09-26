@@ -29,7 +29,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.quant.dataset_store import DEFAULT_ROOT, DatasetStore  # noqa: E402
-from src.quant.download import DAILY_DATASETS, TushareDownloader  # noqa: E402
+from src.quant.download import (  # noqa: E402
+    DAILY_DATASETS,
+    DownloadReport,
+    TushareDownloader,
+)
 from src.quant.tushare_source import (  # noqa: E402
     TushareClient,
     TusharePermissionError,
@@ -110,11 +114,19 @@ def cmd_download(args: argparse.Namespace) -> int:
                     pd.bdate_range(pd.Timestamp(start), pd.Timestamp(end))]
         if args.max_days:
             days = days[-args.max_days:]        # 日历已升序 → 取最近 N 天
+        if args.namechange_only:
+            # 只补 ST 判定的数据源：不碰行情分区，几十秒就能跑完
+            print(f"只下载 namechange（{start}~{end}）")
+            return DownloadReport(results={
+                "namechange": await downloader.namechange(start, end,
+                                                          force=args.force)},
+                universe=args.universe)
         print(f"股票池={args.universe} 交易日 {len(days)} 个"
               f"（{days[0]}~{days[-1]}）；数据集 {len(datasets)} 个；"
               f"报告期 {len(periods)} 个")
         report = await downloader.download(
             start, end, datasets=datasets, periods=periods,
+            include_namechange=not args.no_namechange,
             force=args.force, days=days,
             progress=lambda text: print(f"  … {text}"))
         return report
@@ -388,6 +400,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="只下最近 N 个交易日（冒烟测试用）")
     download.add_argument("--fina", action="store_true",
                           help="同时下载 fina_indicator_vip（全市场财务横截面）")
+    download.add_argument("--no-namechange", action="store_true",
+                          help="不下载历史名称（namechange）—— 它只服务"
+                               "「剔除 ST」，默认跟随区间一起下")
+    download.add_argument("--namechange-only", action="store_true",
+                          help="只补历史名称（ST 判定用），不碰行情数据集")
     download.add_argument("--start-year", type=int, default=2000)
     download.add_argument("--end-year", type=int, default=2026)
     download.add_argument("--force", action="store_true", help="忽略缓存强制重下")

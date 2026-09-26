@@ -15,7 +15,7 @@
 
 同样是「VWAP 负偏离 5%」：
 
-- 在**震荡票**上是低吸机会（历史上这种偏离平均 2 小时内回归）；
+- 在**震荡票**上是回踩机会（历史上这种偏离平均 2 小时内回归）；
 - 在**单边下跌的趋势票**上是接飞刀（历史上偏离后继续偏离）。
 
 所以股性不只决定「档位给多宽」，还决定**哪些因子的权重该高**：
@@ -319,7 +319,7 @@ def analyze_character(
     bars: pd.DataFrame | None, *, code: str = "", name: str = "",
     mode: Mode = "intraday", template_override: str | None = None,
 ) -> CharacterProfile:
-    """日线 → 个股股性画像（含推荐权重与档位）。
+    """日线 → 个股股性画像（含预填权重与档位）。
 
     任何一项算不出来都走「不可用 + gap」而不是编一个数，
     理由见模块 docstring：股性直接决定权重，编出来的数会静默改变买卖信号。
@@ -393,7 +393,7 @@ def analyze_character(
         volume_activity=volume_activity if volume_activity is not None else 1.0,
         limit_up_freq=limit_up_freq)
 
-    # ---- 推荐模板与权重 ----
+    # ---- 预填模板与权重 ----
     template_key = template_override or _pick_template(
         grade=grade, regime=regime, limit_up_freq=limit_up_freq,
         volume_activity=volume_activity if volume_activity is not None else 1.0)
@@ -409,7 +409,7 @@ def analyze_character(
     levels = _suggest_levels(atr_pct=atr_pct, grade=grade) if mode == "intraday" else {}
 
     # ---- 人话说明 ----
-    regime_text = {"swing": "震荡型（均值回归占优，适合高抛低吸）",
+    regime_text = {"swing": "震荡型（均值回归占优，适合冲高回踩）",
                    "mixed": "混合型（震荡与趋势交替）",
                    "trend": "趋势型（单边推进，做T极易卖飞）"}[regime]
     notes.append(
@@ -431,8 +431,8 @@ def analyze_character(
     if mode == "intraday" and levels:
         notes.append(
             f"建议档位差 ≥ {levels['min_band_pct']:.1f}%、止损 {levels['stop_loss_pct']:.1f}%"
-            f"（该股 ATR 口径），低于此值的低吸/高抛会被双边摩擦成本吃光")
-    notes.append(f"推荐权重配方：{chosen.label}（股性微调后已归一化到100）")
+            f"（该股 ATR 口径），低于此值的回踩/冲高会被双边摩擦成本吃光")
+    notes.append(f"预填权重配方：{chosen.label}（股性微调后已归一化到100）")
 
     return CharacterProfile(
         code=code, name=name, available=True, mode=mode,
@@ -472,7 +472,7 @@ def character_score_from(*, dev_pct: float | None, atr_pct: float | None,
     price/vwap，是为了让「逐bar重放」能用同一支打分核：
     重放表里没有现成的 vwap 列，但有 `dev_pct`，口径完全一致。
 
-    符号与全模块一致：>0 对低吸有利。
+    符号与全模块一致：>0 对回踩有利。
     """
     if dev_pct is None or atr_pct is None or atr_pct <= 0:
         return None

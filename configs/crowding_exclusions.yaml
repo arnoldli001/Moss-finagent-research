@@ -1,0 +1,101 @@
+# 板块拥挤度功能的**剔除清单**（不显示 / 不下载 / 不算指标）
+#
+# ⚠️ 本文件由 `scripts/prune_crowding.py --emit-config` **生成**，
+# 代码全部由库里查得 —— 手写代码会把「三胎概念/食品安全/元宇宙」
+# 这类无关板块静默删掉（2026-09-22 差点犯）。要改清单请改脚本里的
+# 原始文本或 `FUZZY` 映射，然后重新生成，不要直接编辑本文件。
+#
+# 与 `sector_blacklist.yaml` 的分工：那是**主线池级**排除（不进
+# `ml_board`）；这是**拥挤度功能**排除。用户 2026-09-22 明确说的是
+# 「板块拥挤度功能里」，所以不写进黑名单 —— 那会顺带踢出主线打分池。
+#
+# 三个机制共用本清单：`refresh._drop_blacklisted`（停日更下载）、
+# `metrics.compute_all_metrics`（不算指标）、`db.query_metrics` /
+# `query_all_latest_water_level`（前端不显示）。`visible = 0` 是
+# 额外一步。只挡更新、不删历史。
+version: 1
+decided: "2026-09-22"
+count: 82
+entries:
+  - { code: "885521.TI", name: "粤港澳大湾区" }
+  - { code: "885739.TI", name: "股权转让(并购重组)" }
+  - { code: "885514.TI", name: "京津冀一体化" }
+  - { code: "885965.TI", name: "中俄贸易概念" }
+  - { code: "875235.TI", name: "肝炎概念" }
+  - { code: "885989.TI", name: "肝炎概念" }
+  - { code: "886026.TI", name: "POE胶膜" }
+  - { code: "875033.TI", name: "国企改革" }
+  - { code: "886021.TI", name: "国企改革" }
+  - { code: "865177.TI", name: "AIGC概念" }
+  - { code: "875258.TI", name: "AIGC概念" }
+  - { code: "886019.TI", name: "AIGC概念" }
+  - { code: "885742.TI", name: "摘帽" }
+  - { code: "875060.TI", name: "蓝筹地产股" }
+  - { code: "875188.TI", name: "生物医药B类" }
+  - { code: "885876.TI", name: "网红经济" }
+  - { code: "875164.TI", name: "自由贸易港" }
+  - { code: "885764.TI", name: "自由贸易港" }
+  - { code: "885598.TI", name: "新股与次新股" }
+  - { code: "871017.TI", name: "航空货运与物流" }
+  - { code: "875162.TI", name: "两会概念" }
+  - { code: "871019.TI", name: "海上运输" }
+  - { code: "875216.TI", name: "幽门螺杆菌概念" }
+  - { code: "885952.TI", name: "幽门螺杆菌概念" }
+  - { code: "873901.TI", name: "次新股" }
+  - { code: "875198.TI", name: "互联网出海" }
+  - { code: "875063.TI", name: "紫光系" }
+  - { code: "871018.TI", name: "客运航空公司" }
+  - { code: "885487.TI", name: "天津自贸区" }
+  - { code: "875039.TI", name: "雄安概念股" }
+  - { code: "871026.TI", name: "纺织服装与奢侈品" }
+  - { code: "871034.TI", name: "饮料" }
+  - { code: "875255.TI", name: "牙科医疗" }
+  - { code: "885926.TI", name: "牙科医疗" }
+  - { code: "875066.TI", name: "苹果概念" }
+  - { code: "885376.TI", name: "苹果概念" }
+  - { code: "865009.TI", name: "现代服务业" }
+  - { code: "875116.TI", name: "现代服务业" }
+  - { code: "871041.TI", name: "医疗保健技术" }
+  - { code: "885652.TI", name: "钛白粉概念" }
+  - { code: "875249.TI", name: "生物质能发电" }
+  - { code: "886005.TI", name: "生物质能发电" }
+  - { code: "885587.TI", name: "举牌" }
+  - { code: "875044.TI", name: "特斯拉" }
+  - { code: "875077.TI", name: "信息安全" }
+  - { code: "875234.TI", name: "食品添加剂" }
+  - { code: "871049.TI", name: "资本市场" }
+  - { code: "865134.TI", name: "SaaS概念" }
+  - { code: "875187.TI", name: "SaaS概念" }
+  - { code: "865050.TI", name: "物联网" }
+  - { code: "875052.TI", name: "物联网" }
+  - { code: "885312.TI", name: "物联网" }
+  - { code: "875228.TI", name: "京东概念" }
+  - { code: "875238.TI", name: "数字经济" }
+  - { code: "885976.TI", name: "数字经济" }
+  - { code: "871038.TI", name: "个人护理用品" }
+  - { code: "885663.TI", name: "证金持股" }
+  - { code: "865201.TI", name: "金融科技" }
+  - { code: "875170.TI", name: "金融科技" }
+  - { code: "875197.TI", name: "烟草" }
+  - { code: "885851.TI", name: "烟草" }
+  - { code: "865084.TI", name: "移动互联网" }
+  - { code: "875021.TI", name: "移动互联网" }
+  - { code: "871004.TI", name: "建筑材料" }
+  - { code: "881115.TI", name: "建筑材料" }
+  - { code: "865056.TI", name: "大数据" }
+  - { code: "875054.TI", name: "大数据" }
+  - { code: "865040.TI", name: "智慧城市" }
+  - { code: "875153.TI", name: "智慧城市" }
+  - { code: "885378.TI", name: "智慧城市" }
+  - { code: "875161.TI", name: "创投概念" }
+  - { code: "865131.TI", name: "腾讯概念" }
+  - { code: "875008.TI", name: "腾讯概念" }
+  - { code: "885779.TI", name: "腾讯概念" }
+  - { code: "865067.TI", name: "内地房地产" }
+  - { code: "875090.TI", name: "内地房地产" }
+  - { code: "875025.TI", name: "彩票概念股" }
+  - { code: "875089.TI", name: "纸业股" }
+  - { code: "871015.TI", name: "商业服务与用品" }
+  - { code: "875185.TI", name: "百货业" }
+  - { code: "886082.TI", name: "同花顺果指数" }
+  - { code: "886110.TI", name: "2026中报预增" }

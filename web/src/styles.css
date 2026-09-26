@@ -9,6 +9,8 @@
   --medium: #d9a13b;
   --low: #d95c4a;
   --radius: 8px;
+  /* 表格行分隔线：比 --border(#2c3742) 更淡，用作行间的"表格线"而不是框线 */
+  --table-line: rgba(139,152,165,0.16);
 }
 
 * { box-sizing: border-box; }
@@ -20,7 +22,102 @@ body {
   font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
 }
 
-.app { max-width: 1280px; margin: 0 auto; padding: 16px; }
+/*
+ * 界面缩放：让内容与字体随视口一起变大，而不是靠用户手动按 Ctrl+。
+ *
+ * ## 为什么需要它
+ *
+ * 原来 `.app` 是 `max-width: 1280px`。在 1920 宽的屏幕上内容只有 1280px，
+ * 两侧各留 320px 空白（合计 640px 被浪费）；用户的实际反馈是"浏览器放到 110%
+ * 才正好" —— 因为 110% 缩放把视口等效压到 ~1745px，布局里的**固定 px** 随之
+ * 等比放大，内容占比才看起来正常。
+ *
+ * 这个界面里 `font-size` 全是绝对 px（348 处，0 处 rem），所以**改根字号没用**
+ * —— px 不随根字号缩放。要复现"浏览器缩放"的效果只能用 `zoom`：它和浏览器
+ * 缩放一样，把元素连同布局与字体一起等比放大（Chrome/Edge/Safari/Firefox 126+
+ * 都支持）。字更大、内容占更满、右侧表格列不再被压扁。
+ *
+ * ## 缩放系数怎么定
+ *
+ * **不能用视口单位算**：实测 Chromium 的 `zoom` 属性**不解析 `vw`**
+ * （`zoom: calc(100vw / 1780)` 被算成 `zoom: 1`，完全不生效；`100%` 更糟，`zoom`
+ * 里的百分比是相对元素自身尺寸解析的，循环依赖）。所以只能用 `@media` 断点
+ * 给出阶梯值 —— 这也是"整页缩放"的标准做法（无需 JS，随窗口变化自动生效）。
+ *
+ * 基准是"让布局按 ~1780px 的视口来排"：
+ *
+ * | 视口宽 | zoom | 等效 12px 字号 |
+ * |---|---|---|
+ * | < 1780 | 1.00 | 12.0px |
+ * | ≥ 1780 | 1.06 | 12.7px |
+ * | ≥ 1920 | 1.08 | 13.0px |
+ * | ≥ 2048 | 1.10 | 13.2px |
+ * | ≥ 2300 | 1.15（上限） | 13.8px |
+ *
+ * 上限 1.15 防超宽屏把字放到失真（13.8px 仍在正文可读范围）；窄屏一律 1.00，
+ * 该由响应式断点处理，不是整体缩。
+ *
+ * ## 与 `position: fixed` 的关系（已实测）
+ *
+ * 工作草案里 `zoom` 会建立包含块，但 **Chromium 不会**：1920x1080 无头 Edge 里，
+ * `.app` 内 `position: fixed; inset: 0` 的元素测得 1881×987，与 `.app` 外的对照
+ * 探测元素完全一致，高度是视口高（987）而非文档高（3562）。所以模态遮罩、toast
+ * 这类浮层不受影响，仍相对视口定位。
+ *
+ * 另外 `zoom` 会等比放大内边距，所以内边距用 `1vw`：若写成
+ * `clamp(10px, 1vw, 16px)`，16px 会在 1920 屏上被再放大 1.08 倍，把算好的
+ * 内容宽又挤掉一截。
+ */
+.app {
+  zoom: 1;
+  /* 不再设 max-width：内容宽已随缩放增长，加固定上限会在宽屏上重新长出留白
+     （1920 屏上内容约 1742px，2048px 以内都没有留白） */
+  max-width: none;
+  margin: 0 auto;
+  /*
+   * 左右各留 3% 空白区。
+   *
+   * ## 取值演变（两次都是用户口径，别把历史丢了）
+   *
+   * | 时间 | 左右留白 | 依据 |
+   * |---|---|---|
+   * | 2026-09-21 | `padding: 1vw`（≈0） | 内容顶到屏幕两边，太挤 |
+   * | 2026-09-21 | `5%` | "左右各留 5% 空白区" |
+   * | 2026-09-25 | **`3%`** | "app-wide 左右显示区域再各扩大 2%" |
+   *
+   * 所以"扩大 2%"是**在 5% 的基础上**各减 2 个百分点 —— 留白 5% → 3%，
+   * 内容占宽从 90% 提到 94%（1920 屏上多出约 77px 可用宽度）。
+   *
+   * ## 横向为什么用 `%` 而不是 `vw`
+   *
+   * 这个类带 `zoom`，而 `zoom` 会**等比放大 `vw`**：`3vw` 在 1920 屏（zoom 1.08）
+   * 下渲染出来约是 3.24%。`%` 是相对**自身包含块**（= 视口宽）解析的，
+   * 缩放之后仍精确落在 3%。两者都写 3 看着一样，实测宽度差几十像素。
+   *
+   * ## 纵向保持 1vw
+   *
+   * 用户只要求左右；首屏高度本来就紧（做 T 面板一屏要放状态条+图+打分）。
+   * 要一起放宽只改这个值即可。
+   *
+   * ## 留白变窄会不会压坏内容
+   *
+   * 不会重叠、只会换行或出横向滚动条，依据三条（都已核对）：
+   *   ① 宽表都有 `overflow-x: auto` 包裹（`.health-table-scroll`、
+   *      `.etf-flow-signal-scroll`、拥挤度相关表等）；
+   *   ② 所有弹性行都是 `flex-wrap: wrap`（选股卡片的徽标、面板头、模式切换条）；
+   *   ③ 两栏骨架的主列是 `flex: 1 1 auto; min-width: 0`，被挤时可以正常收缩。
+   * 现在是**变宽**而不是收窄，只会更宽松，风险更低。
+   * `position: fixed` 的浮层（toast / 模态遮罩 / 抽屉遮罩）用 `inset: 0`，
+   * 按视口定位，不受这里的内边距影响。
+   */
+  padding: 1vw 3%;
+}
+
+/* 阶梯式整页缩放：字与内容一起变大（见上方说明为什么不用 vw 计算） */
+@media (min-width: 1780px) { .app { zoom: 1.06; } }
+@media (min-width: 1920px) { .app { zoom: 1.08; } }
+@media (min-width: 2048px) { .app { zoom: 1.10; } }
+@media (min-width: 2300px) { .app { zoom: 1.15; } }
 
 .header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; }
 .header h1 { margin: 0; font-size: 22px; }
@@ -58,6 +155,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .badge {
   font-size: 11px; padding: 2px 8px; border-radius: 10px; color: #fff;
+  /* 必须禁止换行：徽标是"一整块"信息，折成两行既难看又会被行高切掉
+     （实测"已熔断暂停"5 个字在窄列里被切成"已熔断暂"+"停"） */
+  display: inline-block; white-space: nowrap;
 }
 .conf-high { background: var(--high); }
 .conf-medium { background: var(--medium); color: #222; }
@@ -74,6 +174,47 @@ details summary { cursor: pointer; font-size: 12px; color: var(--accent); }
   text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
 }
 .audit-table th { color: var(--muted); font-weight: 500; }
+
+/*
+ * 通用数据表（.data-table）：表头/数据对齐 + 表格线 + 斑马纹。
+ *
+ * 这里原先**没有任何规则** —— 全站 14 张 .data-table 一直吃浏览器默认样式，
+ * 表现就是：没有一条分隔线、表头按内容换行（"中位延迟"折成两行后比内容还高，
+ * 看着和下面的数字对不上）、数字列左对齐而表头被撑到别处、Tushare 表整张溢出面板。
+ *
+ * 与 .qsel-result-table（用户口径 2026-09-18）保持同一套视觉语言：完整表格线 +
+ * 表头底色 + 斑马纹。行线用 --table-line（比 --border 更淡），既分得开又不抢眼。
+ */
+.data-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.data-table th, .data-table td {
+  /* 统一左对齐：表头与数据同一基线，纵向扫读不会错列 */
+  text-align: left;
+  vertical-align: middle;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--table-line);
+}
+.data-table th {
+  /* 表头是"一列的名字"，绝不允许折行 —— 折行会把表头顶到两行高，
+     视觉上就和第一行数据挤在一起了 */
+  white-space: nowrap;
+  color: var(--muted);
+  font-weight: 500;
+  background: rgba(255, 255, 255, 0.03);
+  border-bottom-color: var(--border);   /* 表头与数据行之间的分隔线加重一档 */
+}
+.data-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, 0.015); }
+.data-table tbody tr:hover { background: rgba(255, 255, 255, 0.05); }
+.data-table tbody tr:last-child td { border-bottom: none; }
+
+/* 数值列：表头与数据**同时右对齐**（对齐小数位/位数），等宽数字防抖动 */
+.data-table th.num, .data-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.data-table td.num { font-family: ui-monospace, Consolas, monospace; }
+/* 等宽列（代码/日期）：tabular-nums 让同一列的数字上下对齐 */
+.data-table td.mono { font-variant-numeric: tabular-nums; }
+
 .hash-list { list-style: none; padding: 0; font-size: 12px; }
 .hash-list li { padding: 2px 0; }
 code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
@@ -116,13 +257,31 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .markdown th, .markdown td { border: 1px solid var(--border); padding: 6px 10px; }
 
 /* 顶部视图切换 */
-.tabs { display: flex; gap: 6px; margin-left: auto; }
+.tabs { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap;
+  align-items: center; justify-content: flex-end; }
 .tab {
   background: transparent; color: var(--muted);
   border: 1px solid var(--border); min-width: auto;
   padding: 6px 14px; font-size: 13px; border-radius: 16px;
+  /* ★ 中文标签默认会在任意字符处折行 —— "投研分析"变成"投研分/析"两行，
+     页签高度参差、很难看（实测反馈）。标签是**短词**，任何时候都不该折行；
+     空间不够时应该换行的是"整排页签"，由 `.tabs` 的 flex-wrap 负责。 */
+  white-space: nowrap;
+  flex: none;
 }
 .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+/* 管理员控制台：与租户业务页签**视觉上分组**
+   （管理员看到的是系统管理，不该和"投研分析/量化交易"混成一排） */
+/* 管理员页签组。**故意不加左边框/左内距**：那分隔线原本是用来把管理员页签
+   和左边的"系统管理"分组标签隔开的，而那个标签已按用户口径删除 ——
+   留着分隔线就会在第一个页签（用户管理）左边多出一根孤立的竖线。
+   而且两套导航本来就互斥（`adminNav` 为真时租户页签根本不渲染），
+   不存在"需要隔开的两组"。 */
+.tabs-admin { /* 保留类名：后续管理台专属样式挂这里 */ }
+.tab-admin { border-color: rgba(217,161,59,0.55); color: var(--medium); }
+.tab-admin.active { background: var(--medium); color: #1a1205;
+  border-color: var(--medium); }
 
 /* 次要按钮 */
 .btn-ghost {
@@ -142,8 +301,25 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 }
 .stat-label { font-size: 12px; color: var(--muted); }
 .stat-value { font-size: 22px; font-weight: 600; }
-.sched-table { font-size: 13px; }
+.sched-table { font-size: 13px; table-layout: auto; }
 .sched-table td, .sched-table th { vertical-align: middle; }
+/*
+ * 列宽：让"状态"与"最近执行"一行放下，剩余空间全部让给"说明"。
+ *
+ * 手法是 `width: 1%` + `white-space: nowrap`：表格里宽度会按内容自动扩展，
+ * 所以 1% 等于"缩到刚好放下内容"，多出来的宽度自动归给说明列 —— 比写死 px
+ * 更稳（字号受整页缩放影响，写死会在 1.15 倍时又不够）。
+ *
+ * 原来这两列没设宽度也没禁换行，所以"已熔断暂停"被切成"已熔断暂"+"停"两行、
+ * 时间也被拆行；同时说明列被挤窄。
+ */
+.sched-status, .sched-last {
+  width: 1%; white-space: nowrap;
+}
+/* 手动运行按钮同样不该被折行 */
+.sched-table .btn-ghost { white-space: nowrap; }
+/* 说明列：占满剩余宽度，允许换行（它本来就长） */
+.sched-table td:nth-child(2) { min-width: 260px; }
 .run-success { background: var(--high); }
 .run-failed { background: var(--low); }
 .run-running { background: var(--accent); }
@@ -197,6 +373,12 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 /* ============ 事件告警 ============ */
 .muted-text { color: var(--muted); font-size: 12px; }
 .mono { font-family: ui-monospace, Consolas, monospace; }
+
+/* 龙头表「业务相关性」列：仅靠股价相关性入池的标出来。
+   ⚠️ 「龙头」本身是资金/动量口径（identify_leaders 不看业务），
+   这列的作用就是让「资金龙头」与「业务龙头」分得开 —— 不然用户会
+   按业务去理解一个纯资金口径的榜（2026-09-22 的氟化工/雅克科技）。 */
+.mainline-leader-weak-biz { color: var(--medium); font-style: italic; }
 
 /* 铃铛 */
 .alert-bell {
@@ -269,9 +451,21 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .alert-item.level-medium { border-left-color: var(--medium); }
 .alert-item.level-low { border-left-color: var(--muted); }
 .alert-item.read { opacity: 0.55; }
-.alert-item-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+/* 标题**必须换行到 2 行**（用户口径 2026-10-01："事件告警的每条内容显示不全，
+   最多大概只有 20 个字，不直观，需要点开看才行。"）。
+   ## 病因是 CSS 不是数据
+   实测 pilot 库 75 条告警的 title：中位数 24 字、最长 80 字。而 `.alert-item-title`
+   原来是 `white-space: nowrap` + ellipsis —— 在 `minmax(380px,1fr)` 的列表列里
+   再扣掉左侧 `方向·级别` 徽标，一行只装得下约 20 字，于是"数据是全的、
+   界面上却只剩开头"。用户看到的"显示不全"就是这一层的截断。
+   ## 为什么是 2 行而不是放开
+   左列表是"扫一眼挑一条"的地方（`.alert-items` 还有 `max-height: 62vh` 滚动），
+   不限行数会让几条长标题把一屏占满，反而更难扫。2 行 ≈ 50 字，已覆盖绝大多数标题。
+   `align-items: flex-start` 是配套的：徽标贴第一行，不跟着两行标题垂直居中。 */
+.alert-item-head { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 4px; }
 .alert-item-title { font-size: 13px; font-weight: 600;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; }
 .unread-dot { width: 7px; height: 7px; border-radius: 50%;
   background: var(--accent); margin-left: auto; flex-shrink: 0; }
 .alert-item-meta { font-size: 11px; color: var(--muted); }
@@ -311,34 +505,109 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .disclaimer { margin-top: 14px; font-size: 11px; color: var(--muted); line-height: 1.6; }
 .alerts-disclaimer { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(127,127,127,0.2); }
 
-/* ---- 市场环境条（指数量能 / 板块排行 / 海外映射） ---- */
+/* ---- 市场环境条（指数量能 / 板块排行 / 海外映射） ----
+   用户口径 2026-09-23：这一行**整体加高 + 行内文字全部大 2 号**
+   （原来 12px/11px 在整页里偏小，而「退潮期 / 缩量 3,706 亿 / 不做T降本 / 禁止追高」
+   是当天最该一眼看到的信息）。
+   ⚠️ 字号只在**本行内**放大：`.muted-text`（"市场环境："标签）与 `.mono`（数字）
+   都是全局类，所以用 `.market-strip` 作用域覆盖，不去改全局定义。 */
 .market-strip {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 8px 14px; font-size: 12px;
+  border-radius: var(--radius); padding: 12px 16px; font-size: 14px;
 }
+.market-strip .muted-text { font-size: 14px; }
 .market-chip {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 3px 10px; border-radius: 12px;
+  padding: 5px 12px; border-radius: 14px;
   background: rgba(255,255,255,0.04); border: 1px solid var(--border);
 }
 .market-chip b { font-weight: 600; }
-.market-chip em { font-style: normal; font-size: 11px; }
+.market-chip em { font-style: normal; font-size: 13px; }
 .overseas-chip { max-width: 100%; flex-wrap: wrap; }
 .overseas-item {
-  padding: 0 4px; border-left: 1px solid var(--border); font-size: 11px;
+  padding: 0 4px; border-left: 1px solid var(--border); font-size: 13px;
 }
 .overseas-input {
-  width: 210px; padding: 6px 10px; font-size: 12px;
+  width: 210px; padding: 6px 10px; font-size: 14px;
 }
 .board-input {
-  width: 200px; padding: 6px 10px; font-size: 12px;
+  width: 200px; padding: 6px 10px; font-size: 14px;
 }
+/* 决策徽标：情绪周期结论（XX期 · 量能 · 禁止追高）
+   —— 用户口径 2026-09-23，从底部"数据健康度"挪到市场环境行最右侧。
+   它是这一行里唯一"要我今天怎么做"的信息，所以给出比 chip 更强的对比度。 */
+.market-strip-spacer { flex: 1 1 auto; }
+.cycle-badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 5px 14px; border-radius: 14px; font-weight: 600; font-size: 14px;
+  border: 1px solid var(--border); background: rgba(255,255,255,0.04);
+  cursor: help; white-space: nowrap;
+}
+.cycle-badge .cycle-flag {
+  font-weight: 500; font-size: 13px; padding: 0 6px;
+  border-left: 1px solid rgba(127,127,127,0.35);
+}
+/* 「量能」那一段（缩量 1,180 亿 / 放量 320 亿）。
+ *
+ * 与周期阶段（`.cycle-stage`，白）和操作 flag（`.cycle-flag`）区分开：
+ * 周期说明"什么环境"、量能说明"环境里的燃料"、flag 才是"所以怎么做"。
+ * 用等宽字体让数字对齐，扫一眼能看出量级。 */
+.cycle-badge .cycle-turnover {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 13px; font-weight: 600; white-space: nowrap;
+}
+/* 徽标内文字配色 —— **两次用户口径，后者覆盖前者**：
+ *
+ *   第一次（2026-09-23）："退潮期、缩量放量、禁止追高这些内容文字换一下颜色，
+ *   白色和蓝色即可" → 阶段=白、量能/flag=蓝，解决"一行里四种颜色互相打架"。
+ *
+ *   第二次（2026-09-23，当前）："缩量 放量 禁止追高 的提示块改成红色字体"
+ *   → **只把这两段**改成红（用 `--low`，与 `.account-warn`、`.cycle-badge.veto`
+ *   的红同源），阶段仍是白色。
+ *
+ * ⚠️ 给后来改这块的人：这**不是**"忘了遵守只用白蓝"，而是这两段被单独点名要红。
+ * 它们都是风险提示（量能异常 / 不许追高），红字在这里是有语义的。
+ * 外框与底色仍按 ok/warn/veto 走，结论的严重程度不丢。
+ * ⚠️ 这几条必须写在 `.cycle-badge.ok/.warn/.veto` **之后**：它们与那三档特异性
+ * 相同（都是 0,2,0），靠书写顺序取胜。 */
+.cycle-badge.ok { color: var(--low); border-color: rgba(64,200,120,0.5);
+  background: rgba(64,200,120,0.12); }
+.cycle-badge.warn { color: var(--medium); border-color: rgba(240,160,32,0.55);
+  background: rgba(240,160,32,0.14); }
+.cycle-badge.veto { color: var(--high); border-color: rgba(240,80,80,0.6);
+  background: rgba(240,80,80,0.16); }
+.cycle-badge .cycle-stage { color: #ffffff; }
+.cycle-badge .cycle-turnover,
+.cycle-badge .cycle-flag { color: var(--low); }
 
 /* ============================================================
    多因子（策略回测 · 多因子模式）
    ============================================================ */
 .quant-panel { display: flex; flex-direction: column; gap: 16px; }
+
+/* 定位说明条：本页是「横截面因子研究」，不是个股回测。
+   实测的误读来源（"每个因子不该在指定个股上回测吗"），所以放在最上面。 */
+.quant-scope {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 10px 12px; font-size: 12px; line-height: 1.7;
+  border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--panel-2, rgba(127, 127, 127, 0.06));
+}
+.quant-scope-next {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+}
+
+/* 参数分两组：样本区间（用哪段历史）/ 检验口径（多严格算有效）。
+   两者性质不同 —— 后者不改因子怎么算。 */
+.quant-controls-group { margin-bottom: 12px; }
+.quant-controls-title {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; font-weight: 600; margin-bottom: 6px;
+}
+.quant-controls-title .muted-text { font-weight: 400; font-size: 11px; }
+.quant-controls-group .quant-controls { margin-bottom: 0; }
 
 .quant-status {
   display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
@@ -449,24 +718,27 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .quant-disclaimer { margin-top: 14px; font-size: 11px; }
 
 /* ============================================================
-   数据源健康度（能力矩阵 + 实测延迟排序）
+   数据源健康度（只剩实测延迟排序表）
    ============================================================ */
-.data-health-panel h3 { margin: 14px 0 8px; font-size: 13px; }
-.data-health-panel h3 .muted-text { font-weight: 400; font-size: 11px; }
 
-.health-chain { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
-.health-chain-row {
-  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px;
-}
-.health-chain-row > .muted-text { min-width: 74px; }
-.chain-node { display: inline-flex; align-items: center; gap: 6px; }
-.chain-node.first {
-  font-weight: 600; color: var(--accent);
-}
-.chain-arrow { color: var(--muted); margin: 0 2px; }
-.health-notes {
-  margin: 12px 0 0 18px; font-size: 11px; color: var(--muted); line-height: 1.7;
-}
+/*
+ * 列宽一律交给内容决定（table-layout: auto），不指定百分比。
+ *
+ * 这里试过 table-layout: fixed + col 百分比，想"表头宽度即列宽" —— 实测反而
+ * 更差：fixed 会把百分比按比例摊到每一列，于是 "分区"(4 位数字)、"滞后"("5 天")
+ * 各自拿到 120~160px，数字列之间大片留白，且余量随面板宽度变化，越宽越散。
+ * auto 布局下浏览器按内容算列宽，数字列天然贴合数字宽度，短列不会虚胖。
+ *
+ * 真正决定"表头是否对得上数据"的不是列宽，而是 **th 与 td 用同一个 text-align**
+ * —— 由下面的 .num / .center 类保证。
+ */
+.data-health-panel .data-table { min-width: 720px; }
+/* 极窄屏才出现的横向滚动容器；宽屏下内容自适应，不会出现滚动条 */
+.health-table-scroll { overflow-x: auto; }
+
+/* 状态/徽标列：居中，"正常/需更新"才对得上表头 */
+.data-health-panel .data-table th.center,
+.data-health-panel .data-table td.center { text-align: center; }
 
 /* ============================================================
    日K级别做T（量价体系）
@@ -563,7 +835,9 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   color: var(--medium);
 }
 
-.app-wide { max-width: 1760px; }
+/* 资金流 / 做T 这类宽表页面：缩放已由 `.app` 统一处理，这里不再单独限宽
+   （留着会在宽屏上重新长出留白） */
+.app-wide { max-width: none; }
 
 .intraday-root { display: flex; flex-direction: column; gap: 14px; }
 
@@ -578,14 +852,18 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   display: flex; flex-direction: column; gap: 12px;
 }
 .intraday-drawer {
-  flex: 0 0 246px; width: 246px;
+  /* 用户口径 2026-09-23："左侧自选股池的宽度和文字大小要调大一点，
+     可以挤压右侧的分时图等信息宽度" —— 246 → 320px。
+     ⚠️ `margin-right` 必须**同步**改成 -(宽度 + 12 的 gap)：它负责"收起时不占宽"，
+     漏改的话收起后会留一条空白（宽度加大后空白也跟着变大）。 */
+  flex: 0 0 320px; width: 320px;
   position: sticky; top: 12px;
   max-height: calc(100vh - 120px);
   display: flex; flex-direction: column;
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius);
   transform: translateX(-108%);
-  margin-right: -258px;                 /* 收起时不占宽度 */
+  margin-right: -332px;                 /* 收起时不占宽度 = 320 + 12(gap) */
   opacity: 0; pointer-events: none;
   transition: transform 0.18s ease, opacity 0.18s ease, margin-right 0.18s ease;
 }
@@ -597,12 +875,12 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .drawer-icon { font-size: 13px; line-height: 1; }
 .drawer-head {
   display: flex; align-items: center; gap: 6px;
-  padding: 8px 10px; border-bottom: 1px solid var(--border);
-  font-size: 13px;
+  padding: 9px 11px; border-bottom: 1px solid var(--border);
+  font-size: 14px;
 }
 .drawer-head .btn-ghost.tiny { min-width: auto; padding: 2px 8px; font-size: 11px; }
 .drawer-head .drawer-hide { margin-left: auto; }
-.drawer-status { margin: 6px 10px 0; font-size: 10px; }
+.drawer-status { margin: 6px 10px 0; font-size: 11.5px; }
 .watch-list {
   list-style: none; margin: 0; padding: 6px;
   overflow-y: auto; flex: 1 1 auto; min-height: 0;
@@ -623,17 +901,22 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   grid-template-areas: "name chg" "code score" "badge badge";
   align-items: center; text-align: left;
   background: transparent; color: var(--text); border: none;
-  border-radius: 6px; padding: 6px 8px; font-size: 12px; cursor: pointer;
+  border-radius: 6px; padding: 8px 10px; font-size: 14px; cursor: pointer;
 }
 .watch-row .watch-pick:hover { background: rgba(74,158,255,0.1); }
 .watch-name {
   grid-area: name; font-weight: 600;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.watch-code { grid-area: code; font-size: 10px; }
-.watch-chg { grid-area: chg; text-align: right; font-size: 12px; }
-.watch-score { grid-area: score; text-align: right; font-size: 10px; }
-.watch-row .sig-badge { grid-area: badge; justify-self: start; margin-top: 2px; }
+.watch-code { grid-area: code; font-size: 12px; }
+.watch-chg { grid-area: chg; text-align: right; font-size: 14px; }
+.watch-score { grid-area: score; text-align: right; font-size: 12px; }
+.watch-row .sig-badge { justify-self: start; }
+/* 信号徽标 + 估值标签同占 `badge` 行：右移到估值标签左侧。
+ * ⚠️ 两者**必须各占一个网格单元**（而不是都写 `grid-area: badge`）—— 写同一个
+ * 区域名会让它们叠在一起（实测就是估值标签直接盖住了「观望」）。 */
+.watch-row .watch-pick { grid-template-areas: "name chg" "code score" "badge val"; }
+.watch-row .val-tag { grid-area: val; justify-self: start; margin-top: 2px; }
 .watch-row .watch-remove {
   flex: 0 0 auto; min-width: 0; width: 20px; padding: 0;
   background: transparent; color: var(--muted); border: none;
@@ -660,11 +943,29 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   }
 }
 
-/* ---- 走势图口径切换条（紧贴图上方） ---- */
+/* ---- 走势图口径切换条 ---- */
 .mode-bar {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   font-size: 12px;
 }
+
+/* ---- 抬头 + 「周期」并排一行（用户口径 2026-09-23）----
+   原来两者是上下两行（抬头一行、周期条一行），在 1080p 上白吃掉一整行高度，
+   把下面的估值/分时图整体往下推。现在抬头占满剩余宽度、「周期」条贴在它**右侧**；
+   窄屏放不下时靠 flex-wrap 自动换行回落成两行，不需要额外的媒体查询断点。 */
+.intraday-head-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}
+.intraday-head-row .intraday-headline {
+  /* 框长 = **原长度的 65%**（用户口径 2026-09-23）。
+     原长度 = 行宽 − 周期条 − 间距（实测 1160 − 160 − 12 = 988），
+     65% ≈ 642px ≈ 行宽的 55%（周期条宽度固定，所以用行宽百分比近似即可）。
+     `min-width: max-content` 是安全垫：碰上更长的股票名时允许它撑到内容宽 ——
+     宁可略宽一点，也不能折行或裁字。 */
+  flex: 0 0 55%;
+  min-width: max-content;
+}
+.intraday-head-row .mode-bar { flex: 0 1 auto; min-width: 0; }
 .intraday-toolbar {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--border);
@@ -683,10 +984,24 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 12px 16px;
+  /* 抬头内的**基线字号**：16 → 14（用户口径 2026-09-23「内容字号小 2 号」）。
+     代码/涨跌幅那两个 mono span 没有自己的字号类，继承的就是这一档。 */
+  font-size: 14px;
+  /* 「大字」档：股价与**低吸/高抛/止损**共用（用户口径 2026-09-23：
+     档位三项要和股价一样大）。写成变量是为了以后调字号时不会只改一处、
+     两边不一致 —— 这两者"必须同号"是明确要求，不是巧合。 */
+  --hl-big: 20px;
 }
-.hl-name { font-size: 18px; font-weight: 600; }
-.hl-price { font-size: 22px; font-weight: 700; }
-.hl-levels { font-size: 12px; }
+.hl-name { font-size: 16px; font-weight: 600; }             /* 18 → 16（小 2 号） */
+.hl-price { font-size: var(--hl-big, 20px); font-weight: 700; }   /* 22 → 20（小 2 号） */
+.hl-levels { font-size: var(--hl-big, 20px); }              /* 10 → 20：与股价同号 */
+/* 「换手 x.xx%」用的是全局 .muted-text（12px，全站几百处在用，不能动它），
+   所以只在抬头这一层降一级。
+   ⚠️ `:not(.hl-levels)` 不能省：`.hl-levels` 自己就带着 `muted-text` 类
+   （`className="hl-levels mono muted-text"`），而 `.intraday-headline .muted-text`
+   的特异性(0,2,0) 高于 `.hl-levels`(0,1,0) —— 不排除就会把上面那条"与股价同号"
+   又压回 10px（改完实测才发现，记在这里免得下次再踩）。 */
+.intraday-headline .muted-text:not(.hl-levels) { font-size: 10px; }
 
 /* 自选股已改为左侧滑动窗口（见上方 .intraday-drawer / .watch-list）：
    旧的横向 chip 样式整套删除，避免"改了一处、另一处还在生效"的幽灵样式。 */
@@ -711,6 +1026,25 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .sig-hollow { background: transparent; border: 1px solid var(--accent); color: var(--accent); }
 .sig-none { background: var(--border); color: var(--muted); }
 
+/* 估值结论标签（自选列表行内，紧跟在信号徽标右侧）。
+ *
+ * 用户口径 2026-09-23：主区域整块「① 估值空间」面板移除，结论只留四档标签。
+ * 样式**刻意比信号徽标更弱**（描边+淡底、无实心填充）：
+ * 「观望/低吸做T·实心」是当轮要动手的信号，估值是背景属性 ——
+ * 两者一样抢眼，扫列表时就会先看到估值而不是信号。
+ * 档位配色沿用估值面板的语义（绿=有空间 → 红=透支），
+ * 与 `.hr-*`（面板版徽标）同色，切换过去不会认不出。
+ */
+.val-tag {
+  font-size: 10px; line-height: 1.5; padding: 1px 7px; border-radius: 8px;
+  white-space: nowrap; border: 1px solid transparent;
+}
+.val-ample { color: var(--high); border-color: rgba(46,168,110,0.55); background: rgba(46,168,110,0.12); }
+.val-moderate { color: var(--accent); border-color: rgba(74,158,255,0.5); background: rgba(74,158,255,0.12); }
+.val-stretched { color: var(--medium); border-color: rgba(240,160,32,0.55); background: rgba(240,160,32,0.12); }
+.val-expensive { color: var(--low); border-color: rgba(217,92,74,0.55); background: rgba(217,92,74,0.12); }
+.val-unknown { color: var(--muted); border-color: var(--border); }
+
 /* 左：估值空间（窄列）｜右：分时图与提示点（吃掉剩余全部宽度）
  *
  * 列顺序**故意**是"估值在前、图在后"：DOM 顺序是 估值 → 图（用户习惯先看结论、
@@ -718,15 +1052,26 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
  * 在前），结果图只拿到 360~460px、估值反而占满剩余宽度 —— 正是"分时图被挤得
  * 文字看不清"的根因。
  *
- * 估值给 minmax(320px, 400px)：再窄 PE/PB 那几行数字会换行；再宽就是白占图的宽度。
+ * 估值给 minmax(300px, 360px)：再窄 PE/PB 那几行数字会换行；再宽就是白占图的宽度。
  * 图给 minmax(0, 1fr)：1fr 而不是 auto，保证它一定能被压缩（否则窄屏溢出横向滚动）。
+ *
+ * 2026-09-23 用户要求「估值空间那个 sector 再窄一点，多给分时图与提示点空间」：
+ * 上限 400 → **360**、下限 320 → **300**。上限才是并排时的实际宽度，
+ * 所以图上实得约 40px（1668px 视口下约 2%）。
+ *
+ * ⚠️ 下限不敢再降：估值区里有张 5 列同业表（标的/PE/PB/涨跌幅/相对PE），
+ * 300px 减去 `.panel` padding 32px 与单元格 padding 12px×5 = 60px，
+ * 留给数字列约 180px（4×45px），标的列只剩约 70px ——
+ * 刚好够「名称换行 + 代码一行」。降到 280px 数字列就会开始换行。
  */
 .intraday-top {
-  display: grid; grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
+  display: grid; grid-template-columns: minmax(0, 1fr);
   gap: 14px; align-items: start;
 }
-/* 1320px 以下改上下堆叠：并排时图会窄于 ~880px，分时图的坐标标签就开始挤了 */
-@media (max-width: 1320px) { .intraday-top { grid-template-columns: 1fr; } }
+/* 用户口径 2026-09-23：左列「① 估值空间」整块移除后这里只剩分时图一张卡，
+ * 因此从"两列（300~360px + 1fr）"改成**单列铺满** —— 网格保留（不换成
+ * 普通 div）是为了将来再并排别的卡片时只改这一行的列定义。
+ * 原来的 1240px 断点是给"估值区 300px + 图"算的，单列后不再需要。 */
 .intraday-panel { margin-bottom: 0; }
 .panel-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
 .panel-head h2 { margin: 0; }
@@ -896,6 +1241,16 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   background: rgba(74,158,255,0.07); border-left: 3px solid var(--accent);
   padding: 8px 12px; border-radius: 0 6px 6px 0;
 }
+/* 判决句与「↻ 立即刷新 / 权重编辑」同一行（用户口径 2026-09-23）：
+   判决占面板宽的 **60%**（原来是整行），按钮贴它右侧；窄屏放不下自动换行。
+   行本身承担与下图之间的间距（判决句的下边距在这一行里归零）。 */
+.daily-verdict-row {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.daily-verdict-row .score-verdict {
+  flex: 0 0 60%; min-width: 0; margin-bottom: 0;
+}
 .score-table th.num, .score-table td.num { text-align: right; width: 92px; }
 .score-table td { vertical-align: top; }
 .factor-name { font-weight: 600; white-space: nowrap; }
@@ -958,16 +1313,13 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .pol-tag.pol-neu { background: var(--border); }
 
 /* ---- 数据健康度 ---- */
-.health-panel h3 { margin: 0 0 8px; }
-.health-row { display: flex; gap: 16px; flex-wrap: wrap; font-size: 11px; margin-bottom: 8px; }
-.health-attempts { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
-.attempt {
-  font-size: 10px; padding: 2px 8px; border-radius: 8px;
-  border: 1px solid var(--border); color: var(--muted);
-}
-.attempt.ok { color: var(--high); border-color: rgba(46,168,110,0.5); }
-.attempt.fail { color: var(--low); border-color: rgba(217,92,74,0.4); }
-.gap-list { margin: 0; padding-left: 18px; font-size: 11px; line-height: 1.7; }
+/*
+ * 数据源健康度：只剩实测延迟表（用户口径 2026-09-23）。
+ * 原先这块还有 链路示意 / 能力矩阵 / Tushare 表 / 仓库表 / notes，
+ * 以及做T面板里的 `.health-panel`（标题 + 三源行 + attempts 芯片 + 缺口清单）。
+ * 它们连同样的 CSS 一起删掉 —— 留着"没有元素会命中的规则"，
+ * 下次读样式的人会以为页面上还有这些块。
+ */
 
 
 /* ---- 单股票策略回测 ---- */
@@ -1146,15 +1498,27 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .weight-editor-note { flex: 1 1 auto; min-width: 220px; }
 .weight-editor .error-text { color: var(--low); font-size: 12px; }
 
-/* ---- 市场情绪周期条（做T环境温度 + 退潮期闸门） ---- */
+/* ---- 市场情绪周期（做T环境温度 + 退潮期闸门） ----
+ *
+ * 2026-09-23 用户要求：**从"分时图下方独立成条"挪到 `周期` 开关右侧、
+ * 同一水平高度，大小高度与它一致**。所以这里与 `.mode-bar` 协作：
+ *   `.mode-bar` 已经是 `display:flex; align-items:center; flex-wrap:wrap`，
+ *   周期条作为它的直接子元素即可同排；`margin-left:auto` 让它靠右对齐。
+ *
+ * ⚠️ **2026-09-23 同日又改**：日内分时那一侧的展示条被用户要求**整条删除**，
+ *   于是 `.cycle-strip` 现在**只剩权重编辑弹窗（`WeightProfileEditor`）在用**。
+ *   原来为日内分时那条写的两条规则也随之删掉（不再有任何引用）：
+ *     - `.cycle-strip .gate-text`（一票否决文案，日内分时专用）
+ *     - `@media (max-width:1400px) { .cycle-strip-stats … }`（统计细节窄屏收起）
+ *   保留 `.cycle-strip` 本身与下面的 `.muted-text` —— 弹窗仍在用。
+ */
 .cycle-strip {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  font-size: 12px; margin-bottom: 8px;
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px;
+  /* 与原位置的差异：贴在同一行里，所以不要下外边距、不要占满整行 */
+  margin-bottom: 0;
 }
-.cycle-strip .gate-text {
-  color: var(--low); font-weight: 600; flex-basis: 100%;
-}
-.cycle-strip .muted-text { flex: 1 1 320px; line-height: 1.6; }
+.cycle-strip .muted-text { flex: 0 1 auto; line-height: 1.6; }
 
 /* ---- 权重编辑：实时价格线影响面板 ---- */
 .badge-tag.live-badge { background: rgba(46,168,110,0.18); color: var(--high); }
@@ -1371,6 +1735,60 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   border: 1px solid var(--border); border-radius: 4px;
 }
 
+/* ============ 左侧抽屉：「自选 / 自定义板块」下拉 ============
+   板块与自选共用同一条抽屉：下拉换来源，下面列表跟着换内容
+   （用户口径 2026-09-21：板块要和自选"列一个位置"）。
+   下拉要吃掉剩余宽度 —— 板块名长短不一，固定宽度会截断中文名。 */
+.watch-source {
+  flex: 1 1 auto; min-width: 0;
+  padding: 2px 4px; font-size: 12px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+/* 抽屉里的就地表单（新建板块 / 加成分股）：竖排，窄抽屉里也能用 */
+.drawer-form {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 6px 10px 0; padding: 8px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: rgba(255,255,255,0.02);
+}
+.drawer-form-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.drawer-input {
+  flex: 1 1 auto; min-width: 0; width: 100%;
+  padding: 3px 6px; font-size: 12px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.drawer-form-row .drawer-input { width: auto; min-width: 44px; }
+.btn-ghost.danger { color: var(--high); }
+.btn-ghost.danger:hover:not(:disabled) { border-color: var(--high); }
+
+/* ============ 「全部加入板块」弹窗 ============ */
+.qsel-modal-backdrop {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px; background: rgba(0,0,0,0.5);
+}
+.qsel-modal {
+  width: min(560px, 100%); max-height: 80vh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 16px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+}
+.qsel-modal-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; font-size: 14px;
+}
+/* `.notice-close` 原本只在 `.notice-toast` 下定义，这里复用同一套观感 */
+.qsel-modal-head .notice-close {
+  flex: 0 0 auto; min-width: 0; width: 20px; height: 20px;
+  padding: 0; line-height: 1; font-size: 14px; cursor: pointer;
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.qsel-modal-head .notice-close:hover { color: var(--text); border-color: var(--muted); }
+
 /* 置顶按钮：置顶后高亮，且置顶行的整体色调略作区分（一眼看出"这些是我钉住的"） */
 .watch-pin {
   flex: 0 0 auto; min-width: 0; width: 22px; height: 22px; padding: 0;
@@ -1534,10 +1952,8 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 }
 .qsel-detail b { font-size: 13px; }
 .qsel-detail .data-table { width: auto; min-width: 320px; }
-.qsel-sector-form {
-  border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 8px 12px; display: flex; flex-direction: column; gap: 8px;
-}
+/* 注：`.qsel-sector-*`（板块管理卡片）已随「自定义板块」页签下线 ——
+   板块的新建/成分/删除搬到了左侧抽屉，那里的样式叫 `.drawer-form`。 */
 .qsel-form-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .qsel-input {
   padding: 3px 8px; font-size: 12px; min-width: 120px;
@@ -1545,12 +1961,6 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   border: 1px solid var(--border); border-radius: 4px;
 }
 .qsel-input.qsel-num { width: 64px; min-width: 64px; margin: 0 3px; }
-.qsel-sector-list { display: flex; flex-direction: column; gap: 8px; }
-.qsel-sector-card {
-  border: 1px solid var(--border); border-radius: var(--radius);
-  padding: 8px 12px; display: flex; flex-direction: column; gap: 8px;
-}
-.qsel-sector-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 /* ==================================================================
    擒牛线主图（日K做T）：口径条 + 用法状态条 + 读数条
@@ -1558,23 +1968,10 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
    用户 2026-09-18 口径：原来的蜡烛K线图下线，主图换成擒牛线五条档位线。
    Y 轴按线值定标（不并入K线极值），因此原本被极值压平的细节能看清。 */
 .niuline-wrap .chart-toolbar { flex-wrap: wrap; }
-.niuline-meta {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  font-size: 11px; margin: 2px 0 6px;
-}
-.niuline-variant {
-  padding: 1px 7px; border-radius: 9px; font-size: 11px;
-  border: 1px solid var(--border); color: var(--muted);
-}
-.niuline-variant.v-stock {
-  color: var(--accent); border-color: rgba(74,158,255,0.55);
-  background: rgba(74,158,255,0.10);
-}
-.niuline-variant.v-index {
-  color: var(--medium); border-color: rgba(240,160,32,0.55);
-  background: rgba(240,160,32,0.10);
-}
-.niuline-note { color: var(--medium); }
+/* 注：原来这里还有 `.niuline-meta` / `.niuline-variant` / `.niuline-note` 三条样式，
+   对应界面上的"口径条"（变体名、CBX 公式、N/M 参数、退回口径原因）。
+   用户口径 2026-09-23：那些属于核心机密，不再显示 —— 样式一并删除，
+   免得以后有人以为"只是没渲染"又把它们挂回去。 */
 .niuline-stance {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 5px 8px; margin-bottom: 6px;
@@ -1599,6 +1996,85 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 }
 .niuline-readout .up { color: var(--low); }
 .niuline-readout .down { color: var(--high); }
+
+/* ---- 日K主图的十字光标浮层读数（用户口径 2026-09-23）----
+   鼠标在图上时要实时给出：X 轴日期、Y 轴价格（光标高度对应的价）、
+   以及该日K 的涨跌幅/最高/最低。浮层跟着鼠标走，贴边时由组件翻到另一侧。
+   `pointer-events: none` 必须留着 —— 否则浮层自己会吃掉 mousemove，
+   光标一移到框上就"卡"在框边缘。 */
+.niuline-wrap { position: relative; }
+.niuline-hover {
+  position: absolute; z-index: 6; pointer-events: none;
+  min-width: 168px; padding: 6px 9px;
+  background: rgba(15, 20, 25, 0.95);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-size: 11px; line-height: 1.7;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+.niuline-hover-date { color: var(--muted); margin-bottom: 2px; }
+.niuline-hover-row { display: flex; justify-content: space-between; gap: 14px; }
+.niuline-hover b { color: var(--accent); }
+.niuline-hover .up { color: var(--low); }
+.niuline-hover .down { color: var(--high); }
+
+/* ---- 区间测量结果框（日K主图拖拽框选，用户口径 2026-09-23）----
+   比光标浮层略宽（一列"标签 + 值"读起来顺），位置由组件算好后内联给出。 */
+.niuline-measure {
+  position: absolute; z-index: 7; width: 236px; padding: 6px 9px;
+  background: rgba(15, 20, 25, 0.96);
+  border: 1px solid var(--accent); border-radius: 6px;
+  font-size: 11px; line-height: 1.7;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+}
+.niuline-measure-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 2px; color: var(--muted);
+}
+.niuline-measure-close {
+  background: transparent; color: var(--muted); border: none;
+  min-width: 0; padding: 0 2px; font-size: 13px; line-height: 1;
+  cursor: pointer; border-radius: 4px;
+}
+.niuline-measure-close:hover { color: var(--text); background: rgba(255,255,255,0.08); }
+.niuline-measure b { color: var(--accent); }
+.niuline-measure .up { color: var(--low); }
+.niuline-measure .down { color: var(--high); }
+/* 工具栏的「区间测量」开关：按下态要看得出来（否则用户不知道拖拽为什么变成了框选） */
+.chart-btn.active {
+  border-color: var(--accent); color: var(--accent);
+  background: rgba(74,158,255,0.14);
+}
+
+/* ---- 情绪周期五线图（竞价选股池上方，用户口径 2026-09-23）----
+   口径见《情绪周期表的用法》；只统计主板。图例配色沿用文档那张图的图例。 */
+.auction-cycle-legend {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  font-size: 11px; margin-bottom: 4px;
+}
+.auction-cycle-key { display: inline-flex; align-items: center; gap: 5px; }
+/* 可点选隐藏的图例（大肉/大面/连板数）：按钮要看起来像图例，但能看出可点 */
+.auction-cycle-key.is-btn {
+  border: 1px solid transparent; border-radius: 4px; padding: 1px 5px;
+  font: inherit; font-size: 11px; color: var(--text); background: transparent;
+  cursor: pointer;
+}
+.auction-cycle-key.is-btn:hover {
+  border-color: var(--border); background: rgba(255,255,255,0.06);
+}
+.auction-cycle-key.is-off { opacity: 0.55; }
+.auction-cycle-key.is-off .auction-cycle-name { text-decoration: line-through; }
+.auction-cycle-key i,
+.auction-cycle-hover i {
+  display: inline-block; width: 9px; height: 3px; border-radius: 2px;
+}
+.auction-cycle-key em { font-style: normal; font-size: 10px; }
+.auction-cycle-hover {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  font-size: 11px; margin-top: 2px;
+}
+.auction-cycle-hover span { display: inline-flex; align-items: center; gap: 5px; }
+.auction-cycle-hover b { color: var(--accent); }
+.auction-cycle-gaps { font-size: 11px; margin-top: 4px; opacity: 0.85; }
 
 /* ==================================================================
    板块概念拥挤度（资金流监控面板第三个页签）
@@ -1638,44 +2114,123 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 }
 .crowding-alert-head h3 { margin: 0; font-size: 13px; }
 .crowding-alert-empty { padding: 6px 0; font-size: 12px; color: var(--muted); }
-.crowding-alert-list, .crowding-watch-list {
+.crowding-alert-list {
   list-style: none; margin: 6px 0 0; padding: 0;
   display: flex; flex-direction: column; gap: 2px;
 }
-.crowding-alert-item, .crowding-watch-item {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 4px 8px; border-radius: 4px; font-size: 12px;
+/* 窄屏/长表：整张表纵向滚动 + 横向滚动，表头在纵向滚动时**冻结在顶部**。
+   表头能 sticky 的前提是这里真的有纵向滚动（max-height 生效）——
+   只写 overflow-x 时容器不是纵向滚动容器，sticky 会看着"没生效"。 */
+.crowding-alert-scroll {
+  overflow: auto;
+  max-height: var(--crowding-table-h, 620px);
 }
+
+/* 表头与数据行**共用**同一份列宽（由组件里的 GRID 常量注入 --crowding-grid）。
+   两者都必须是 grid 才能严格对齐 —— flex 是每行各自计算宽度，表头对不上。
+   行内元素一律"一个元素 = 一列"，不要再塞 flex 占位符，否则列会串位。 */
+.crowding-alert-header, .crowding-alert-item {
+  display: grid;
+  grid-template-columns: var(--crowding-grid);
+  align-items: center;
+  /* 列间距 16px：置顶/删除两个按钮紧挨着板块名，间距小了文字会显得挤 */
+  gap: 16px;
+  min-width: max-content;
+}
+.crowding-alert-header {
+  /* 表头冻结：容器（.crowding-alert-scroll）带 max-height + overflow:auto，
+     所以纵向滚动时表头一直吸在顶部。必须有**不透明底色**，否则下面的行会
+     透出来糊在一起。 */
+  position: sticky; top: 0; z-index: 3;
+  background: var(--bg, #0f1419);
+  padding: 5px 10px;
+  font-size: 11px; color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+/* 数值列一律右对齐 + 等宽数字：表头与数据用同一个对齐方式才不会看着错位 */
+.crowding-hcell, .crowding-hsort { text-align: right; white-space: nowrap; }
+.crowding-hcell.left, .crowding-hsort.left { text-align: left; }
+/* 板块列：表头与名称都居中，两者对齐口径一致 */
+.crowding-hcell.center, .crowding-hsort.center { text-align: center; }
+/* 可排序列头：长得像表头而不是按钮，点击区域铺满整列 */
+.crowding-hsort {
+  min-width: 0; padding: 0; font-size: 11px; font-family: inherit;
+  background: transparent; border: none; color: var(--muted); cursor: pointer;
+}
+.crowding-hsort:hover { color: var(--accent); }
+.crowding-sort-arrow { margin-left: 3px; font-size: 9px; color: var(--accent); }
+
+/* 数据行：每行下加一条浅分隔线，读起来像表格而不是一堆散行 */
+/* 置顶/删除/查看详情三类按钮在各自格子里居中：
+   格子比按钮文字宽，左对齐会让按钮看着贴住左邻列、右边却空一截。 */
+.crowding-pin, .crowding-del { justify-self: center; }
+.crowding-alert-item > button.btn-ghost.tiny { justify-self: center; }
+
+.crowding-alert-item {
+  padding: 6px 10px; font-size: 12px;
+  border-bottom: 1px solid var(--table-line, rgba(139,152,165,0.16));
+}
+.crowding-alert-item:last-child { border-bottom: none; }
+.crowding-alert-item > * { min-width: 0; }
+/* 右对齐的数值格（排名/水位/平滑/近6年最高/成交额/4 个指标）。
+   格子里有的元素默认左对齐、有的被 .crowding-water 设了右对齐，混着来就会
+   和表头对不上 —— 统一走这一个类。 */
+.crowding-num, .crowding-water, .crowding-metric-value, .crowding-rank {
+  text-align: right; white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* 行左侧的状态色用 inset 阴影而不是 border-left：border 会占掉 3px 宽度，
+   让这一行的 grid 内容整体右移、和表头错位 3px。 */
 .crowding-alert-item.tone-high {
-  background: rgba(224,90,80,0.16); border-left: 3px solid var(--high);
+  background: rgba(224,90,80,0.16); box-shadow: inset 3px 0 0 var(--high);
 }
 .crowding-alert-item.tone-warn {
-  background: rgba(240,160,32,0.13); border-left: 3px solid var(--medium);
+  background: rgba(240,160,32,0.13); box-shadow: inset 3px 0 0 var(--medium);
 }
-.crowding-watch-item.tone-high { border-left: 3px solid var(--high); }
-.crowding-watch-item.tone-warn { border-left: 3px solid var(--medium); }
 .crowding-alert-name {
   background: transparent; border: none; color: var(--text); cursor: pointer;
-  min-width: auto; padding: 0; font-size: 12px; font-weight: 600;
+  min-width: auto; padding: 0 6px; font-size: 12px; font-weight: 600;
+  text-align: center; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis;
   text-decoration: underline dotted rgba(139,152,165,0.55);
 }
 .crowding-alert-name:hover { color: var(--accent); }
-.crowding-water { font-weight: 600; }
+/* 板块代码列（板块名左侧）：等宽字体 + 居中，和「板块」列同一对齐口径 */
+.crowding-code {
+  font-size: 11px; color: var(--muted);
+  text-align: center; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.crowding-rank { text-align: right; white-space: nowrap; }
+.crowding-water { font-weight: 600; text-align: right; white-space: nowrap; }
 .crowding-water.tone-high { color: var(--high); }
 .crowding-water.tone-warn { color: var(--medium); }
 .crowding-water.tone-none { color: var(--muted); }
 /* 总览散点 / 详情 */
 .crowding-overview { display: flex; flex-direction: column; }
+/* 散点上标出的板块名（成交额 > 10 亿那些）：小字 + 同底色描边，
+   压在网格线和其它圆点上也能读清，又不抢散点本身的视觉 */
+.crowding-point-label {
+  paint-order: stroke; stroke: var(--bg, #0f1419); stroke-width: 2.5px;
+  stroke-linejoin: round;
+}
 .crowding-hover {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   font-size: 11px; margin-top: 4px; padding: 3px 6px;
   border: 1px solid var(--border); border-radius: 4px;
 }
 .crowding-detail { display: flex; flex-direction: column; }
-/* 自选池 */
-.crowding-watchlist {
-  border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px;
+/* ---- 详情图的十字轴（跟随鼠标，显示 X 日期 + Y 读数） ---- */
+/* 日期标签加描边底：压住曲线也读得清 */
+.crowding-crosshair-date {
+  paint-order: stroke; stroke: var(--bg, #0f1419); stroke-width: 3px;
+  stroke-linejoin: round;
 }
+/* 右侧读数气泡：底色与面板一致，避免和网格线糊在一起 */
+.crowding-crosshair-tag {
+  fill: var(--panel, #1a2129); stroke: var(--border); stroke-width: 0.8;
+}
+.crowding-crosshair-readout { color: var(--accent); font-weight: 600; }
 .crowding-search { position: relative; flex: 1 1 260px; min-width: 220px; }
 .crowding-search .qsel-input { width: 100%; }
 .crowding-suggest {
@@ -1699,13 +2254,74 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
    ==================================================================
    结构：运行状态条 → 运行摘要 → 选股池 → 差一点 → 个股详情 → 落选区。 */
 .quant-tab-root { display: flex; flex-direction: column; }
+
+/* ---- 顶部一级模块页签：量化选股 · 竞价选股 · 做T辅助（并列） ----
+   为什么放在页面最顶部、而不是各自的周期条里：这三个是**同级模块**
+   （前两个组合级、做T辅助个股级）。2026-09-23 之前「量化选股」混在做T的
+   「周期」条里当第三种周期、「竞价选股」紧挨着它 —— 于是"周期口径"和
+   "独立模块"长得一样，用户反馈层级混乱，要求把三者并列到顶部。
+   底部分隔线是关键：它把"一级模块"和模块内部的控制条（如 .mode-switch）
+   从视觉上分开；胶囊样式沿用头部导航的 .tab 口径（同一套交互语言）。 */
+.quant-modules {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px; padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+  /* 用户口径 2026-09-23：这三个子页签（量化选股/竞价选股/做T辅助）
+     要**居中**显示，原来靠左。 */
+  justify-content: center;
+}
+.quant-module {
+  background: transparent; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 18px;
+  min-width: auto; padding: 7px 18px; font-size: 14px; cursor: pointer;
+}
+.quant-module:hover { color: var(--text); border-color: var(--accent); }
+.quant-module.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* 模块页签右侧的风险提示（用户口径 2026-09-23，原文照抄）。
+   用 `margin-left:auto` 顶到行尾；字号比页签小一档、颜色更淡 ——
+   它是免责声明而不是操作入口，不能和"量化选股 / 竞价选股 / 做T辅助"抢注意力。
+   窄屏（页签占满一行后）它会换到第二行，并被 `margin-left:auto` 推到**右端** ——
+   实测这个位置读起来仍然顺（贴着页签块的下缘），比孤零零的左侧更自然。
+   ⚠️ 类名与 `.quant-disclaimer`（多因子面板底部那条，`QuantFactorPanel.tsx`）**刻意分开**：
+   同名会让 `margin-top:14px` 把这条顶下去、也会把 `margin-left:auto` 泄漏给那个段落。 */
+.quant-tabs-disclaimer {
+  margin-left: auto; font-size: 12px; color: var(--muted);
+  letter-spacing: 0.2px; opacity: 0.9;
+}
+
 .auction-root { display: flex; flex-direction: column; gap: 10px; }
-.auction-head {
-  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-  padding: 8px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+/* 调度状态 + 「↻ 刷新」「▶ 重跑一次」：跟在「竞价选股池（n）」标题那一行的最右端
+   （用户口径 2026-09-23，原来是页面顶部独立一条带边框的横条，标题左边空一大片）。
+   `.panel-head > .muted-text` 自带 margin-left:auto，所以这一组自然被顶到最右。 */
+.auction-head-actions {
+  display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-left: 4px;
+  /* 与左边的「范围：…」说明拉开一道分隔线，免得两段小字连成一片 */
+  padding-left: 10px; border-left: 1px solid var(--border);
 }
 .auction-status { font-size: 12px; color: var(--muted); }
 .auction-status.live { color: var(--accent); }
+/* 「刷新」的可见反馈（用户口径 2026-09-22：点了看不出变化）。
+   比状态文字更淡一档，避免和「最近一次 … done」抢注意力。 */
+.auction-refreshed { font-size: 11px; opacity: 0.8; white-space: nowrap; }
+/* ---- 手动关注列表（用户口径 2026-09-22，紧贴选股池下方）---- */
+.auction-watch-add { display: flex; align-items: center; gap: 8px; padding: 0 12px 8px; }
+.auction-watch-input {
+  width: 160px; padding: 4px 8px; font-size: 12px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: transparent; color: var(--text);
+}
+.auction-watch-list {
+  list-style: none; margin: 0; padding: 0 12px 8px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.auction-watch-item {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 6px 10px; display: flex; flex-direction: column; gap: 3px;
+}
+.auction-watch-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+/* 操作建议：≤50 字由**后端**截断，这里只保证不换行挤爆 */
+.auction-watch-advice { margin: 0; font-size: 12px; line-height: 1.5; }
 .auction-meta {
   display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px;
 }
@@ -1713,6 +2329,64 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .auction-gaps { font-size: 12px; }
 .auction-gaps summary { cursor: pointer; color: var(--muted); }
 .auction-gaps ul { margin: 4px 0 0 18px; padding: 0; }
+
+/* ---- 情绪周期阶段指南（温度后面、选股池上方）----
+   内容出自 skill 原文，可能很长（action 上百字、判据十几条），
+   所以三栏并列 + 判据收进 details，保证不把选股池挤出首屏。 */
+.auction-guide .panel-head h3 { display: flex; align-items: baseline; gap: 6px; }
+/* 情绪周期阶段指南右侧的「发酵题材」（用户口径 2026-09-22）。
+   放在面板头的右端：`panel-head` 是 flex，这里用 auto 左边距顶到最右。
+   内容可能较长（题材名 + 家数 + 最高板 + 龙头），所以允许换行、不挤掉标题。 */
+.auction-ferment {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-left: auto; font-size: 12px;
+}
+.auction-ferment-tag {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  padding: 2px 8px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+/* 第一名（资金最集中/梯队最高的那个）实心强调，与"择股方向"标签同一套视觉语言 */
+.auction-ferment-tag.best {
+  border-color: var(--accent); color: var(--text);
+  background: rgba(74,158,255,0.14);
+}
+.auction-ferment-tag small { font-size: 10px; color: var(--muted); }
+.auction-ferment-tag.best small { color: var(--text); opacity: 0.85; }
+.auction-guide-grid {
+  display: grid; gap: 8px; padding: 0 12px 8px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+.auction-guide-card {
+  display: flex; flex-direction: column; gap: 5px;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 10px; font-size: 12px; line-height: 1.65;
+}
+.auction-guide-card > b { font-size: 12px; color: var(--accent); }
+.auction-guide-card p { margin: 0; }
+.auction-guide-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.auction-guide-tag {
+  padding: 1px 7px; font-size: 11px; border-radius: 10px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.auction-guide-tag.best {
+  border-color: var(--accent); color: var(--text);
+  background: rgba(74,158,255,0.14);
+}
+.auction-guide-risk { margin: 0; padding-left: 16px; }
+.auction-guide-risk li { color: var(--high); }
+.auction-guide-more { padding: 0 12px 8px; font-size: 12px; }
+.auction-guide-more summary { cursor: pointer; color: var(--muted); }
+.auction-guide-def { margin: 6px 0; line-height: 1.7; }
+.auction-guide-indicators {
+  margin: 4px 0 0; padding: 0; list-style: none;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.auction-guide-indicators li {
+  display: flex; flex-direction: column; gap: 1px;
+  border-left: 2px solid var(--border); padding-left: 8px;
+}
+.auction-guide-indicators li > b { color: var(--text); font-size: 12px; }
 /* 选股池 */
 .auction-pick-list { list-style: none; margin: 0; padding: 0;
   display: flex; flex-direction: column; gap: 6px; }
@@ -1722,6 +2396,17 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 }
 .auction-pick.active { border-color: var(--accent); background: rgba(74,158,255,0.06); }
 .auction-pick-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 就地展开的单只详情：接在被点的那张卡下面，用左边框点明"它属于上面这张卡"。
+   原来它是池子后面的独立区块，点第一张卡时落在屏幕外 ~1000px，
+   看着像"点了没反应"（实测报障）。 */
+.auction-pick-detail {
+  display: flex; flex-direction: column;
+  margin-top: 8px; padding-top: 8px;
+  border-top: 1px dashed var(--border);
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+}
+.auction-pick-detail-close { align-self: flex-start; margin-top: 8px; }
 .auction-rank { font-size: 12px; font-weight: 600; color: var(--muted); min-width: 26px; }
 .auction-score { font-weight: 700; font-size: 16px; }
 .auction-score small { font-size: 10px; font-weight: 400; color: var(--muted); }
@@ -1791,3 +2476,1952 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   border-color: rgba(255,120,60,0.8); color: #ff9a5c; font-weight: 600;
 }
 .auction-tag.tier { border-color: rgba(80,200,160,0.8); color: #5fd8a8; }
+
+/* ==================================================================
+   板块拥挤度 · 清单操作（置顶/删除/选中）与单板块详情弹窗
+   ==================================================================
+   清单（`sector_crowding_list`）是散点总览与告警面板共用的一份配置，
+   所以这里的按钮样式两个面板通用。 */
+
+/* 置顶/删除按钮：紧挨在板块名左侧，宽度固定，避免行内元素跳动 */
+.crowding-pin, .crowding-del {
+  flex: 0 0 auto; min-width: 62px; padding: 2px 8px; font-size: 11px;
+}
+.crowding-del { color: var(--muted); }
+.crowding-del:hover { color: var(--low); border-color: rgba(217,92,74,0.7); }
+.crowding-pin.active {
+  color: var(--accent); border-color: rgba(74,158,255,0.65);
+  background: rgba(74,158,255,0.12);
+}
+/* 置顶行整行加一条左侧蓝边（同样用 inset 阴影，避免破坏列对齐） */
+.crowding-alert-item.pinned { box-shadow: inset 3px 0 0 var(--accent); }
+/* 置顶 + 告警同时命中时，把告警的底色保留下来（阴影取并集） */
+.crowding-alert-item.pinned.tone-high {
+  box-shadow: inset 3px 0 0 var(--high);
+}
+.crowding-alert-item.pinned.tone-warn {
+  box-shadow: inset 3px 0 0 var(--medium);
+}
+
+/* ---- 单板块详情弹窗（居中，不是下方内嵌面板） ---- */
+.crowding-modal-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.62);
+  display: flex; align-items: center; justify-content: center;
+  padding: 3vh 2vw;
+}
+.crowding-modal {
+  background: var(--bg, #0f1419); border: 1px solid var(--border);
+  border-radius: 10px; width: min(1080px, 96vw); max-height: 92vh;
+  display: flex; flex-direction: column;
+  box-shadow: 0 18px 48px rgba(0,0,0,0.55);
+}
+.crowding-modal-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+}
+.crowding-modal-head h3 { margin: 0; font-size: 15px; }
+.crowding-modal-body { overflow: auto; padding: 10px 14px; }
+.crowding-modal-body .chart-toolbar { margin-bottom: 4px; flex-wrap: wrap; }
+/* 放大视图：弹窗放开到几乎满屏，图表随之变宽（缩放看细节时更从容） */
+.crowding-modal.expanded { width: min(1900px, 99vw); max-height: 98vh; }
+.crowding-modal.expanded .crowding-modal-body { padding: 6px 10px; }
+.crowding-modal-foot {
+  padding: 6px 14px; border-top: 1px solid var(--border); font-size: 11px;
+}
+.crowding-modal-close { color: var(--muted); }
+.crowding-modal-close:hover { color: var(--text); border-color: var(--muted); }
+
+/* 窄屏：弹窗几乎占满，图表横向滚动而不是被压扁 */
+@media (max-width: 720px) {
+  .crowding-modal { width: 100%; max-height: 96vh; }
+  .crowding-modal-body { overflow: auto; }
+  .crowding-modal-body .intraday-svg { min-width: 640px; }
+}
+
+/* ---- 周频异动指标 4 列（列名在表头，格子里只放数字） ---- */
+/* 对齐/等宽数字已在上面 .crowding-num 组里统一处理，这里只管涨跌颜色 */
+.crowding-metric-value.up { color: var(--low); }
+.crowding-metric-value.down { color: var(--high); }
+.crowding-metric-value.flat { color: var(--muted); }
+.crowding-metric-foot {
+  font-size: 11px; line-height: 1.7; padding: 6px 2px 0;
+  border-top: 1px solid var(--border);
+}
+.crowding-metric-foot b { color: var(--text); }
+
+/* ---- 自定义告警列 + 阈值编辑面板 ---- */
+/* 格子里是"方向箭头 + 阈值"，所以做成一个小按钮而不是纯文本 */
+.crowding-alert-cell {
+  display: inline-flex; align-items: center; justify-content: center; gap: 3px;
+  min-width: 0; padding: 2px 6px; font-size: 11px; cursor: pointer;
+  background: transparent; color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.crowding-alert-cell:hover { border-color: var(--accent); color: var(--accent); }
+.crowding-alert-cell.unset { color: var(--muted); border-style: dashed; }
+.crowding-alert-dir { font-size: 10px; }
+/* 已触发：整格变红加粗，扫一眼就能看出哪几条线被击穿了 */
+.crowding-alert-cell.fired {
+  color: var(--low); border-color: var(--low); font-weight: 600;
+  background: rgba(217,92,74,0.14);
+}
+.crowding-alert-dot { font-size: 8px; line-height: 1; }
+
+/* 编辑面板：悬浮在表格上方，带遮罩避免误点后面的行 */
+.crowding-alert-editor-mask {
+  position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,0.28);
+}
+.crowding-alert-editor {
+  position: relative; z-index: 41;
+  margin: 8px 0; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 8px;
+  background: var(--panel, #1a2129); border: 1px solid var(--accent);
+  border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+  font-size: 12px;
+}
+.crowding-alert-editor-head { display: flex; align-items: center; gap: 8px; }
+.crowding-alert-editor-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.crowding-alert-editor-row > .muted-text:first-child { min-width: 56px; }
+.crowding-alert-modes { display: flex; gap: 6px; flex-wrap: wrap; }
+.crowding-alert-value { width: 110px; }
+.crowding-alert-slider { width: 100%; accent-color: var(--accent); }
+.crowding-alert-verdict {
+  padding: 5px 8px; border-radius: 4px; font-size: 11px;
+  background: rgba(139,152,165,0.10); color: var(--muted);
+}
+.crowding-alert-verdict.up { color: var(--low); background: rgba(217,92,74,0.14); }
+.crowding-alert-editor-foot {
+  display: flex; align-items: center; gap: 8px;
+  border-top: 1px solid var(--border); padding-top: 8px;
+}
+
+/* ==================================================================
+   主线挖掘（Mainline Mining）· 顶级页签
+   ==================================================================
+   结构：顶部漏斗 → 子视图页签 → 内容（热力图/告警流水/跟踪卡片/期货/回测）
+   → 脚注；下钻是固定定位弹层。所有类名以 mainline- 前缀，避免与既有规则冲突。
+   配色沿用 :root 变量；A 股习惯的涨红跌绿由 .up/.down 承担
+   （与 .crowding-metric-value.up/.down 同口径：up = var(--low) 红）。
+
+   ⚠️ 本模块**不再是「资金流监控」的左栏**（用户口径 2026-09-20：提为与
+   资金流监控同级的顶级页签，位置在「量化交易」右侧）。因此这里按**整页宽度**
+   排版：热力图用 auto-fill 自适应列数（宽屏能铺到十几列），告警/回测表格
+   也按整页展开。原先为 380px 侧栏写的 `.fundflow-layout` 系列规则已删除 ——
+   留着会让人以为还能嵌回去。 */
+.mainline-root {
+  min-width: 0;
+  display: flex; flex-direction: column; gap: 10px;
+  font-size: 12.5px;
+}
+
+/* ---- 涨跌配色 / 状态文字（涨红跌绿） ---- */
+.mainline-root .up,
+.mainline-body .up,
+.mainline-modal-body .up { color: var(--low); }
+.mainline-root .down,
+.mainline-body .down,
+.mainline-modal-body .down { color: var(--high); }
+.mainline-root .flat,
+.mainline-body .flat,
+.mainline-modal-body .flat { color: var(--muted); }
+.mainline-pass-text { color: var(--low); }
+.mainline-fail-text { color: var(--medium); }
+.mainline-confirmed { color: var(--low); font-size: 12px; }
+
+
+/* ---- 顶部：标题 + 交易日 + 时段 + 漏斗 + 操作 ---- */
+.mainline-head {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.mainline-head-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.mainline-head-top b { font-size: 13px; }
+.mainline-head-top button { min-width: auto; padding: 3px 9px; font-size: 11px; }
+.mainline-session {
+  padding: 0 7px; border-radius: 9px; font-size: 11px; line-height: 17px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.mainline-session.state-open { color: var(--low); border-color: rgba(217,92,74,0.5); }
+.mainline-session.state-closed { color: var(--muted); }
+.mainline-session.state-pre_open { color: var(--medium); border-color: rgba(217,161,59,0.5); }
+
+/* 漏斗：全市场 N → 已评分 → 候选 → 精选 → 告警 */
+.mainline-funnel {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  font-size: 11px;
+}
+.mainline-funnel-item {
+  display: inline-flex; align-items: baseline; gap: 3px;
+  padding: 1px 7px; border-radius: 10px;
+  border: 1px solid var(--border);
+}
+.mainline-funnel-item b { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.mainline-funnel-item.candidate { border-color: rgba(74,158,255,0.5); }
+.mainline-funnel-item.selected { border-color: rgba(217,92,74,0.55); }
+.mainline-funnel-item.alert { border-color: rgba(217,161,59,0.6); color: var(--medium); }
+.mainline-funnel-arrow { color: var(--muted); }
+
+.mainline-task { display: flex; align-items: center; gap: 8px; }
+.mainline-done { color: var(--low); font-size: 12px; }
+.mainline-hint {
+  font-size: 11px; color: var(--medium);
+  border-left: 2px solid var(--medium); padding-left: 6px;
+}
+
+/* ---- 子视图页签 ---- */
+.mainline-tabs {
+  display: flex; gap: 4px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 5px 6px;
+}
+.mainline-tab {
+  min-width: auto; padding: 3px 10px; font-size: 11px;
+  background: transparent; color: var(--muted);
+  border: 1px solid transparent; border-radius: 12px; cursor: pointer;
+}
+.mainline-tab:hover { color: var(--text); border-color: var(--border); }
+.mainline-tab.active {
+  background: rgba(74,158,255,0.16); color: var(--accent);
+  border-color: rgba(74,158,255,0.55);
+}
+
+.mainline-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+/* ---- 通用卡片 ---- */
+.mainline-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px; min-width: 0;
+}
+.mainline-card-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.mainline-card-head h4 { margin: 0; font-size: 12px; }
+.mainline-subhead { margin: 8px 0 4px; font-size: 11px; color: var(--muted); }
+.mainline-empty {
+  padding: 10px 4px; font-size: 12px; color: var(--muted);
+  line-height: 1.7;
+}
+.mainline-empty-lg {
+  background: var(--panel); border: 1px dashed var(--border);
+  border-radius: var(--radius); padding: 12px;
+}
+.mainline-empty-lg b { color: var(--text); }
+.mainline-foot {
+  font-size: 11px; line-height: 1.7; padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.mainline-gaps {
+  font-size: 11px; line-height: 1.7; color: var(--medium);
+  background: rgba(217,161,59,0.08); border: 1px solid rgba(217,161,59,0.35);
+  border-radius: var(--radius); padding: 4px 8px;
+}
+.mainline-seat-note { font-size: 11px; color: var(--muted); }
+.mainline-link {
+  min-width: auto; padding: 0; background: transparent; border: none;
+  color: var(--text); font-size: 12px; cursor: pointer;
+  text-decoration: underline dotted rgba(139,152,165,0.6);
+}
+.mainline-link:hover { color: var(--accent); }
+
+/* ---- 等级色（强/中/弱 + 未触发） ---- */
+.mainline-level { font-size: 11px; white-space: nowrap; }
+.mainline-level.level-strong { color: var(--low); }
+.mainline-level.level-medium { color: var(--medium); }
+.mainline-level.level-weak { color: var(--accent); }
+.mainline-level.level-none { color: var(--muted); }
+.mainline-alert-dot {
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+  background: var(--muted);
+}
+.mainline-alert-dot.level-strong { background: var(--low); }
+.mainline-alert-dot.level-medium { background: var(--medium); }
+.mainline-alert-dot.level-weak { background: var(--accent); }
+.mainline-res-tag {
+  margin-left: 4px; padding: 0 5px; border-radius: 8px; font-size: 10px;
+  font-style: normal; line-height: 15px; color: var(--low);
+  border: 1px solid rgba(217,92,74,0.5); background: rgba(217,92,74,0.10);
+}
+.mainline-tag-selected, .mainline-tag-candidate {
+  margin-left: 5px; padding: 0 6px; border-radius: 8px; font-size: 10px;
+  line-height: 15px; display: inline-block;
+}
+.mainline-tag-selected { color: var(--low); border: 1px solid rgba(217,92,74,0.5); }
+.mainline-tag-candidate { color: var(--accent); border: 1px solid rgba(74,158,255,0.5); }
+
+/* ---- 筛选条 ---- */
+.mainline-alert-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.mainline-alert-bar .mode-switch { margin: 0; }
+.mainline-alert-bar .mode-btn { padding: 2px 9px; font-size: 11px; }
+.mainline-alert-bar select { padding: 3px 6px; font-size: 11px; }
+
+/* ---- 表格（明细/回测用） ---- */
+.mainline-table-scroll { overflow: auto; max-width: 100%; }
+.mainline-table {
+  width: 100%; border-collapse: collapse; font-size: 11px;
+}
+.mainline-table th, .mainline-table td {
+  padding: 4px 7px; text-align: left; white-space: nowrap;
+  border-bottom: 1px solid var(--table-line, rgba(139,152,165,0.16));
+}
+.mainline-table th { color: var(--muted); font-weight: 500; }
+.mainline-table td.num, .mainline-table th.num { text-align: right; }
+.mainline-table td.num { font-family: ui-monospace, Consolas, monospace; }
+.mainline-table tr.row-active td { background: rgba(74,158,255,0.10); }
+.mainline-table td.mainline-logic {
+  white-space: normal; min-width: 200px; max-width: 460px;
+  line-height: 1.6; color: var(--muted);
+}
+.mainline-stars { color: var(--medium); letter-spacing: 1px; }
+.mainline-dir.dir-positive { color: var(--low); }
+.mainline-dir.dir-negative { color: var(--high); }
+.mainline-dir.dir-auxiliary { color: var(--muted); }
+
+/* ==================================================================
+   ① 异动评分热力图（色块矩阵）
+   ================================================================== */
+.mainline-heat { display: flex; flex-direction: column; gap: 6px; }
+.mainline-heat-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mainline-heat-bar .mode-switch { margin: 0; }
+.mainline-heat-bar .mode-btn { padding: 2px 9px; font-size: 11px; }
+.mainline-heat-legend {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap; font-size: 10px;
+}
+.mainline-heat-swatch {
+  width: 20px; height: 11px; border-radius: 2px; display: inline-block;
+}
+.mainline-heat-legend-note { margin-left: 4px; }
+.mainline-heat-grid {
+  display: grid; gap: 3px;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+}
+/* 色块：按钮默认样式全部清掉（全局 button 是蓝底白字，会把色带盖住） */
+.mainline-heat-cell {
+  position: relative; min-width: 0;
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 4px 5px; border-radius: 4px;
+  border: 1px solid transparent; cursor: pointer;
+  color: #f2f4f7; font-size: 11px; line-height: 1.35;
+  align-items: flex-start; text-align: left;
+}
+.mainline-heat-cell:hover { border-color: var(--text); }
+.mainline-heat-cell.candidate { border-color: rgba(255,255,255,0.35); }
+.mainline-heat-cell.selected { border-color: #fff; border-width: 2px; }
+.mainline-heat-cell.missing {
+  background: rgba(139,152,165,0.16); color: var(--muted);
+  border-style: dashed; border-color: var(--border);
+}
+.mainline-heat-name {
+  font-weight: 600; max-width: 100%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mainline-heat-score { font-size: 13px; font-weight: 700; }
+.mainline-heat-delta { font-size: 10px; opacity: 0.92; }
+/* 色块底色是深色时，"涨红"看不见（红底上的红字）——所以块内改用品红/青做对比，
+   保留方向信息又能读出来；表格里的涨跌仍走全局 .up/.down */
+.mainline-heat-cell .up { color: #ffb4a8; }
+.mainline-heat-cell .down { color: #9ff0c4; }
+.mainline-heat-res {
+  position: absolute; top: 3px; right: 4px;
+  font-size: 9px; font-style: normal; line-height: 12px;
+  padding: 0 4px; border-radius: 7px;
+  background: rgba(15,20,25,0.55); color: #fff;
+}
+
+/* ==================================================================
+   ② 告警信号流水（grid 表，表头与数据行共用列宽）
+   ================================================================== */
+.mainline-alert-scroll { overflow: auto; max-height: 560px; }
+.mainline-alert-header, .mainline-alert-item {
+  display: grid; grid-template-columns: var(--mainline-alert-grid);
+  align-items: center; gap: 8px; min-width: max-content;
+}
+.mainline-alert-header {
+  position: sticky; top: 0; z-index: 3;
+  background: var(--bg, #0f1419);
+  padding: 4px 8px; font-size: 10px; color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+.mainline-hcell { white-space: nowrap; }
+.mainline-hcell.num { text-align: right; }
+.mainline-alert-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column;
+}
+.mainline-alert-item {
+  padding: 4px 8px; border-bottom: 1px solid var(--table-line, rgba(139,152,165,0.16));
+}
+.mainline-alert-item .num { text-align: right; }
+.mainline-alert-item.level-strong { border-left: 2px solid rgba(217,92,74,0.75); }
+.mainline-alert-item.level-medium { border-left: 2px solid rgba(217,161,59,0.6); }
+.mainline-alert-item.level-weak { border-left: 2px solid rgba(74,158,255,0.5); }
+/* 未兑现：整行降透明度（仍然可读、可点、不被隐藏——失败样本是最该复盘的） */
+.mainline-alert-item.unrealized { opacity: 0.52; }
+.mainline-alert-item.unrealized:hover { opacity: 0.9; }
+.mainline-alert-date { font-size: 11px; }
+.mainline-alert-name { font-weight: 600; }
+.mainline-alert-dims { font-size: 11px; color: var(--muted); }
+
+/* ==================================================================
+   ③ 重点板块跟踪（卡片）
+   ================================================================== */
+.mainline-tracked-grid {
+  display: grid; gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+}
+.mainline-tracked-card {
+  min-width: 0; display: flex; flex-direction: column; gap: 4px;
+  text-align: left; align-items: stretch; cursor: pointer;
+  background: rgba(255,255,255,0.02); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 6px 8px; font-size: 11px;
+}
+.mainline-tracked-card:hover { border-color: var(--accent); }
+.mainline-tracked-top { display: flex; align-items: baseline; gap: 5px; }
+.mainline-tracked-name {
+  font-weight: 700; font-size: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mainline-tracked-total { font-size: 15px; font-weight: 700; color: var(--accent); }
+.mainline-tracked-metrics {
+  display: flex; flex-wrap: wrap; gap: 3px 9px; font-size: 10px;
+  color: var(--muted);
+}
+.mainline-tracked-metrics b { color: var(--text); margin-left: 3px; }
+.mainline-tracked-flow {
+  display: flex; gap: 12px; font-size: 10px;
+  border-top: 1px dashed var(--border); padding-top: 4px;
+}
+.mainline-tracked-flow span { display: flex; flex-direction: column; }
+.mainline-tracked-flow i { font-style: normal; color: var(--muted); font-size: 10px; }
+.mainline-tracked-flow b { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.mainline-tracked-leaders { display: flex; flex-wrap: wrap; gap: 4px; }
+.mainline-leader-chip {
+  display: inline-flex; align-items: baseline; gap: 3px;
+  padding: 1px 6px; border-radius: 9px; font-size: 10px;
+  border: 1px solid var(--border); color: var(--text);
+}
+.mainline-leader-chip i { font-style: normal; }
+
+/* ==================================================================
+   ④ 期货先行信号
+   ================================================================== */
+.mainline-futures { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.mainline-gauge-scroll {
+  max-height: 420px; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.mainline-gauge-row {
+  min-width: 0; width: 100%; padding: 2px 4px;
+  display: grid; gap: 6px; align-items: center;
+  grid-template-columns: 74px minmax(60px, 1fr) 44px auto minmax(0, 1.1fr);
+  background: transparent; color: var(--text);
+  border: 1px solid transparent; border-radius: 4px;
+  font-size: 11px; cursor: pointer; text-align: left;
+}
+.mainline-gauge-row:hover { border-color: var(--border); background: rgba(255,255,255,0.03); }
+.mainline-gauge-row.active {
+  border-color: var(--accent); background: rgba(74,158,255,0.12);
+}
+.mainline-gauge-row.level-strong { border-left: 2px solid rgba(217,92,74,0.75); }
+.mainline-gauge-row.level-medium { border-left: 2px solid rgba(217,161,59,0.6); }
+.mainline-gauge-row.level-weak { border-left: 2px solid rgba(74,158,255,0.5); }
+.mainline-gauge-name {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600;
+}
+.mainline-gauge-track {
+  height: 10px; border-radius: 5px; overflow: hidden;
+  background: rgba(139,152,165,0.18);
+}
+.mainline-gauge-fill { display: block; height: 100%; border-radius: 5px; }
+.mainline-gauge-value {
+  text-align: right; font-family: ui-monospace, Consolas, monospace;
+}
+.mainline-gauge-kinds { display: inline-flex; gap: 3px; }
+.mainline-kind-chip {
+  font-style: normal; font-size: 9px; line-height: 14px; padding: 0 4px;
+  border-radius: 7px; color: var(--muted); border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.mainline-gauge-boards {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 期股联动热力图 */
+.mainline-corr-scroll { overflow: auto; max-width: 100%; max-height: 460px; }
+.mainline-corr-grid { display: grid; gap: 1px; min-width: max-content; }
+.mainline-corr-corner, .mainline-corr-head {
+  font-size: 10px; color: var(--muted);
+  position: sticky; top: 0; z-index: 2; background: var(--panel);
+  padding: 2px 3px; white-space: nowrap; overflow: hidden;
+}
+.mainline-corr-corner {
+  left: 0; z-index: 4; text-align: left; color: var(--muted);
+}
+.mainline-corr-head { text-align: center; }
+.mainline-corr-rowhead {
+  position: sticky; left: 0; z-index: 3; background: var(--panel);
+  min-width: 0; padding: 1px 4px; font-size: 10px; text-align: left;
+  border: 1px solid transparent; color: var(--text); cursor: pointer;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mainline-corr-rowhead.active { color: var(--accent); border-color: var(--accent); }
+.mainline-corr-cell {
+  height: 22px; display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-family: ui-monospace, Consolas, monospace;
+  border-radius: 2px;
+}
+.mainline-corr-cell.dim { background: rgba(139,152,165,0.07); color: var(--muted); }
+.mainline-corr-pos { color: var(--low); }
+.mainline-corr-neg { color: var(--high); }
+
+.mainline-futures-picked {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  font-size: 11px; padding: 4px 6px; margin-bottom: 6px;
+  background: rgba(74,158,255,0.07); border-radius: 4px;
+}
+.mainline-futures-alerts {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.mainline-futures-alert {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 3px 6px; font-size: 11px;
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.mainline-futures-alert.level-strong { border-color: rgba(217,92,74,0.6); }
+.mainline-futures-alert.level-medium { border-color: rgba(217,161,59,0.5); }
+.mainline-futures-alert.level-weak { border-color: rgba(74,158,255,0.45); }
+.mainline-futures-title { color: var(--text); }
+
+/* ==================================================================
+   ⑤ 下钻：六维雷达 + 三层明细 + 龙头股 + 评分走势（弹层）
+   ================================================================== */
+.mainline-modal-mask {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(8,10,13,0.72);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 32px 16px; overflow: auto;
+}
+.mainline-modal {
+  width: min(1080px, 100%); max-height: 90vh; overflow: auto;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.mainline-modal-head {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  position: sticky; top: -12px; z-index: 5;
+  background: var(--bg); padding: 4px 0 6px;
+  border-bottom: 1px solid var(--border);
+}
+.mainline-modal-head h3 { margin: 0; font-size: 14px; }
+.mainline-modal-head button { min-width: auto; padding: 3px 10px; font-size: 11px; }
+.mainline-modal-body { display: flex; flex-direction: column; gap: 10px; }
+
+.mainline-score-banner {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 8px 10px; display: flex; flex-direction: column; gap: 6px;
+  background: rgba(255,255,255,0.02);
+}
+.mainline-score-main { display: flex; align-items: baseline; gap: 8px; }
+.mainline-score-value { font-size: 26px; font-weight: 700; color: var(--accent); }
+.mainline-score-cells {
+  display: grid; gap: 4px 10px;
+  grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+  font-size: 11px;
+}
+.mainline-score-cells > div { display: flex; flex-direction: column; }
+.mainline-score-cells span { font-size: 10px; }
+.mainline-score-cells b { font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+/* 颜色规则放在 b 的基样式之后：同优先级时靠后者生效 */
+.mainline-score-cells b.up { color: var(--low); }
+.mainline-score-cells b.down { color: var(--high); }
+.mainline-score-cells b.flat { color: var(--muted); }
+.mainline-score-meta { font-size: 11px; }
+.mainline-reasons {
+  margin: 0; padding-left: 16px; font-size: 11px; color: var(--muted);
+  line-height: 1.7;
+}
+
+.mainline-drill-grid {
+  display: grid; gap: 10px;
+  grid-template-columns: minmax(300px, 340px) minmax(0, 1fr);
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .mainline-drill-grid { grid-template-columns: minmax(0, 1fr); }
+}
+.mainline-radar-svg { width: 100%; height: auto; display: block; }
+.mainline-trend-wrap { min-width: 0; }
+.mainline-trend-svg { width: 100%; height: auto; display: block; }
+.mainline-legend {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 10px; margin-top: 2px;
+}
+.mainline-legend-line {
+  display: inline-block; width: 16px; height: 2px; margin-right: 4px;
+  vertical-align: middle;
+}
+.mainline-legend-line.accent { background: var(--accent); }
+.mainline-legend-line.medium { background: var(--medium); }
+.mainline-legend-line.high { background: var(--high); }
+
+/* 三层明细 */
+.mainline-layer {
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 5px 7px; margin-bottom: 5px; min-width: 0;
+}
+.mainline-layer.off { opacity: 0.6; border-style: dashed; }
+.mainline-layer-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.mainline-layer-note { padding: 2px 0 4px; line-height: 1.6; }
+.mainline-dim-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 2px;
+  /* 窄屏（弹窗在手机上）时整块横向滚动，而不是把 6 列压成读不出的样子 */
+  overflow-x: auto;
+}
+.mainline-dim-list li {
+  display: grid; gap: 6px; align-items: baseline; font-size: 11px;
+  grid-template-columns: minmax(72px, 1fr) 48px 60px 62px minmax(0, 1.4fr) minmax(0, 1fr);
+  min-width: 620px;
+  border-top: 1px dashed var(--table-line, rgba(139,152,165,0.16));
+  padding: 2px 0;
+}
+.mainline-dim-list li.off { color: var(--medium); }
+.mainline-dim-name { font-weight: 600; }
+.mainline-dim-score { text-align: right; }
+.mainline-dim-raw {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  font-size: 10px;
+}
+.mainline-dim-note { font-size: 10px; }
+
+/* ==================================================================
+   ⑥ 回测与报告
+   ================================================================== */
+.mainline-backtest { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.mainline-metric-grid {
+  display: grid; gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+.mainline-metric-card {
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 6px 8px; display: flex; flex-direction: column; gap: 2px;
+  background: rgba(255,255,255,0.02);
+}
+.mainline-metric-card.pass { border-color: rgba(46,168,110,0.5); }
+.mainline-metric-card.fail { border-color: rgba(217,161,59,0.55); }
+.mainline-metric-value { font-size: 17px; font-weight: 700; }
+.mainline-metric-target { font-size: 10px; }
+.mainline-corr-table td, .mainline-corr-table th { font-size: 10px; }
+.mainline-corr-th { max-width: 90px; overflow: hidden; text-overflow: ellipsis; }
+.mainline-corr-rowhead-cell { max-width: 170px; overflow: hidden; text-overflow: ellipsis; }
+.mainline-corr-self { color: var(--muted); }
+/* 超过阈值的相关系数对：底色 + 加粗，扫表时不会被数字淹没 */
+.mainline-corr-high {
+  background: rgba(217,92,74,0.22); color: var(--low); font-weight: 700;
+}
+.mainline-high-pair {
+  margin-left: 6px; font-family: ui-monospace, Consolas, monospace;
+  color: var(--medium);
+}
+.mainline-scene-fail td { background: rgba(217,161,59,0.07); }
+.mainline-markdown { font-size: 12px; }
+.mainline-markdown table { width: 100%; }
+.mainline-markdown td, .mainline-markdown th { font-size: 11px; white-space: nowrap; }
+.mainline-markdown ul { padding-left: 18px; }
+
+/* 细滚动条：左栏只有 380px，系统粗滚动条会吃掉可读宽度 */
+.mainline-body, .mainline-gauge-scroll, .mainline-alert-scroll,
+.mainline-table-scroll, .mainline-corr-scroll, .mainline-modal {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.mainline-body::-webkit-scrollbar, .mainline-gauge-scroll::-webkit-scrollbar,
+.mainline-alert-scroll::-webkit-scrollbar,
+.mainline-table-scroll::-webkit-scrollbar,
+.mainline-corr-scroll::-webkit-scrollbar,
+.mainline-modal::-webkit-scrollbar { width: 8px; height: 8px; }
+.mainline-body::-webkit-scrollbar-thumb,
+.mainline-gauge-scroll::-webkit-scrollbar-thumb,
+.mainline-alert-scroll::-webkit-scrollbar-thumb,
+.mainline-table-scroll::-webkit-scrollbar-thumb,
+.mainline-corr-scroll::-webkit-scrollbar-thumb,
+.mainline-modal::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 4px;
+}
+
+/* ------------------------------------------------------------------
+   回测收益展示面板（信号后 7/20/60 日最大涨幅 + 区间领涨成分股）
+   ------------------------------------------------------------------
+   两条刻意的排版规则：
+
+   1. **「窗口没走满」的单元格要比走满的弱。** 未走满时最终值显示 "——"，
+      另起一行小字给"至今 x% / 剩 N 日"。字号与颜色的差异是**唯一**让用户
+      看出"这个数与旁边那列不是一回事"的线索，所以不能和正常值一样醒目。
+   2. **领涨股是"股名 + 涨幅"并列**，股名用正常色、涨幅跟着涨跌色 ——
+      一列里塞三只票时，颜色比文字更快区分谁涨得多。
+   ------------------------------------------------------------------ */
+
+.mainline-returns .mainline-metric-grid { margin-top: 6px; }
+
+/* 未走满的进度小字：明显弱于最终值，避免被读成同一口径 */
+.mainline-window-partial {
+  font-size: 10px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+/* 近期与未来（窗口未走满）的行：整体压暗一点，与历史行走满的行区分 */
+.mainline-returns-table tr.mainline-returns-recent td {
+  background: rgba(74, 158, 255, 0.05);
+}
+
+/* X2 / X3：折叠出来的重复触发次数，要能一眼看到"这个概念又报了一次" */
+.mainline-count-x {
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.mainline-leaders {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: baseline;
+}
+
+.mainline-leader {
+  display: inline-flex;
+  gap: 3px;
+  align-items: baseline;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.mainline-leader b { font-weight: 500; }
+
+.mainline-leader i {
+  font-style: normal;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 10px;
+}
+
+/* 领涨股列较宽（三只票 + 涨幅），给个下限免得被挤成一列一个字 */
+.mainline-returns-table td:last-child { min-width: 190px; }
+
+/* 折叠行（告警日期超过 1 个月的概念合并成一行，填的是该概念的合计）：
+   要比明细行"重" —— 字重、底色和一道分隔线是**唯一**能让人一眼看出
+   "这行是汇总、不是某一天"的线索 */
+.mainline-returns-table tr.mainline-returns-group td {
+  background: rgba(74, 158, 255, 0.08);
+  border-top: 1px solid var(--table-line);
+  font-weight: 500;
+}
+
+/* 展开出来的明细行：左侧一道竖线，看得出它挂在哪个概念下面 */
+.mainline-returns-table tr.mainline-returns-nested td:first-child {
+  box-shadow: inset 2px 0 0 rgba(74, 158, 255, 0.55);
+}
+
+.mainline-group-toggle {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+
+.mainline-group-toggle:hover { color: var(--accent); }
+
+.mainline-caret {
+  display: inline-block;
+  width: 12px;
+  color: var(--accent);
+}
+
+.mainline-group-drill { margin-left: 4px; font-size: 11px; }
+
+/* 可排序的列头（概念板块收益排行的「20日胜率」）。
+   按钮铺满整个单元格而不是只包住文字：7px 的 padding 让点击目标大一倍，
+   而 `text-align: inherit` 保证它跟着 th.num 右对齐、不破坏数字列的整齐 */
+.mainline-table th.sortable .mainline-sort {
+  display: block;
+  width: 100%;
+  padding: 0;
+  margin: 0;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mainline-table th.sortable .mainline-sort:hover { color: var(--accent); }
+
+.mainline-sort-caret { margin-left: 3px; font-size: 9px; color: var(--accent); }
+
+/* 未排序时给一个"可以点"的提示符，不能和已排序的箭头一样醒目 */
+.mainline-sort-caret.idle { color: var(--muted); opacity: 0.75; }
+
+/* ==================================================================
+   ETF 份额监控（ETF Share Flow）· 「资金流监控」的第二个子页签
+   ==================================================================
+   结构：顶部状态条（交易日/环境/计数/刷新）→ 门控提示条 → 数据缺口
+   → 子视图页签（总览 / 份额变化明细 / 信号列表 / 回测结果）→ 内容 → 脚注。
+   所有类名以 etf-flow- 前缀，避免与既有规则冲突；配色沿用 :root 变量，
+   涨跌仍是 A 股习惯的**涨红跌绿**（与 .mainline-root、.crowding-metric-value
+   同一口径：up = var(--low) 红）。
+
+   三处刻意做强的对比（都是为了防止同一个误读：把被门控的信号当成告警）：
+   ① 环境横幅整块带牛/熊/震荡底色，不只靠一行文字；
+   ② 门控提示条（.etf-flow-gate-strip / .etf-flow-regime-warn）用黄色告警底，
+      并且在四个子视图里都可见；
+   ③ 已门控的信号（.etf-flow-signal.gated、tr.row-gated）灰化 + 虚线边框，
+      与"会告警"的信号一眼可分，但**不隐藏**（复盘门控本身要用）。 */
+
+.etf-flow-root {
+  min-width: 0;
+  display: flex; flex-direction: column; gap: 8px;
+  font-size: 12.5px;
+}
+
+/* ---- 涨跌配色（涨红跌绿） ---- */
+.etf-flow-root .up { color: var(--low); }
+.etf-flow-root .down { color: var(--high); }
+.etf-flow-root .flat { color: var(--muted); }
+
+/* ---- 顶部状态条 ---- */
+.etf-flow-head {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.etf-flow-head-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.etf-flow-head-top b { font-size: 13px; }
+.etf-flow-head-top button { min-width: auto; padding: 3px 9px; font-size: 11px; }
+.etf-flow-session, .etf-flow-regime-chip {
+  padding: 0 7px; border-radius: 9px; font-size: 11px; line-height: 17px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.etf-flow-regime-chip { color: var(--text); }
+.etf-flow-regime-chip.regime-bull {
+  color: var(--low); border-color: rgba(217,92,74,0.55);
+}
+.etf-flow-regime-chip.regime-bear {
+  color: var(--high); border-color: rgba(46,168,110,0.55);
+}
+.etf-flow-regime-chip.regime-range {
+  color: var(--medium); border-color: rgba(217,161,59,0.55);
+}
+
+.etf-flow-funnel {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px;
+}
+.etf-flow-funnel-item {
+  display: inline-flex; align-items: baseline; gap: 3px;
+  padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border);
+}
+.etf-flow-funnel-item b {
+  font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+}
+.etf-flow-funnel-item.alert {
+  border-color: rgba(217,161,59,0.6); color: var(--medium);
+}
+.etf-flow-funnel-item.gated {
+  border-color: rgba(139,152,165,0.5); color: var(--muted);
+}
+
+/* ---- 门控提示条：跨子视图可见（用户可能直接点「信号列表」） ---- */
+.etf-flow-gate-strip {
+  font-size: 11.5px; line-height: 1.7; color: var(--medium);
+  background: rgba(217,161,59,0.10); border: 1px solid rgba(217,161,59,0.45);
+  border-radius: var(--radius); padding: 5px 9px;
+}
+.etf-flow-gate-strip b { color: var(--medium); }
+
+/* ---- 数据缺口 / 脚注 ---- */
+.etf-flow-gaps {
+  font-size: 11px; line-height: 1.7; color: var(--medium);
+  background: rgba(217,161,59,0.08); border: 1px solid rgba(217,161,59,0.35);
+  border-radius: var(--radius); padding: 4px 8px;
+}
+.etf-flow-foot {
+  font-size: 11px; line-height: 1.7; padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+/* ---- 子视图页签 ---- */
+.etf-flow-tabs {
+  display: flex; gap: 4px; flex-wrap: wrap;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 5px 6px;
+}
+.etf-flow-tab {
+  min-width: auto; padding: 3px 10px; font-size: 11px;
+  background: transparent; color: var(--muted);
+  border: 1px solid transparent; border-radius: 12px; cursor: pointer;
+}
+.etf-flow-tab:hover { color: var(--text); border-color: var(--border); }
+.etf-flow-tab.active {
+  background: rgba(74,158,255,0.16); color: var(--accent);
+  border-color: rgba(74,158,255,0.55);
+}
+.etf-flow-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+/* ---- 通用卡片 / 空状态 / 工具条 ---- */
+.etf-flow-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px; min-width: 0;
+}
+.etf-flow-card-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.etf-flow-card-head h4 { margin: 0; font-size: 12px; }
+.etf-flow-empty {
+  padding: 10px 4px; font-size: 12px; color: var(--muted); line-height: 1.7;
+}
+.etf-flow-empty b { color: var(--text); }
+.etf-flow-note { font-size: 11px; line-height: 1.7; padding-top: 4px; }
+.etf-flow-toolbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.etf-flow-toolbar .mode-switch { margin: 0; }
+.etf-flow-toolbar .mode-btn { padding: 2px 9px; font-size: 11px; }
+.etf-flow-toolbar select { padding: 3px 6px; font-size: 11px; }
+.etf-flow-toolbar button { min-width: auto; padding: 3px 9px; font-size: 11px; }
+
+/* ==================================================================
+   ① 总览：环境横幅 + 指标卡 + 共振指示灯
+   ================================================================== */
+.etf-flow-overview { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+.etf-flow-regime {
+  border: 1px solid var(--border); border-left: 3px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px;
+  display: flex; flex-direction: column; gap: 6px;
+  background: var(--panel);
+}
+.etf-flow-regime.regime-bull {
+  border-left-color: var(--low);
+  background: linear-gradient(90deg, rgba(217,92,74,0.10), transparent 55%);
+}
+.etf-flow-regime.regime-bear {
+  border-left-color: var(--high);
+  background: linear-gradient(90deg, rgba(46,168,110,0.10), transparent 55%);
+}
+.etf-flow-regime.regime-range {
+  border-left-color: var(--medium);
+  background: linear-gradient(90deg, rgba(217,161,59,0.10), transparent 55%);
+}
+.etf-flow-regime-top {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+}
+.etf-flow-regime-top > span {
+  display: inline-flex; align-items: baseline; gap: 4px; font-size: 11.5px;
+}
+.etf-flow-regime-top b { font-family: ui-monospace, Consolas, monospace; }
+.etf-flow-regime-label { font-size: 15px; }
+.etf-flow-regime.regime-bull .etf-flow-regime-label { color: var(--low); }
+.etf-flow-regime.regime-bear .etf-flow-regime-label { color: var(--high); }
+.etf-flow-regime.regime-range .etf-flow-regime-label { color: var(--medium); }
+.etf-flow-gate-tag {
+  padding: 0 7px; border-radius: 9px; font-size: 11px; line-height: 17px;
+  border: 1px solid var(--border); white-space: nowrap;
+}
+.etf-flow-gate-tag.pass {
+  color: var(--high); border-color: rgba(46,168,110,0.5);
+  background: rgba(46,168,110,0.10);
+}
+.etf-flow-gate-tag.block {
+  color: var(--medium); border-color: rgba(217,161,59,0.6);
+  background: rgba(217,161,59,0.14);
+}
+/* 不放行的说明块：整个模块里最该被读到的一段字 */
+.etf-flow-regime-warn {
+  font-size: 12px; line-height: 1.75; color: var(--medium);
+  background: rgba(217,161,59,0.10); border: 1px solid rgba(217,161,59,0.45);
+  border-radius: 4px; padding: 6px 9px;
+}
+.etf-flow-regime-warn b { color: var(--medium); font-size: 12.5px; }
+.etf-flow-regime-notes {
+  margin: 4px 0 0; padding-left: 18px; font-size: 11px; line-height: 1.7;
+}
+
+.etf-flow-grid {
+  display: grid; gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(198px, 1fr));
+}
+.etf-flow-metric {
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 6px 8px; display: flex; flex-direction: column; gap: 4px;
+  background: rgba(255,255,255,0.02);
+}
+.etf-flow-metric-top {
+  display: flex; align-items: baseline; gap: 5px; flex-wrap: wrap;
+}
+.etf-flow-metric-top b { font-size: 12px; }
+.etf-flow-metric-sub { display: flex; gap: 4px; font-size: 10px; }
+.etf-flow-metric-shares {
+  display: flex; align-items: baseline; gap: 4px; font-size: 11px;
+}
+.etf-flow-metric-shares b { font-size: 16px; font-weight: 700; }
+.etf-flow-metric-changes {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px;
+}
+.etf-flow-metric-changes span {
+  display: flex; flex-direction: column; gap: 1px; min-width: 0;
+}
+.etf-flow-metric-changes i { font-style: normal; font-size: 10px; }
+.etf-flow-metric-changes b { font-size: 11.5px; }
+.etf-flow-metric-foot {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 6px; font-size: 10px;
+}
+.etf-flow-metric-foot b { margin-left: 3px; font-size: 11.5px; color: var(--text); }
+.etf-flow-warn-tag {
+  padding: 0 5px; border-radius: 8px; font-size: 10px; font-style: normal;
+  line-height: 15px; color: var(--medium); white-space: nowrap;
+  border: 1px solid rgba(217,161,59,0.5); background: rgba(217,161,59,0.10);
+}
+
+.etf-flow-reso-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.etf-flow-reso {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px;
+  font-size: 11px;
+}
+.etf-flow-reso.on {
+  border-color: rgba(217,92,74,0.5); background: rgba(217,92,74,0.07);
+}
+.etf-flow-light {
+  width: 9px; height: 9px; border-radius: 50%; flex: none;
+  display: inline-block; background: var(--muted);
+}
+.etf-flow-light.up {
+  background: var(--low); box-shadow: 0 0 6px rgba(217,92,74,0.65);
+}
+.etf-flow-light.down {
+  background: var(--high); box-shadow: 0 0 6px rgba(46,168,110,0.6);
+}
+.etf-flow-light.flat { background: var(--muted); }
+.etf-flow-reso-name { font-weight: 600; min-width: 76px; }
+.etf-flow-reso-count b { padding: 0 2px; }
+.etf-flow-reso-tag {
+  padding: 0 6px; border-radius: 8px; font-size: 10px; font-style: normal;
+  line-height: 15px; color: var(--low);
+  border: 1px solid rgba(217,92,74,0.5); background: rgba(217,92,74,0.10);
+}
+.etf-flow-reso-etfs {
+  display: flex; gap: 4px; flex-wrap: wrap; flex: 1 1 200px;
+}
+.etf-flow-soft-chip {
+  padding: 0 6px; border-radius: 8px; font-size: 10px; line-height: 16px;
+  border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+}
+.etf-flow-soft-chip i { font-style: normal; margin-left: 5px; }
+
+/* ==================================================================
+   ② 份额变化明细 / ④ 回测：表格
+   ================================================================== */
+.etf-flow-table-scroll { overflow: auto; max-width: 100%; }
+.etf-flow-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.etf-flow-table th, .etf-flow-table td {
+  padding: 4px 7px; text-align: left; white-space: nowrap;
+  border-bottom: 1px solid var(--table-line, rgba(139,152,165,0.16));
+}
+.etf-flow-table th { color: var(--muted); font-weight: 500; }
+.etf-flow-table td.num, .etf-flow-table th.num { text-align: right; }
+.etf-flow-table td.num { font-family: ui-monospace, Consolas, monospace; }
+/* 被门控的样本：灰化但仍在表里（失败样本是调参最该看的） */
+.etf-flow-table tr.row-gated td { opacity: 0.55; }
+.etf-flow-table tr.row-gated:hover td { opacity: 0.92; }
+.etf-flow-table tr.row-fail td { background: rgba(217,161,59,0.07); }
+.etf-flow-gap-cell { white-space: normal; min-width: 68px; }
+.etf-flow-inline-chip {
+  margin-left: 6px; padding: 0 6px; border-radius: 8px;
+  border: 1px solid var(--border);
+  font-family: ui-monospace, Consolas, monospace;
+}
+.etf-flow-pass { color: var(--high); font-size: 11px; }
+.etf-flow-fail { color: var(--medium); font-size: 11px; }
+
+/* ==================================================================
+   ③ 信号列表（按类型分组，理由逐条展开）
+   ================================================================== */
+.etf-flow-signals { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.etf-flow-signal-scroll { overflow-x: auto; }
+.etf-flow-signal-group { margin-bottom: 8px; }
+.etf-flow-signal-group-head {
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  margin: 4px 0;
+}
+.etf-flow-signal-group-head b { font-size: 12px; }
+/* 表头与数据行共用同一份列宽（列数必须与 TSX 里的 span 数一致） */
+.etf-flow-signal-head,
+.etf-flow-signal {
+  display: grid; gap: 6px; align-items: center;
+  grid-template-columns: 84px minmax(150px, 1.4fr) 78px 62px 62px 66px 88px 72px 104px;
+  min-width: 880px;
+}
+.etf-flow-signal-head {
+  padding: 2px 6px; font-size: 10px; color: var(--muted);
+}
+.etf-flow-signal-head .num { text-align: right; }
+.etf-flow-signal-list {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.etf-flow-signal {
+  padding: 5px 6px; border-radius: 4px; font-size: 11px;
+  border: 1px solid var(--border); border-left: 2px solid var(--border);
+  background: rgba(255,255,255,0.02);
+}
+.etf-flow-signal .num { text-align: right; }
+.etf-flow-signal.level-strong { border-left-color: rgba(217,92,74,0.75); }
+.etf-flow-signal.level-medium { border-left-color: rgba(217,161,59,0.6); }
+.etf-flow-signal.level-weak { border-left-color: rgba(74,158,255,0.5); }
+.etf-flow-signal.gated { opacity: 0.55; border-style: dashed; }
+.etf-flow-signal.gated:hover { opacity: 0.92; }
+.etf-flow-signal-name {
+  display: flex; align-items: baseline; gap: 5px; min-width: 0;
+  font-weight: 600; overflow: hidden;
+}
+.etf-flow-signal-name i { font-style: normal; font-weight: 400; font-size: 10px; }
+.etf-flow-level { font-size: 11px; white-space: nowrap; }
+.etf-flow-level.level-strong { color: var(--low); }
+.etf-flow-level.level-medium { color: var(--medium); }
+.etf-flow-level.level-weak { color: var(--accent); }
+.etf-flow-level.level-none { color: var(--muted); }
+.etf-flow-signal-tags { display: flex; gap: 4px; }
+.etf-flow-gated-tag, .etf-flow-alert-tag, .etf-flow-weak-tag {
+  padding: 0 6px; border-radius: 8px; font-size: 10px; font-style: normal;
+  line-height: 16px; white-space: nowrap;
+}
+.etf-flow-gated-tag {
+  color: var(--muted); border: 1px solid rgba(139,152,165,0.6);
+  background: rgba(139,152,165,0.14);
+}
+.etf-flow-alert-tag {
+  color: var(--low); border: 1px solid rgba(217,92,74,0.5);
+  background: rgba(217,92,74,0.10);
+}
+.etf-flow-weak-tag {
+  color: var(--accent); border: 1px solid rgba(74,158,255,0.45);
+  background: rgba(74,158,255,0.10);
+}
+/* 触发理由逐条列出，横跨整行 */
+.etf-flow-reasons {
+  grid-column: 1 / -1; list-style: none; margin: 0; padding: 2px 0 0;
+  display: flex; flex-direction: column; gap: 1px;
+  color: var(--muted); font-size: 10.5px; line-height: 1.6;
+}
+.etf-flow-reasons li::before { content: "· "; }
+
+.etf-flow-backtest { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+
+/* 细滚动条（与主线挖掘同口径） */
+.etf-flow-body, .etf-flow-table-scroll, .etf-flow-signal-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.etf-flow-body::-webkit-scrollbar,
+.etf-flow-table-scroll::-webkit-scrollbar,
+.etf-flow-signal-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.etf-flow-body::-webkit-scrollbar-thumb,
+.etf-flow-table-scroll::-webkit-scrollbar-thumb,
+.etf-flow-signal-scroll::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 4px;
+}
+
+/* ==================================================================
+   认证界面（登录 / 注册 / 找回 + 顶栏账户区）
+   ==================================================================
+   独立成块而不是散落各处：这套样式只服务「未登录」与「账户菜单」两个场景，
+   与业务面板无关。集中在一起，将来换主题或抽公共样式时一眼能找到边界。 */
+
+.auth-shell {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.auth-card {
+  width: 100%; max-width: 420px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 12px;
+  padding: 30px 28px;
+  box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+}
+.auth-checking { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+.auth-title { margin: 0 0 4px; font-size: 21px; letter-spacing: 0.2px; }
+.auth-sub { margin: 0 0 22px; color: var(--muted); font-size: 12px; }
+
+/* ---- 三个页签：做成"胶囊分段控件" ----
+   原来只用一条 2px 下划线表示选中，未选中的两个**连边框都没有** ——
+   用户看不出那里可以点（实测反馈原话："几个按键都没边界，
+   让人看不出来这个是可以选择的按键"）。
+   现在：外面是一个分段控件容器，选中项是**四周都有边界的填色胶囊**，
+   未选中项也有可见边框与 hover 反馈，默认/悬停/选中三态都能区分。 */
+.auth-tabs {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px;
+  margin-bottom: 20px; padding: 4px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+}
+.auth-tab {
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  cursor: pointer; padding: 9px 6px; font-size: 13px; border-radius: 7px;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.auth-tab:hover {
+  color: var(--text); background: rgba(74,158,255,0.10);
+  border-color: rgba(74,158,255,0.35);
+}
+.auth-tab.active {
+  background: var(--accent); color: #06121f; font-weight: 600;
+  border-color: var(--accent);
+  box-shadow: 0 1px 6px rgba(74,158,255,0.35);
+}
+.auth-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.auth-label { display: block; font-size: 12px; color: var(--muted); margin: 13px 0 6px; }
+.auth-input {
+  width: 100%; box-sizing: border-box; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px; color: var(--text);
+  padding: 10px 12px; font-size: 14px;
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.auth-input::placeholder { color: #5d6b78; }
+.auth-input:hover { border-color: #3c4a58; }
+.auth-input:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(74,158,255,0.18);
+}
+.auth-row { display: flex; gap: 8px; align-items: center; }
+.auth-row .auth-input { flex: 1; }
+
+/* 次级按钮：必须**可见边框**，否则看不出可点（同上反馈）。
+   同时用强调色描边+淡底，与输入框区分开"这是动作，那是填内容"。 */
+.auth-inline-btn {
+  background: rgba(74,158,255,0.12); border: 1px solid rgba(74,158,255,0.45);
+  color: var(--accent); border-radius: 8px; padding: 10px 14px;
+  cursor: pointer; font-size: 13px; white-space: nowrap; font-weight: 500;
+  transition: background 0.12s, border-color 0.12s;
+}
+.auth-inline-btn:hover:not(:disabled) {
+  background: rgba(74,158,255,0.22); border-color: var(--accent);
+}
+.auth-inline-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+.auth-check { display: flex; align-items: center; gap: 8px; margin: 16px 0 4px;
+  font-size: 12px; color: var(--muted); cursor: pointer; }
+.auth-check input { accent-color: var(--accent); width: 15px; height: 15px;
+  cursor: pointer; }
+
+/* 主按钮：实心 + 悬停提亮 + 按下微沉，三态可辨 */
+.auth-submit {
+  width: 100%; margin-top: 20px; padding: 12px; border: 1px solid var(--accent);
+  border-radius: 8px; background: var(--accent); color: #06121f;
+  font-size: 15px; font-weight: 700; cursor: pointer; letter-spacing: 0.3px;
+  transition: filter 0.12s, transform 0.06s, box-shadow 0.12s;
+  box-shadow: 0 2px 10px rgba(74,158,255,0.28);
+}
+.auth-submit:hover:not(:disabled) { filter: brightness(1.12); }
+.auth-submit:active:not(:disabled) { transform: translateY(1px); }
+.auth-submit:disabled { opacity: 0.4; cursor: not-allowed; box-shadow: none; }
+
+.auth-msg { margin: 0 0 10px; font-size: 13px; }
+.auth-hint { margin: 16px 0 0; font-size: 12px; color: var(--muted);
+  line-height: 1.7; }
+
+/* ---- 顶栏账户区 ---- */
+.account { position: relative; margin-left: auto; align-self: center; }
+.account-chip {
+  display: flex; align-items: center; gap: 7px; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 999px; padding: 5px 11px 5px 5px; color: var(--text);
+  font-size: 13px;
+}
+.account-avatar {
+  width: 22px; height: 22px; border-radius: 50%; background: var(--accent);
+  color: #06121f; display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+}
+.account-tier {
+  font-size: 11px; padding: 1px 7px; border-radius: 999px;
+  background: var(--border); color: var(--muted); margin-left: 2px;
+}
+.account-caret { color: var(--muted); font-size: 10px; }
+.account-menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 50;
+  width: 300px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 10px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+}
+.account-info { padding: 4px 6px 10px; font-size: 13px; }
+.account-dim { color: var(--muted); font-size: 12px; margin-top: 3px; }
+.account-warn { color: var(--low); }
+.account-note { margin: 6px 0; font-size: 12px; }
+.account-sep { height: 1px; background: var(--border); margin: 8px 0; }
+/* 菜单项：从"无边框文字"改成**有边界的按钮**。
+   用户反馈原话："几个按键都没边界，让人看不出来是可以选择的按键" ——
+   菜单里更容易误解（看起来像分节标题）。现在每项都是可见的圆角块。 */
+.account-item {
+  display: block; width: 100%; text-align: left;
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 9px 11px; border-radius: 7px; cursor: pointer; font-size: 13px;
+  margin-bottom: 6px; transition: border-color 0.12s, background 0.12s;
+}
+.account-item:hover { border-color: var(--accent);
+  background: rgba(74,158,255,0.10); }
+.account-item:last-child { margin-bottom: 0; }
+.account-item.danger { color: var(--low); border-color: rgba(217,92,74,0.45); }
+.account-item.danger:hover { background: rgba(217,92,74,0.12);
+  border-color: var(--low); }
+.account-sub { padding: 8px 4px 10px 10px; border-left: 2px solid var(--accent);
+  margin: 0 0 8px 0; }
+.session-row {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 8px; padding: 7px 0; font-size: 12px;
+  border-bottom: 1px solid var(--table-line);
+}
+.session-row:last-child { border-bottom: none; }
+.account-mini {
+  background: rgba(74,158,255,0.12); border: 1px solid rgba(74,158,255,0.45);
+  color: var(--accent); border-radius: 6px; padding: 6px 10px; cursor: pointer;
+  font-size: 12px; white-space: nowrap; transition: background 0.12s;
+}
+.account-mini:hover:not(:disabled) { background: rgba(74,158,255,0.22); }
+.account-mini:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ==================================================================
+   管理员控制台（用户管理）
+   ================================================================== */
+.admin { padding: 4px 0; }
+.admin-head {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.admin-head h2 { margin: 0; font-size: 18px; }
+.admin-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+.admin-stat {
+  font-size: 12px; color: var(--muted); background: var(--panel);
+  border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px;
+}
+.admin-stat b { color: var(--text); font-size: 13px; }
+/* 管理台标题旁的"实例徽标"：环境 + 账号库路径。
+   刻意做得**像一行技术信息而不是装饰**（等宽字体、弱色、可 hover 看全路径）——
+   它的作用是让人一眼确认"我在管哪个实例"，不是吸引注意力。 */
+.admin-instance {
+  font-size: 11px; color: var(--muted);
+  background: rgba(255,255,255,0.03);
+  border: 1px dashed var(--border); border-radius: 6px;
+  padding: 3px 8px; cursor: help;
+  max-width: 46ch; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 有待审批时高亮：这是管理员进来最先要处理的事 */
+.admin-stat.hot {
+  border-color: var(--medium); color: var(--medium);
+  background: rgba(217,161,59,0.12);
+}
+.admin-stat.hot b { color: var(--medium); }
+
+.admin-pending {
+  border: 1px solid var(--medium); border-radius: var(--radius);
+  background: rgba(217,161,59,0.06); padding: 14px; margin-bottom: 16px;
+}
+.admin-pending h3 { margin: 0 0 10px; font-size: 14px; color: var(--medium); }
+.approve-row {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; flex-wrap: wrap; padding: 9px 0;
+  border-bottom: 1px solid var(--table-line);
+}
+.approve-row:last-child { border-bottom: none; }
+.approve-who { font-size: 13px; }
+.approve-controls { display: flex; gap: 7px; align-items: center;
+  flex-wrap: wrap; }
+.approve-controls .auth-input { width: auto; min-width: 96px; padding: 7px 9px;
+  font-size: 12px; }
+
+.admin-create {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel); padding: 16px; margin-bottom: 16px;
+}
+.admin-create h3 { margin: 0 0 12px; font-size: 14px; }
+.admin-create-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 9px;
+}
+.admin-create-actions { margin-top: 12px; max-width: 200px; }
+
+.admin-filters {
+  display: flex; gap: 8px; align-items: center; margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.admin-filters .auth-input { width: auto; min-width: 160px; padding: 8px 10px;
+  font-size: 13px; }
+
+.admin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.admin-table th {
+  text-align: left; color: var(--muted); font-weight: 500; font-size: 12px;
+  padding: 8px 10px; border-bottom: 1px solid var(--border);
+}
+.admin-table td {
+  padding: 9px 10px; border-bottom: 1px solid var(--table-line);
+  vertical-align: middle;
+}
+.admin-table tr.self { background: rgba(74,158,255,0.07); }
+.admin-user { font-weight: 500; display: flex; align-items: center; gap: 6px; }
+.admin-actions { white-space: nowrap; }
+
+/* 状态徽标：颜色要能一眼区分能用/不能用 */
+.admin-badge {
+  display: inline-block; font-size: 11px; padding: 2px 9px;
+  border-radius: 999px; border: 1px solid var(--border);
+}
+.admin-badge.s-active { color: var(--high); border-color: var(--high); }
+.admin-badge.s-pending { color: var(--medium); border-color: var(--medium); }
+.admin-badge.s-disabled, .admin-badge.s-rejected {
+  color: var(--low); border-color: var(--low);
+}
+.admin-badge.s-expired { color: var(--muted); }
+
+.admin-drawer {
+  margin-top: 18px; border: 1px solid var(--accent);
+  border-radius: var(--radius); background: var(--panel); padding: 16px;
+}
+.admin-drawer-head {
+  display: flex; justify-content: space-between; align-items: center;
+  margin-bottom: 14px;
+}
+.admin-drawer-head h3 { margin: 0; font-size: 15px; }
+.admin-drawer-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 18px;
+}
+.admin-inline { display: flex; gap: 7px; align-items: center; flex-wrap: wrap;
+  margin-top: 6px; }
+.admin-inline .auth-input { width: auto; min-width: 110px; padding: 7px 9px;
+  font-size: 12px; }
+.account-mini.danger { color: var(--low); border-color: rgba(217,92,74,0.45);
+  background: rgba(217,92,74,0.10); }
+.account-mini.danger:hover:not(:disabled) { background: rgba(217,92,74,0.22); }
+
+.pool-item {
+  display: flex; justify-content: space-between; align-items: center;
+  width: 100%; gap: 8px; text-align: left; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--border);
+  color: var(--text); border-radius: 7px; padding: 9px 11px;
+  font-size: 13px; margin-bottom: 6px;
+  transition: border-color 0.12s, background 0.12s;
+}
+.pool-item:hover { border-color: var(--accent); }
+.pool-item.active {
+  border-color: var(--accent); background: rgba(74,158,255,0.14);
+  font-weight: 600;
+}
+.pool-name { display: flex; align-items: center; gap: 6px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pool-kind {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  background: var(--border); color: var(--muted); flex: none;
+}
+.pool-count { color: var(--muted); font-size: 12px; flex: none; }
+
+.mono { font-family: ui-monospace, Consolas, monospace; }
+
+/* ==================================================================
+   个股口径编辑（抽屉）
+   ================================================================== */
+.profile-drawer-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 40px 20px; overflow-y: auto; z-index: 200;
+}
+.profile-drawer {
+  position: relative; width: 100%; max-width: 720px;
+  background: var(--panel); border: 1px solid var(--accent);
+  border-radius: 12px; padding: 22px;
+  box-shadow: 0 24px 60px rgba(0,0,0,0.6);
+}
+.profile-drawer-close { position: absolute; top: 14px; right: 14px; }
+/* 「自选池管理」抽屉：复用同一套背景，只是面板更宽（池列表 + 股票列表两栏）。
+   z-index 比 `profile-drawer-backdrop` 低 —— 从池里点某只票的「口径」时，
+   口径抽屉要盖在池管理之上，否则用户改完口径会发现自己"回到"了池列表下面。 */
+.profile-head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 12px; padding-right: 80px;
+}
+.profile-head h3 { margin: 0; font-size: 16px; }
+.profile-head .auth-input { width: auto; min-width: 130px; padding: 7px 10px;
+  font-size: 13px; }
+.profile-block {
+  border-top: 1px solid var(--border); padding-top: 14px; margin-top: 14px;
+}
+.profile-block-head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.profile-block-head h4 { margin: 0; font-size: 14px; }
+.profile-total { font-size: 12px; }
+.profile-total.ok { color: var(--high); }
+/* 权重合计不等于 100 时给醒目提示（总分刻度会失去可比性），但不阻止保存 */
+.profile-total.warn { color: var(--medium); font-weight: 600; }
+.profile-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px;
+}
+.profile-field { display: flex; align-items: center; gap: 6px; }
+.profile-key {
+  font-size: 12px; color: var(--muted); min-width: 84px;
+  font-family: ui-monospace, Consolas, monospace;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.profile-field .auth-input { flex: 1; padding: 6px 9px; font-size: 13px; }
+.profile-del {
+  background: none; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; width: 24px; height: 28px; cursor: pointer;
+  line-height: 1; flex: none;
+}
+.profile-del:hover { color: var(--low); border-color: var(--low); }
+.profile-actions {
+  display: flex; gap: 10px; align-items: center; margin-top: 18px;
+}
+.profile-actions .auth-submit { margin-top: 0; max-width: 220px; }
+.profile-panel code {
+  background: var(--bg); padding: 1px 6px; border-radius: 4px;
+  font-size: 11px;
+}
+
+/* ---- 管理员控制台：监控卡片 + 权限矩阵 ---- */
+/* `.nav-group-label`（那个长得像页签却点不动的"系统管理"分组标签）已按用户
+   口径 2026-09-23 删除，对应的样式一并清掉 —— 留着一条没有使用者的规则，
+   下一个改这块的人会以为还有个分组标签要维护。 */
+.nav-warn {
+  font-size: 11px; color: var(--medium); border: 1px solid var(--medium);
+  border-radius: 999px; padding: 3px 9px; white-space: nowrap;
+  align-self: center;
+}
+.admin-section {
+  margin: 22px 0 8px; font-size: 14px; color: var(--muted);
+  border-top: 1px solid var(--border); padding-top: 14px;
+}
+
+.monitor-cards {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px; margin: 14px 0;
+}
+.monitor-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel); padding: 12px 14px;
+}
+.monitor-card.warn { border-color: var(--medium);
+  background: rgba(217,161,59,0.08); }
+.monitor-card-value { font-size: 20px; font-weight: 700; }
+.monitor-card.warn .monitor-card-value { color: var(--medium); }
+.monitor-card-label { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+/* 用量进度条：让用掉几成一眼可见（只给绝对值没法判断健康度） */
+.meter {
+  position: relative; height: 18px; min-width: 120px;
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 4px; overflow: hidden;
+}
+.meter-fill { height: 100%; background: rgba(74,158,255,0.55); }
+.meter-fill.warn { background: rgba(217,161,59,0.7); }
+.meter-text {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; font-size: 11px; color: var(--text);
+}
+
+/* ---- 资源监控：剩余额度（今日调用 / 本月 token） ---- */
+.quota-cell { display: flex; flex-direction: column; gap: 4px; min-width: 230px; }
+.quota-row { display: flex; align-items: center; gap: 6px; }
+.quota-label {
+  font-size: 11px; color: var(--muted); white-space: nowrap;
+  min-width: 58px;
+}
+.quota-row .meter { min-width: 96px; flex: 1; }
+.quota-remain {
+  font-size: 11px; color: var(--muted); white-space: nowrap;
+  min-width: 62px; text-align: right;
+}
+.quota-remain.warn { color: var(--medium); font-weight: 600; }
+/* 口径与局限：默认折叠。它是"读数字之前该知道的前提"，不是每次都要
+   重读一遍的内容 —— 但必须**可点开**，否则等于没写。 */
+.quota-basis { margin: 6px 0 12px; font-size: 12px; }
+.quota-basis summary { cursor: pointer; color: var(--muted); }
+.quota-basis summary:hover { color: var(--accent); }
+.quota-basis ul { margin: 8px 0 0 4px; padding-left: 18px; color: var(--muted); }
+.quota-basis li { margin-bottom: 4px; line-height: 1.6; }
+
+.tier-card {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--panel); padding: 14px; margin-bottom: 14px;
+}
+.tier-card-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+/* ★ 关键：这一行里的每一项都**不许被压扁**。
+   用户反馈（2026-09-23）："上下三角调节费率的窗口特别小，完全看不到了"。
+   根因就是 flex 项目默认 `flex-shrink: 1` —— 等级名 + 代码 + 徽标 + 月费
+   + 保存按钮挤在一行时，月费那个数字框被压缩到只剩十几像素，
+   数字正好被 `input[type=number]` 的原生微调箭头盖住，看起来就只剩一个
+   小圆圈。`flex: 0 0 auto` 让它保持声明宽度，宁可整体换行也不压扁控件。 */
+.tier-card-head > * { flex: 0 0 auto; }
+.tier-label { width: auto; min-width: 130px; padding: 7px 10px;
+  font-weight: 600; }
+/* `.tier-price-row` / `.tier-price` / `.step-btn`（月费数字框与它的 − / + 步进
+   按钮）已随"删除月费设置"一并移除 —— 留着这些规则会让下一个人以为
+   界面上还有个价格控件。`flex: 0 0 auto` 那条保留：等级名输入框和保存按钮
+   仍在这一行里，同样不能被压扁。 */
+.tier-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 8px;
+}
+
+.matrix-table th { vertical-align: top; }
+.matrix-feature { min-width: 190px; }
+.matrix-cell { display: flex; align-items: center; gap: 8px; }
+.matrix-price { width: 92px; padding: 6px 8px; font-size: 13px; }
+.matrix-price:disabled { opacity: 0.4; }
+
+/* ==================================================================
+   品牌区（顶栏可点击站名 + 登录页品牌头）
+   ================================================================== */
+.brand {
+  display: flex; align-items: center; gap: 10px; padding: 2px 6px;
+  background: none; border: 1px solid transparent; border-radius: 10px;
+  cursor: pointer; text-align: left; color: var(--text);
+  transition: border-color 0.12s, background 0.12s;
+}
+.brand:hover { border-color: var(--border); background: rgba(74,158,255,0.08); }
+.brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.brand-mark {
+  display: flex; align-items: center; justify-content: center;
+  width: 34px; height: 34px; flex: none; border-radius: 9px;
+  background: rgba(74,158,255,0.14); color: var(--accent);
+  border: 1px solid rgba(74,158,255,0.35);
+}
+.brand-text { display: flex; flex-direction: column; line-height: 1.25; }
+.brand-name { font-size: 19px; font-weight: 700; letter-spacing: 0.2px;
+  white-space: nowrap; }
+.brand-sub { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+/* 顶栏用 baseline 对齐（老样式），品牌是两行块 → 改成居中更整齐 */
+.header { align-items: center; }
+
+/* 顶栏只显示圆形头像（用户口径：不要身份徽标） */
+/* compact 模式（顶栏右上角）：人头 + 齿轮，**去掉所有外形**。
+   用户反馈原话 2026-09-23："只有个人头，好歹右侧搞个齿轮状设置图标，
+   不要用什么椭圆形状，太丑了，直接去掉外形"。
+   这里把 `.account-chip` 自己那套面板底色 + 边框 + `border-radius: 999px`
+   全部撤掉（原来压成 `border-radius: 50%` 就成了那个胶囊），
+   只留图标本身 + hover/active 的淡底色作为"可点"的反馈。
+   为什么保留 hover 反馈：完全无反馈的无边框图标会被当成装饰，
+   用户根本不会去点 —— 而这是**唯一的**账户/退出入口。 */
+.account-chip.bare {
+  background: none; border: none; padding: 3px 6px; gap: 7px;
+  border-radius: 8px; color: var(--muted);
+  transition: background 0.12s, color 0.12s;
+}
+.account-chip.bare:hover { background: rgba(255,255,255,0.07); color: var(--text); }
+.account-chip.bare:active { background: rgba(255,255,255,0.12); }
+/* 头像在那个胶囊里原本是"实心蓝圆 + 白色人头"；去掉外形之后
+   实心蓝圆反而又变成一个"形状"，所以这里只留描边人头。 */
+.account-chip.bare .account-avatar {
+  width: auto; height: auto; background: none; color: inherit;
+}
+/* 人头 + 齿轮的尺寸**只在这里定义**（两处 SVG 上都不写 width/height）。
+   用户口径 2026-09-23："这个人头和设置按键要做成 2 倍大，现在太小了" ——
+   原来是 15px，这里给 30px（正好 2 倍）。写成 CSS 而不是 SVG 属性，
+   是为了下次调大小只改一处，且两个图标不会各自跑偏。
+   `flex: none` 防止在窄屏下被顶栏的 flex 布局压扁。 */
+.account-chip.bare .acct-icon {
+  width: 30px; height: 30px; flex: none; display: block;
+}
+
+/* ---- 登录页：品牌头 + 审批提示 ---- */
+.auth-brand {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 18px;
+}
+.auth-brand-mark {
+  display: flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px; flex: none; border-radius: 12px;
+  background: rgba(74,158,255,0.14); color: var(--accent);
+  border: 1px solid rgba(74,158,255,0.35);
+}
+.auth-brand .auth-title { margin: 0 0 2px; }
+.auth-brand .auth-sub { margin: 0; }
+
+.auth-approval {
+  display: flex; align-items: flex-start; gap: 10px; margin-bottom: 18px;
+  padding: 11px 13px; border-radius: 9px; font-size: 12.5px;
+  line-height: 1.65; background: rgba(217,161,59,0.09);
+  border: 1px solid rgba(217,161,59,0.45); color: var(--text);
+}
+.auth-approval-icon { color: var(--medium); flex: none; margin-top: 1px; }
+.auth-approval-line {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  margin-top: 4px; color: var(--muted);
+}
+.auth-wx {
+  font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+  color: var(--medium); background: var(--bg); padding: 1px 7px;
+  border-radius: 5px; border: 1px solid var(--border);
+  user-select: all;   /* 点一下即全选，方便手动复制 */
+}
+.auth-copy {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--muted); border-radius: 5px; padding: 1px 8px;
+  font-size: 11.5px; cursor: pointer;
+}
+.auth-copy:hover { color: var(--accent); border-color: var(--accent); }
+
+/* ---- 真人检测（图形验证码） ---- */
+.human-check { margin: 12px 0 2px; }
+.human-hint { color: var(--muted); font-weight: 400; }
+.human-row { display: flex; align-items: center; gap: 8px; }
+.human-image {
+  padding: 0; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg); cursor: pointer; overflow: hidden; flex: none;
+  width: 168px; height: 52px; display: flex; align-items: center;
+  justify-content: center;
+}
+.human-image:hover { border-color: var(--accent); }
+.human-image:disabled { cursor: wait; opacity: 0.7; }
+.human-image img { display: block; }
+.human-placeholder { font-size: 12px; color: var(--muted); }
+.human-input {
+  flex: 1; min-width: 90px; letter-spacing: 3px; text-transform: uppercase;
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+/* ---- 功能权限矩阵：开关 ---- */
+.matrix-switch {
+  display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+  user-select: none;
+}
+.matrix-switch input {
+  width: 17px; height: 17px; accent-color: var(--accent); cursor: pointer;
+}
+.matrix-switch-text {
+  font-size: 12px; color: var(--muted); min-width: 42px;
+}
+.matrix-switch.on .matrix-switch-text { color: var(--high); font-weight: 600; }
+
+.matrix-bulk {
+  display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px;
+}
+.matrix-bulk-group { display: inline-flex; gap: 4px; align-items: center; }
+
+/* ---- 后端可达性横幅（连不上时才出现）----
+   放在顶栏下方、整页宽度：它解释的是"整站不可用"，不属于任何单个面板。
+   用 --low（红）而不是 --medium：这不是"某项数据缺失"的降级提示，
+   而是"服务没了"，必须一眼可辨。 */
+.conn-banner {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  background: #3a1f1f; border-bottom: 1px solid var(--low);
+  padding: 10px 18px; font-size: 13px; line-height: 1.6;
+}
+.conn-dot {
+  width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto;
+  background: var(--low); box-shadow: 0 0 0 3px rgba(255, 90, 90, 0.18);
+  animation: conn-pulse 1.6s ease-in-out infinite;
+}
+@keyframes conn-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.conn-text { flex: 1 1 320px; color: var(--text, #e6e6e6); }
+.conn-text code {
+  background: rgba(0, 0, 0, 0.3); padding: 1px 6px; border-radius: 4px;
+  font-size: 12px; white-space: nowrap;
+}
+
+/* ==================================================================
+   手机端适配（用户口径 2026-09-23："手机界面这个网站没怎么适配，布局错位"）
+   ==================================================================
+
+   ## 为什么是"补一层断点"而不是重做响应式
+
+   这套 CSS 是按**桌面工作台**设计的：宽表格、多列网格、两栏骨架，
+   已有的断点集中在 900~1180px（那些是给笔记本窄窗口用的）。
+   而手机是 **390~430px**，落在一个**从没被考虑过的区间**：
+   页签排不下就换行、宽表格把整页撑宽、两栏骨架把主面板压到几十像素。
+
+   所以这里只在 `max-width: 720px`（覆盖竖屏手机与小平板）里
+   做四件事，**不动任何桌面规则**：
+     ① 顶栏从"一行挤下品牌+页签+铃铛+头像"改成"品牌一行，页签横向滑动一行"；
+     ② 宽内容（表格/网格）自己横向滚动，**不再把整个页面撑宽**（页面被撑宽
+        就是"布局错位"的根源：其它元素都跟着视口一起错位）；
+     ③ 覆盖层（口径抽屉、自选栏）占满宽度或改成浮层，不挤主内容；
+     ④ 字号与内边距收紧一档。
+
+   ⚠️ 桌面规则一条没删：所有改动都在 `@media` 里，宽屏行为完全不变。
+*/
+
+@media (max-width: 720px) {
+  /* ---- ① 顶栏：品牌独占一行，页签横向滑动 ---- */
+  /* 原来是 `display:flex` 单行 + `flex-wrap` 只在页签内部生效：
+     品牌（含 19px 的英文名，约 220px）+ 7 个不换行的页签挤在 390px 里，
+     页签会折成 3~4 行，而且因为 `margin-left:auto` + `justify-content:flex-end`
+     每一行都右对齐 —— 看起来就是"错位"。 */
+  .header {
+    flex-wrap: wrap;
+    row-gap: 8px;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  /* 用 `order` 把"品牌 + 铃铛 + 头像"排在第 1 行、页签排第 2 行。
+     DOM 顺序是 品牌 → 页签 → 铃铛 → 头像，只靠 `flex-basis: 100%` 会把
+     铃铛/头像挤到**第 3 行**（实测截图就是这样）—— 而它们本该在品牌右边。 */
+  .brand { order: 1; flex: 1 1 auto; min-width: 0; padding: 2px 2px; }
+  /* 右对齐用 **`.brand` 的 `margin-right: auto`**，而不是给铃铛/头像各加
+     `margin-left: auto` —— 后者会让两个都"各自往右推"，谁先换行就把剩下的
+     挤到下一行（实测：铃铛留在品牌行，头像单独掉到第二行正中）。
+     `.account` 的基础样式里本来就有 `margin-left: auto`，这里必须覆盖掉。 */
+  .brand { margin-right: auto; }
+  .alert-bell { order: 1; margin-left: 0; }
+  .account { order: 1; margin-left: 8px; }
+  .brand-mark { width: 28px; height: 28px; border-radius: 8px; }
+  .brand-name { font-size: 15px; white-space: normal; line-height: 1.2; }
+  /* 副标题在手机上纯占高度，收掉（信息在登录页/关于里都有） */
+  .brand-sub { display: none; }
+  /* 页签：**一条横向可滑动的带子**。
+     这是移动端的标准做法 —— 比折成 4 行好读，也不会把顶栏顶到半屏高。 */
+  .tabs {
+    order: 2;
+    flex: 1 1 100%;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    width: 100%;
+    margin-left: 0;
+    justify-content: flex-start;
+    gap: 6px;
+    padding-bottom: 2px;
+    -webkit-overflow-scrolling: touch;   /* iOS 惯性滚动 */
+    scrollbar-width: none;               /* Firefox 隐藏滚动条 */
+  }
+  .tabs::-webkit-scrollbar { display: none; }
+  .tab { flex: 0 0 auto; padding: 6px 11px; font-size: 12.5px; }
+  .alert-bell { width: 34px; height: 34px; }
+
+  /* ---- ② 宽内容自己滚动，别把页面撑宽 ---- */
+  /* 页面被撑宽之后，**顶栏、浮层、fixed 元素都会跟着视口错位** ——
+     这才是"布局错位"最像的原因。宽表格的容器给横向滚动即可。 */
+  .app { padding-left: 3%; padding-right: 3%; }
+  .admin,
+  .crowding-root,
+  .fundflow-body,
+  .mainline-root,
+  .alerts-layout,
+  .intraday-root { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .admin-table { font-size: 12px; }
+  /* 表格**给一个最小宽度并让容器横向滚动**，而不是让每列被压到一个字宽。
+     不设 min-width 时，6 列表格在 390px 里会把表头折成"待/审/批""试/用"
+     这种竖排单字 —— 能看，但读起来很糟。`.admin` 已有 `overflow-x: auto`，
+     所以这里只负责给出最小宽度。 */
+  .admin-table { min-width: 560px; }
+  .admin-table th, .admin-table td {
+    padding: 6px 8px; white-space: nowrap;
+  }
+  /* 资金流排行表（`audit-table compact-table flow-table`）：列多且都是数字，
+     窄屏让它自己横向滚动，而不是把页面撑宽。 */
+  .flow-table { font-size: 12px; }
+  .flow-block { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  /* 面板头/工具栏本来就 `flex-wrap: wrap`，这里只把间距收紧 */
+  .admin-head { gap: 8px; margin-bottom: 10px; }
+  .admin-head h2 { font-size: 16px; }
+  /* 管理台的"实例徽标"在窄屏会挤掉统计条：让它整行显示 */
+  .admin-instance { max-width: 100%; flex: 1 1 100%; }
+
+  /* ---- ③ 覆盖层：抽屉/模态别挤主内容 ---- */
+  /* 口径抽屉原本 backdrop 上下留 40px；手机上横向只剩 ~350px 可用 */
+  .profile-drawer-backdrop { padding: 10px 8px; }
+  .profile-drawer { padding: 14px; border-radius: 10px; }
+  .profile-drawer-close { top: 10px; right: 10px; }
+  /* 做T的左侧自选栏：桌面是"占宽的两栏"，手机上必须变成**浮层**，
+     否则展开后主面板只剩 ~130px（图与打分全挤成一列）。 */
+  .intraday-drawer {
+    position: absolute; left: 0; top: 0; z-index: 30;
+    width: min(78vw, 300px); flex: 0 0 auto;
+    max-height: 68vh;
+    box-shadow: 0 12px 34px rgba(0,0,0,0.55);
+  }
+  /* ★ 个股抬头：桌面为了"框长 = 原长 65%"用了 `flex: 0 0 55%` +
+     `min-width: max-content`（宁可略宽也不折行）。**手机上这条是致命的**：
+     `max-content` 会按内容撑到 ~844px（含"低吸/高抛/止损"那一串 20px 大字），
+     整页因此横向溢出 —— 实测 `scrollWidth=864`（视口 390），
+     截图里右侧的"低吸…"被切掉，其它元素跟着视口错位。
+     手机上改成"整行 + 允许换行"，并把那一串大字降到 14px。 */
+  .intraday-head-row .intraday-headline {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+  .intraday-headline { font-size: 13px; gap: 8px; padding: 10px 12px; }
+  .hl-price { font-size: 18px; }
+  .hl-levels { font-size: 14px; }
+  /* Toast 与网络错误横幅在窄屏不该溢出 */
+  .toast-stack { right: 8px; left: 8px; bottom: 8px; max-width: none; }
+  .conn-banner { padding: 8px 10px; }
+
+  /* ★ 账户菜单（「账户与设置」下拉）在手机上**改成贴着视口左右**，
+     不再挂在那个小图标上。
+
+     为什么必须这样（用户口径 2026-09-23："用户设置界面显示在左上角，
+     左半边没显示出来，出界了"）：菜单原本是
+       `.account-menu { position: absolute; right: 0; width: 300px }`
+     —— 它从**头像右边缘往左**展开。桌面上头像在最右侧，往左展开正好。
+     但手机上头像会换行到第二行、靠左边，此时"右边缘往左 300px"直接
+     跑到视口外：菜单左半边被裁掉，看起来像"浮在左上角、缺了一半"。
+
+     `position: fixed` + `left/right` 让它相对**视口**定位，与头像在
+     哪一行、哪一侧无关，任何屏宽都完整可见。 */
+  .account-menu {
+    position: fixed;
+    left: 8px; right: 8px; top: 56px;
+    width: auto; max-width: none;
+    max-height: calc(100vh - 72px);
+    overflow-y: auto;
+  }
+
+  /* ---- ④ 字号与内边距收紧一档 ---- */
+  input, select, button { font-size: 14px; }   /* ≥16px 会触发 iOS 自动放大，14 反而不会 */
+  .submit-bar { flex-wrap: wrap; }
+  .query-input { flex: 1 1 100%; }
+  .target-input { width: 100%; }
+}
+
+/* 更窄的竖屏（iPhone SE / 小屏安卓）：再收一档，页签改小 */
+@media (max-width: 420px) {
+  .brand-name { font-size: 14px; }
+  .tab { padding: 5px 9px; font-size: 12px; }
+  .admin-stat { padding: 3px 8px; font-size: 11px; }
+}
+
+/* ---- 风险提示（免责声明）：统一组件，见 components/Disclaimer.tsx ---- */
+.disclaimer {
+  margin: 10px 0 0; padding: 6px 10px;
+  font-size: 11.5px; line-height: 1.6; color: var(--muted);
+  border-left: 2px solid var(--border);
+  background: rgba(255,255,255,0.02); border-radius: 0 6px 6px 0;
+}
+.disclaimer.compact { margin: 6px 0 0; padding: 4px 8px; font-size: 11px; }

@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
 from collections.abc import Iterable
@@ -36,7 +37,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.sector_crowding.config import SectorCrowdingConfig, load_config
+from src.sector_crowding.config import (
+    SectorCrowdingConfig,
+    load_config,
+    load_crowding_exclusions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,14 @@ DAILY_TABLE = "sector_crowding_daily"
 META_TABLE = "sector_meta"
 MEMBER_TABLE = "sector_member"
 WATCH_TABLE = "sector_crowding_watch"
+#: 看板清单（总览散点图 + 告警面板共用一份）：visible/pinned/manual 持久化
+LIST_TABLE = "sector_crowding_list"
+#: 周频异动指标（近5日/1月/2月水位变化 + 1月净流入占比），见 metrics.py
+METRIC_TABLE = "sector_crowding_metric"
+#: 周频指标的运行台账（判断"本周算过没有"）
+METRIC_META_TABLE = "sector_crowding_metric_meta"
+#: 自定义告警阈值（每板块一条：高于/低于某个水位就告警）
+ALERT_TABLE = "sector_crowding_alert"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {DAILY_TABLE} (
@@ -90,7 +103,73 @@ CREATE TABLE IF NOT EXISTS {WATCH_TABLE} (
     note        TEXT NOT NULL DEFAULT '',
     added_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS {LIST_TABLE} (
+    sector_code  TEXT PRIMARY KEY,
+    sector_name  TEXT NOT NULL DEFAULT '',
+    visible      INTEGER NOT NULL DEFAULT 1,
+    pinned       INTEGER NOT NULL DEFAULT 0,
+    source       TEXT NOT NULL DEFAULT 'manual',
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_crowding_list_visible
+    ON {LIST_TABLE}(visible, pinned DESC, sort_order, sector_code);
+
+CREATE TABLE IF NOT EXISTS {METRIC_TABLE} (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    sector_code       TEXT NOT NULL,
+    sector_name       TEXT NOT NULL DEFAULT '',
+    --: 指标口径的"本周"键（YYYY-MM-Www）与产出时刻
+    compute_week      TEXT NOT NULL,
+    computed_at       TEXT NOT NULL,
+    --: 各窗口的基准日与变化百分比（chg = 末端水位 / 基准水位 - 1，单位 %）
+    base_date_5d      TEXT NOT NULL DEFAULT '',
+    chg_5d            REAL,
+    base_date_1m      TEXT NOT NULL DEFAULT '',
+    chg_1m            REAL,
+    base_date_2m      TEXT NOT NULL DEFAULT '',
+    chg_2m            REAL,
+    --: 近1月资金净流入 / 基准日流通市值（%）
+    flow_base_date    TEXT NOT NULL DEFAULT '',
+    flow_last_date    TEXT NOT NULL DEFAULT '',
+    net_inflow        REAL,
+    circ_mv_base      REAL,
+    flow_ratio        REAL,
+    UNIQUE(sector_code, compute_week)
+);
+CREATE INDEX IF NOT EXISTS idx_crowding_metric_week
+    ON {METRIC_TABLE}(compute_week);
+
+CREATE TABLE IF NOT EXISTS {METRIC_META_TABLE} (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- 自定义告警阈值：与"看板清单"分表，因为告警是独立的关注维度 ——
+-- 板块可以在清单里可见但不设告警，也可以设了告警而暂时隐藏。
+CREATE TABLE IF NOT EXISTS {ALERT_TABLE} (
+    sector_code TEXT PRIMARY KEY,
+    --: above = 水位高于阈值告警；below = 低于阈值告警
+    mode        TEXT NOT NULL DEFAULT 'above',
+    --: 阈值 [0, 1]
+    threshold   REAL NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
 """
+
+#: `sector_crowding_list.source` 取值：manual = 用户在前端新增；
+#: default = 首屏从"全量概念板块"种子化写入（用户删除后置 visible=0）；
+#: hidden = 系统自动隐藏的**空壳板块**（`bars=0`，从未刷到过数据）。
+#: 与用户手动删除（source 仍是 default/manual、visible=0）区分开，
+#: 这样"恢复被系统隐藏的板块"能只挑出该恢复的那批，不会把用户主动删的也放回来。
+SOURCE_MANUAL = "manual"
+SOURCE_DEFAULT = "default"
+SOURCE_HIDDEN = "hidden"
 
 _ADDABLE: dict[str, dict[str, str]] = {
     DAILY_TABLE: {},
@@ -100,7 +179,21 @@ _ADDABLE: dict[str, dict[str, str]] = {
     },
     MEMBER_TABLE: {},
     WATCH_TABLE: {},
+    LIST_TABLE: {},
+    METRIC_TABLE: {
+        # 这一行的资金流用的是哪份成分股名单：`purified`（主线提纯，`relevant=1`）
+        # 或 `raw`（`sector_member` 原始名单 / 现场抓取）。没有这一列就无法
+        # 回答"提纯名单到底有没有生效"，只能靠日志猜。
+        "member_source": "TEXT NOT NULL DEFAULT ''",
+    },
+    METRIC_META_TABLE: {},
+    ALERT_TABLE: {},
 }
+
+#: 自定义告警的方向
+ALERT_ABOVE = "above"   #: 水位高于阈值 → 告警（拥挤了，风险）
+ALERT_BELOW = "below"   #: 水位低于阈值 → 告警（跌到冷清区，可能有机会）
+ALERT_MODES = (ALERT_ABOVE, ALERT_BELOW)
 
 
 def _now() -> str:
@@ -294,11 +387,20 @@ def query_sector_crowding(conn: sqlite3.Connection, sector_code: str, *,
 
 def query_all_latest_water_level(conn: sqlite3.Connection, *,
                                  concepts_only: bool = False,
-                                 trade_date: str = "") -> list[dict[str, Any]]:
+                                 trade_date: str = "",
+                                 sector_codes: list[str] | None = None
+                                 ) -> list[dict[str, Any]]:
     """全板块**最新交易日**的水位（前端散点总览用）。
 
     `trade_date` 留空时取全库最大交易日 —— 不能让每个板块各取自己的最新日：
     停牌/退市的板块最新日会更早，混在一起画散点会出现"今天的图里混着上周的点"。
+
+    `sector_codes` 非 None 时只返回这些板块（前端持久化清单的过滤口径）。
+
+    ⚠️ 这里同样过滤板块黑名单（2026-09-22 补）。前端"持久化清单"若来自
+    `list_visible_codes` 本已不含被剔板块，但**只要有一个调用方传的是全量
+    代码**（或前端自己在缓存里留着旧清单），被剔板块就会重新出现在散点图上。
+    读取侧兜住这一层，与 `query_metrics` 同一个理由。
     """
     target = str(trade_date or "").strip()
     if not target:
@@ -310,25 +412,37 @@ def query_all_latest_water_level(conn: sqlite3.Connection, *,
     sql = f"""
     SELECT d.sector_code, d.sector_name, d.trade_date, d.sector_amount,
            d.market_amount, d.raw_crowding, d.ma5_crowding, d.water_level,
-           COALESCE(m.is_concept, 1) AS is_concept, m.bars
+           COALESCE(m.is_concept, 1) AS is_concept, m.bars,
+           COALESCE(l.pinned, 0) AS pinned
     FROM {DAILY_TABLE} d
     LEFT JOIN {META_TABLE} m ON m.sector_code = d.sector_code
+    LEFT JOIN {LIST_TABLE} l ON l.sector_code = d.sector_code
     WHERE d.trade_date = ?
     """
     params: list[Any] = [target]
     if concepts_only:
         sql += " AND COALESCE(m.is_concept, 1) = 1"
-    sql += " ORDER BY d.water_level IS NULL, d.water_level DESC"
-    return [dict(row) for row in conn.execute(sql, params)]
+    if sector_codes is not None:
+        if not sector_codes:
+            return []
+        sql += f" AND d.sector_code IN ({','.join('?' * len(sector_codes))})"
+        params.extend(str(code) for code in sector_codes)
+    sql += " ORDER BY COALESCE(l.pinned, 0) DESC, d.water_level IS NULL, d.water_level DESC"
+    blocked = _sector_blacklist()
+    return [dict(row) for row in conn.execute(sql, params)
+            if str(row["sector_code"]) not in blocked]
 
 
 def query_alerts(conn: sqlite3.Connection, *, threshold: float = 0.8,
                  concepts_only: bool = True,
-                 trade_date: str = "") -> list[dict[str, Any]]:
+                 trade_date: str = "",
+                 sector_codes: list[str] | None = None) -> list[dict[str, Any]]:
     """水位 ≥ 阈值的板块（按水位降序）。
 
     水位为 NULL（数据不足）的**不参与告警** —— "不知道"和"不拥挤"是两件事，
     把 NULL 当成 0 或当成触发都是错的。
+
+    `sector_codes` 非 None 时只在这些板块里判定告警（与散点图同一份清单）。
     """
     target = str(trade_date or "").strip()
     if not target:
@@ -341,16 +455,24 @@ def query_alerts(conn: sqlite3.Connection, *, threshold: float = 0.8,
     SELECT d.sector_code, d.sector_name, d.trade_date, d.sector_amount,
            d.market_amount, d.raw_crowding, d.ma5_crowding, d.water_level,
            COALESCE(m.is_concept, 1) AS is_concept,
+           COALESCE(l.pinned, 0) AS pinned, m.bars,
            (SELECT MAX(x.ma5_crowding) FROM {DAILY_TABLE} x
              WHERE x.sector_code = d.sector_code) AS max_ma5_crowding
     FROM {DAILY_TABLE} d
     LEFT JOIN {META_TABLE} m ON m.sector_code = d.sector_code
+    LEFT JOIN {LIST_TABLE} l ON l.sector_code = d.sector_code
     WHERE d.trade_date = ? AND d.water_level IS NOT NULL AND d.water_level >= ?
     """
     params: list[Any] = [target, float(threshold)]
     if concepts_only:
         sql += " AND COALESCE(m.is_concept, 1) = 1"
-    sql += " ORDER BY d.water_level DESC"
+    if sector_codes is not None:
+        if not sector_codes:
+            return []
+        sql += f" AND d.sector_code IN ({','.join('?' * len(sector_codes))})"
+        params.extend(str(code) for code in sector_codes)
+    sql += (" ORDER BY COALESCE(l.pinned, 0) DESC, "
+            "d.water_level IS NULL, d.water_level DESC")
     return [dict(row) for row in conn.execute(sql, params)]
 
 
@@ -414,6 +536,561 @@ def watchlist_codes(conn: sqlite3.Connection) -> set[str]:
         f"SELECT sector_code FROM {WATCH_TABLE}")}
 
 
+# ======================================================================
+# 看板清单（总览散点图 + 告警面板共用）
+# ======================================================================
+#
+# 语义：**行存在 = 用户已表态；行不存在 = 从未配置过（默认可见）**。
+# 因此"用户删掉全部板块"（全部 visible=0）与"库里一行都没有"是两种状态：
+# 前者界面应为空，后者才回落到"默认显示全部概念板块"。
+#
+# 一旦用户在界面上新增过一个板块，我们会把当前默认可见的板块种子化落库
+# （`seed_list`），此后可见性完全由库里决定 —— 这是"上次的增删和置顶配置不变"
+# 能成立的前提。
+
+def query_list_view(conn: sqlite3.Connection, *,
+                    concepts_only: bool = True) -> list[dict[str, Any]]:
+    """清单视图：每个候选板块一行，带 `visible / pinned / missing / in_watchlist`。
+
+    候选集 = `sector_meta` 里的概念板块（或全部）**并集**已经写过配置行的板块。
+    成交额/水位取**最新交易日**，与散点总览同口径。
+
+    `visible` 的默认值（"没有配置行"时怎么算）：
+
+    | 板块 | 默认 |
+    |---|---|
+    | 有配置行 | 用行上的 `visible`（用户的删除/恢复说了算） |
+    | 概念 + 有数据 | 可见 |
+    | 非概念 + 有数据 | **不可见** —— 从没被种子化过。若默认可见，
+      取消勾选"只看概念板块"时会凭空冒出一千多个从未看过的板块 |
+    | `bars=0`（空壳） | **不可见** —— 同花顺 865xxx 段那类从未刷到数据的
+      空壳，放出来只占位置显示"—" |
+
+    空壳一律默认不可见是**关键**：否则每 60 秒轮询的接口每次都要多传几百行无用数据。
+    """
+    latest = latest_trade_date(conn)
+    # `l.sector_code IS NULL` = 该板块没有配置行（用户从未表态）
+    blank_visible = ("CASE WHEN l.sector_code IS NULL THEN "
+                     "CASE WHEN COALESCE(m.is_concept, 0) = 1 "
+                     "AND COALESCE(m.bars, 0) > 0 THEN 1 ELSE 0 END "
+                     "ELSE l.visible END")
+    # UNION ALL 的结果集里不能直接用表达式排序（SQLite：`3rd ORDER BY term does
+    # not match any column in the result set`），所以整段包一层子查询再排序。
+    inner = f"""
+    SELECT m.sector_code,
+           COALESCE(NULLIF(l.sector_name, ''), m.sector_name, '') AS sector_name,
+           m.is_concept, m.board_type, m.bars, m.last_update_date,
+           {blank_visible}  AS visible,
+           COALESCE(l.pinned, 0)   AS pinned,
+           COALESCE(l.source, '')  AS source,
+           COALESCE(l.sort_order, 0) AS sort_order,
+           CASE WHEN l.sector_code IS NULL THEN 1 ELSE 0 END AS missing,
+           CASE WHEN w.sector_code IS NULL THEN 0 ELSE 1 END AS in_watchlist,
+           COALESCE(a.mode, '')      AS alert_mode,
+           a.threshold               AS alert_threshold,
+           d.trade_date, d.sector_amount, d.market_amount,
+           d.raw_crowding, d.ma5_crowding, d.water_level
+    FROM {META_TABLE} m
+    LEFT JOIN {LIST_TABLE} l ON l.sector_code = m.sector_code
+    LEFT JOIN {WATCH_TABLE} w ON w.sector_code = m.sector_code
+    LEFT JOIN {ALERT_TABLE} a ON a.sector_code = m.sector_code
+    LEFT JOIN {DAILY_TABLE} d
+           ON d.sector_code = m.sector_code AND d.trade_date = ?
+    """
+    params: list[Any] = [latest]
+    if concepts_only:
+        inner += " WHERE COALESCE(m.is_concept, 1) = 1"
+    inner += f"""
+    UNION ALL
+    SELECT l.sector_code,
+           COALESCE(NULLIF(l.sector_name, ''), m2.sector_name, l.sector_code),
+           COALESCE(m2.is_concept, 1), COALESCE(m2.board_type, ''),
+           COALESCE(m2.bars, 0), COALESCE(m2.last_update_date, ''),
+           l.visible, l.pinned, l.source, l.sort_order,
+           0, CASE WHEN w2.sector_code IS NULL THEN 0 ELSE 1 END,
+           COALESCE(a2.mode, ''), a2.threshold,
+           d2.trade_date, d2.sector_amount, d2.market_amount,
+           d2.raw_crowding, d2.ma5_crowding, d2.water_level
+    FROM {LIST_TABLE} l
+    LEFT JOIN {META_TABLE} m2 ON m2.sector_code = l.sector_code
+    LEFT JOIN {WATCH_TABLE} w2 ON w2.sector_code = l.sector_code
+    LEFT JOIN {ALERT_TABLE} a2 ON a2.sector_code = l.sector_code
+    LEFT JOIN {DAILY_TABLE} d2
+           ON d2.sector_code = l.sector_code AND d2.trade_date = ?
+    WHERE m2.sector_code IS NULL
+    """
+    params.append(latest)
+    # ⚠️ 黑名单过滤必须作用在**两个分支上**（2026-09-23 修复，实测踩坑）
+    #
+    # 只过滤 `sector_meta` 那一段是不够的：删掉清单行之后，**另一段**（清单表里
+    # 有、`sector_meta` 里没有的行）仍会把它带出来。反过来也一样。
+    # 两段都过滤才是"这个板块在任何情况下都不出现在读结果里"。
+    #
+    # 更要紧的是下面这个反直觉后果 —— 它正是本轮问题的真正根因：
+    #
+    #   `blank_visible` 的兜底规则是「**没有配置行** + `is_concept=1` +
+    #   `bars>0` → 可见」。而 `sector_meta` 里历史数据**刻意保留**
+    #   （不删历史是可逆性的前提），所以对一个"已剔除"的板块：
+    #
+    #       置 visible=0        → 前端不显示              ✅
+    #       把配置行**删掉**     → 兜底规则判它**可见**     ❌ 反而露出来了
+    #
+    #   实测：删行后 `/config_list` 返回 `visible=true, source='', missing=1`。
+    #   也就是说「删得更彻底」这个直觉在这里是**反的**，必须靠黑名单显式挡住，
+    #   而不能依赖"没有配置行所以看不见"。
+    #
+    # 用与 `seed_list` / `query_metrics` / `refresh` 同一份 `_sector_blacklist()`
+    # （主线点名批次 ∪ 拥挤度剔除清单），四处口径一致。
+    blocked = _sector_blacklist()
+    if blocked:
+        marks = ",".join("?" * len(blocked))
+        inner = (f"SELECT * FROM ({inner}) WHERE sector_code NOT IN ({marks})")
+        params.extend(sorted(blocked))
+    sql = (f"SELECT * FROM ({inner}) sub "
+           f"ORDER BY pinned DESC, visible DESC, "
+           f"water_level IS NULL, water_level DESC, sector_code")
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def list_visible_codes(conn: sqlite3.Connection, *,
+                       concepts_only: bool = True) -> list[str]:
+    """当前**可见**的清单板块代码（散点图与告警面板据此过滤）。"""
+    return [str(row["sector_code"]) for row in query_list_view(
+        conn, concepts_only=concepts_only) if int(row["visible"])]
+
+
+def upsert_list_item(conn: sqlite3.Connection, sector_code: str, *,
+                     sector_name: str = "", visible: bool | None = None,
+                     pinned: bool | None = None, source: str = "",
+                     sort_order: int | None = None) -> dict[str, Any]:
+    """写一条清单配置（幂等）。只更新显式传入的字段。
+
+    返回 `{created, sector_code, visible, pinned}`。
+    """
+    code = str(sector_code or "").strip()
+    if not code:
+        raise ValueError("sector_code 不能为空")
+    stamp = _now()
+    existed = conn.execute(
+        f"SELECT 1 FROM {LIST_TABLE} WHERE sector_code = ?", (code,)).fetchone()
+    conn.execute(
+        f"""
+        INSERT INTO {LIST_TABLE}
+            (sector_code, sector_name, visible, pinned, source, sort_order,
+             created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sector_code) DO UPDATE SET
+            sector_name = CASE WHEN excluded.sector_name <> ''
+                               THEN excluded.sector_name
+                               ELSE {LIST_TABLE}.sector_name END,
+            visible = CASE WHEN ? = 1 THEN excluded.visible
+                           ELSE {LIST_TABLE}.visible END,
+            pinned  = CASE WHEN ? = 1 THEN excluded.pinned
+                           ELSE {LIST_TABLE}.pinned END,
+            source  = CASE WHEN excluded.source <> '' THEN excluded.source
+                           ELSE {LIST_TABLE}.source END,
+            sort_order = CASE WHEN ? = 1 THEN excluded.sort_order
+                              ELSE {LIST_TABLE}.sort_order END,
+            updated_at = excluded.updated_at
+        """,
+        (code, str(sector_name or ""), 1 if (visible is None or visible) else 0,
+         1 if pinned else 0, str(source or ""),
+         int(sort_order) if sort_order is not None else 0, stamp, stamp,
+         1 if visible is not None else 0, 1 if pinned is not None else 0,
+         1 if sort_order is not None else 0),
+    )
+    conn.commit()
+    row = conn.execute(
+        f"SELECT visible, pinned FROM {LIST_TABLE} WHERE sector_code = ?",
+        (code,)).fetchone()
+    return {"created": existed is None, "sector_code": code,
+            "visible": bool(row["visible"]) if row else True,
+            "pinned": bool(row["pinned"]) if row else False}
+
+
+def seed_list(conn: sqlite3.Connection, *, concepts_only: bool = True) -> int:
+    """把当前默认可见的板块落库成显式配置行（`visible=1, pinned=0`）。
+
+    只在"从未配置过"时调用一次：一旦落库，用户的删除/置顶就不会被默认值覆盖。
+    返回新增行数。
+
+    **空的板块（`bars=0`，从未刷到过数据）不落库** —— 它们放进来只会占位置、
+    显示"—"，还会和同名的有效板块撞名（实测 250 个空壳里 183 个是 865xxx 段，
+    造成"黄金/猪肉/5G"这类名字在列表里出现 2~3 次）。不落库即"默认不可见"，
+    以后真要补数据了也能从「已隐藏板块」恢复。
+
+    ## ⚠️ 必须尊重黑名单（2026-09-23 修复，实测踩坑）
+
+    原来这里没有任何黑名单判断，于是出现一个**把删除操作直接抹掉**的回路：
+
+        prune_concepts 置 `visible=0` → 用户要求"彻底去掉" → 删掉清单行
+        → 下一次 `/config_list` 调 `seed_list`
+        → 它看到"该板块在 `sector_meta` 里 `bars=1456>0` 且不在清单表里"
+        → **重新插入 `visible=1`** → 板块回到前端可见列表
+
+    实测复现：删行后调一次 `seed_list` → `新增 1 行`，目标行数从 0 变 1。
+    用户会看到"删了又自己长回来"，而且**没有任何日志**。
+
+    为什么判据是黑名单而不是 `bars`：`bars>0` 是"有没有数据"的事实陈述，
+    黑名单才是"用户还要不要它"的意图陈述。两者混用就会让**数据的存在**
+    冒充**用户的决定**（与 `apply_pure_pool` 那条"未评估 ≠ 不相关"的教训同型）。
+    `sector_meta` 里的历史数据**刻意保留**（不删历史是可逆性的前提），
+    所以判据必须在读取侧，不能靠把 `bars` 改小来"修数据"。
+
+    用与 `query_metrics` / `refresh` 同一份 `_sector_blacklist()`
+    （主线点名批次 ∪ 拥挤度剔除清单），三处口径一致，不会漂移。
+    """
+    existing = {str(row[0]) for row in conn.execute(
+        f"SELECT sector_code FROM {LIST_TABLE}")}
+    blocked = _sector_blacklist()
+    sql = f"SELECT sector_code, sector_name FROM {META_TABLE} WHERE bars > 0"
+    if concepts_only:
+        sql += " AND is_concept = 1"
+    stamp = _now()
+    payload = [(str(row["sector_code"]), str(row["sector_name"] or ""),
+                1, 0, SOURCE_DEFAULT, 0, stamp, stamp)
+               for row in conn.execute(sql)
+               if str(row["sector_code"]) not in existing
+               and str(row["sector_code"]) not in blocked]
+    if not payload:
+        return 0
+    conn.executemany(
+        f"INSERT INTO {LIST_TABLE} (sector_code, sector_name, visible, pinned, "
+        f"source, sort_order, created_at, updated_at) "
+        f"VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(sector_code) DO NOTHING", payload)
+    conn.commit()
+    return len(payload)
+
+
+def hide_dead_boards(conn: sqlite3.Connection, *, force: bool = False) -> int:
+    """把**可见的**空壳板块（`bars=0`）软删并标记 `source='hidden'`。
+
+    `force=False`（默认，启动时自动跑一次）只处理从未被标记过的行，所以
+    "用户手动恢复过"的板块不会被又自动藏回去 —— 自动清理只做一次，
+    之后由用户在界面上决定。`force=True`（接口显式调用）则重新隐藏当前
+    所有可见的空壳板块。
+
+    返回本次隐藏的板块数。
+    """
+    guard = "" if force else f" AND COALESCE(source, '') <> '{SOURCE_HIDDEN}'"
+    # 注意：SQLite 的 UPDATE 不接受 `SET 别名.列`（那只在 SELECT 里成立），
+    # 所以这里不写 `UPDATE ... AS l SET l.visible=0`，直接写列名。
+    cursor = conn.execute(f"""
+        UPDATE {LIST_TABLE}
+           SET visible = 0, source = '{SOURCE_HIDDEN}', updated_at = ?
+         WHERE visible = 1
+           AND COALESCE(source, '') <> '{SOURCE_MANUAL}'
+           AND EXISTS (SELECT 1 FROM {META_TABLE} m
+                        WHERE m.sector_code = {LIST_TABLE}.sector_code
+                          AND m.bars = 0)
+           {guard}
+    """, (_now(),))
+    conn.commit()
+    return int(cursor.rowcount or 0)
+
+
+def query_hidden_boards(conn: sqlite3.Connection, *, keyword: str = "",
+                        limit: int = 0) -> list[dict[str, Any]]:
+    """被系统隐藏（或用户删除）的板块，供「已隐藏板块」恢复列表用。
+
+    不放进 `/config_list`：那是个每 60 秒轮询的接口，把几百个不可见行一起塞进去
+    会让每次轮询都白传一大截数据；这里按需单独取。
+    """
+    sql = f"""
+    SELECT l.sector_code,
+           COALESCE(NULLIF(l.sector_name, ''), m.sector_name, l.sector_code)
+             AS sector_name,
+           COALESCE(l.source, '') AS source,
+           l.pinned, l.updated_at,
+           COALESCE(m.bars, 0) AS bars,
+           COALESCE(m.is_concept, 1) AS is_concept,
+           COALESCE(m.last_update_date, '') AS last_update_date,
+           (SELECT MAX(d.trade_date) FROM {DAILY_TABLE} d
+             WHERE d.sector_code = l.sector_code) AS last_trade_date
+      FROM {LIST_TABLE} l
+      LEFT JOIN {META_TABLE} m ON m.sector_code = l.sector_code
+     WHERE l.visible = 0
+    """
+    params: list[Any] = []
+    text = str(keyword or "").strip()
+    if text:
+        sql += " AND (l.sector_code LIKE ? OR COALESCE(m.sector_name, '') LIKE ?" \
+               "      OR l.sector_name LIKE ?)"
+        params.extend([f"%{text}%"] * 3)
+    sql += " ORDER BY COALESCE(m.bars, 0), l.sector_code"
+    if limit > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def count_hidden_dead(conn: sqlite3.Connection) -> int:
+    """被系统标为 hidden 且仍未刷到数据的板块数（界面提示用）。"""
+    row = conn.execute(f"""
+        SELECT COUNT(*) AS n FROM {LIST_TABLE} l
+          LEFT JOIN {META_TABLE} m ON m.sector_code = l.sector_code
+         WHERE l.visible = 0 AND l.source = '{SOURCE_HIDDEN}'
+           AND COALESCE(m.bars, 0) = 0
+    """).fetchone()
+    return int(row["n"] or 0) if row else 0
+
+
+def max_ma5_map(conn: sqlite3.Connection) -> dict[str, float]:
+    """每个板块的历史最高平滑拥挤度（"近6年最高"那一列）。
+
+    一次 GROUP BY 拿全量，供清单/告警面板整表渲染用。
+    **不要**用它替代 `query_alerts` 里的相关子查询场景：那里只需要几十行，
+    而这里一次扫 217 万行（实测 ~0.4s），只在"要显示整张表"时调一次。
+    """
+    rows = conn.execute(
+        f"SELECT sector_code, MAX(ma5_crowding) AS mx FROM {DAILY_TABLE} "
+        f"WHERE ma5_crowding IS NOT NULL GROUP BY sector_code").fetchall()
+    return {str(row["sector_code"]): float(row["mx"])
+            for row in rows if row["mx"] is not None}
+
+
+def count_list_rows(conn: sqlite3.Connection) -> int:
+    return int(conn.execute(f"SELECT COUNT(*) FROM {LIST_TABLE}").fetchone()[0])
+
+
+# ======================================================================
+# 自定义告警阈值（每板块一条）
+# ======================================================================
+
+def alert_triggered(mode: str, threshold: float | None,
+                    water: float | None) -> bool:
+    """是否触发告警。水位缺失（数据不足）**不算触发** —— "不知道" != "不拥挤"，
+    与面板里水位 NULL 不参与默认告警是同一口径。"""
+    if threshold is None or water is None:
+        return False
+    if not math.isfinite(float(water)) or not math.isfinite(float(threshold)):
+        return False
+    value, cut = float(water), float(threshold)
+    if mode == ALERT_BELOW:
+        return value < cut
+    return value > cut
+
+
+def upsert_alert(conn: sqlite3.Connection, sector_code: str, *,
+                 mode: str, threshold: float, note: str = "") -> dict[str, Any]:
+    """设置/更新某板块的告警阈值。
+
+    校验放在这里而不是只放接口层：阈值必须是 `[0, 1]` 的有限数、方向必须是
+    已知值 —— 静默写入一个 `NaN` 或越界值会让"触发判定"永远为假，比报错更难查。
+    """
+    code = str(sector_code or "").strip()
+    if not code:
+        raise ValueError("sector_code 不能为空")
+    direction = str(mode or "").strip().lower()
+    if direction not in ALERT_MODES:
+        raise ValueError(f"告警方向必须是 {' / '.join(ALERT_MODES)}")
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("告警阈值必须是数字") from exc
+    if not math.isfinite(value):
+        raise ValueError("告警阈值必须是有限数字")
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("告警阈值必须在 [0, 1] 之间")
+    stamp = _now()
+    conn.execute(
+        f"""
+        INSERT INTO {ALERT_TABLE}(sector_code, mode, threshold, note,
+                                  created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sector_code) DO UPDATE SET
+            mode = excluded.mode, threshold = excluded.threshold,
+            note = excluded.note, updated_at = excluded.updated_at
+        """, (code, direction, value, str(note or ""), stamp, stamp))
+    conn.commit()
+    return {"sector_code": code, "mode": direction, "threshold": value}
+
+
+def delete_alert(conn: sqlite3.Connection, sector_code: str) -> bool:
+    cursor = conn.execute(f"DELETE FROM {ALERT_TABLE} WHERE sector_code = ?",
+                          (str(sector_code or "").strip(),))
+    conn.commit()
+    return bool(cursor.rowcount)
+
+
+def query_alerts_config(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
+    """全部自定义告警配置，按 `sector_code` 索引（前端整表渲染用）。"""
+    return {str(row["sector_code"]): dict(row)
+            for row in conn.execute(f"SELECT * FROM {ALERT_TABLE}")}
+
+
+def count_alerts_config(conn: sqlite3.Connection) -> int:
+    return int(conn.execute(
+        f"SELECT COUNT(*) FROM {ALERT_TABLE}").fetchone()[0])
+
+
+def reset_list(conn: sqlite3.Connection) -> int:
+    """清空清单配置 → 回到"默认显示全部板块"。
+
+    **不要**紧接着调 `seed_list()`：清空 + 重新种子化等于把用户的删除/置顶
+    全部抹掉，那是"重置"而不是"清空"。清空后靠 `query_list_view` 的
+    `COALESCE(l.*, 默认)` 回落即可（新用户本来就该看到全量）。
+    """
+    cursor = conn.execute(f"DELETE FROM {LIST_TABLE}")
+    conn.commit()
+    return int(cursor.rowcount or 0)
+
+
+# ======================================================================
+# 周频异动指标（metrics.py 产出，前端 4 列）
+# ======================================================================
+
+def upsert_metrics(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]],
+                   *, commit: bool = True) -> int:
+    """写某周的各板块异动指标（幂等，按 `(sector_code, compute_week)` UPSERT）。"""
+    payload = []
+    for row in rows:
+        code = str(row.get("sector_code") or "").strip()
+        week = str(row.get("compute_week") or "").strip()
+        if not code or not week:
+            continue
+        payload.append({
+            "sector_code": code,
+            "sector_name": str(row.get("sector_name") or ""),
+            "compute_week": week,
+            "computed_at": str(row.get("computed_at") or _now()),
+            "base_date_5d": str(row.get("base_date_5d") or ""),
+            "chg_5d": _num(row.get("chg_5d")),
+            "base_date_1m": str(row.get("base_date_1m") or ""),
+            "chg_1m": _num(row.get("chg_1m")),
+            "base_date_2m": str(row.get("base_date_2m") or ""),
+            "chg_2m": _num(row.get("chg_2m")),
+            "flow_base_date": str(row.get("flow_base_date") or ""),
+            "flow_last_date": str(row.get("flow_last_date") or ""),
+            "net_inflow": _num(row.get("net_inflow")),
+            "circ_mv_base": _num(row.get("circ_mv_base")),
+            "flow_ratio": _num(row.get("flow_ratio")),
+            "member_source": str(row.get("member_source") or ""),
+        })
+    if not payload:
+        return 0
+    conn.executemany(
+        f"""
+        INSERT INTO {METRIC_TABLE}
+            (sector_code, sector_name, compute_week, computed_at,
+             base_date_5d, chg_5d, base_date_1m, chg_1m,
+             base_date_2m, chg_2m, flow_base_date, flow_last_date,
+             net_inflow, circ_mv_base, flow_ratio, member_source)
+        VALUES (:sector_code, :sector_name, :compute_week, :computed_at,
+                :base_date_5d, :chg_5d, :base_date_1m, :chg_1m,
+                :base_date_2m, :chg_2m, :flow_base_date, :flow_last_date,
+                :net_inflow, :circ_mv_base, :flow_ratio, :member_source)
+        ON CONFLICT(sector_code, compute_week) DO UPDATE SET
+            sector_name    = excluded.sector_name,
+            computed_at    = excluded.computed_at,
+            base_date_5d   = excluded.base_date_5d,
+            chg_5d         = excluded.chg_5d,
+            base_date_1m   = excluded.base_date_1m,
+            chg_1m         = excluded.chg_1m,
+            base_date_2m   = excluded.base_date_2m,
+            chg_2m         = excluded.chg_2m,
+            flow_base_date = excluded.flow_base_date,
+            flow_last_date = excluded.flow_last_date,
+            net_inflow     = excluded.net_inflow,
+            circ_mv_base   = excluded.circ_mv_base,
+            flow_ratio     = excluded.flow_ratio,
+            member_source  = excluded.member_source
+        """, payload)
+    if commit:
+        conn.commit()
+    return len(payload)
+
+
+def latest_metric_week(conn: sqlite3.Connection) -> str:
+    """库里最新一周的指标键（'' = 从未算过）。"""
+    row = conn.execute(
+        f"SELECT MAX(compute_week) AS w FROM {METRIC_TABLE}").fetchone()
+    return str(row["w"] or "") if row else ""
+
+
+def query_metrics(conn: sqlite3.Connection, *, week: str = ""
+                  ) -> dict[str, dict[str, Any]]:
+    """某一周的指标，按 `sector_code` 索引（`week` 留空 → 最新一周）。
+
+    返回 {} 表示还没算过 —— 前端此时这几列显示"—"，不会显示 0（"没算"和
+    "没变化"必须区分得开，与水位 NULL 的处理口径一致）。
+
+    ## ⚠️ 读取时也要过滤板块黑名单（2026-09-22 补，前端"删不掉"的根因）
+
+    `compute_all_metrics` 的黑名单过滤**只对之后算的周生效**。用户剔除一个板块后，
+    **当周已经算好的行还留在 `sector_crowding_metric` 里**，前端读这张表，
+    于是板块"删了还在" —— 实测用户为此把同一批板块报了两次。
+
+    这里在**读取**侧过滤，而不是去删行：与 `refresh._drop_blacklisted` 的
+    "只挡更新、不删历史"同一口径（历史行留着可回溯），但**展示与检测范围**
+    立刻生效，不必等下一周重算。
+
+    黑名单不可用时**不过滤**（与日更、指标计算三处口径一致）：
+    把"读不到清单"当成"排除全部"会让前端一片空白。
+    """
+    target = str(week or "").strip() or latest_metric_week(conn)
+    if not target:
+        return {}
+    rows = conn.execute(
+        f"SELECT * FROM {METRIC_TABLE} WHERE compute_week = ?", (target,))
+    blocked = _sector_blacklist()
+    return {str(row["sector_code"]): dict(row) for row in rows
+            if str(row["sector_code"]) not in blocked}
+
+
+def _sector_blacklist() -> frozenset[str]:
+    """不显示在拥挤度看板上的板块 = 主线批次剔除 ∪ 拥挤度剔除清单。
+
+    ⚠️ 用两份**用户点名**的清单，而不是整份 `sector_blacklist.yaml`（604 条）：
+    后者含大量历史遗留的 `865xxx` / GICS 行业 / 地域板块，而拥挤度模块
+    **刻意保留**它们（"以后想看行业拥挤度不用重跑 6 年"）。按整份过滤会把
+    最新一周 1878 个板块砍到 1541，多砍的绝大多数是行业指数 —— 过度过滤。
+
+    与 `metrics._sector_blacklist` 故意各写一份：`db.py` 是底层读接口，
+    不应反向依赖 `metrics.py`（循环导入）。两份都"任一不可用就只用可用的那份"。
+    """
+    out: set[str] = set()
+    try:
+        from src.mainline.config import load_removed_concepts
+
+        loaded = load_removed_concepts()
+        if loaded:
+            out |= set(loaded)
+    except Exception as exc:  # noqa: BLE001 清单坏了不该让前端打不开
+        logger.warning("主线批次剔除清单读取失败，本轮不含这部分：%s",
+                       type(exc).__name__)
+    try:
+        extra = load_crowding_exclusions()
+        if extra:
+            out |= set(extra)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("拥挤度剔除清单读取失败，本轮不含这部分：%s",
+                       type(exc).__name__)
+    return frozenset(out)
+
+
+def get_metric_meta(conn: sqlite3.Connection) -> dict[str, str]:
+    return {str(row["key"]): str(row["value"])
+            for row in conn.execute(f"SELECT key, value FROM {METRIC_META_TABLE}")}
+
+
+def set_metric_meta(conn: sqlite3.Connection, values: dict[str, str]) -> None:
+    stamp = _now()
+    conn.executemany(
+        f"INSERT INTO {METRIC_META_TABLE}(key, value, updated_at) VALUES (?,?,?) "
+        f"ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+        f"updated_at = excluded.updated_at",
+        [(str(k), str(v), stamp) for k, v in values.items()])
+    conn.commit()
+
+
+def reset_metrics(conn: sqlite3.Connection) -> int:
+    """删掉全部周频指标（重算前清场用，避免历史周堆积）。"""
+    cursor = conn.execute(f"DELETE FROM {METRIC_TABLE}")
+    conn.commit()
+    return int(cursor.rowcount or 0)
+
+
 def query_sector_members(conn: sqlite3.Connection,
                          sector_code: str) -> list[dict[str, Any]]:
     return [dict(row) for row in conn.execute(
@@ -463,27 +1140,58 @@ def _num(value: Any) -> float | None:
 
 
 __all__ = [
+    "ALERT_ABOVE",
+    "ALERT_BELOW",
+    "ALERT_MODES",
+    "ALERT_TABLE",
     "DAILY_TABLE",
+    "LIST_TABLE",
     "MEMBER_TABLE",
     "META_TABLE",
+    "METRIC_META_TABLE",
+    "METRIC_TABLE",
+    "SOURCE_DEFAULT",
+    "SOURCE_HIDDEN",
+    "SOURCE_MANUAL",
     "WATCH_TABLE",
     "add_to_watchlist",
+    "alert_triggered",
+    "count_alerts_config",
+    "count_hidden_dead",
+    "count_list_rows",
     "count_rows",
+    "delete_alert",
     "get_db_connection",
     "get_last_update_date",
+    "get_metric_meta",
+    "hide_dead_boards",
     "init_tables",
+    "latest_metric_week",
     "latest_trade_date",
     "list_sectors_needing_refresh",
+    "list_visible_codes",
     "list_watchlist",
+    "max_ma5_map",
     "query_alerts",
+    "query_alerts_config",
     "query_all_latest_water_level",
+    "query_hidden_boards",
+    "query_list_view",
+    "query_metrics",
     "query_sector_crowding",
     "query_sector_members",
     "query_sector_meta",
     "remove_from_watchlist",
+    "reset_list",
+    "reset_metrics",
     "search_sectors",
+    "seed_list",
+    "set_metric_meta",
     "update_sector_meta",
+    "upsert_alert",
+    "upsert_list_item",
     "upsert_members",
+    "upsert_metrics",
     "upsert_sector_crowding",
     "watchlist_codes",
 ]

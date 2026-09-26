@@ -50,7 +50,10 @@ INDEX_BY_BOARD: list[tuple[tuple[str, ...], str, str]] = [
     (("15", "16"), "399001", "深证成指"),
     (("51", "56"), "000001", "上证指数"),
 ]
-DEFAULT_INDEX = ("000001", "上证指数")
+#: 板块归属的兜底指数 —— `(代码, 名称)`。
+#: ⚠️ 与 `intraday/service.py` 的 `DEFAULT_INDEX_CODE`（纯代码字符串）**不是一回事**：
+#: 两者曾同名 `DEFAULT_INDEX`，一个元组一个 str，import 错会在解包处才报错。
+DEFAULT_BOARD_INDEX = ("000001", "上证指数")
 
 
 def board_index_for(code: str) -> tuple[str, str]:
@@ -58,7 +61,7 @@ def board_index_for(code: str) -> tuple[str, str]:
     for prefixes, index_code, name in INDEX_BY_BOARD:
         if code.startswith(prefixes):
             return index_code, name
-    return DEFAULT_INDEX
+    return DEFAULT_BOARD_INDEX
 
 
 def elapsed_session_ratio(now: datetime | None = None) -> float:

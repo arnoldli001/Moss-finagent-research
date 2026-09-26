@@ -128,8 +128,8 @@ async def data_status(universe: str = "a_share", root: str = DEFAULT_ROOT) -> di
         "ready": any(item["dataset"] == "daily_basic" and item["partitions"] > 0
                      for item in datasets),
         "hint": ("数据未就绪：先在命令行执行 "
-                 "`python scripts/quant_sync.py download --start 2026-01-01 "
-                 "--end <今天>` 下载因子数据")
+                 "`python scripts/quant_sync.py download --full-history "
+                 "--end <今天>`（daily 可追到 2006-01-01）下载因子数据")
         if not datasets else "",
         "pid": os.getpid(),
     }
@@ -141,7 +141,12 @@ async def data_status(universe: str = "a_share", root: str = DEFAULT_ROOT) -> di
 
 
 class ScreenRequest(BaseModel):
-    start: str = Field(default="2026-01-01", description="开始日期 YYYY-MM-DD")
+    # 默认 2024-01-01 而不是 2026-01-01：本地数据已回补到 2006 年（5000+ 个
+    # 交易日），而**样本外可信度完全取决于区间长度** —— 只筛 2026 年时样本外
+    # 仅 3 个非重叠持有期，年化/夏普是噪声。2024 起约 660 个交易日
+    # （实测 10.3 分钟 / 峰值 5.1 GB / 样本外约 10 期），是普通机器跑得动的
+    # 最深处；再往前会被 `screen_runner.guard_panel_budget` 拦下。
+    start: str = Field(default="2024-01-01", description="开始日期 YYYY-MM-DD")
     end: str = Field(default="", description="结束日期 YYYY-MM-DD，空=到今天")
     factors: list[str] = Field(default_factory=list,
                                description="参与筛选的因子键；空=全部 35 个")
@@ -152,6 +157,17 @@ class ScreenRequest(BaseModel):
     train_ratio: float = Field(default=0.7, gt=0.0, lt=1.0)
     target_count: int = Field(default=20, ge=1, le=35)
     neutralize: bool = Field(default=True, description="是否做市值中性化")
+    exclude_st: bool = Field(default=False,
+                             description="剔除 ST（历史名称口径）。默认关闭："
+                                         "它会改变截面构成，按项目原则"
+                                         "「会改变结果的过滤必须是显式选项」")
+    liquidity_filter: bool = Field(
+        default=False,
+        description="股票池过滤：按过去 20 日均成交额每日剔除最差的 30%"
+                    "（业界常规做法）。默认关闭 —— 同样会改变截面构成；"
+                    "打开后列同比例变少，长区间才跑得动")
+    liquidity_drop_pct: float = Field(default=0.30, ge=0.0, le=0.9,
+                                      description="股票池过滤每日剔除比例")
     n_groups: int = Field(default=5, ge=2, le=10)
 
 
@@ -175,6 +191,9 @@ class SingleBacktestRequest(BaseModel):
     t_plus_1: bool = Field(default=True, description="是否遵守 T+1")
     respect_price_limits: bool = Field(default=True, description="涨停不买/跌停不卖")
     respect_suspension: bool = Field(default=True, description="停牌不交易")
+    respect_st: bool = Field(default=True,
+                             description="ST 期间不买入（历史名称口径；"
+                                         "实盘里很多账户本来就不允许买 ST）")
     commission_rate: float = Field(default=0.0003, ge=0.0, le=0.01)
     min_commission: float = Field(default=5.0, ge=0.0)
     stamp_tax_rate: float = Field(default=0.0005, ge=0.0, le=0.01)
@@ -372,7 +391,7 @@ async def quant_help(topic: str = "factors") -> dict:
     try:
         payload = build_help(topic)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=brief(exc)) from exc
     return {**payload, "disclaimer": _DISCLAIMER}
 
 
@@ -454,16 +473,28 @@ async def get_stock_boards(code: str, limit: int = 12) -> dict:
     已剔除市场级/量化标签类概念（"同花顺全A""百元股""上市首五日"等）。
 
     `auto_default` 是给前端**自动关联**用的：取相关性最高的那个概念名。
+
+    ⚠️ 两处取数（名录 + 概念库）都是**同步 SQL**，必须放线程里：
+    名录第一次要读 5,562 行（实测 1.4 秒），而这条接口在首屏就会被前端调用
+    （「关联板块」输入框的自动填充）。放在事件循环上会让同期的自选池/快照请求
+    一起排队 —— 冷启动实测首屏全部就绪因此多 ~1.5 秒（2026-09-24）。
     """
+    from src.core.executors import run_infra
     from src.quant.concept_repo import concept_repository
     from src.quant.stock_directory import stock_directory
 
     repo = concept_repository()
-    try:
-        name = stock_directory().name_of(code, auto_enrich=False) or ""
-    except Exception:  # noqa: BLE001 名录不可用不影响概念查询
-        name = ""
-    boards, stale = repo.boards_of(code, name=name, limit=max(1, min(limit, 40)))
+
+    def _lookup() -> tuple[str, list, bool]:
+        try:
+            resolved = stock_directory().name_of(code, auto_enrich=False) or ""
+        except Exception:  # noqa: BLE001 名录不可用不影响概念查询
+            resolved = ""
+        found, is_stale = repo.boards_of(
+            code, name=resolved, limit=max(1, min(limit, 40)))
+        return resolved, found, is_stale
+
+    name, boards, stale = await run_infra(_lookup)
     return {
         "code": code,
         "name": name,
@@ -499,7 +530,7 @@ async def rebuild_stock_directory() -> dict:
     try:
         report = directory.build_from_stock_basic()
     except DirectoryError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=brief(exc)) from exc
     return {**report, "dataset": "stock_basic",
             "note": "ETF/指数不在 stock_basic 里，会在首次查询时按需补录"}
 
@@ -531,7 +562,7 @@ async def save_strategy(body: StrategySaveRequest) -> dict:
             name=body.name, config=body.config, result=body.result,
             source="api", thresholds=body.thresholds)
     except StrategyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=brief(exc)) from exc
     return {"saved": True, "strategy": record.as_dict(),
             "directory": str(strategy_store().root),
             "disclaimer": _DISCLAIMER}
@@ -558,7 +589,7 @@ async def get_strategy(strategy_id: str) -> dict:
     try:
         record = strategy_store().load(strategy_id)
     except StrategyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=brief(exc)) from exc
     return {"strategy": record.as_dict(), "disclaimer": _DISCLAIMER}
 
 
@@ -569,7 +600,7 @@ async def delete_strategy(strategy_id: str) -> dict:
     try:
         removed = strategy_store().delete(strategy_id)
     except StrategyError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=brief(exc)) from exc
     if not removed:
         raise HTTPException(status_code=404, detail=f"策略不存在：{strategy_id}")
     return {"deleted": True, "id": strategy_id}

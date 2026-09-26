@@ -181,7 +181,8 @@ class NewsSentimentAnalyzer:
     def __init__(self, gateway: Any = None, news_fetcher: Any = None,
                  cache_ttl: int = 0, task_tier: str = TASK_TIER,
                  llm_retries: int = 1, item_text_chars: int = 180,
-                 use_gateway_cache: bool = False,
+                 use_gateway_cache: bool = True,
+                 gateway_cache_ttl_hours: float = 6.0,
                  reuse_when_unchanged: bool = True) -> None:
         self._gateway = gateway
         self._news_fetcher = news_fetcher
@@ -189,10 +190,20 @@ class NewsSentimentAnalyzer:
         self._task_tier = task_tier or TASK_TIER
         self._llm_retries = max(0, int(llm_retries))
         self._item_text_chars = max(40, int(item_text_chars))
-        # 默认**不**使用网关层LLM缓存：网关会把「空返回」也缓存24h，
-        # 一旦某次推理模型把token全耗在思维链上（正文为空），同一prompt之后
-        # 每次都会被这条「毒缓存」命中，永远拿不到结果。
+        # **默认使用网关缓存**（2026-09-21 改）。
+        #
+        # 原来这里是 False，理由是"网关会把空返回也缓存 24h，同一 prompt 之后
+        # 永远命中毒缓存"。那个 bug 已经修掉了 —— 见 `gateway.py` 里
+        # 「空响应不算缓存命中」与「空响应不写缓存」两处。继续关着等于白扔：
+        # 本模块 prompt 的重复率实测 91%（414 次调用只有 39 个不同 prompt），
+        # 而它是唯一**没有任何落盘**的 LLM 模块，冷启动必然全部重算。
         self._use_gateway_cache = use_gateway_cache
+        # 磁盘条目的存活时间。与进程内的 `cache_ttl`（默认 10 分钟）不同：
+        # prompt 里已经**含了新闻正文**，所以"新闻没变 → 结论照样成立"，
+        # 跨重启复用在语义上是安全的；真正让结论失效的是新闻变化，
+        # 而那会改变 prompt 文本、自然换 key。默认 6 小时是折中：
+        # 覆盖盘中反复刷新与当天重启，又不会拿昨天的情绪判今天。
+        self._gateway_cache_ttl_hours = max(0.0, float(gateway_cache_ttl_hours))
         # 新闻内容未变时**不重跑 LLM**（见 analyze 的说明）。
         self._reuse_when_unchanged = bool(reuse_when_unchanged)
         # code → (时间戳, 新闻内容指纹, 结果)
@@ -207,9 +218,14 @@ class NewsSentimentAnalyzer:
 
     async def analyze(
         self, *, code: str, name: str = "", limit: int = 10,
-        max_items: int = 10,
+        max_items: int = 10, force: bool = False,
     ) -> NewsSentiment:
         """取新闻并打分；任何环节不可用都返回带 gap 的降级结果。
+
+        `force=True` 是**前端"强制刷新"的唯一正确入口**：它会同时跳过本模块的
+        进程内缓存、指纹复用，并且把 `use_cache=False` 传给网关 ——
+        三者缺一不可。只清模块缓存是不够的：网关的磁盘缓存里还留着上次的
+        答案，前端就会看到"点了强制刷新但数据没变"（用户明确要求避免这个）。
 
         ## 为什么 TTL 到期后还要比一次"新闻内容指纹"（2026-09-16 实测）
 
@@ -224,11 +240,11 @@ class NewsSentimentAnalyzer:
         新闻抓取频率与之前完全一致，所以这是纯收益。
         """
         cached = self._cache.get(code)
-        if (cached is not None and self._cache_ttl > 0
+        if (not force and cached is not None and self._cache_ttl > 0
                 and time.monotonic() - cached[0] < self._cache_ttl):
             logger.debug("消息面缓存命中 %s（TTL %ds）", code, self._cache_ttl)
             return cached[2]
-        if cached is not None and self._reuse_when_unchanged:
+        if not force and cached is not None and self._reuse_when_unchanged:
             fingerprint = await self._news_fingerprint(code, limit=limit)
             if fingerprint and fingerprint == cached[1]:
                 # 内容没变：滑动 TTL 并复用结果，省掉一次 LLM
@@ -237,7 +253,7 @@ class NewsSentimentAnalyzer:
                 logger.debug("消息面内容未变，复用上次打分 %s（省一次LLM）", code)
                 return cached[2]
         result = await self._analyze_uncached(
-            code=code, name=name, limit=limit, max_items=max_items)
+            code=code, name=name, limit=limit, max_items=max_items, force=force)
         if self._cache_ttl > 0 or self._reuse_when_unchanged:
             fingerprint = _fingerprint_of(result) or (cached[1] if cached else "")
             self._cache[code] = (time.monotonic(), fingerprint, result)
@@ -256,7 +272,7 @@ class NewsSentimentAnalyzer:
 
     async def _analyze_uncached(
         self, *, code: str, name: str = "", limit: int = 10,
-        max_items: int = 10,
+        max_items: int = 10, force: bool = False,
     ) -> NewsSentiment:
         if self._news_fetcher is None:
             return NewsSentiment(
@@ -307,7 +323,11 @@ class NewsSentimentAnalyzer:
                 response = await self._gateway.complete(
                     self._task_tier, SYSTEM_PROMPT, current_prompt,
                     agent_id=AGENT_ID, trace_id=f"intraday_{code}",
-                    json_mode=True, use_cache=self._use_gateway_cache)
+                    json_mode=True,
+                    # force（前端强制刷新）必须一路穿到网关：只清本模块的
+                    # 进程内缓存会绕不过磁盘缓存，表现为"刷新了但没变"。
+                    use_cache=self._use_gateway_cache and not force,
+                    cache_ttl_hours=self._gateway_cache_ttl_hours)
             except Exception as exc:  # noqa: BLE001 模型不可用 → 计数口径
                 logger.warning("消息面LLM调用失败(%s): %s", code, brief(exc, BRIEF_DEFAULT))
                 base.gap = f"LLM调用失败（{brief(exc, BRIEF_TIGHT)}），降级为关键词计数口径"

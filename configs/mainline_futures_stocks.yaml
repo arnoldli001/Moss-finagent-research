@@ -1,0 +1,1067 @@
+# 主线挖掘 · 期货品种 ↔ A股个股 价格联动（**自动生成，请勿手工编辑**）
+#
+# 由 `python -m src.mainline.futures_stocks --build` 生成。
+# 手工维护的品种↔板块映射与传导逻辑在 mainline_futures_mapping.yaml，
+# 本文件只补充「与每个品种价格联动最强的个股」，两者在加载时合并。
+#
+# 口径：日收益率的皮尔逊相关系数；期货用 pre_close 规避主力连续换月跳空；
+# 样本不足 min_samples 的品种/个股直接跳过（不给低置信度的联动）。
+# ⚠️ 相关性 ≠ 因果：高相关可能只是同受一个宏观因子驱动。
+#    `in_board=false` 的高相关股最值得人工看一眼（可能是映射漏了它，
+#    也可能是伪相关）。
+version: 1
+generated_at: '2026-09-20T19:18:29+08:00'
+window_days: 250
+min_samples: 120
+top: 3
+range:
+- '20250807'
+- '20260918'
+method: 日收益率（期货用 pre_close 规避主力连续换月跳空）的皮尔逊相关系数
+note: ''
+links:
+  A.DCE:
+  - code: 000833
+    name: 粤桂股份
+    correlation: 0.2294
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000930
+    name: 中粮科技
+    correlation: 0.2124
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601952'
+    name: 苏垦农发
+    correlation: 0.2076
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  AG.SHF:
+  - code: '000426'
+    name: 兴业银锡
+    correlation: 0.7279
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '002716'
+    name: 湖南白银
+    correlation: 0.7201
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601212'
+    name: 白银有色
+    correlation: 0.673
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  AL.SHF:
+  - code: '601600'
+    name: 中国铝业
+    correlation: 0.6373
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '002532'
+    name: 天山铝业
+    correlation: 0.6249
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000807
+    name: 云铝股份
+    correlation: 0.617
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  AO.SHF:
+  - code: '601600'
+    name: 中国铝业
+    correlation: 0.2505
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '300344'
+    name: ''
+    correlation: 0.2428
+    samples: 135
+    in_board: false
+    avg_amount: 0.0
+  - code: '601699'
+    name: 潞安环能
+    correlation: 0.2406
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  AU.SHF:
+  - code: '600489'
+    name: 中金黄金
+    correlation: 0.6928
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '300139'
+    name: 晓程科技
+    correlation: 0.6781
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000975
+    name: 山金国际
+    correlation: 0.6333
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  BR.SHF:
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.4389
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603619'
+    name: 中曼石油
+    correlation: 0.4361
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.4282
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  BU.SHF:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.5347
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603619'
+    name: 中曼石油
+    correlation: 0.5085
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.4832
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  BZ.DCE:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.5227
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.5136
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.4945
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  C.DCE:
+  - code: '003033'
+    name: 征和工业
+    correlation: -0.2523
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600375'
+    name: 汉马科技
+    correlation: -0.2421
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '688347'
+    name: 华虹宏力
+    correlation: -0.231
+    samples: 261
+    in_board: false
+    avg_amount: 0.0
+  CF.ZCE:
+  - code: 000933
+    name: 神火股份
+    correlation: 0.367
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '002532'
+    name: 天山铝业
+    correlation: 0.3468
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601118'
+    name: 海南橡胶
+    correlation: 0.3449
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  CU.SHF:
+  - code: 000878
+    name: 云南铜业
+    correlation: 0.6849
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601899'
+    name: 紫金矿业
+    correlation: 0.6767
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601168'
+    name: 西部矿业
+    correlation: 0.6688
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  EB.DCE:
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.4663
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.4634
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603619'
+    name: 中曼石油
+    correlation: 0.4557
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  EC.INE:
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.3324
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.3136
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000554'
+    name: 泰山石油
+    correlation: 0.2957
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  EG.DCE:
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.5068
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  - code: '600256'
+    name: 广汇能源
+    correlation: 0.486
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.4578
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  FG.ZCE:
+  - code: '301632'
+    name: 广东建科
+    correlation: 0.3033
+    samples: 268
+    in_board: false
+    avg_amount: 0.0
+  - code: '002405'
+    name: 四维图新
+    correlation: 0.2658
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 002383
+    name: 合众思壮
+    correlation: 0.2644
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  FU.SHF:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.6012
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.583
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603619'
+    name: 中曼石油
+    correlation: 0.5633
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  HC.SHF:
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.3557
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600740'
+    name: 山西焦化
+    correlation: 0.3344
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000402'
+    name: 金融街
+    correlation: 0.3062
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  I.DCE:
+  - code: '300833'
+    name: 浩洋股份
+    correlation: 0.243
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000402'
+    name: 金融街
+    correlation: 0.2408
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600266'
+    name: 城建发展
+    correlation: 0.2405
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  IC.CFX:
+  - code: 002049
+    name: 紫光国微
+    correlation: 0.7115
+    samples: 261
+    in_board: false
+    avg_amount: 0.0
+  - code: '688391'
+    name: 钜泉科技
+    correlation: 0.7003
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '688439'
+    name: 振华风光
+    correlation: 0.6977
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  IF.CFX:
+  - code: '300059'
+    name: 东方财富
+    correlation: 0.6785
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600109'
+    name: 国金证券
+    correlation: 0.6725
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600030'
+    name: 中信证券
+    correlation: 0.6565
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  IH.CFX:
+  - code: '600030'
+    name: 中信证券
+    correlation: 0.6982
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000623'
+    name: 吉林敖东
+    correlation: 0.6788
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600109'
+    name: 国金证券
+    correlation: 0.6705
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  IM.CFX:
+  - code: '688391'
+    name: 钜泉科技
+    correlation: 0.7371
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '688259'
+    name: 创耀科技
+    correlation: 0.7179
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '688439'
+    name: 振华风光
+    correlation: 0.7174
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  J.DCE:
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.5208
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601699'
+    name: 潞安环能
+    correlation: 0.4381
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600740'
+    name: 山西焦化
+    correlation: 0.4121
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  JM.DCE:
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.5631
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600740'
+    name: 山西焦化
+    correlation: 0.4641
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601666'
+    name: 平煤股份
+    correlation: 0.4506
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  LC.GFE:
+  - code: '002466'
+    name: 天齐锂业
+    correlation: 0.5857
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  - code: 000792
+    name: 盐湖股份
+    correlation: 0.5811
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 002738
+    name: 中矿资源
+    correlation: 0.5701
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  LH.DCE:
+  - code: '603127'
+    name: 昭衍新药
+    correlation: 0.2979
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '001201'
+    name: 东瑞股份
+    correlation: 0.2944
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  - code: '603309'
+    name: 维力医疗
+    correlation: 0.2909
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  LU.INE:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.6225
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.6044
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603619'
+    name: 中曼石油
+    correlation: 0.5482
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  M.DCE:
+  - code: '300999'
+    name: 金龙鱼
+    correlation: 0.2989
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000930
+    name: 中粮科技
+    correlation: 0.2492
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600059'
+    name: 古越龙山
+    correlation: 0.2405
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  MA.ZCE:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.5957
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.5898
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.5808
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  NI.SHF:
+  - code: '300919'
+    name: 中伟新材
+    correlation: 0.5507
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '002340'
+    name: 格林美
+    correlation: 0.5224
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603799'
+    name: 华友钴业
+    correlation: 0.4614
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  OI.ZCE:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.3512
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601088'
+    name: 中国神华
+    correlation: 0.3437
+    samples: 264
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.3136
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  P.DCE:
+  - code: '601088'
+    name: 中国神华
+    correlation: 0.4088
+    samples: 264
+    in_board: false
+    avg_amount: 0.0
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.3945
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.386
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  PG.DCE:
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.6033
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.601
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.5858
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  PP.DCE:
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.5536
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.5493
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.528
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  PS.GFE:
+  - code: '600438'
+    name: 通威股份
+    correlation: 0.478
+    samples: 261
+    in_board: false
+    avg_amount: 0.0
+  - code: '601865'
+    name: 福莱特
+    correlation: 0.3781
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603185'
+    name: 弘元绿能
+    correlation: 0.375
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  PT.GFE:
+  - code: '000426'
+    name: 兴业银锡
+    correlation: 0.6176
+    samples: 197
+    in_board: false
+    avg_amount: 0.0
+  - code: '600489'
+    name: 中金黄金
+    correlation: 0.5929
+    samples: 197
+    in_board: false
+    avg_amount: 0.0
+  - code: '601899'
+    name: 紫金矿业
+    correlation: 0.5844
+    samples: 197
+    in_board: false
+    avg_amount: 0.0
+  PX.ZCE:
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.5166
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.5004
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.4973
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  RB.SHF:
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.3741
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600740'
+    name: 山西焦化
+    correlation: 0.3477
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601699'
+    name: 潞安环能
+    correlation: 0.3437
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  RM.ZCE:
+  - code: '603312'
+    name: 西典新能
+    correlation: 0.2357
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.2217
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000930
+    name: 中粮科技
+    correlation: 0.2117
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  RU.SHF:
+  - code: '601118'
+    name: 海南橡胶
+    correlation: 0.5088
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000630'
+    name: 铜陵有色
+    correlation: 0.404
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000737'
+    name: 北方铜业
+    correlation: 0.3974
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SA.ZCE:
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.3792
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600740'
+    name: 山西焦化
+    correlation: 0.3626
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600508'
+    name: 上海能源
+    correlation: 0.3101
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SC.INE:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.6156
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601857'
+    name: 中国石油
+    correlation: 0.596
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603619'
+    name: 中曼石油
+    correlation: 0.5541
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SF.ZCE:
+  - code: '601699'
+    name: 潞安环能
+    correlation: 0.3106
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '300344'
+    name: ''
+    correlation: 0.3054
+    samples: 135
+    in_board: false
+    avg_amount: 0.0
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.3028
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SH.ZCE:
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.2505
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600740'
+    name: 山西焦化
+    correlation: 0.2343
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '605007'
+    name: 五洲特纸
+    correlation: 0.2318
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SI.GFE:
+  - code: '002466'
+    name: 天齐锂业
+    correlation: 0.2733
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '300919'
+    name: 中伟新材
+    correlation: 0.2647
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600089'
+    name: 特变电工
+    correlation: 0.2585
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SM.ZCE:
+  - code: 000983
+    name: 山西焦煤
+    correlation: 0.3469
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601699'
+    name: 潞安环能
+    correlation: 0.3241
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600740'
+    name: 山西焦化
+    correlation: 0.3187
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SN.SHF:
+  - code: 000960
+    name: 锡业股份
+    correlation: 0.636
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000426'
+    name: 兴业银锡
+    correlation: 0.5919
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601168'
+    name: 西部矿业
+    correlation: 0.5565
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SP.SHF:
+  - code: 002490
+    name: 山东墨龙
+    correlation: 0.2679
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603367'
+    name: 辰欣药业
+    correlation: 0.2475
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 002108
+    name: 沧州明珠
+    correlation: 0.246
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SR.ZCE:
+  - code: '300999'
+    name: 金龙鱼
+    correlation: 0.3206
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  - code: '601118'
+    name: 海南橡胶
+    correlation: 0.3114
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  - code: 000933
+    name: 神火股份
+    correlation: 0.3094
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  SS.SHF:
+  - code: '300919'
+    name: 中伟新材
+    correlation: 0.5031
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603799'
+    name: 华友钴业
+    correlation: 0.4444
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '002340'
+    name: 格林美
+    correlation: 0.4409
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  T.CFX:
+  - code: '002052'
+    name: 同洲电子
+    correlation: -0.3059
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600635'
+    name: 大众公用
+    correlation: -0.2149
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '603159'
+    name: 上海亚虹
+    correlation: -0.2118
+    samples: 261
+    in_board: false
+    avg_amount: 0.0
+  TA.ZCE:
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.5072
+    samples: 271
+    in_board: true
+    avg_amount: 0.0
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.4956
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600256'
+    name: 广汇能源
+    correlation: 0.4782
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  UR.ZCE:
+  - code: '600938'
+    name: 中国海油
+    correlation: 0.2559
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '600989'
+    name: 宝丰能源
+    correlation: 0.248
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 002490
+    name: 山东墨龙
+    correlation: 0.2342
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  Y.DCE:
+  - code: '600256'
+    name: 广汇能源
+    correlation: 0.4237
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '601088'
+    name: 中国神华
+    correlation: 0.4133
+    samples: 264
+    in_board: false
+    avg_amount: 0.0
+  - code: 000968
+    name: 蓝焰控股
+    correlation: 0.3938
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  ZN.SHF:
+  - code: '601168'
+    name: 西部矿业
+    correlation: 0.5589
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: 000878
+    name: 云南铜业
+    correlation: 0.5534
+    samples: 271
+    in_board: false
+    avg_amount: 0.0
+  - code: '000737'
+    name: 北方铜业
+    correlation: 0.5429
+    samples: 271
+    in_board: false
+    avg_amount: 0.0

@@ -62,15 +62,42 @@ def _trend(date: str, count: int = 3) -> pd.DataFrame:
     return frame[["ts", "price", "avg_price", "volume", "amount"]]
 
 
-def _provider(session: str = TODAY, **sources) -> IntradayDataProvider:
+#: "QMT 在链首"的显式顺序 —— 供**容灾语义**类用例作为测试前提传入。
+#: 线上默认已改成"QMT 在链尾"，但"链上第一个源陈旧时让位给下一个"这类断言
+#: 需要一个确定链序；把它写出来而不是依赖默认值，默认值再改也不会连累这些用例。
+QMT_FIRST = ["qmt", "tencent", "sina", "eastmoney"]
+
+
+def _provider(session: str = TODAY, *, qmt_enabled: bool = True,
+              sources_order: list[str] | None = None,
+              **sources) -> IntradayDataProvider:
     """构造 provider 并把时钟与各数据源换成测试替身。
 
     `_client` 必须置成非 None 的哨兵：`_http()` 在 `self._client is None` 时会
     现场 new 一个**真的** TencentSource 覆盖掉替身 —— 那样测试会悄悄去联网，
     测的就不是闸门了（第一版就踩了这个坑：全源失败的用例"没抛异常"）。
+
+    `qmt_enabled` 默认 **True**：本文件绝大多数用例校验的是「QMT ∥ 腾讯」的
+    容灾与新鲜度闸门语义（陈旧 QMT 让位腾讯、QMT 是新的时仍优先…），
+    这些语义只有在 QMT 参与候选池时才存在。2026-09 起线上默认是
+    `qmt_enabled=False` 且 QMT 排在**链尾**（终端失去行情权限、短期无法恢复），
+    这两条默认行为由 `test_qmt_disabled_by_default_is_absent_from_candidates`
+    与 `test_qmt_enabled_puts_it_back_in_the_pool_at_the_tail` 单独钉住。
+
+    ## `sources_order`：为什么有些用例要显式指定顺序
+
+    链路顺序**由配置决定**（`health.rank` 在样本不足时照抄配置顺序），而线上
+    配置已改成"QMT 在链尾"。可是本文件里有一批用例验证的是「链上第一个源陈旧
+    时会不会让位给下一个」——那是**容灾语义**，需要一个确定的链序才能断言。
+    这类用例显式传 `sources_order=["qmt", "tencent", ...]`，把"QMT 在链首"
+    当作**测试前提**写出来，而不是依赖线上默认值（默认值一改它们就会集体失稳，
+    且失败原因看起来像"容灾坏了"，其实只是顺序变了）。
     """
     config = IntradayConfig()
     config.data.source_cooldown_seconds = 0
+    config.data.qmt_enabled = qmt_enabled
+    if sources_order is not None:
+        config.data.intraday_sources = list(sources_order)
     provider = IntradayDataProvider(config)
     provider._client = object()  # type: ignore[assignment]  # noqa: SLF001
     provider._session_date = lambda: session  # type: ignore[method-assign]  # noqa: SLF001
@@ -127,7 +154,7 @@ def test_stale_qmt_yields_to_fresh_tencent_on_trend() -> None:
     """QMT 回的是昨天的分时 → 判失败并降级腾讯；命中源必须是腾讯。"""
     qmt = _FakeSource(_trend(YESTERDAY))
     tencent = _FakeSource(_trend(TODAY))
-    provider = _provider(qmt=qmt, tencent=tencent)
+    provider = _provider(sources_order=QMT_FIRST, qmt=qmt, tencent=tencent)
 
     frame, source, attempts = asyncio_run(provider.fetch_trend("600036"))
 
@@ -143,7 +170,7 @@ def test_stale_qmt_yields_to_fresh_tencent_on_trend() -> None:
 def test_stale_qmt_yields_to_fresh_tencent_on_bars() -> None:
     qmt = _FakeSource(_trend(YESTERDAY))
     tencent = _FakeSource(_trend(TODAY))
-    provider = _provider(qmt=qmt, tencent=tencent)
+    provider = _provider(sources_order=QMT_FIRST, qmt=qmt, tencent=tencent)
 
     frame, source, attempts = asyncio_run(provider.fetch_bars("600036", days=5))
 
@@ -155,7 +182,7 @@ def test_fresh_qmt_is_still_preferred() -> None:
     """QMT 有当日数据时必须仍然是首选（它是权威源，不该被闸门挤掉）。"""
     qmt = _FakeSource(_trend(TODAY))
     tencent = _FakeSource(_trend(TODAY))
-    provider = _provider(qmt=qmt, tencent=tencent)
+    provider = _provider(sources_order=QMT_FIRST, qmt=qmt, tencent=tencent)
 
     frame, source, attempts = asyncio_run(provider.fetch_trend("600036"))
 
@@ -173,6 +200,7 @@ def test_all_stale_returns_newest_with_explicit_warning() -> None:
     older = _trend("2026-09-12")
     newer = _trend(YESTERDAY)
     provider = _provider(
+        sources_order=QMT_FIRST,
         qmt=_FakeSource(older), tencent=_FakeSource(newer),
         eastmoney=_FakeSource(None), sina=_FakeSource(older))
 
@@ -188,7 +216,8 @@ def test_all_stale_returns_newest_with_explicit_warning() -> None:
 def test_stale_fallback_is_not_cached() -> None:
     """陈旧回退结果不写缓存：下一次要重新走容灾链，源恢复后能立刻切回来。"""
     qmt = _FakeSource(_trend(YESTERDAY))
-    provider = _provider(qmt=qmt, tencent=_FakeSource(None))
+    provider = _provider(sources_order=QMT_FIRST, qmt=qmt,
+                         tencent=_FakeSource(None))
 
     asyncio_run(provider.fetch_trend("600036"))
     qmt.frame = _trend(TODAY)  # QMT 补上了当日数据
@@ -204,7 +233,7 @@ def test_no_session_clock_disables_gate() -> None:
     """时钟取不到时不能拦数据 —— 判断依据缺失时宁可不过滤。"""
     qmt = _FakeSource(_trend(YESTERDAY))
     tencent = _FakeSource(_trend(TODAY))
-    provider = _provider("", qmt=qmt, tencent=tencent)
+    provider = _provider("", sources_order=QMT_FIRST, qmt=qmt, tencent=tencent)
 
     _, source, attempts = asyncio_run(provider.fetch_trend("600036"))
 
@@ -220,7 +249,8 @@ def test_holiday_keeps_last_session_data() -> None:
     可用的数据也拒掉。
     """
     qmt = _FakeSource(_trend(YESTERDAY))
-    provider = _provider(YESTERDAY, qmt=qmt, tencent=_FakeSource(_trend(YESTERDAY)))
+    provider = _provider(YESTERDAY, sources_order=QMT_FIRST, qmt=qmt,
+                         tencent=_FakeSource(_trend(YESTERDAY)))
 
     frame, source, attempts = asyncio_run(provider.fetch_trend("600036"))
 
@@ -382,7 +412,8 @@ def test_await_today_is_skipped_without_a_session_clock(monkeypatch) -> None:
 def test_qmt_source_still_warms_when_tencent_is_the_answer() -> None:
     """回归：闸门降级后 QMT 也不能停止补下载，否则永远回不到首选。"""
     qmt = _FakeSource(_trend(YESTERDAY))
-    provider = _provider(qmt=qmt, tencent=_FakeSource(_trend(TODAY)))
+    provider = _provider(sources_order=QMT_FIRST, qmt=qmt,
+                         tencent=_FakeSource(_trend(TODAY)))
     asyncio_run(provider.fetch_trend("600036"))
     assert qmt.calls == 1  # 每次请求都要试 QMT（补下载在源内部完成）
 
@@ -533,11 +564,69 @@ def test_covered_trading_days_counts_distinct_dates() -> None:
 # ==================== 既有行为不能破 ====================
 
 
+def test_qmt_disabled_by_default_is_absent_from_candidates() -> None:
+    """**线上默认**：`qmt_enabled=False` 时 QMT 不参与任何取数链。
+
+    2026-09 起本机 QMT 终端失去行情权限（`127.0.0.1:58610` 拒连），而它原来
+    在链首 —— 每次取数都要先撞一次失败的 xtquant 连接（实测白等 4~5s 超时）
+    才轮得到腾讯。所以默认关闭，并把它从候选池里**彻底摘掉**，而不是"排在最后"：
+    排在最后仍会付这次超时（实测：改顺序不够，`health.rank` 在样本不足时
+    照抄配置顺序，只有把它移出候选池才真的不调用）。
+
+    三条链都要检查，避免只改了一处（`fetch_quotes` 就曾硬编码直连 QMT）。
+    """
+    config = IntradayConfig()
+    assert config.data.qmt_enabled is False, "IntradayConfig 默认必须是关闭"
+
+    provider = _provider(qmt_enabled=False)
+    for method in ("bars", "trend"):
+        order = provider._ordered_sources(method)  # noqa: SLF001
+        assert "qmt" not in order, f"{method} 候选池里不该有 qmt：{order}"
+        assert order[0] == "tencent", f"{method} 实际链首必须是腾讯：{order}"
+
+
+def test_qmt_enabled_puts_it_back_in_the_pool_at_the_tail() -> None:
+    """有行情权限的部署打开开关即可在**链尾**兜底（QMT 不会再回到链首）。
+
+    2026-09-23 起 `intraday_sources` 把 qmt 写在**最后**：终端已失去行情权限
+    且短期无法恢复，写在最前只会让每次取数先白等一次连接超时（实测 4~5s）。
+    顺序与开关因此表达同一个意图 —— 关着 = 不参与；打开 = 兜底。
+
+    这条断言同时钉住"顺序与开关不能各说各话"：把 qmt 挪回链首会让它失败。
+    """
+    provider = _provider(qmt_enabled=True)
+    for method in ("bars", "trend"):
+        order = provider._ordered_sources(method)  # noqa: SLF001
+        assert "qmt" in order, f"{method} 启用后 QMT 应参与：{order}"
+        assert order[-1] == "qmt", f"{method} 启用后 QMT 必须在链尾：{order}"
+        assert order[0] == "tencent", f"{method} 链首仍应是腾讯：{order}"
+
+
+def test_quote_chain_skips_qmt_when_disabled() -> None:
+    """`fetch_quotes` 的 QMT 分支必须看配置（曾硬编码直连，关掉也没用）。"""
+    qmt = _FakeSource(_trend(TODAY))
+    provider = _provider(qmt_enabled=False, qmt=qmt, tencent=_FakeSource(None))
+    provider._client = object()  # type: ignore[assignment]  # noqa: SLF001
+
+    health_calls: list[tuple[str, str]] = []
+    original = provider.health.record_failure
+
+    def spy(source: str, method: str, detail: str = "") -> None:
+        health_calls.append((source, method))
+        original(source, method, detail)
+
+    provider.health.record_failure = spy  # type: ignore[method-assign]
+    asyncio_run(provider.fetch_quotes(["600036"]))
+    assert not [c for c in health_calls if c[0] == "qmt"], \
+        "QMT 关闭时不该产生 QMT 的失败记录（说明根本没调用它）"
+
+
 def test_all_sources_failing_still_raises() -> None:
     """没有一个源返回数据时仍然是 DataFetchError，不能被"兜底候选"吞掉。"""
     from src.core.exceptions import DataFetchError
 
     provider = _provider(
+        sources_order=QMT_FIRST,
         qmt=_FakeSource(None, error="终端未启动"),
         tencent=_FakeSource(None, error="网络异常"),
         eastmoney=_FakeSource(None), sina=_FakeSource(None, error="限流"))
@@ -549,6 +638,7 @@ def test_all_sources_failing_still_raises() -> None:
 
 def test_attempt_records_are_returned_in_chain_order() -> None:
     provider = _provider(
+        sources_order=QMT_FIRST,
         qmt=_FakeSource(_trend(YESTERDAY)), tencent=_FakeSource(_trend(TODAY)))
     _, _, attempts = asyncio_run(provider.fetch_trend("600036"))
     assert [a.source for a in attempts][:2] == ["迅投QMT", "腾讯行情"]

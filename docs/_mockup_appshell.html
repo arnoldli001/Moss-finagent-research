@@ -1,0 +1,983 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Moss 投研平台 · 侧边栏改版效果图（静态稿）</title>
+<style>
+/* ==================================================================
+   侧边栏改版 · 静态效果图
+   ------------------------------------------------------------------
+   这份稿子的用途是**确认布局与信息层级**，不是最终视觉。所以：
+     · 数据全是示意值（不接任何接口）
+     · 交互只有"点侧边栏切页"，其余是静态的
+     · 每组页面只放该页**最有代表性的** 1~2 块内容，不追求齐全
+   颜色沿用现有前端（深色 + 蓝色强调 + 红涨绿跌），方便和现状对照。
+   ================================================================== */
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: #0d0f13;
+  color: #e6e8eb;
+  font: 13px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+}
+button { font: inherit; cursor: pointer; }
+
+/* ── 外壳：左导航 + 右内容 ── */
+.shell { display: grid; grid-template-columns: 236px minmax(0, 1fr); min-height: 100vh; }
+
+/* ── 左侧导航 ── */
+.side {
+  background: #14171c;
+  border-right: 1px solid #23272f;
+  display: flex; flex-direction: column;
+  min-width: 0;
+}
+.brand {
+  display: flex; align-items: center; gap: 9px;
+  padding: 14px 16px; border-bottom: 1px solid #23272f;
+}
+.brand-logo {
+  width: 26px; height: 26px; border-radius: 7px; flex: none;
+  background: linear-gradient(135deg, #4a9eff, #2b6fd4);
+  display: grid; place-items: center; font-weight: 700; font-size: 13px;
+}
+.brand-t { font-weight: 600; font-size: 13.5px; letter-spacing: .2px; }
+.brand-s { font-size: 10.5px; color: #6f7c8a; }
+
+.nav { padding: 10px 8px 16px; overflow-y: auto; }
+.grp { margin-top: 12px; }
+.grp:first-child { margin-top: 2px; }
+.grp-h {
+  font-size: 10.5px; color: #6f7c8a; letter-spacing: .08em;
+  padding: 0 10px 6px; text-transform: none;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; text-align: left;
+  background: none; border: 0; color: #b9c2cc;
+  padding: 8px 10px; border-radius: 7px;
+  font-size: 13px; line-height: 1.3;
+  border-left: 2px solid transparent;
+}
+.nav-item:hover { background: #1b1f26; color: #e6e8eb; }
+.nav-item.on {
+  background: #17243a; color: #eaf2ff; font-weight: 600;
+  border-left-color: #4a9eff;
+}
+.nav-ic {
+  width: 17px; text-align: center; flex: none;
+  color: #7d8b9a; font-size: 12.5px;
+}
+.nav-item.on .nav-ic { color: #4a9eff; }
+.nav-badge {
+  margin-left: auto; font-size: 10.5px; padding: 0 6px;
+  border-radius: 999px; background: #253048;
+  color: #9dc0f5; font-variant-numeric: tabular-nums;
+}
+.nav-badge.warn { background: #3a2a1c; color: #f0b070; }
+.side-foot {
+  margin-top: auto; padding: 10px 14px; border-top: 1px solid #23272f;
+  font-size: 11px; color: #6f7c8a; display: flex; gap: 8px; align-items: center;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: #2ea86e; flex: none; }
+.dot.warn { background: #d9a13b; }
+
+/* ── 顶部条 ── */
+.main { display: flex; flex-direction: column; min-width: 0; }
+.top {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 18px; border-bottom: 1px solid #23272f;
+  background: #101318; position: sticky; top: 0; z-index: 5;
+}
+.page-title { font-size: 15.5px; font-weight: 600; }
+.page-sub { font-size: 11.5px; color: #6f7c8a; }
+.top-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.pill {
+  font-size: 11px; padding: 2px 9px; border-radius: 999px;
+  border: 1px solid #2a3038; color: #9aa6b3;
+}
+.pill.ok { border-color: #245a3f; color: #59c98d; background: #10261c; }
+.pill.warn { border-color: #5a4624; color: #e0b063; background: #241d10; }
+.btn {
+  background: #1b2028; color: #cfd6de; border: 1px solid #2a3038;
+  border-radius: 7px; padding: 5px 11px; font-size: 12px;
+}
+.btn.primary { background: #2f6fd0; border-color: #2f6fd0; color: #fff; }
+
+/* ── 内容区 ── */
+.content { padding: 14px 18px 28px; display: flex; flex-direction: column; gap: 12px; }
+.cols2 { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 12px; align-items: start; }
+.card {
+  background: #14171c; border: 1px solid #23272f; border-radius: 10px;
+  padding: 12px 14px; min-width: 0;
+}
+.card-h {
+  display: flex; align-items: baseline; gap: 9px; margin-bottom: 9px;
+  font-size: 13px; font-weight: 600;
+}
+.card-h .muted { font-weight: 400; }
+.muted { color: #6f7c8a; font-size: 11.5px; }
+
+/* KPI */
+.kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; }
+.kpi {
+  background: #14171c; border: 1px solid #23272f; border-radius: 9px;
+  padding: 9px 11px; min-width: 0;
+}
+.kpi-l { font-size: 11px; color: #6f7c8a; }
+.kpi-v { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.kpi-v small { font-size: 11px; color: #6f7c8a; font-weight: 400; margin-left: 2px; }
+.kpi-f { font-size: 10.5px; color: #6f7c8a; }
+
+/* 表 */
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left; font-size: 11px; color: #6f7c8a; font-weight: 400;
+  padding: 6px 8px; border-bottom: 1px solid #23272f; white-space: nowrap;
+}
+td { padding: 7px 8px; border-bottom: 1px solid #1c2027; font-size: 12.5px; }
+tbody tr:last-child td { border-bottom: 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.code { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px; color: #8b98a5; }
+.up { color: #e5484d; }   /* 红涨 */
+.down { color: #2ea86e; } /* 绿跌 */
+
+/* 标签 */
+.tag {
+  display: inline-block; font-size: 11px; padding: 1px 7px;
+  border-radius: 5px; border: 1px solid #2a3038; color: #9aa6b3; white-space: nowrap;
+}
+.tag.bull { border-color: rgba(229,72,77,.5); color: #e5484d; }
+.tag.bear { border-color: rgba(46,168,110,.5); color: #2ea86e; }
+.tag.neu { border-color: rgba(139,152,165,.4); }
+.tag.blue { border-color: rgba(74,158,255,.45); color: #6cb0ff; background: rgba(74,158,255,.1); }
+.tag.purple { border-color: rgba(169,123,255,.45); color: #b28cff; background: rgba(169,123,255,.1); }
+.tag.orange { border-color: rgba(224,138,60,.45); color: #e08a3c; background: rgba(224,138,60,.1); }
+.tag.green { border-color: rgba(46,168,110,.45); color: #2ea86e; background: rgba(46,168,110,.1); }
+
+/* 条状 */
+.bar { height: 5px; border-radius: 3px; background: #23272f; overflow: hidden; min-width: 40px; }
+.bar > i { display: block; height: 100%; background: #4a9eff; }
+.bar.red > i { background: #e5484d; }
+.bar.green > i { background: #2ea86e; }
+
+/* 一行内联 */
+.row { display: flex; align-items: center; gap: 8px; }
+.spread { justify-content: space-between; }
+.stack { display: flex; flex-direction: column; gap: 7px; }
+.hr { height: 1px; background: #23272f; margin: 9px 0; }
+
+/* 进度/公式块 */
+.formula {
+  background: #101318; border: 1px dashed #2a3038; border-radius: 8px;
+  padding: 8px 10px; font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px; color: #9aa6b3; line-height: 1.7; overflow-x: auto;
+}
+.tl { display: flex; flex-direction: column; gap: 0; }
+.tl-row { display: grid; grid-template-columns: 52px 1fr; gap: 9px; padding: 5px 0; font-size: 12px; }
+.tl-t { color: #6f7c8a; font-variant-numeric: tabular-nums; }
+.tl-dot { width: 7px; height: 7px; border-radius: 50%; background: #2ea86e; }
+.tl-dot.wait { background: #d9a13b; }
+.tl-dot.pur { background: #a97bff; }
+
+.legend {
+  font-size: 11px; color: #6f7c8a; border-top: 1px dashed #23272f;
+  padding-top: 8px; margin-top: 4px; line-height: 1.7;
+}
+.note {
+  background: #1a1508; border: 1px solid #4a3a1c; border-radius: 8px;
+  padding: 7px 10px; font-size: 11.5px; color: #d8b878; line-height: 1.6;
+}
+.mock-watermark {
+  position: fixed; right: 10px; bottom: 8px; z-index: 50;
+  font-size: 10.5px; color: #4a545f; background: #0d0f13cc;
+  padding: 3px 8px; border-radius: 6px; border: 1px solid #23272f;
+}
+
+/* ==================================================================
+   手机形态：三种，见文档说明
+   ================================================================== */
+/* 手机竖屏：抽屉式 */
+.m-portrait .shell { grid-template-columns: minmax(0, 1fr); }
+.m-portrait .side {
+  position: fixed; inset: 0 auto 0 0; width: 246px; z-index: 20;
+  transform: translateX(0); box-shadow: 0 0 40px #000a;
+}
+.m-portrait.drawer-closed .side { transform: translateX(-100%); }
+.m-portrait .scrim {
+  position: fixed; inset: 0; background: #0009; z-index: 15;
+}
+.m-portrait.drawer-closed .scrim { display: none; }
+.hamburger {
+  display: none; background: none; border: 0; color: #cfd6de;
+  font-size: 17px; padding: 0 4px;
+}
+.m-portrait .hamburger, .m-landscape .hamburger { display: block; }
+
+/* 手机横屏 / 平板：纯图标轨道 */
+.m-landscape .shell, .m-tablet .shell { grid-template-columns: 54px minmax(0, 1fr); }
+.m-landscape .side, .m-tablet .side { width: 54px; }
+.m-landscape .brand-t, .m-landscape .brand-s,
+.m-landscape .grp-h, .m-landscape .nav-item > span:not(.nav-ic),
+.m-landscape .nav-badge, .m-landscape .side-foot span,
+.m-tablet .brand-t, .m-tablet .brand-s,
+.m-tablet .grp-h, .m-tablet .nav-item > span:not(.nav-ic),
+.m-tablet .nav-badge, .m-tablet .side-foot span { display: none; }
+.m-landscape .nav-item, .m-tablet .nav-item {
+  justify-content: center; padding: 10px 0; gap: 0;
+}
+.m-landscape .brand, .m-tablet .brand { justify-content: center; padding: 12px 0; }
+.m-landscape .side-foot, .m-tablet .side-foot { justify-content: center; padding: 10px 0; }
+.m-landscape .grp, .m-tablet .grp { margin-top: 6px; }
+.m-landscape .nav { padding: 6px 5px 12px; }
+.m-tablet .nav { padding: 6px 5px 12px; }
+
+/* 竖屏手机上的内容：单列、KPI 两列 */
+.m-portrait .cols2, .m-portrait .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.m-portrait .cols2 > * { grid-column: 1 / -1; }
+.m-portrait .kpis { gap: 8px; }
+.m-portrait .content { padding: 11px 12px 24px; }
+.m-portrait .top { padding: 9px 12px; gap: 8px; }
+.m-portrait .page-title { font-size: 14.5px; }
+.m-landscape .content { padding: 9px 12px 16px; }
+.m-landscape .kpis { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; }
+.m-landscape .top { padding: 6px 12px; }
+.m-landscape .cols2 { grid-template-columns: minmax(0, 1fr) 260px; }
+.scrollhint { display: none; }
+
+/* ── 竖屏手机：顶栏必须"收"（第一版这里是坏的） ──
+   实测 390px 下，原来那套「标题 + 2 个状态胶囊 + 2 个按钮」会：
+     · 标题被挤成 3 行（"公开信息聚合 · 统 / 计量 · 公式参考"）
+     · 胶囊竖着断字（"采 集 正 常"）
+     · 表格最右列被切掉
+   最终设计：顶栏只留 **标题（一行省略）+ 一个状态点 + ⋯ 溢出菜单**，
+   其余全部收进溢出菜单。状态胶囊在手机上本来就信息量低
+   （"采集正常"是默认态，异常时那个点会变黄/红，足够）。 */
+.m-portrait .top > div:first-of-type { min-width: 0; flex: 1 1 auto; }
+.m-portrait .page-title {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.m-portrait .page-sub { display: none; }
+.m-portrait .top-right { gap: 4px; flex: none; }
+.m-portrait .top-right .pill { display: none; }
+.m-portrait .top-right .pill.warn {
+  display: inline-block; font-size: 10px; padding: 1px 6px;
+}
+.m-portrait .top-right .btn:not(.overflow) { display: none; }
+.btn.overflow { display: none; }
+.m-portrait .btn.overflow { display: block; padding: 5px 9px; }
+
+/* ── 竖屏手机：表格横向滑动，并给出可见提示 ──
+   数据表（7 列）在 390px 上不可能塞下。选择"可横向滑动 + 显式提示"，
+   而不是"砍列" —— 砍列会让用户以为系统缺数据。
+   ⚠️ 滚动条在手机上不可见，所以提示必须**写出来**，
+   否则用户不知道右边还有内容（这正是现在顶栏页签的问题）。 */
+.m-portrait .card { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.m-portrait table { min-width: 420px; }
+.m-portrait .scrollhint {
+  display: block; font-size: 10.5px; color: #6f7c8a;
+  padding: 5px 2px 0;
+}
+/* 竖屏隐掉**次要列**（`.hide-m`）—— 这是"砍列"而不是"横向滑动"，
+   两者都要有：
+     · 砍列：表格回到能读的宽度（7 列里"来源类型/可信度"是次要的）
+     · 滑动：剩下的列仍可能超宽（如"标题摘要"很长），滑动能看全
+   ⚠️ 只砍**次要**列。砍掉主要列会让用户以为系统缺数据。 */
+.m-portrait .hide-m { display: none; }
+/* 竖屏列宽全部放开：固定 px 列宽在 390px 上会把标题挤成每行 5 个字
+   （实测："伊朗媒体：伊 / 拉克纳杰夫机 / 场暂停往返伊…"） */
+.m-portrait table th, .m-portrait table td { white-space: normal; }
+</style>
+</head>
+<body>
+
+<!-- 侧边栏（唯一一份，被所有形态复用） -->
+<template id="side-tpl">
+  <div class="brand">
+    <div class="brand-logo">M</div>
+    <div>
+      <div class="brand-t">Moss 投研平台</div>
+      <div class="brand-s">多 Agent 投研工作台</div>
+    </div>
+  </div>
+  <nav class="nav" id="nav"></nav>
+  <div class="side-foot">
+    <span class="dot" id="foot-dot"></span>
+    <span id="foot-t">后端在线 · 8110</span>
+  </div>
+</template>
+
+<div id="app"></div>
+<div class="mock-watermark">静态效果图 · 数据为示意值 · 不可交互</div>
+
+<script>
+/* ==================================================================
+   NAV：四组。这就是本次改版的核心 —— 把 9~14 个扁平页签收进 4 组。
+   ================================================================== */
+const NAV = [
+  { g: "投资分析", items: [
+    { id: "research",  ic: "◈", t: "AI 投研工作台" },
+    { id: "mainline",  ic: "◆", t: "板块主线挖掘", badge: "3", warn: true },
+    { id: "fundflow",  ic: "◇", t: "资金流监控" },
+    { id: "etf",       ic: "▣", t: "ETF 份额监控" },
+  ]},
+  { g: "量化", items: [
+    { id: "factor",    ic: "▤", t: "因子与回测" },
+    { id: "screen",    ic: "▥", t: "量化选股" },
+    { id: "auction",   ic: "▧", t: "集合竞价选股" },
+    { id: "tplus",     ic: "▨", t: "做 T 辅助" },
+  ]},
+  { g: "情报", items: [
+    { id: "intel",     ic: "◎", t: "情报中心", badge: "171" },
+    { id: "brief",     ic: "▦", t: "盘前简报" },
+    { id: "alerts",    ic: "⚠", t: "事件告警中心", badge: "23", warn: true },
+  ]},
+  { g: "平台", items: [
+    { id: "pools",     ic: "◫", t: "我的自选池" },
+    { id: "sched",     ic: "⚙", t: "调度与任务" },
+    { id: "audit",     ic: "☰", t: "审计与合规" },
+    { id: "users",     ic: "◍", t: "用户管理" },
+  ]},
+];
+
+const kpi = (l, v, u, f) =>
+  `<div class="kpi"><div class="kpi-l">${l}</div>` +
+  `<div class="kpi-v">${v}${u ? `<small>${u}</small>` : ""}</div>` +
+  `<div class="kpi-f">${f || ""}</div></div>`;
+const bar = (p, cls = "") =>
+  `<div class="bar ${cls}"><i style="width:${p}%"></i></div>`;
+const tag = (t, cls) => `<span class="tag ${cls || ""}">${t}</span>`;
+
+/* ==================================================================
+   每个页面的内容。刻意只放"最有代表性的" 1~2 块 —— 这是结构稿，
+   目的是确认**每页长什么样、信息怎么排**，不是画完所有字段。
+   ================================================================== */
+const PAGES = {
+  research: {
+    title: "AI 投研工作台", sub: "多 Agent 协作 · 全链路可溯源",
+    top: [["pill ok", "采集正常"], ["pill", "上次运行 09:12"]],
+    body: () => `
+      <div class="card">
+        <div class="card-h">提问 <span class="muted">支持自然语言；分析过程与引用可展开</span></div>
+        <div class="row" style="gap:8px">
+          <div style="flex:1;background:#101318;border:1px solid #2a3038;border-radius:8px;padding:9px 11px;color:#6f7c8a">
+            例：分析光伏设备板块近 20 日资金流与拥挤度，给出主线强度排序
+          </div>
+          <button class="btn primary">开始分析</button>
+        </div>
+        <div class="legend">18 个 Agent 分 5 层：数据层 A01–A04 · 信息层 A05–A07 · 分析层 A08–A12 · 行业层 A13–A16 · 决策层 A17 · 审计层 A18</div>
+      </div>
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">最近任务</div>
+          <table><thead><tr><th>任务</th><th>Agent</th><th>耗时</th><th>状态</th></tr></thead><tbody>
+            <tr><td>光伏设备主线强度分析</td><td class="code">A13 行业</td><td class="num">42.1s</td><td>${tag("已完成", "green")}</td></tr>
+            <tr><td>两融周度变化归因</td><td class="code">A09 资金</td><td class="num">18.6s</td><td>${tag("已完成", "green")}</td></tr>
+            <tr><td>半导体设备拥挤度回测</td><td class="code">A18 审计</td><td class="num">—</td><td>${tag("运行中", "blue")}</td></tr>
+            <tr><td>盘前预测（08:10）</td><td class="code">A17 决策</td><td class="num">61.3s</td><td>${tag("已完成", "green")}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card">
+          <div class="card-h">Agent 状态</div>
+          <div class="stack">
+            ${["A13 行业层", "A09 资金流", "A18 审计"].map((n, i) => `
+              <div class="row spread"><span>${n}</span>
+                ${tag(i === 2 ? "运行中" : "空闲", i === 2 ? "blue" : "")}</div>`).join("")}
+          </div>
+        </div>
+      </div>`,
+  },
+
+  mainline: {
+    title: "板块主线挖掘", sub: "主线强度 · 拥挤度 · 资金流共振",
+    top: [["pill ok", "数据 T-1"], ["pill", "刷新于 09:20"]],
+    body: () => `
+      <div class="kpis">${[
+        kpi("识别主线", "12", "条", "强度 ≥60"),
+        kpi("强主线", "3", "条", "强度 ≥80"),
+        kpi("拥挤预警", "2", "条", "分位 ≥85"),
+        kpi("资金净流入", "+86.4", "亿", "全市场 · 昨日"),
+        kpi("北向", "+21.7", "亿", "昨日"),
+        kpi("覆盖个股", "486", "只", "去重后"),
+      ].join("")}</div>
+      <div class="card">
+        <div class="card-h">主线列表 <span class="muted">按强度降序 · 点开看成分股与证据</span></div>
+        <table><thead><tr>
+          <th>板块</th><th>强度</th><th style="width:110px">强度分</th>
+          <th>拥挤度分位</th><th>资金流</th><th>领涨龙头</th><th>信号</th>
+        </tr></thead><tbody>
+          ${[
+            ["半导体设备", 90, "87 分位", "+32.6 亿", "中微公司", ["主线", "green"], "star"],
+            ["AI 算力", 78, "91 分位", "+24.1 亿", "工业富联", ["拥挤", "orange"], ""],
+            ["储能", 71, "46 分位", "+18.9 亿", "阳光电源", ["主线", "green"], ""],
+            ["消费电子", 64, "38 分位", "+9.2 亿", "立讯精密", ["观察", ""], ""],
+            ["有色金属", 49, "22 分位", "−6.4 亿", "洛阳钼业", ["转弱", "bear"], ""],
+          ].map(([n, s, crowd, flow, lead, [lt, lc], star]) => `
+            <tr>
+              <td><b>${n}</b> ${star ? tag("⭐", "purple") : ""}</td>
+              <td class="num">${s}</td>
+              <td>${bar(s, s >= 80 ? "red" : "")}</td>
+              <td class="code">${crowd}</td>
+              <td class="num ${flow.startsWith("+") ? "up" : "down"}">${flow}</td>
+              <td>${lead}</td>
+              <td>${tag(lt, lc)}</td>
+            </tr>`).join("")}
+        </tbody></table>
+        <div class="note">拥挤度是**风险**指标：分位越高说明交易越拥挤。它与"强度"方向相同时是共振，
+          <b>强度高但拥挤度也高</b>时必须单独提示（AI 算力就是这种）。</div>
+      </div>`,
+  },
+
+  fundflow: {
+    title: "资金流监控", sub: "主力 / 北向 / 两融 · 板块与个股",
+    top: [["pill ok", "数据 T-1"]],
+    body: () => `
+      <div class="kpis">${[
+        kpi("主力净流入", "+86.4", "亿", "全市场"),
+        kpi("北向净流入", "+21.7", "亿", "昨日"),
+        kpi("两融余额", "1.83", "万亿", "环比 +0.4%"),
+        kpi("净流入板块", "17", "个", "共 31 个"),
+        kpi("连续流入", "6", "日", "半导体设备"),
+        kpi("净流出板块", "14", "个", "煤炭居首"),
+      ].join("")}</div>
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">板块资金流 <span class="muted">按净流入降序</span></div>
+          <table><thead><tr><th>板块</th><th>主力净额</th><th>5 日累计</th><th>占比</th></tr></thead><tbody>
+            ${[["半导体设备", "+32.6 亿", "+118.2 亿", 92],
+               ["AI 算力", "+24.1 亿", "+76.5 亿", 78],
+               ["储能", "+18.9 亿", "+41.3 亿", 64],
+               ["有色", "−6.4 亿", "−12.8 亿", 22],
+               ["煤炭", "−11.2 亿", "−28.4 亿", 14]].map(([n, a, b, p]) => `
+              <tr><td>${n}</td>
+                <td class="num ${String(a).startsWith("+") ? "up" : "down"}">${a}</td>
+                <td class="num ${String(b).startsWith("+") ? "up" : "down"}">${b}</td>
+                <td>${bar(p, String(a).startsWith("+") ? "red" : "green")}</td></tr>`).join("")}
+          </tbody></table>
+        </div>
+        <div class="card">
+          <div class="card-h">口径说明</div>
+          <div class="formula">主力净额 = 特大单 + 大单净额<br>
+            占比 = 该板块净额 / 全市场净额绝对值<br>
+            5 日累计为滚动窗口，含当日</div>
+        </div>
+      </div>`,
+  },
+
+  etf: {
+    title: "ETF 份额监控", sub: "份额变化 · 折溢价 · 净申购",
+    top: [["pill ok", "数据 T-1"]],
+    body: () => `
+      <div class="kpis">${[
+        kpi("跟踪 ETF", "184", "只", "含宽基与行业"),
+        kpi("净申购", "42", "只", "昨日"),
+        kpi("净赎回", "31", "只", "昨日"),
+        kpi("份额增幅最大", "+8.4", "%", "科创 50ETF"),
+        kpi("折价最大", "−1.2", "%", "中概互联"),
+        kpi("规模合计", "1.42", "万亿", "跟踪池"),
+      ].join("")}</div>
+      <div class="card">
+        <div class="card-h">份额变化 <span class="muted">只列变动幅度前 8</span></div>
+        <table><thead><tr><th>ETF</th><th>代码</th><th>份额变化</th><th>幅度</th><th>折溢价</th><th>规模</th></tr></thead><tbody>
+          ${[["科创 50ETF", "588000", "+8.4%", "−0.12%", "486 亿"],
+             ["半导体 ETF", "512480", "+6.1%", "+0.08%", "312 亿"],
+             ["中证 500ETF", "510500", "+3.2%", "−0.04%", "268 亿"],
+             ["煤炭 ETF", "515220", "−5.7%", "−0.21%", "68 亿"],
+             ["中概互联", "513050", "−4.3%", "−1.20%", "392 亿"]].map(([n, c, ch, pr, sz]) => `
+            <tr><td>${n}</td><td class="code">${c}</td>
+              <td class="num ${ch.startsWith("+") ? "up" : "down"}">${ch}</td>
+              <td class="num ${pr.startsWith("−") && pr.length > 6 ? "down" : ""}">${pr}</td>
+              <td class="num">${sz}</td></tr>`).join("")}
+        </tbody></table>
+        <div class="note">ETF 份额是**逆势**信号：份额增而价格跌，说明有资金在左侧承接。
+          它与舆情方向相反时正是"背离"，需要单独展示。</div>
+      </div>`,
+  },
+
+  factor: {
+    title: "因子与回测", sub: "因子库 · IC/IR · 单因子回测",
+    top: [["pill ok", "回测数据就绪"]],
+    body: () => `
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">因子库 <span class="muted">按 IC 降序</span></div>
+          <table><thead><tr><th>因子</th><th>类型</th><th>IC</th><th>IR</th><th>覆盖</th><th>近 20 日</th></tr></thead><tbody>
+            ${[["动量_20D", "量价", 0.062, 0.71, "98%", 78],
+               ["换手率_5D", "流动性", 0.051, 0.58, "99%", 66],
+               ["主力净额_3D", "资金", 0.047, 0.52, "96%", 61],
+               ["拥挤度反转", "风险", 0.038, 0.44, "91%", 48],
+               ["北向持仓变化", "资金", 0.029, 0.33, "88%", 37]].map(([n, t, ic, ir, cov, p]) => `
+              <tr><td>${n}</td><td class="muted">${t}</td>
+                <td class="num">${ic}</td><td class="num">${ir}</td>
+                <td class="num">${cov}</td><td>${bar(p)}</td></tr>`).join("")}
+          </tbody></table>
+        </div>
+        <div class="card">
+          <div class="card-h">因子公式 <span class="muted">可自行复算</span></div>
+          <div class="formula">动量_20D = close / close[-20] − 1<br><br>
+            IC = corr(因子值_t, 收益_t+1)<br>
+            IR = mean(IC) / std(IC)</div>
+          <div class="legend">因子值、分组收益、IC 序列都能导出 CSV，
+            公式与参数在界面上直接给出 —— 结论可复算，不需要相信黑盒。</div>
+        </div>
+      </div>`,
+  },
+
+  screen: {
+    title: "量化选股", sub: "条件筛选 · 因子打分 · 结果导出",
+    top: [["pill", "上次筛选 09:24"]],
+    body: () => `
+      <div class="card">
+        <div class="card-h">筛选条件</div>
+        <div class="row" style="flex-wrap:wrap;gap:7px">
+          ${[["动量_20D ≥ 0.05"], ["换手率 ≥ 3%"], ["主力净额 3 日为正"],
+             ["市值 50–500 亿"], ["非 ST"], ["上市 > 1 年"]]
+            .map(([c]) => tag(c, "blue")).join("")}
+          <button class="btn">+ 添加条件</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h">结果 <span class="muted">命中 38 只 · 按综合分降序</span></div>
+        <table><thead><tr><th>名称</th><th>代码</th><th>综合分</th><th>动量</th><th>换手</th><th>主力净额</th><th>行业</th></tr></thead><tbody>
+          ${[["中微公司", "688012", 92, "0.084", "4.2%", "+3.6 亿", "半导体设备"],
+             ["拓荆科技", "688072", 88, "0.071", "3.8%", "+2.1 亿", "半导体设备"],
+             ["阳光电源", "300274", 81, "0.062", "3.1%", "+1.8 亿", "储能"],
+             ["立讯精密", "002475", 76, "0.058", "2.9%", "+0.9 亿", "消费电子"]].map(([n, c, s, m, t, f, i]) => `
+            <tr><td><b>${n}</b></td><td class="code">${c}</td>
+              <td class="num">${s}</td><td class="num">${m}</td>
+              <td class="num">${t}</td><td class="num up">${f}</td>
+              <td class="muted">${i}</td></tr>`).join("")}
+        </tbody></table>
+      </div>`,
+  },
+
+  auction: {
+    title: "集合竞价选股", sub: "09:15–09:25 逐秒序列 · 异动识别",
+    top: [["pill warn", "非交易时段 · 展示最近交易日"]],
+    body: () => `
+      <div class="kpis">${[
+        kpi("采集日", "09-25", "", "序列完整"),
+        kpi("覆盖个股", "312", "只", "含涨停股"),
+        kpi("高开异动", "17", "只", "高开 >3%"),
+        kpi("竞价放量", "9", "只", "量比 >5"),
+        kpi("撤单异常", "3", "只", "需人工复核"),
+        kpi("数据保留", "30", "天", "上游仅存 1 个月"),
+      ].join("")}</div>
+      <div class="card">
+        <div class="card-h">竞价异动 <span class="muted">点开看逐秒撤单/挂单序列</span></div>
+        <table><thead><tr><th>名称</th><th>代码</th><th>高开</th><th>量比</th><th>09:25 匹配量</th><th>形态</th></tr></thead><tbody>
+          ${[["康强电子", "002119", "+6.2%", 8.4, "1.2 亿", ["抢筹", "bull"]],
+             ["泉阳泉", "600189", "+4.8%", 6.1, "0.6 亿", ["抢筹", "bull"]],
+             ["均胜电子", "600699", "+3.1%", 5.2, "0.9 亿", ["平稳", ""]],
+             ["哈药股份", "600664", "−5.4%", 7.7, "0.8 亿", ["出货", "bear"]]].map(([n, c, o, r, v, [f, fc]]) => `
+            <tr><td><b>${n}</b></td><td class="code">${c}</td>
+              <td class="num ${o.startsWith("+") ? "up" : "down"}">${o}</td>
+              <td class="num">${r}</td><td class="num">${v}</td>
+              <td>${tag(f, fc)}</td></tr>`).join("")}
+        </tbody></table>
+        <div class="note">竞价逐秒序列**没有免费备源**（QMT tick 需权限、Tushare 无竞价过程），
+          上游只保留约 1 个月，所以要每个交易日采一次并回补缺口。</div>
+      </div>`,
+  },
+
+  tplus: {
+    title: "做 T 辅助", sub: "日内高低点 · 分时信号 · 阈值回测",
+    top: [["pill ok", "行情正常"], ["pill", "自选 48"]],
+    body: () => `
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">自选池 T 信号 <span class="muted">先验证阈值再做 T</span></div>
+          <table><thead><tr><th>标的</th><th>现价</th><th>涨跌</th><th>日内位置</th><th>信号</th></tr></thead><tbody>
+            ${[["长鑫科技 688825", "42.18", "−4.13%", 22, ["低吸区", "green"]],
+               ["中际旭创 300308", "168.4", "−2.89%", 31, ["低吸区", "green"]],
+               ["新易盛 300502", "92.6", "−3.59%", 18, ["低吸区", "green"]],
+               ["宁德时代 300750", "246.8", "−2.49%", 44, ["中性", ""]],
+               ["陕西煤业 601225", "24.6", "+0.58%", 78, ["减仓区", "orange"]]].map(([n, p, ch, pos, [sg, sc]]) => `
+              <tr><td>${n}</td><td class="num">${p}</td>
+                <td class="num ${ch.startsWith("+") ? "up" : "down"}">${ch}</td>
+                <td>${bar(pos, pos < 35 ? "green" : "red")}</td>
+                <td>${tag(sg, sc)}</td></tr>`).join("")}
+          </tbody></table>
+        </div>
+        <div class="card">
+          <div class="card-h">阈值回测</div>
+          <div class="formula">日内位置 = (现价 − 今低) / (今高 − 今低)<br><br>
+            &lt; 25% → 低吸区<br>
+            &gt; 75% → 减仓区<br><br>
+            近 60 日：胜率 61.4% · 盈亏比 1.7</div>
+          <button class="btn" style="margin-top:8px">查看依据</button>
+        </div>
+      </div>`,
+  },
+
+  intel: {
+    title: "情报中心", sub: "公开信息聚合 · 统计量 · 公式参考",
+    top: [["pill ok", "采集正常"], ["pill warn", "数据不完整"], ["pill", "刷新于 17:11"]],
+    sub_tabs: ["热点&amp;研报小作文 171", "投资日历 2356"],
+    body: () => `
+      <div class="note">本平台只做三件事：<b>聚合公开信息 · 输出统计量 · 公开计算公式</b>。
+        不含证券投资咨询，不推荐具体证券，不给出买卖时机与目标价。
+        页面中任何倾向性描述<b>仅为对第三方原文语气的归类统计</b>，不是平台判断。</div>
+
+      <div class="card">
+        <div class="card-h">平台热议 <span class="muted">扫描 270 条平台快讯 · 名称精确匹配，可核对</span></div>
+        <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:8px">
+          ${["比亚迪 002594 · 提及 2 · 东方财富/同花顺",
+             "药明康德 603259 · 提及 2 · 东方财富/富途",
+             "潍柴动力 000338 · 提及 1 · 东方财富",
+             "长安汽车 000625 · 提及 1 · 东方财富"]
+            .map((x) => tag(x, "blue")).join("")}
+        </div>
+        <table><thead><tr><th>事件</th><th>关联标的</th><th>来源平台</th></tr></thead><tbody>
+          <tr><td>锂电产业链赴港上市热度不减</td><td>璞泰来、新宙邦</td><td class="muted">东方财富</td></tr>
+          <tr><td>翼菲科技机器人进入 PCB 产线</td><td>崇达技术、鹏鼎控股、生益科技</td><td class="muted">东方财富</td></tr>
+        </tbody></table>
+      </div>
+
+      <div class="card">
+        <div class="card-h">热点&amp;研报小作文 <span class="muted">最近 7 天 · 中性不显示 · 未定倾向聚合为一条</span></div>
+        <div class="row" style="flex-wrap:wrap;gap:6px;margin-bottom:8px">
+          ${["全部 171", "高可信 ≥80 · 19", "多源共振 · 2", "券商研报 · 41",
+             "自媒体 · 45", "仅官方 · 6", "低可信 <50 · 11"]
+            .map((t, i) => tag(t, i === 0 ? "blue" : "")).join("")}
+        </div>
+        <table><thead><tr>
+          <th style="width:78px">时间</th>
+          <th class="hide-m" style="width:82px">来源类型</th>
+          <th>标题 / 摘要</th><th style="width:70px">可信度</th>
+          <th class="hide-m" style="width:110px">关联标的</th>
+          <th style="width:70px">原文倾向</th>
+        </tr></thead><tbody>
+          <tr>
+            <td class="code">16:50</td><td class="hide-m">${tag("财经快讯", "")}</td>
+            <td><b>伊朗媒体：伊拉克纳杰夫机场暂停往返伊朗的所有航班</b>
+              <div class="muted">该条倾向未定，已并入下方"未给出明确倾向"组</div></td>
+            <td class="num">58</td><td class="hide-m muted">—</td><td>${tag("未定", "neu")}</td>
+          </tr>
+          <tr>
+            <td class="code">11:51</td><td class="hide-m">${tag("财经快讯", "")}</td>
+            <td><b>映射 Meta 催化！花旗看好微信"小微"成终极 AI Agent</b>
+              <div class="muted">本地模型摘要 · 保留原文数字</div></td>
+            <td class="num">74</td><td class="hide-m muted">腾讯控股</td><td>${tag("偏多", "bull")}</td>
+          </tr>
+          <tr style="background:#12161c">
+            <td class="code">折叠</td><td class="hide-m">${tag("多数尚未抽取倾向", "")}</td>
+            <td><b>▸ 未给出明确倾向的公开信息（170 条）</b>
+              <div class="muted">共 170 条（已判定未定 24 条、尚未抽取 146 条）。点开可逐条查看。</div></td>
+            <td class="num">170</td><td class="hide-m muted">未判定</td><td>${tag("—", "neu")}</td>
+          </tr>
+        </tbody></table>
+        <div class="legend">相似新闻聚合：3 簇 / 折叠 11 条 · 原文倾向分布 偏多 5 / 偏空 0（中性不统计）</div>
+      </div>`,
+  },
+
+  brief: {
+    title: "盘前简报", sub: "基于上一交易日收盘 + 隔夜信息 · 基准 2026-09-25 08:10",
+    top: [["pill ok", "已生成 08:10"], ["pill", "下次 明日 08:10"]],
+    body: () => `
+      <div class="note">数据基准：<b>2026-09-24（上一交易日）收盘</b> +
+        隔夜信息（09-24 15:00 → 本日 08:10）。<b>不含本日盘中数据</b> ——
+        盘中变化由「事件告警中心」实时跟踪。</div>
+
+      <div class="card">
+        <div class="card-h">① 盘前新闻</div>
+        <table><thead><tr><th>股票/板块</th><th>事件</th><th>提及的平台</th></tr></thead><tbody>
+          <tr><td>半导体设备</td><td>多家券商上调明年资本开支预期</td><td class="muted">财联社、东方财富</td></tr>
+          <tr><td>储能</td><td>海外大储招标超预期</td><td class="muted">财联社、同花顺</td></tr>
+          <tr><td>煤炭</td><td>港口库存连续三周累积</td><td class="muted">东方财富</td></tr>
+        </tbody></table>
+      </div>
+
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">② 盘前研报热度 <span class="muted">可信度加权 · 非篇数</span></div>
+          <table><thead><tr><th>板块</th><th>加权热度</th><th>研报数</th><th>方向</th></tr></thead><tbody>
+            <tr><td>半导体设备</td><td class="num">92</td><td class="num">14</td><td>${tag("偏多", "bull")}</td></tr>
+            <tr><td>AI 算力</td><td class="num">78</td><td class="num">11</td><td>${tag("偏多", "bull")}</td></tr>
+            <tr><td>煤炭</td><td class="num">41</td><td class="num">5</td><td>${tag("偏空", "bear")}</td></tr>
+          </tbody></table>
+        </div>
+        <div class="card">
+          <div class="card-h">③ 盘前预测</div>
+          <div class="formula">情绪周期：修复<br>涨停结构：昨 41 家<br>
+            资金流：主力 +86.4 亿<br>拥挤度：2 个板块 ≥85 分位</div>
+          <div class="legend">关键判断变化**相对昨收基准**：
+            半导体设备由"观察"升至"主线"。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-h">④ 今日日历 <span class="muted">未来 7 日 7 项</span></div>
+        <table><thead><tr><th>日期</th><th>类型</th><th>事件</th><th>覆盖范围</th><th>确定性</th></tr></thead><tbody>
+          <tr><td class="code">09-27</td><td>${tag("宏观发布", "purple")}</td>
+            <td>规模以上工业企业利润</td><td class="muted">全市场</td><td>${tag("官方", "")}</td></tr>
+          <tr><td class="code">09-28</td><td>${tag("限售解禁", "orange")}</td>
+            <td>解禁市值 591.08 亿</td><td>40 家</td><td>${tag("可改期", "")}</td></tr>
+          <tr><td class="code">10-01</td><td>${tag("交易日", "blue")}</td>
+            <td>休市（2026-10-01 起）</td><td class="muted">—</td><td>${tag("规则", "")}</td></tr>
+        </tbody></table>
+      </div>`,
+  },
+
+  alerts: {
+    title: "事件告警中心", sub: "信息事件 · 多源共振 · 弹窗抑制",
+    top: [["pill warn", "非交易时段 · 只入库不弹窗"], ["pill", "未读 23"]],
+    sub_tabs: ["全部 47", "利空 29", "利多 18", "高 12", "未读 23"],
+    body: () => `
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">事件流</div>
+          <table><thead><tr>
+            <th style="width:66px">时间</th><th style="width:64px">方向</th>
+            <th>标题</th><th style="width:96px">关联标的</th>
+            <th style="width:60px">置信</th><th style="width:56px">级别</th>
+          </tr></thead><tbody>
+            ${[["15:22", "利空", "win", "港口库存连续三周累积，动力煤需求进入淡季", "中国神华", 0.84, "高"],
+               ["14:08", "利多", "win", "先进封装投产爬坡，资本开支预期上调", "中芯国际", 0.91, "高"],
+               ["13:41", "利多", "win", "储能招标超预期，海外大单能见度抬升", "宁德时代", 0.78, "中"],
+               ["11:07", "利空", "win", "销售数据延续弱势，债务展期预期升温", "万科 A", 0.66, "中"],
+               ["10:33", "利多", "read", "新机备货量上修，汽车电子第二曲线放量", "立讯精密", 0.74, "中"]]
+              .map(([t, dir, st, title, code, conf, lv]) => `
+              <tr${st === "read" ? ' style="opacity:.62"' : ""}>
+                <td class="code">${t}</td>
+                <td>${tag(dir, dir === "利空" ? "bear" : "bull")}</td>
+                <td>${title}</td><td>${code}</td>
+                <td class="num">${conf}</td>
+                <td>${tag(lv, lv === "高" ? "orange" : "")}</td></tr>`).join("")}
+          </tbody></table>
+        </div>
+        <div class="stack">
+          <div class="card">
+            <div class="card-h">弹窗规则 <span class="muted">防打扰</span></div>
+            <div class="formula">方向明确（非中性/未定）<br>
+              + 可信度 ≥74<br>
+              + 引擎判为 high<br>
+              + 跨源同文合并为一条<br>
+              + <b>仅交易时段弹窗</b></div>
+            <div class="legend">非交易时段**照常入库**，只是不弹 ——
+              第二天开盘前在列表里能看到昨晚发生了什么。</div>
+          </div>
+          <div class="card">
+            <div class="card-h">弹窗样式（示例）</div>
+            <div style="background:#1b2028;border:1px solid #2a3038;border-left:3px solid #e5484d;
+                        border-radius:8px;padding:8px 10px">
+              <div class="row" style="gap:7px">
+                ${tag("利空·high", "bear")}
+                <b style="font-size:12.5px">中国神华：港口库存三周累积</b>
+              </div>
+              <div class="muted" style="margin-top:3px">利空 84 / 利多 0 · 置信 84%</div>
+            </div>
+          </div>
+        </div>
+      </div>`,
+  },
+
+  pools: {
+    title: "我的自选池", sub: "自选标的 · 分组 · 备注",
+    top: [["pill", "自选 48 只"]],
+    body: () => `
+      <div class="card">
+        <div class="card-h">自选池 <span class="muted">按分数变化降序</span></div>
+        <table><thead><tr><th>名称</th><th>代码</th><th>现价</th><th>涨跌</th><th>分数</th><th>变化</th><th>所属</th></tr></thead><tbody>
+          ${[["沃尔德", "688028", "68.4", "−5.79%", 76, "+15"],
+             ["新易盛", "300502", "92.6", "−3.59%", 71, "+10"],
+             ["杰华特", "688141", "32.1", "−5.78%", 64, "+11"],
+             ["长鑫科技", "688825", "42.18", "−4.13%", 82, "+8"],
+             ["陕西煤业", "601225", "24.6", "+0.58%", 53, "−8"]].map(([n, c, p, ch, s, d]) => `
+            <tr><td><b>${n}</b></td><td class="code">${c}</td>
+              <td class="num">${p}</td>
+              <td class="num ${String(ch).startsWith("+") ? "up" : "down"}">${ch}</td>
+              <td class="num">${s}</td>
+              <td class="num ${String(d).startsWith("+") ? "up" : "down"}">${d}</td>
+              <td class="muted">默认</td></tr>`).join("")}
+        </tbody></table>
+      </div>`,
+  },
+
+  sched: {
+    title: "调度与任务", sub: "定时作业 · 交易日时间轴 · 运行记录",
+    top: [["pill ok", "调度器运行中"], ["pill", "32 个作业"]],
+    body: () => `
+      <div class="kpis">${[
+        kpi("作业总数", "32", "个", "已注册"),
+        kpi("今日运行", "46", "次", "含重试"),
+        kpi("失败", "1", "次", "intel_hot_topics"),
+        kpi("下次触发", "18:27", "", "盘前预测"),
+        kpi("调度模式", "交易日", "", "非交易日自动跳过"),
+        kpi("健康度", "96.9", "%", "近 24h"),
+      ].join("")}</div>
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">今日任务时间轴</div>
+          <div class="tl">
+            ${[["08:05", "情报采集（第一次）", "ok", "6.2s"],
+               ["08:10", "盘前预测", "ok", "61.3s"],
+               ["09:15", "竞价逐秒采集", "wait", "等待中"],
+               ["10:05", "情报采集（第二次）", "ok", "5.8s"],
+               ["15:15", "情报采集（收盘）", "ok", "7.1s"],
+               ["18:27", "平台热议聚合", "pur", "本地模型 · 约 80s"]]
+              .map(([t, n, st, d]) => `
+              <div class="tl-row"><span class="tl-t">${t}</span>
+                <div class="row" style="gap:7px"><span class="tl-dot ${st === "wait" ? "wait" : st === "pur" ? "pur" : ""}"></span>
+                  <span>${n}</span><span class="muted" style="margin-left:auto">${d}</span></div></div>`).join("")}
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h">最近运行</div>
+          <table><thead><tr><th>作业</th><th>状态</th><th>耗时</th></tr></thead><tbody>
+            <tr><td>intel_hot_topics</td><td>${tag("失败", "bear")}</td><td class="num">—</td></tr>
+            <tr><td>intel_tone_extract</td><td>${tag("成功", "green")}</td><td class="num">118s</td></tr>
+            <tr><td>event_alert_scan</td><td>${tag("成功", "green")}</td><td class="num">9.4s</td></tr>
+            <tr><td>intel_signal_alert</td><td>${tag("成功", "green")}</td><td class="num">1.2s</td></tr>
+          </tbody></table>
+          <div class="legend">每个作业都能看到"上次运行 / 耗时 / 状态"——
+            调度失败最怕的是**静默**，所以运行记录必须显式。</div>
+        </div>
+      </div>`,
+  },
+
+  audit: {
+    title: "审计与合规", sub: "操作日志 · 数据溯源 · 免责声明",
+    top: [["pill ok", "审计库正常"]],
+    body: () => `
+      <div class="cols2">
+        <div class="card">
+          <div class="card-h">审计日志 <span class="muted">独立存储 · 不可篡改</span></div>
+          <table><thead><tr><th>时间</th><th>用户</th><th>操作</th><th>对象</th><th>结果</th></tr></thead><tbody>
+            ${[["17:02", "admin", "标记告警已读", "al_8f3a…", "ok"],
+               ["16:58", "testyang", "查看热点&研报小作文", "filter=high", "ok"],
+               ["16:40", "admin", "导出因子数据", "momentum_20d", "ok"],
+               ["16:12", "unknown", "登录失败", "IP 1.2.3.4", "拒绝"]]
+              .map(([t, u, a, o, r]) => `
+              <tr><td class="code">${t}</td><td>${u}</td><td>${a}</td>
+                <td class="code">${o}</td>
+                <td>${tag(r, r === "ok" ? "green" : "bear")}</td></tr>`).join("")}
+          </tbody></table>
+        </div>
+        <div class="card">
+          <div class="card-h">合规基线</div>
+          <div class="stack">
+            ${["所有输出附带免责声明", "多租户数据按 RLS 隔离",
+               "审计日志独立存储，不可篡改", "敏感数据操作日志保存 ≥3 年",
+               "不提供投资咨询，不推荐具体证券"]
+              .map((x) => `<div class="row" style="gap:7px">${tag("✓", "green")}<span>${x}</span></div>`).join("")}
+          </div>
+          <div class="legend">数据溯源：每个数据点带 source_url / publish_time /
+            fetch_time / raw_content_hash；LLM 推理记录 prompt_hash 与 token 数。</div>
+        </div>
+      </div>`,
+  },
+
+  users: {
+    title: "用户管理", sub: "账号 · 等级 · 功能权限",
+    top: [["pill", "13 位用户"], ["pill ok", "待审批 2"]],
+    body: () => `
+      <div class="kpis">${[
+        kpi("用户总数", "13", "位", "含 1 管理员"),
+        kpi("活跃", "9", "位", "近 7 日登录"),
+        kpi("待审批", "2", "位", "注册未通过"),
+        kpi("付费等级", "3", "档", "basic/pro/vip"),
+        kpi("功能项", "24", "个", "可单独授权"),
+        kpi("锁定中", "0", "位", "连续失败 5 次锁"),
+      ].join("")}</div>
+      <div class="card">
+        <div class="card-h">用户列表</div>
+        <table><thead><tr><th>账号</th><th>等级</th><th>状态</th><th>功能授权</th><th>最近登录</th><th>有效期</th></tr></thead><tbody>
+          ${[["admin", "admin", "正常", "全部 24 项", "17:02", "—"],
+             ["testyang", "vip", "正常", "18 项", "16:58", "2027-03-01"],
+             ["user_lin", "pro", "正常", "11 项", "09:31", "2026-12-15"],
+             ["user_zhao", "basic", "待审批", "—", "—", "—"]]
+            .map(([a, t, s, f, l, e]) => `
+            <tr><td><b>${a}</b></td>
+              <td>${tag(t, t === "admin" ? "purple" : t === "vip" ? "blue" : "")}</td>
+              <td>${tag(s, s === "正常" ? "green" : "orange")}</td>
+              <td class="muted">${f}</td><td class="code">${l}</td>
+              <td class="code">${e}</td></tr>`).join("")}
+        </tbody></table>
+      </div>`,
+  },
+};
+
+/* ==================================================================
+   渲染
+   ================================================================== */
+let CUR = "intel";
+
+function renderNav() {
+  const nav = document.getElementById("nav");
+  // ⚠️ 必须容忍"还没有容器"。第一版把 `renderNav()` 放在填充外壳**之前**，
+  // 首次加载时 `#nav` 不存在 → 抛 TypeError → 整个渲染脚本挂掉，
+  // 页面只剩空白（而 Playwright 不会因为 JS 报错就失败，所以看起来像"截图没内容"）。
+  if (!nav) return;
+  nav.innerHTML = NAV.map((g) => `
+    <div class="grp">
+      <div class="grp-h">${g.g}</div>
+      ${g.items.map((it) => `
+        <button class="nav-item${it.id === CUR ? " on" : ""}" data-p="${it.id}">
+          <span class="nav-ic">${it.ic}</span>
+          <span>${it.t}</span>
+          ${it.badge ? `<span class="nav-badge${it.warn ? " warn" : ""}">${it.badge}</span>` : ""}
+        </button>`).join("")}
+    </div>`).join("");
+  nav.querySelectorAll(".nav-item").forEach((b) => {
+    b.onclick = () => render(b.dataset.p);
+  });
+}
+
+function render(pageId) {
+  if (PAGES[pageId]) CUR = pageId;
+  const p = PAGES[CUR];
+  const form = document.body.className || "";
+  // ★ 顺序：先建外壳 → 再填导航。反过来会拿到上一轮的 DOM（或什么都没有）。
+  document.getElementById("app").innerHTML = `
+    ${form.includes("m-portrait") ? '<div class="scrim"></div>' : ""}
+    <div class="shell">
+      <aside class="side">
+        <div class="brand">
+          <div class="brand-logo">M</div>
+          <div>
+            <div class="brand-t">Moss 投研平台</div>
+            <div class="brand-s">多 Agent 投研工作台</div>
+          </div>
+        </div>
+        <nav class="nav" id="nav"></nav>
+        <div class="side-foot"><span class="dot"></span><span>后端在线 · 8110</span></div>
+      </aside>
+      <div class="main">
+        <header class="top">
+          <button class="hamburger">☰</button>
+          <div>
+            <div class="page-title">${p.title}</div>
+            <div class="page-sub">${p.sub || ""}</div>
+          </div>
+          <div class="top-right">
+            ${(p.top || []).map(([c, t]) => `<span class="${c}">${t}</span>`).join("")}
+            <button class="btn">↻ 刷新</button>
+            <button class="btn primary">立即运行</button>
+            <button class="btn overflow" title="更多操作">⋯</button>
+          </div>
+        </header>
+        ${p.sub_tabs ? `<div style="display:flex;gap:6px;padding:9px 18px 0">
+          ${p.sub_tabs.map((t, i) => `<button class="btn${i === 0 ? " primary" : ""}">${t}</button>`).join("")}
+        </div>` : ""}
+        <div class="content">
+          <div class="scrollhint">← 表格可左右滑动查看全部列</div>
+          ${p.body()}
+        </div>
+      </div>
+    </div>`;
+  renderNav();
+  if (form.includes("m-portrait")) {
+    const hb = document.querySelector(".hamburger");
+    if (hb) hb.onclick = () => document.body.classList.toggle("drawer-closed");
+    const sc = document.querySelector(".scrim");
+    if (sc) sc.onclick = () => document.body.classList.add("drawer-closed");
+  }
+}
+
+window.render = render;
+window.PAGE_IDS = Object.keys(PAGES);
+render(CUR);
+</script>
+</body>
+</html>

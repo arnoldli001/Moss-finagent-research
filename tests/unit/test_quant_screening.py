@@ -14,6 +14,7 @@ import pytest
 
 from src.quant.screening import (
     ScreenConfig,
+    apply_st_mask,
     cluster_by_correlation,
     composite_score,
     correlation_matrix,
@@ -265,3 +266,41 @@ def test_non_overlapping_sampling_reduces_period_count() -> None:
     sampled = window[::stride]
     assert len(sampled) == 3          # 60 天 / 20
     assert len(DATES[::20]) == 3
+
+
+# ============== 剔除 ST（历史名称口径） ==============
+
+def test_apply_st_mask_blanks_only_st_cells() -> None:
+    """掩码只把 ST 的格子置 NaN —— 同日其它票、同票其它日照常参与截面。
+
+    置 NaN 而不是删行/删列，是为了不改变面板形状：
+    `compute_ic_series` 成对剔除、`qcut` 也会自动排除 NaN。
+    """
+    frame = pd.DataFrame(
+        {"000001": [1.0, 2.0, 3.0], "000002": [4.0, 5.0, 6.0]},
+        index=["20260101", "20260102", "20260103"])
+    mask = pd.DataFrame(
+        {"000001": [True, False, False], "000002": [False, False, True]},
+        index=frame.index)
+    masked, note = apply_st_mask({"roe": frame}, mask)
+    out = masked["roe"]
+    assert pd.isna(out.loc["20260101", "000001"])      # ST 格子被清掉
+    assert out.loc["20260101", "000002"] == 4.0        # 同日非 ST 不受影响
+    assert out.loc["20260102", "000001"] == 2.0        # 同票非 ST 日不受影响
+    assert pd.isna(out.loc["20260103", "000002"])
+    assert out.shape == frame.shape                    # 形状不变
+    assert "已剔除 ST" in note and "2 个「股票日」" in note
+
+
+def test_apply_st_mask_handles_misaligned_mask() -> None:
+    """掩码的日期/代码轴与面板不一致时按"取交集"处理，不能抛异常。
+
+    实际调用里掩码来自 `StStatus.mask(panels.dates, panels.codes)`，轴是一致的；
+    但 reindex 兜底能保证"列多一个少一个"不会让整个筛选崩掉。
+    """
+    frame = pd.DataFrame({"000001": [1.0]}, index=["20260101"])
+    mask = pd.DataFrame({"000001": [True], "000009": [True]},
+                        index=["20260101", "20260102"])
+    masked, note = apply_st_mask({"bp": frame}, mask)
+    assert pd.isna(masked["bp"].loc["20260101", "000001"])
+    assert "1 个「股票日」" in note

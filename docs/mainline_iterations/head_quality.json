@@ -1,0 +1,170 @@
+{
+  "head_quantile": 0.8,
+  "survivors": [
+    "accumulation.leverage.raw.form_b",
+    "accumulation.volume_price.raw.form_b",
+    "accumulation.northbound.raw.form_b",
+    "six_dim.macro"
+  ],
+  "windows": [
+    "旧",
+    "中",
+    "新"
+  ],
+  "auc_floor": 0.52,
+  "boot_floor": 0.5,
+  "horizon": 20,
+  "big": 0.1,
+  "top": [
+    {
+      "factor": "accumulation.leverage.raw.form_b",
+      "worst_big": 0.5455567807883498,
+      "worst_rel": 0.5171775444534185
+    },
+    {
+      "factor": "accumulation.volume_price.raw.form_b",
+      "worst_big": 0.5455567807883498,
+      "worst_rel": 0.5150945515151979
+    },
+    {
+      "factor": "accumulation.northbound.raw.form_b",
+      "worst_big": 0.536034977999792,
+      "worst_rel": 0.5150945515151979
+    },
+    {
+      "factor": "bar.vol20",
+      "worst_big": 0.5239384824646278,
+      "worst_rel": 0.48429335319318734
+    },
+    {
+      "factor": "six_dim.prosperity.raw.revenue_yoy",
+      "worst_big": 0.514297366701146,
+      "worst_rel": 0.5081280224878794
+    },
+    {
+      "factor": "six_dim.technical.raw.volume",
+      "worst_big": 0.5105977639199626,
+      "worst_rel": 0.4752660756731338
+    },
+    {
+      "factor": "bar.pos60",
+      "worst_big": 0.5096369422145078,
+      "worst_rel": 0.47161063494454386
+    },
+    {
+      "factor": "six_dim.macro",
+      "worst_big": 0.5073172273670625,
+      "worst_rel": 0.49839910553197975
+    },
+    {
+      "factor": "six_dim.technical.raw.ma",
+      "worst_big": 0.5031121175960078,
+      "worst_rel": 0.4622007835011652
+    },
+    {
+      "factor": "promoted",
+      "worst_big": 0.5008954198845557,
+      "worst_rel": 0.4980770098830407
+    },
+    {
+      "factor": "six_dim.macro.raw.common",
+      "worst_big": 0.5008954198845557,
+      "worst_rel": 0.4980770098830407
+    },
+    {
+      "factor": "bar.ret5",
+      "worst_big": 0.5000027175242268,
+      "worst_rel": 0.4518619037393309
+    },
+    {
+      "factor": "etf_bonus",
+      "worst_big": 0.498998282146532,
+      "worst_rel": 0.4741016997951657
+    },
+    {
+      "factor": "accumulation.leverage.raw.etf_level",
+      "worst_big": 0.49879990059122065,
+      "worst_rel": 0.45820293738466594
+    },
+    {
+      "factor": "accumulation.volume_price.raw.cum_ratio",
+      "worst_big": 0.49871262026601065,
+      "worst_rel": 0.4904367205507472
+    },
+    {
+      "factor": "accumulation.volume_price.raw.nb_rank",
+      "worst_big": 0.49871262026601065,
+      "worst_rel": 0.4904367205507472
+    },
+    {
+      "factor": "accumulation.volume_price.raw.ratio",
+      "worst_big": 0.49871262026601065,
+      "worst_rel": 0.4904367205507472
+    },
+    {
+      "factor": "accumulation.volume_price.raw.etf_level",
+      "worst_big": 0.49802066559312935,
+      "worst_rel": 0.46402870117691686
+    },
+    {
+      "factor": "accumulation.northbound.raw.etf_level",
+      "worst_big": 0.49757625705157854,
+      "worst_rel": 0.444179866273815
+    },
+    {
+      "factor": "six_dim.chips",
+      "worst_big": 0.49647882413644034,
+      "worst_rel": 0.43508420522744606
+    },
+    {
+      "factor": "six_dim.chips.raw.profit_ratio",
+      "worst_big": 0.49647882413644034,
+      "worst_rel": 0.43508420522744606
+    },
+    {
+      "factor": "accumulation.leverage.raw.cum_ratio",
+      "worst_big": 0.4960987937478763,
+      "worst_rel": 0.4909960808761693
+    },
+    {
+      "factor": "accumulation.leverage.raw.nb_rank",
+      "worst_big": 0.4960987937478763,
+      "worst_rel": 0.4909960808761693
+    },
+    {
+      "factor": "accumulation.leverage.raw.ratio",
+      "worst_big": 0.4960987937478763,
+      "worst_rel": 0.4909960808761693
+    },
+    {
+      "factor": "accumulation.northbound.raw.cum_ratio",
+      "worst_big": 0.4960285039941903,
+      "worst_rel": 0.4909960808761693
+    },
+    {
+      "factor": "accumulation.northbound.raw.nb_rank",
+      "worst_big": 0.4960285039941903,
+      "worst_rel": 0.4909960808761693
+    },
+    {
+      "factor": "accumulation.northbound.raw.ratio",
+      "worst_big": 0.4960285039941903,
+      "worst_rel": 0.4909960808761693
+    },
+    {
+      "factor": "accumulation_score",
+      "worst_big": 0.49418996598376896,
+      "worst_rel": 0.4962499025180572
+    },
+    {
+      "factor": "six_dim_coverage",
+      "worst_big": 0.4910028149668353,
+      "worst_rel": 0.48208238078506044
+    },
+    {
+      "factor": "six_dim.technical",
+      "worst_big": 0.49079624290024554,
+      "worst_rel": 0.45714200875212146
+    }
+  ]
+}

@@ -1,5 +1,5 @@
 /**
- * 盘前简报：盘前新闻 / 研报热度 / 政策信号 / 研究笔记 四段聚合视图。
+ * 盘前简报：盘前新闻 / 研报热度 / 政策信号 / 券商作文 四段聚合视图。
  *
  * ## ⚠️ 名称与实质的差距，必须如实说明
  *
@@ -14,7 +14,7 @@
  *
  * ## 四段的排列顺序有理由，不是随意的
  *
- *   政策信号 > 盘前新闻 > 研报 > 研究笔记
+ *   政策信号 > 盘前新闻 > 研报 > 券商作文
  *
  * 政策影响面最大且最不可预期（一条政策能改变整条主线），
  * 研究笔记是第三方观点里最"软"的一类，排最后。
@@ -140,14 +140,14 @@ export default function IntelBriefTab({ brief }: { brief: PremarketBrief }) {
         title="券商研报"
         sub="持牌机构署名"
         items={s.broker_heat ?? []}
-        empty="当前窗口没有研报（需在情报流里配置关注标的）"
+        empty="当前窗口没有研报（需在「热点&研报小作文」里配置关注标的）"
         openHash={openHash} onToggle={toggle}
       />
       <Section
-        title="研究笔记"
+        title="券商作文"
         sub="第三方笔记，倾向属原文"
         items={s.research_notes ?? []}
-        empty="当前窗口没有研究笔记（该来源需要有效授权）"
+        empty="当前窗口没有券商作文（该来源需要有效授权）"
         openHash={openHash} onToggle={toggle}
       />
 

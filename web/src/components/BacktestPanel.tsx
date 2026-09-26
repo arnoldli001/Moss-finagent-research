@@ -15,7 +15,7 @@ export default function BacktestPanel() {
         </button>
         <button className={mode === "single" ? "mode-btn active" : "mode-btn"}
                 onClick={() => setMode("single")}
-                title="单股票策略：指定一只票，用因子条件描述买卖点做时序回测，可一键保存策略">
+                title="单股票策略：指定一只票，用因子条件描述进出场条件做时序回测，可一键保存策略">
           单股票策略回测
         </button>
       </nav>
@@ -23,7 +23,7 @@ export default function BacktestPanel() {
       {mode === "single" ? (
         <QuantSingleStockPanel />
       ) : (
-        <QuantFactorPanel />
+        <QuantFactorPanel onSwitchToSingle={() => setMode("single")} />
       )}
     </div>
   );

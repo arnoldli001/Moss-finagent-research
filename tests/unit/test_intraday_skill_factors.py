@@ -110,7 +110,7 @@ def test_merge_and_diff_weights_report_only_changed() -> None:
 # ==================== 缠论结构分 ====================
 
 def test_chan_score_below_pivot_is_positive_and_saturates() -> None:
-    """中枢下方 = 超跌 → 正分（利于低吸），且离开中枢超过 overshoot 后饱和。
+    """中枢下方 = 超跌 → 正分（利于回踩），且离开中枢超过 overshoot 后饱和。
 
     默认 `divergence_weight=0.5`：位置分与背驰分各占一半，
     所以这里看到的分数是"位置分 × 0.5"（无背驰时背驰项为 0）。

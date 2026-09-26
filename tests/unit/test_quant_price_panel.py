@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 
 from src.quant.price_panel import (
-    PRICE_FIELDS,
+    BAR_PRICE_FIELDS,
     PriceStore,
     _points_to_frame,
     price_panel_summary,
@@ -42,7 +42,7 @@ class _FakeFetcher:
         if code in self.fail:
             raise RuntimeError("QMT 挂了")
         if code in self.empty:
-            return pd.DataFrame(columns=["date", *PRICE_FIELDS])
+            return pd.DataFrame(columns=["date", *BAR_PRICE_FIELDS])
         return _frame(start, end)
 
 
@@ -67,7 +67,7 @@ def test_points_to_frame_builds_ohlcv() -> None:
     assert frame["date"].tolist() == ["20260914", "20260915"]
     assert frame["close"].tolist() == [10.2, 10.4]
     assert frame["amount"].tolist() == [1.0e7, 1.2e7]
-    assert list(frame.columns) == ["date", *PRICE_FIELDS]
+    assert list(frame.columns) == ["date", *BAR_PRICE_FIELDS]
 
 
 def test_points_to_frame_dedupes_and_sorts() -> None:

@@ -102,6 +102,30 @@ class CronScheduler:
                 pass
             self._task = None
 
+    async def trigger(self, name: str, *, source: str = "startup") -> dict[str, Any]:
+        """立刻执行一个已注册作业（启动自检的补偿路径用），返回运行记录。
+
+        ## 与定时触发的两处差别
+
+        1. `trigger` 字段不同 —— 运行记录里能看出这次是启动自检补的，
+           而不是 16:40 那班定时；
+        2. **不受"连续失败自动暂停"拦截**。暂停的用意是防"每 30 分钟撞同一堵墙"，
+           而启动自检是一次性的：重启本身可能已经消除了失败原因
+           （比如 token 刚配好、磁盘刚腾出空间），这时应当再试一次。
+
+        ⚠️ 并发安全靠 `execute_job` 内部的 `_lock_for(job_name)`：
+        自检与定时撞上时后者会串行等待，不会双跑（下载/灌库都是幂等的，
+        但串行能避免两份下载互相抢带宽）。
+        """
+        from src.scheduler.jobs import execute_job
+
+        fn = self._execute or execute_job
+        self._running.add(name)
+        try:
+            return await fn(self._runtime, name, self._run_log, source)
+        finally:
+            self._running.discard(name)
+
     async def _loop(self) -> None:
         # 先对齐到下一分钟边界后2秒，降低分钟内抖动导致的漏触发
         while not self._stop.is_set():

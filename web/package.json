@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check:intel": "esbuild src/intelRenderCheck.tsx --bundle --platform=node --format=cjs --jsx=automatic --log-level=warning --outfile=node_modules/.cache/intelRenderCheck.cjs && node node_modules/.cache/intelRenderCheck.cjs"
   },
   "dependencies": {
     "marked": "^15.0.0",

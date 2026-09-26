@@ -133,6 +133,34 @@ class CachedRepository(DataPointRepository):
             await self._invalidate(indicator)
         return deleted
 
+    async def delete_points_by_source(self, source_name: str) -> int:
+        # 跨指标删除：委托内层后 best-effort 清空全部数据点查询缓存。
+        deleted = await self._inner.delete_points_by_source(source_name)
+        if deleted:
+            await self._invalidate_all()
+        return deleted
+
+    async def prune_before(self, cutoff_date: str) -> int:
+        # 跨指标删除：委托内层后，best-effort 清空全部数据点查询缓存。
+        deleted = await self._inner.prune_before(cutoff_date)
+        if deleted:
+            await self._invalidate_all()
+        return deleted
+
+    async def _invalidate_all(self) -> None:
+        """清空全部数据点查询缓存（保留策略跨指标，无法逐指标失效）。"""
+        client = await self._get_client()
+        if client is None:
+            return
+        pattern = f"{_KEY_PREFIX}:*"
+        try:
+            async for batch in _scan_keys(client, pattern):
+                if batch:
+                    await client.delete(*batch)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Redis全量缓存失效失败（下次查询自动纠正）：%s", exc)
+            self._degraded = True
+
     async def _invalidate(self, indicator: str) -> None:
         """删除某indicator下的全部查询缓存。"""
         client = await self._get_client()

@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, AlertSettings, ScanState, api } from "../api";
+import {
+  filterKeyOf, readAlerts, readAlertSettings, writeAlerts,
+} from "../alertsCache";
 import AlertDetail from "./AlertDetail";
 
 type Props = {
@@ -9,8 +12,18 @@ type Props = {
   onReadChanged: () => void;
 };
 
+/**
+ * 方向标签：**利空 / 利多**（不是"风险 / 机会"）。
+ *
+ * 用户口径与本项目合规基线：平台只描述公开信息，不给操作暗示。
+ * "机会"是带操作暗示的词（暗示"该买"），而"利空/利多"是对
+ * **第三方原文语气**的事实描述 —— 与情报流里的 `tone` 同一套措辞。
+ *
+ * ⚠️ 底层枚举值仍是 `risk` / `opportunity`（后端、数据库、筛选参数都用它），
+ * 这里只改**展示文案** —— 改枚举会牵动库里的历史数据与所有筛选链接。
+ */
 const TYPE_LABEL: Record<string, string> = {
-  risk: "风险", opportunity: "机会",
+  risk: "利空", opportunity: "利多",
 };
 const LEVEL_LABEL: Record<string, string> = {
   high: "高", medium: "中", low: "低",
@@ -34,7 +47,20 @@ export default function AlertsPanel(
   const pollRef = useRef<number | null>(null);
 
   const load = useCallback(async () => {
-    setLoading(true);
+    const fkey = filterKeyOf(type, level, status);
+    // ★ **先画缓存、再后台核对**（stale-while-revalidate）。
+    //
+    // 用户口径（2026-09-26）："切网站内界面再切回也要 2 秒显示"。
+    // 量出来的原因很硬：隧道实测只有 ~51 KB/s，而列表是 112 KB ——
+    // 每次切回来都重走一遍隧道就是 2 秒起。可这份数据**刚刚才在手里**
+    // （上一次打开时拿到的），没有任何理由扔掉重拿。
+    //
+    // 所以：有缓存就立刻画出来，同时发请求核对；拿到新的再覆盖。
+    // 已经画了旧数据时**不显示"加载中…"** —— 那会让"立刻可用"又变回
+    // "看起来在等"，等于白做。
+    const cached = readAlerts(fkey);
+    if (cached) setAlerts(cached.alerts);
+    setLoading(!cached);
     setError(null);
     try {
       const resp = await api.alerts({
@@ -42,8 +68,12 @@ export default function AlertsPanel(
         status: status || undefined, limit: 100,
       });
       setAlerts(resp.alerts);
+      // 存的是**这一档**的结果（键含筛选），否则"仅未读"会拿到"全部"
+      writeAlerts(fkey, resp);
     } catch (e) {
-      setError(String(e));
+      // 有缓存时不要把用户已经看到的内容换成一句错误 —— 后台核对失败
+      // 不该让他手里的列表消失。静默保留缓存内容即可。
+      if (!cached) setError(String(e));
     } finally {
       setLoading(false);
     }
@@ -52,6 +82,22 @@ export default function AlertsPanel(
   useEffect(() => { void load(); }, [load, incomingTick]);
 
   useEffect(() => {
+    // ★ 先用预加载带回来的设置，**省掉一次隧道往返**。
+    //
+    // 用户报障（2026-09-26）："事件告警 打开还是有 1-2 秒的延迟"。
+    // 根因是响应没压缩（已在 `src/api/main.py` 注册 GZipMiddleware，
+    // 实测 109KB → 1.9KB）。这里是**第二笔**可省的开销：
+    // 面板打开时又单独发了一条 `/alerts/settings`，而登录预加载走的
+    // `/alerts/bootstrap` **已经把 settings 一起取回来了**（见
+    // `alertsCache.preloadAlerts`）。在 ~51 KB/s 的隧道上这是一次纯浪费的往返。
+    //
+    // 有缓存设置就直接用、**不再发请求**；没有（未登录预加载 / 缓存过期）
+    // 才回退到正常拉取 —— 行为与优化前一致。
+    const cachedSettings = readAlertSettings(filterKeyOf("", "", ""));
+    if (cachedSettings) {
+      setSettings(cachedSettings);
+      return;
+    }
     api.alertSettings().then(setSettings).catch(() => undefined);
   }, []);
 
@@ -161,8 +207,8 @@ export default function AlertsPanel(
         {settings && !settings.email.configured && (
           <div className="info-box warn-box">
             邮件通道未配置（在 .env 设置 ALERT_SMTP_USER / ALERT_SMTP_AUTH_CODE 后重启），
-            当前仅站内实时推送；配置后风险分&gt;{settings.email.risk_min_score}
-            或机会分≥{settings.email.opp_min_score} 的告警将发送至 {settings.email.to}
+            当前仅站内实时推送；配置后利空分&gt;{settings.email.risk_min_score}
+            或利多分≥{settings.email.opp_min_score} 的告警将发送至 {settings.email.to}
           </div>
         )}
 
@@ -209,8 +255,8 @@ export default function AlertsPanel(
         <div className="alerts-filters">
           <select value={type} onChange={(e) => setType(e.target.value)}>
             <option value="">全部方向</option>
-            <option value="risk">风险</option>
-            <option value="opportunity">机会</option>
+            <option value="risk">利空</option>
+            <option value="opportunity">利多</option>
           </select>
           <select value={level} onChange={(e) => setLevel(e.target.value)}>
             <option value="">全部级别</option>
@@ -252,8 +298,8 @@ export default function AlertsPanel(
                     那会让人以为是个内部编号。 */}
                 {a.source_name || "来源已隐藏"}
                 {" · "}{a.event_publish_time || a.trigger_time}
-                {" · "}风险{Math.round(a.risk_score)}
-                /机会{Math.round(a.opportunity_score)}
+                {" · "}利空{Math.round(a.risk_score)}
+                /利多{Math.round(a.opportunity_score)}
                 /置信{(a.confidence * 100).toFixed(0)}%
               </div>
             </li>
@@ -267,7 +313,8 @@ export default function AlertsPanel(
         )}
       </div>
 
-      <AlertDetail alert={selected} onClose={() => setSelected(null)} />
+      <AlertDetail alert={selected} onClose={() => setSelected(null)}
+                   disclaimer={settings?.disclaimer} />
     </div>
   );
 }

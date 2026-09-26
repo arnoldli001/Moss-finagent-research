@@ -93,12 +93,27 @@ function isStaleServer(status: QuantDataStatus): boolean {
   return status.warehouse === undefined;
 }
 
-export default function QuantFactorPanel() {
+/** `20260104` → `2026-01-04`（数据状态接口返回的是紧凑日期）。 */
+const fmtDay = (value: string | undefined) =>
+  value && value.length === 8
+    ? `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6)}`
+    : value ?? "";
+
+export default function QuantFactorPanel({
+  onSwitchToSingle,
+}: {
+  /** 切到「单股票策略回测」（由 BacktestPanel 注入；缺省时只显示提示文案）。 */
+  onSwitchToSingle?: () => void;
+}) {
   const [library, setLibrary] = useState<QuantFactorList | null>(null);
   const [status, setStatus] = useState<QuantDataStatus | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
-  const [start, setStart] = useState("2026-01-01");
+  // 默认 2024-01-01：本地数据已回补到 2006 年，而样本外可信度取决于区间长度 ——
+  // 只筛 2026 年时样本外仅 3 个非重叠持有期（年化是噪声）；2024 起约 663 个
+  // 交易日（实测 7.6 分钟 / 峰值 5.4 GB / 样本外约 10 期，面板已按需装配），
+  // 是默认 8 GB 内存预算下的稳妥选择。再往前会被服务端的内存护栏拦下。
+  const [start, setStart] = useState("2024-01-01");
   const [end, setEnd] = useState("");
   const [horizon, setHorizon] = useState(20);
   const [minIc, setMinIc] = useState(0.02);
@@ -107,6 +122,8 @@ export default function QuantFactorPanel() {
   const [trainRatio, setTrainRatio] = useState(0.7);
   const [targetCount, setTargetCount] = useState(20);
   const [neutralize, setNeutralize] = useState(true);
+  const [excludeSt, setExcludeSt] = useState(false);
+  const [liquidityFilter, setLiquidityFilter] = useState(false);
   const [running, setRunning] = useState(false);
   const [stage, setStage] = useState<string | null>(null);
   const [result, setResult] = useState<QuantScreenResult | null>(null);
@@ -162,6 +179,8 @@ export default function QuantFactorPanel() {
         train_ratio: trainRatio,
         target_count: targetCount,
         neutralize,
+        exclude_st: excludeSt,
+        liquidity_filter: liquidityFilter,
       });
       const tick = async () => {
         try {
@@ -191,8 +210,45 @@ export default function QuantFactorPanel() {
     }
   };
 
+  // 本地到底有多少历史，直接写在参数边上。
+  // 实测的误解来源：数据其实已回补到 2006 年（仓库 8573 万行），
+  // 但默认区间是 2026-01-01 起 —— 用户只看到 171 个交易日的结论，
+  // 会以为"这个功能没意义"。把可用区间摊开，误判就没了。
+  const coverage = status?.datasets.find((item) => item.dataset === "daily_basic");
+
   return (
     <div className="quant-panel">
+      {/*
+        这个页面是**截面研究**页，不是"给某只票做回测"。
+        实测用户的原话："每个因子不应该设置参数、在指定的个股上去回测吗？"——
+        所以把"本页做什么 / 不做什么 / 看个股去哪"写在最上面，
+        而不是只藏在「使用说明书」里。
+      */}
+      <div className="quant-scope">
+        <div>
+          <b>本页是「横截面因子研究」，不是个股回测。</b>
+          <span className="muted-text">
+            它把全市场 5000 多只票按因子<b>逐日排序分组</b>，回答"哪些因子有效、
+            哪些因子彼此重复、合成后分组是否单调"。
+            它<b>不给任何一只个股的买卖点</b>，也不预测涨跌。
+          </span>
+        </div>
+        <div className="quant-scope-next">
+          <span className="muted-text">
+            要看某只票怎么买卖（入场/出场条件、止损止盈、仓位、T+1、涨跌停、交易成本）
+          </span>
+          {onSwitchToSingle ? (
+            <button className="btn-ghost tiny" type="button"
+                    onClick={onSwitchToSingle}
+                    title="指定一只票，用因子条件写进出场规则，做时序回测">
+              → 切到「单股票策略回测」
+            </button>
+          ) : (
+            <span className="muted-text">→ 请用上方「单股票策略回测」标签页</span>
+          )}
+        </div>
+      </div>
+
       <section className="panel">
         <div className="panel-head">
           <h2>多因子库（{library?.count ?? 0} 个）</h2>
@@ -306,53 +362,109 @@ export default function QuantFactorPanel() {
           </span>
         </div>
 
+        {/*
+          参数分两组显示，因为它们是**两种东西**（这是第二个误读来源）：
+          ① 样本区间：用哪一段历史做检验；
+          ② 检验口径：多严格才算"有效因子"—— 它**不改因子怎么算**。
+          因子自身的参数（20 日动量 / 60 日波动 / 120 日动量）写在因子定义里，
+          是不可调、也不做网格寻优的（否则 35 个因子一起调参＝过拟合机器）。
+        */}
+        <div className="quant-controls-group">
+          <div className="quant-controls-title">
+            样本区间
+            <span className="muted-text">
+              {coverage
+                ? `本地可用 ${fmtDay(coverage.first)} ~ ${fmtDay(coverage.last)}（${coverage.partitions} 个交易日）——区间越长样本外越可信；实测 663 个交易日约 7.6 分钟 / 5.4 GB，默认 8 GB 内存预算下约 4 年封顶`
+                : "决定用哪一段历史做检验（越长越可信）"}
+            </span>
+          </div>
+          <div className="quant-controls">
+            <label title="筛选用的起始日期；本地数据已回补至 2006 年，不必只填今年">
+              开始
+              <input value={start} onChange={(e) => setStart(e.target.value)}
+                     placeholder="2024-01-01" />
+            </label>
+            <label title="留空 = 到今天">
+              结束（空=今天）
+              <input value={end} onChange={(e) => setEnd(e.target.value)}
+                     placeholder="2026-09-15" />
+            </label>
+          </div>
+        </div>
+
+        <div className="quant-controls-group">
+          <div className="quant-controls-title">
+            检验口径
+            <span className="muted-text">
+              只决定"多严格算有效"，<b>不改变因子怎么算</b>；因子自身的参数
+              （如 momentum_20 的 20 日）写死在因子定义里，不可调、也不做参数寻优
+            </span>
+          </div>
+          <div className="quant-controls">
+            <label title="算 IC 时看未来多少个交易日的收益（≈1 个月）；也决定分层回测的持有期">
+              IC 前瞻（交易日）
+              <input type="number" min={1} max={120} value={horizon}
+                     onChange={(e) => setHorizon(Number(e.target.value))} />
+            </label>
+            <label title="因子值与未来收益的截面相关性下限；低于它视为无效因子">
+              |IC| 门槛
+              <input type="number" step={0.01} min={0} value={minIc}
+                     onChange={(e) => setMinIc(Number(e.target.value))} />
+            </label>
+            <label title="IC 均值/IC 标准差的下限，衡量稳定性；|ICIR| < 0.3 通常不值得用">
+              |ICIR| 门槛
+              <input type="number" step={0.1} min={0} value={minIcir}
+                     onChange={(e) => setMinIcir(Number(e.target.value))} />
+            </label>
+            <label title="两个因子平均秩相关超过它就算同一簇，每簇只留 |ICIR| 最高的一个">
+              相关性阈值 ρ
+              <input type="number" step={0.05} min={0} max={1} value={corrThreshold}
+                     onChange={(e) => setCorrThreshold(Number(e.target.value))} />
+            </label>
+            <label title="前 N% 交易日用于挑因子，后 (1-N)% 只用于检验（walk-forward）">
+              训练集比例
+              <input type="number" step={0.05} min={0.1} max={0.9} value={trainRatio}
+                     onChange={(e) => setTrainRatio(Number(e.target.value))} />
+            </label>
+            <label title="去重后最多保留多少个因子（按 |ICIR| 截断）">
+              目标因子数
+              <input type="number" min={1} max={35} value={targetCount}
+                     onChange={(e) => setTargetCount(Number(e.target.value))} />
+            </label>
+            <label className="inline"
+                   title="剔除 ST/*ST（按**当时的历史名称**判定，不是今天的名字）：ST 涨跌停 5%、退市风险，且会污染基本面因子。默认关闭 —— 它会改变截面构成">
+              <input type="checkbox" checked={excludeSt}
+                     onChange={(e) => setExcludeSt(e.target.checked)} />
+              剔除 ST
+            </label>
+            <label className="inline"
+                   title="股票池过滤：按**过去 20 日平均成交额**排序，每日剔除最差的 30%（业界常规做法）。默认关闭 —— 它会改变截面构成。打开后僵尸股不再进截面，面板的列也同比例变少，长区间才跑得动">
+              <input type="checkbox" checked={liquidityFilter}
+                     onChange={(e) => setLiquidityFilter(e.target.checked)} />
+              剔除流动性最差 30%
+            </label>
+            <label className="inline"
+                   title="剔除市值这个共同暴露；开了之后规模类因子与它共线，其 IC 仅供参考">
+              <input type="checkbox" checked={neutralize}
+                     onChange={(e) => setNeutralize(e.target.checked)} />
+              市值中性化
+            </label>
+          </div>
+        </div>
+
         <div className="quant-controls">
-          <label>
-            开始
-            <input value={start} onChange={(e) => setStart(e.target.value)}
-                   placeholder="2026-01-01" />
-          </label>
-          <label>
-            结束（空=今天）
-            <input value={end} onChange={(e) => setEnd(e.target.value)}
-                   placeholder="2026-09-15" />
-          </label>
-          <label>
-            IC 前瞻（交易日）
-            <input type="number" min={1} max={120} value={horizon}
-                   onChange={(e) => setHorizon(Number(e.target.value))} />
-          </label>
-          <label>
-            |IC| 门槛
-            <input type="number" step={0.01} min={0} value={minIc}
-                   onChange={(e) => setMinIc(Number(e.target.value))} />
-          </label>
-          <label>
-            |ICIR| 门槛
-            <input type="number" step={0.1} min={0} value={minIcir}
-                   onChange={(e) => setMinIcir(Number(e.target.value))} />
-          </label>
-          <label>
-            相关性阈值 ρ
-            <input type="number" step={0.05} min={0} max={1} value={corrThreshold}
-                   onChange={(e) => setCorrThreshold(Number(e.target.value))} />
-          </label>
-          <label>
-            训练集比例
-            <input type="number" step={0.05} min={0.1} max={0.9} value={trainRatio}
-                   onChange={(e) => setTrainRatio(Number(e.target.value))} />
-          </label>
-          <label>
-            目标因子数
-            <input type="number" min={1} max={35} value={targetCount}
-                   onChange={(e) => setTargetCount(Number(e.target.value))} />
-          </label>
-          <label className="inline">
-            <input type="checkbox" checked={neutralize}
-                   onChange={(e) => setNeutralize(e.target.checked)} />
-            市值中性化
-          </label>
-          <button onClick={() => void runScreen()} disabled={running}>
+          <button onClick={() => void runScreen()} disabled={running}
+                  title={
+                    "点一次 = 跑完整条流水线（子进程执行，约 1~4 分钟）：\n"
+                    + "① 中性化（去极值→市值中性化→标准化）\n"
+                    + "② 训练集 IC/ICIR  ③ 相关性聚类去重  ④ 门槛过滤\n"
+                    + "⑤ 样本外复核（后 30% 只用于检验）  ⑥ 分层回测\n\n"
+                    + "产出三样东西：\n"
+                    + "· 过门槛的因子清单（35 个里剩几个）\n"
+                    + "· 去重淘汰明细（谁被谁替代、因为 |ρ| 多少）\n"
+                    + "· 样本内 → 样本外的 |ICIR| 衰减幅度\n\n"
+                    + "它不产生个股买卖点，也不代表可交易收益。"
+                  }>
             {running ? "计算中…" : `开始筛选（${selected.length || library?.count || 35} 个因子）`}
           </button>
           {running && stage && <span className="loading-pill">{stage}</span>}

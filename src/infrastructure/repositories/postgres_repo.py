@@ -141,6 +141,30 @@ class PostgresRepository(DataPointRepository):
         async with pool.acquire() as conn:
             return int(await conn.fetchval(sql, *params))
 
+    async def delete_points_by_source(self, source_name: str) -> int:
+        """按来源删除数据点（源退役/坏点清理），返回删除行数。"""
+        sql = (
+            "WITH deleted AS ("
+            "DELETE FROM fact_data_points WHERE source_name = $1 RETURNING 1) "
+            "SELECT count(*) FROM deleted"
+        )
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            return int(await conn.fetchval(sql, source_name))
+
+    async def prune_before(self, cutoff_date: str) -> int:
+        """保留策略：删除所有早于 cutoff_date（YYYY-MM-DD）的数据点。"""
+        sql = (
+            "WITH deleted AS ("
+            "DELETE FROM fact_data_points "
+            "WHERE period_date IS NOT NULL AND period_date != '' "
+            "AND period_date < $1 RETURNING 1) "
+            "SELECT count(*) FROM deleted"
+        )
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            return int(await conn.fetchval(sql, cutoff_date))
+
     async def count_by_indicator(self) -> dict[str, int]:
         pool = await self._get_pool()
         async with pool.acquire() as conn:

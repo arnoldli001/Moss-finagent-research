@@ -1,13 +1,15 @@
-"""价格面板：QMT 前复权日线 → 宽表面板 + 本地缓存 + 增量更新（M1 数据层另一半）。
+"""价格面板：行情源前复权日线 → 宽表面板 + 本地缓存 + 增量更新（M1 数据层另一半）。
 
-数据来源：项目既有的 `XtQuantConnector`（`stock_close:{code}`，`adjust="qfq"`），
-它已经把两根钉子钉好了（本会话刚修过）：
-  - 所有 xtquant 调用串行化在 `src/core/qmt_guard.py` 的进程级锁里；
-  - 本地无数据时走**子进程隔离**的补下载，子进程原生崩溃不会带走服务进程。
+## 数据来源（2026-09 改为走项目采集链，不再直连 QMT）
 
-缓存设计：**按标的存一个文件 + 一份 manifest 记录已覆盖的日期区间**。
-增量更新的判断依据是 manifest 里的区间，而不是"文件存在与否"——
-否则"上次只拉了 2025 年、这次要 2020 年起"会被误判成命中，静默少了 5 年数据。
+原实现**直接 new `XtQuantConnector`**，理由写在 docstring 里：它已经把两根钉子
+钉好了（进程级锁串行化、子进程隔离补下载）。但 2026-09 本机 QMT 终端失去行情
+权限后，这个直连意味着**整个量化价格面板一律取不到数** —— 它绕过了项目里
+已经配好的多源容灾链（AkShare → 腾讯 → Tushare → baostock），也绕过了
+`ConnectorRouter` 的失败冷却与新鲜度下限。
+
+现在改走同一个 `build_daily_connector_chain()`：与 `/intraday/daily`、
+缠论、做T日线上下文**完全同一条链、同一套口径**。
 """
 from __future__ import annotations
 
@@ -28,7 +30,13 @@ from src.core.errors import (
 
 logger = logging.getLogger(__name__)
 
-PRICE_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+#: 单只标的日线表的列。
+#:
+#: ⚠️ 量列名是 `volume`（**股**，来自 `DataPoint.extra`），与
+#: `quant/panels.py` 的 `WAREHOUSE_PRICE_FIELDS`（`volume_lot`，**手**，Tushare 口径）
+#: **不是同一套** —— 两者曾同名 `BAR_PRICE_FIELDS`，import 错一个就会在很远的地方
+#: 抛 KeyError，故按数据源显式区分命名。
+BAR_PRICE_FIELDS = ("open", "high", "low", "close", "volume", "amount")
 DEFAULT_ROOT = "data/quant/prices"
 _MANIFEST = "_manifest.json"
 
@@ -64,7 +72,7 @@ def _has_pyarrow() -> bool:
 
 
 def _points_to_frame(points: Sequence[Any]) -> pd.DataFrame:
-    """DataPoint 列表 → index=YYYYMMDD、columns=PRICE_FIELDS 的日线表。"""
+    """DataPoint 列表 → index=YYYYMMDD、columns=BAR_PRICE_FIELDS 的日线表。"""
     rows: list[dict[str, Any]] = []
     for point in points:
         extra = getattr(point, "extra", None) or {}
@@ -78,22 +86,37 @@ def _points_to_frame(points: Sequence[Any]) -> pd.DataFrame:
             "amount": extra.get("amount"),
         })
     if not rows:
-        return pd.DataFrame(columns=["date", *PRICE_FIELDS])
+        return pd.DataFrame(columns=["date", *BAR_PRICE_FIELDS])
     frame = pd.DataFrame(rows)
     frame = frame[frame["date"].str.len() == 8]
-    for column in PRICE_FIELDS:
+    for column in BAR_PRICE_FIELDS:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = (frame.drop_duplicates(subset=["date"], keep="last")
              .sort_values("date").reset_index(drop=True))
-    return frame[["date", *PRICE_FIELDS]]      # 固定列序，避免下游按位置取列出错
+    return frame[["date", *BAR_PRICE_FIELDS]]      # 固定列序，避免下游按位置取列出错
 
 
-async def fetch_daily_bars(code: str, start: str, end: str) -> pd.DataFrame:
-    """默认取数器：QMT 前复权日线（经项目既有连接器）。"""
-    from src.infrastructure.connectors.xtquant_connector import XtQuantConnector
+async def fetch_daily_bars(code: str, start: str, end: str,
+                           indicator: str | None = None) -> pd.DataFrame:
+    """默认取数器：项目多源采集链的前复权日线（**不直连 QMT**）。
 
-    connector = XtQuantConnector()
-    points = await connector.fetch(f"stock_close:{code}", start, end)
+    走 `build_daily_connector_chain()`（AkShare → 腾讯 → Tushare → baostock，
+    QMT 与本地旧 CSV 按配置排在最后/关闭），失败自动故障转移。
+
+    `indicator` 不传时按代码自动判定 `stock_close:` / `etf_close:`
+    （ETF 段 51/56/58/15/16）—— 传错前缀会让 ETF 走个股接口，取回来的是
+    "查无此码"的空结果，而在上层看起来与"这只票停牌"无法区分。
+    指数**没有可靠的前缀推断**（`000001` 既可能是上证综指也可能是平安银行），
+    所以必须由调用方显式传 `index_close:`。
+    """
+    from src.api.runtime import build_daily_connector_chain
+    from src.core import symbols
+
+    target = indicator or (
+        f"etf_close:{code}" if symbols.is_etf_code(str(code).zfill(6))
+        else f"stock_close:{code}")
+    router = build_daily_connector_chain()
+    points = await router.fetch(target, start, end)
     return _points_to_frame(points)
 
 
@@ -101,9 +124,33 @@ class PriceStore:
     """按标的缓存的前复权日线库。"""
 
     def __init__(self, root: str | Path = DEFAULT_ROOT, *,
-                 fetcher: Callable[[str, str, str], Any] | None = None) -> None:
+                 fetcher: Callable[..., Any] | None = None) -> None:
         self.root = Path(root)
         self._fetcher = fetcher or fetch_daily_bars
+
+    def _call_fetcher(self, code: str, start: str, end: str,
+                      indicator: str) -> Any:
+        """按取数器**实际支持的形参**调用（兼容只有 (code, start, end) 的自定义取数器）。
+
+        用签名探测而不是统一改签名：`PriceStore` 的 `fetcher=` 是公开注入点，
+        项目里已有若干只接受三个位置参数的取数器（例如测试与行业脚本），
+        强行要求它们都加 `indicator` 会造成一片无谓的破坏。
+        """
+        accepts = getattr(self, "_fetcher_accepts_indicator", None)
+        if accepts is None:
+            import inspect
+
+            try:
+                params = inspect.signature(self._fetcher).parameters
+                accepts = "indicator" in params or any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD
+                    for p in params.values())
+            except (TypeError, ValueError):  # 内建/不可introspect 的 callable
+                accepts = False
+            self._fetcher_accepts_indicator = accepts  # noqa: SLF001
+        if accepts:
+            return self._fetcher(code, start, end, indicator=indicator)
+        return self._fetcher(code, start, end)
 
     # ---------- 路径 / manifest ----------
 
@@ -194,12 +241,21 @@ class PriceStore:
     # ---------- 同步 ----------
 
     async def sync(self, codes: Iterable[str], start: str, end: str, *,
-                   force: bool = False, concurrency: int = 4) -> PriceSyncInfo:
-        """拉取并缓存日线；已覆盖区间直接跳过（增量），失败只记录不抛。"""
+                   force: bool = False, concurrency: int = 4,
+                   indicator_of: Callable[[str], str] | None = None) -> PriceSyncInfo:
+        """拉取并缓存日线；已覆盖区间直接跳过（增量），失败只记录不抛。
+
+        `indicator_of`：代码 → 采集指标（默认 `stock_close:{code}`）。
+        指数与 ETF 必须传它（`index_close:` / `etf_close:`）—— 前缀决定了走哪个
+        连接器分支，传错会得到空结果且**看起来像"该标的存在但无数据"**，
+        排查方向会被带偏。
+        注入的 `fetcher` 若声明了 `indicator` 形参则会收到它（便于测试与自定义取数器）。
+        """
         info = PriceSyncInfo()
         targets = [str(code).zfill(6) for code in codes]
         info.requested = len(targets)
         semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+        to_indicator = indicator_of or (lambda code: f"stock_close:{code}")
 
         async def one(code: str) -> None:
             if not force and self.covers(code, start, end):
@@ -207,7 +263,7 @@ class PriceStore:
                 return
             async with semaphore:
                 try:
-                    result = self._fetcher(code, start, end)
+                    result = self._call_fetcher(code, start, end, to_indicator(code))
                     if hasattr(result, "__await__"):
                         result = await result
                 except Exception as exc:  # noqa: BLE001 单只失败不中断整批
@@ -254,8 +310,8 @@ class PriceStore:
                    field: str = "close", start: str | None = None,
                    end: str | None = None) -> pd.DataFrame:
         """宽表面板：index=YYYYMMDD，columns=code（缺失即 NaN，不填充）。"""
-        if field not in PRICE_FIELDS:
-            raise ValueError(f"未知字段 {field!r}（可选：{', '.join(PRICE_FIELDS)}）")
+        if field not in BAR_PRICE_FIELDS:
+            raise ValueError(f"未知字段 {field!r}（可选：{', '.join(BAR_PRICE_FIELDS)}）")
         frames = self.load_frames(codes, start, end)
         if not frames:
             return pd.DataFrame()

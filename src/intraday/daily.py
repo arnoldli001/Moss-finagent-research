@@ -9,7 +9,7 @@
   - 最近一日量价形态（16形态矩阵）
   - 位置量化（低位/中位/高位）
   - 主力成本线五形态
-  - B1–B15 买入信号 / S1–S6 卖出风控（逐条条件明细）
+  - B1–B15 多方条件 / S1–S6 卖出风控（逐条条件明细）
   - S5 保护线体系 + S6 高量纪律
 """
 
@@ -37,7 +37,12 @@ from src.intraday.models import (
     DataHealth,
     SourceAttempt,
 )
-from src.intraday.sources import SOURCE_LABELS, close_indicator, daily_bars_from_points
+from src.intraday.sources import (
+    SOURCE_LABELS,
+    close_indicator,
+    daily_bars_from_points,
+    live_session_date,
+)
 from src.intraday.volume import (
     DailyContext,
     enrich_daily_frame,
@@ -192,9 +197,10 @@ def analyse_daily(
     verdict = build_verdict(
         signals["buy"], signals["sell"], discipline, ctx.pattern, ctx.position)
 
-    # ---- 擒牛线（日K做T主图的档位线体系，用户 2026-09-18 提供的同花顺公式）----
-    # 两套公式按标的类别自动选：个股走 AMOUNT 口径、指数/ETF/板块走 C*V 口径
-    # （唯一差别在 CBX；选错会让成本线系统性偏移，见 src/intraday/niuline.py）。
+    # ---- 擒牛线（日K做T主图的档位线体系）----
+    # 计算口径（两套公式、参数、降级规则）都封装在 `src/intraday/niuline.py` 里，
+    # 且**不下发给前端**（用户口径 2026-09-23：核心机密）。
+    # 这里只把"前端画图与判断需要的"装进快照：逐 bar 序列、当期值、线名 label。
     # 必须用**与图同一批 bars**（tail）来算，否则线与蜡烛错位。
     niuline_set = None
     try:
@@ -202,6 +208,11 @@ def analyse_daily(
         from src.intraday.niuline import LINE_META, build_series
 
         series = build_series(code, bars, instrument=instrument, name=name)
+        # 口径判定结果只进服务端日志（排障用），不进 payload
+        logger.info("擒牛线口径 %s：variant=%s price_basis=%s n=%s m=%s "
+                    "cbx_scale=%s reason=%s notes=%s",
+                    code, series.variant, series.price_basis, series.n, series.m,
+                    series.cbx_scale, series.reason, series.notes)
         points = [
             NiuLinePoint(
                 date=str(bar.date),
@@ -210,12 +221,10 @@ def analyse_daily(
             for index, bar in enumerate(bars)
         ]
         niuline_set = NiuLineSet(
-            variant=series.variant, reason=series.reason,
-            price_basis=series.price_basis, cbx_scale=series.cbx_scale,
-            n=series.n, m=series.m,
-            latest=dict(series.latest), notes=list(series.notes), points=points,
-            lines=[{"key": key, "label": label, "note": note}
-                   for key, label, note in LINE_META])
+            latest=dict(series.latest), points=points,
+            # 只留 key/label：note 里写着每条线的公式，绝不能下发
+            lines=[{"key": key, "label": label}
+                   for key, label, _note in LINE_META])
     except ImportError:  # 公开版不含擒牛线公式，属预期
         gaps.append("擒牛线（主图档位线）为商业版功能，开源版未包含")
     except Exception as exc:  # noqa: BLE001 主图线失败不能拖垮整个日K面板
@@ -363,6 +372,25 @@ def _optional_float(value: Any) -> float | None:
     return None if result != result else result       # NaN → None
 
 
+def _session_min_date() -> str | None:
+    """日线新鲜度下限：**行情源当前走到的交易日**（`YYYY-MM-DD`）；取不到返回 None。
+
+    用市场时钟（`live_session_date`）而不是本机日历的原因见它自己的 docstring：
+    春节/国庆这类"工作日但休市"的日子，行情源天然停在上一个交易日 —— 那正是我们要的
+    下限（不会把唯一可用的数据误判成陈旧）；而**盘中**它返回今天，于是"只到昨天"
+    的源会被路由跳过，带**当天形成中bar**的源才有机会被问到。
+
+    fail-open：时钟探测失败时返回 None，下限退回路由的原有口径（本地 DB 最新日期），
+    绝不让一个探测不到的市场时钟把日K面板变成取不到数。
+    """
+    try:
+        return live_session_date() or None
+    except Exception as exc:  # noqa: BLE001 时钟只是"更严的下限"，坏了不该影响取数
+        logger.debug("市场时钟不可用，日线下限退回默认口径: %s",
+                     brief(exc, BRIEF_TIGHT))
+        return None
+
+
 async def fetch_daily_snapshot(
     code: str, name: str, config: IntradayConfig, backend: Any,
     *, lookback_days: int | None = None,
@@ -391,9 +419,18 @@ async def fetch_daily_snapshot(
     # 取 500 个自然日 ≈ 340 根交易日，覆盖 lookback_days(250) + 绘图(120) + 缓冲。
     end_date = started.strftime("%Y-%m-%d")
     start_date = (started - timedelta(days=_DAILY_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    # **新鲜度下限 = 市场时钟当天**（`min_date`）。
+    # 为什么还要这一层：区间查询的自动下限是"本地 DB 最新日期"，而盘中那正好是
+    # **昨天** —— 于是链上第一个返回昨天的源（实测 AkShare 有时能返回 09-22）
+    # 就被当成合格数据采纳，后面带当天形成中bar的腾讯根本没被问到，面板照旧停在昨天。
+    # 市场时钟（`live_session_date`，30 秒缓存）给的是"行情源自己走到哪个交易日"：
+    # 盘中=今天（要求当天 bar），盘前/节假日=上一交易日（不误杀唯一可用的数据）。
+    # 取不到时是 None：下限退回原行为（fail-open，绝不因为时钟不可用就取不到数）。
+    floor = _session_min_date()
     try:
         points = await backend.fetch(
-            close_indicator(code), start_date=start_date, end_date=end_date)
+            close_indicator(code), start_date=start_date, end_date=end_date,
+            min_date=floor)
     except DataFetchError as exc:
         attempts.append(SourceAttempt(
             source=SOURCE_LABELS["router"], ok=False, detail=brief(exc, BRIEF_DEFAULT)))
@@ -414,9 +451,61 @@ async def fetch_daily_snapshot(
         source=SOURCE_LABELS["router"], ok=bool(points), rows=len(points or []),
         detail="日线OHLCV（复用项目QMT→本地CSV→AkShare三级采集链）",
         latency_ms=int((datetime.now() - started).total_seconds() * 1000)))
-    return analyse_daily(
+    snapshot = analyse_daily(
         code=code, name=name, points=points or [], config=config,
         attempts=attempts, gaps=gaps, cycle=cycle, character=character)
+    return _attach_day_extras(snapshot, code)
+
+
+def _attach_day_extras(snapshot: DailySnapshot, code: str) -> DailySnapshot:
+    """把行情仓的**日频补充字段**（换手率 / 资金净流入额）挂到每根bar上。
+
+    ## 为什么在这里、而且**只挂展示**
+
+    日线链（盘中是腾讯日K）不返回换手率与成交额 —— 实测 `turnover` 非空 0/120、
+    `amount` 末值 0.0。这两项在本地行情仓 `data/quant/warehouse.db` 里是日频定稿数据，
+    按 (code, trade_date) 索引查 12~31 ms（见 `day_extras.py`）。
+
+    但**只补到 `snapshot.bars` 上供前端读数与区间统计**，不回头喂 `analyse_daily`：
+    `character.py` 与 `daily_signals.py` 里都有"日线没有换手率列就跳过该项"的分支，
+    一旦把列喂进规则引擎，同一次改动会**悄悄改掉股性分与买卖标记** ——
+    那是另一件事，要单独评估、单独回归。
+
+    fail-open：仓库/该标的数据缺失时只记一条缺口，日K主链路照常出图。
+    """
+    bars = snapshot.bars or []
+    if not snapshot.available or not bars:
+        return snapshot
+    # 延迟导入：行情仓只有这里用得到，装配期不必加载
+    from src.intraday.day_extras import load_daily_extras
+
+    extras = load_daily_extras(code, bars[0].date, bars[-1].date)
+    if not extras:
+        snapshot.health.gaps = [
+            *snapshot.health.gaps,
+            "换手率/资金净流入不可用：本地行情仓（quant_daily_basic / quant_moneyflow）"
+            "没有该标的的数据",
+        ]
+        return snapshot
+    filled = 0
+    for bar in bars:
+        extra = extras.get(bar.date)
+        if extra is None:
+            continue
+        if bar.turnover is None and extra.turnover is not None:
+            bar.turnover = extra.turnover
+            filled += 1
+        bar.net_mf = extra.net_mf
+    snapshot.health.attempts = [
+        *snapshot.health.attempts,
+        SourceAttempt(
+            source="本地行情仓",
+            ok=filled > 0 or any(b.net_mf is not None for b in bars),
+            rows=filled,
+            detail="换手率 / 主力资金净流入额（日频定稿，截至上一交易日；"
+                   "只补展示，不参与打分与信号）"),
+    ]
+    return snapshot
 
 
 

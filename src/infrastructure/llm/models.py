@@ -18,6 +18,8 @@ class ModelSpec(BaseModel):
     base_url: str
     max_tokens: int = 2048
     temperature: float = 0.1
+    # DeepSeek 原生思维链强度（none/low/high/max）；空串=不下发，用服务端默认。
+    reasoning_effort: str = ""
 
 
 class LLMResponse(BaseModel):

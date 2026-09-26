@@ -355,3 +355,58 @@ def test_quarter_periods_skips_future() -> None:
 def test_trading_days_falls_back_to_weekdays() -> None:
     days = trading_days(start="20260911", end="20260915")
     assert days == ["20260911", "20260914", "20260915"]   # 跳过周末
+
+
+# ============== 文本列不能被数字强转吃掉 ==============
+# 事故记录（2026-09-25）：`normalize` 原先只放行 4 个日期/代码列，其余
+# 一律 `pd.to_numeric(errors="coerce")`。后果是 `namechange.name` 全变 NaN，
+# 表现为"历史上曾被 ST 的票数 = 0" —— 一个**不报错**的错误答案；
+# 同批被清空的还有 `suspend_d.suspend_type`（S=停牌/R=复牌）与 `suspend_timing`。
+
+
+def test_normalize_keeps_registered_text_columns() -> None:
+    frame = pd.DataFrame({
+        "ts_code": ["000001.SZ", "000002.SZ"],
+        "name": ["ST一号", "平安银行"],
+        "start_date": ["20100101", "19910403"],
+        "end_date": ["20101231", None],
+        "ann_date": ["20091231", None],
+        "change_reason": ["其他", "其他"],
+    })
+    out = normalize(frame, ts_src.NAME_CHANGE_MAP)
+    assert out["name"].tolist() == ["ST一号", "平安银行"]
+    assert out["change_reason"].tolist() == ["其他", "其他"]
+    # 日期也要保持字符串，不能被转成 20100101.0 这种浮点
+    assert out["start_date"].tolist() == ["20100101", "19910403"]
+    assert out["end_date"].iloc[0] == "20101231"
+
+
+def test_normalize_keeps_suspend_type() -> None:
+    """停复牌类型：丢了它就分不清"停牌"与"复牌"（后者被当成停牌会少交易一天）。"""
+    frame = pd.DataFrame({
+        "ts_code": ["000001.SZ", "000002.SZ"],
+        "trade_date": ["20260924", "20260924"],
+        "suspend_type": ["S", "R"],
+        "suspend_timing": ["09:30-10:00", None],
+    })
+    out = normalize(frame, {"ts_code": "ts_code", "trade_date": "trade_date",
+                            "suspend_type": "suspend_type",
+                            "suspend_timing": "suspend_timing"})
+    assert out["suspend_type"].tolist() == ["S", "R"]
+    assert out["suspend_timing"].iloc[0] == "09:30-10:00"
+
+
+def test_normalize_warns_when_a_text_column_gets_wiped(caplog) -> None:
+    """没登记的文本列仍会被强转 —— 但必须**留下一条 warning**。
+
+    这条守的是"以后加了新数据集、忘了登记文本字段"的场景：
+    静默清空是这次事故的本质，所以至少要让它在日志里响一声。
+    """
+    frame = pd.DataFrame({"ts_code": ["000001.SZ"],
+                          "sell_reason": ["大股东减持"]})
+    with caplog.at_level("WARNING"):
+        out = normalize(frame, {"ts_code": "ts_code",
+                                "sell_reason": "sell_reason"})
+    assert out["sell_reason"].isna().all()          # 现状：仍会被吃掉
+    assert "sell_reason" in caplog.text             # 但不再是静默的
+    assert "_TEXT_COLUMNS" in caplog.text

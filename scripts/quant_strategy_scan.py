@@ -47,7 +47,7 @@ from src.quant.single_backtest import (  # noqa: E402
     run_single_backtest,
 )
 from src.quant.strategy_presets import PRESETS, get_preset  # noqa: E402
-from src.core.errors import BRIEF_DEFAULT
+from src.core.errors import BRIEF_DEFAULT, brief
 
 DEFAULT_UNIVERSE_SIZE = 30
 MIN_EXCESS_DEFAULT = 10.0      # "跑赢买入持有 10% 以上"

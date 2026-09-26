@@ -40,39 +40,14 @@
 }
 
 /* ---------- 页头 ---------- */
-.intel-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 10px;
-}
-.intel-title {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-.intel-title h2 { margin: 0; font-size: 18px; }
-.intel-title .muted-text { font-size: 12px; }
-.intel-head-right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-left: auto;
-  flex-wrap: wrap;
-}
-.intel-chip {
-  font-size: 11.5px;
-  padding: 3px 9px;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  color: var(--muted);
-  white-space: nowrap;
-}
-.intel-chip.ok { color: var(--intel-green); border-color: rgba(46,168,110,0.5); }
-.intel-chip.warn { color: var(--medium); border-color: rgba(217,161,59,0.5); }
+/* ⚠️ 页头（`.intel-head` / `.intel-title` 页头版 / `.intel-head-right` /
+   `.intel-chip`）已于 2026-09-25 随"整行删除"一并移除 ——
+   用户口径："圈出来的文字所在的 intel-head 直接删除这个行，不要显示"。
+   注意：`.intel-title` 这个名字曾经在 feed 表格里**还有一个同名规则**
+   （给列表标题 cell 用）。2026-10-01 表格改成主从列表后那条规则已删掉 ——
+   现在 `.intel-title` 只可能指页头，而页头也已经没有了。
+   刷新按钮 `.intel-refresh` 保留 —— 它是全页唯一的手动刷新入口，
+   已移到子页签行右侧。 */
 .intel-refresh {
   font-size: 12.5px;
   padding: 5px 12px;
@@ -98,15 +73,26 @@
 }
 .intel-compliance b { color: var(--text); }
 
-/* ---------- 子页签 ---------- */
+/* ---------- 子页签（+ 右侧刷新按钮） ---------- */
+/* 页头删掉后，这一行接替了"页签 + 操作"的角色。
+   `margin-bottom` 从 `.intel-subtabs` 移到本行 —— 否则行内 `.intel-subtabs`
+   的下外边距会与行自身的一起叠加成双倍间距。 */
+.intel-subtabs-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: var(--intel-gap);
+}
 .intel-subtabs {
   display: flex;
   gap: 6px;
-  margin-bottom: var(--intel-gap);
   /* 手机上横向滑动而不是折行：折行会让页签区占到半屏高 */
   flex-wrap: wrap;
   min-width: 0;
+  flex: 1 1 auto;
 }
+.intel-refresh { flex: 0 0 auto; margin-left: auto; }
 .intel-subtab {
   display: inline-flex;
   align-items: center;
@@ -141,6 +127,21 @@
   font-size: 13px;
 }
 .intel-error { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+/* 后台采集进行中的提示条（内容已经画出来了，这只是"更新在路上"）。
+   刻意**不用**遮罩/置灰：遮罩会让用户以为"现在不能看"，
+   而手里那份数据是可读的、只是可能会被更新。 */
+.intel-collecting {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding: 6px 10px;
+  border: 1px solid var(--table-line);
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.06);
+  color: var(--muted);
+  font-size: 12px;
+}
 .intel-foot {
   margin-top: 12px;
   padding-top: 8px;
@@ -245,36 +246,88 @@
 .intel-sort.on { border-color: var(--accent); color: var(--accent); }
 .intel-sort:disabled, .intel-filter:disabled { opacity: 0.55; }
 
-/* ---------- 可信度环 + 可展开构成 ---------- */
+/* ---------- 多/空 过滤（用户口径 2026-09-26） ----------
+ *
+ * 文案就是【多】/【空】，与列表标题前那个标记**逐字一致** —— 用户一眼
+ * 就能把"我筛的是什么"和"列表里看到的标记"对上。
+ *
+ * 选中态用与 `DirectionTag` 同一组颜色变量（`--intel-dir-bull` 绿 /
+ * `--intel-dir-bear` 红）：筛选项和它筛出来的标记同色，是这里最省事的
+ * 一致性保证 —— 换成中性选中色，用户还得回头确认"这两个是一回事吗"。
+ *
+ * ⚠️ 注意语义：**偏多（利多）= 绿、偏空（利空）= 红**，与 A 股"红涨绿跌"
+ * 的习惯相反。这是用户明确指定的（见 `intel.css` 方向标记那一段），
+ * 两处必须一致，不能在这里"顺手改成红的多"。
+ */
+.intel-dirfilter.dir-bull.on {
+  border-color: var(--intel-dir-bull);
+  color: var(--intel-dir-bull);
+  background: rgba(53, 208, 127, 0.14);
+}
+.intel-dirfilter.dir-bear.on {
+  border-color: var(--intel-dir-bear);
+  color: var(--intel-dir-bear);
+  background: rgba(229, 72, 77, 0.14);
+}
+/* 未选中时也把标记染成对应色 —— 否则一排灰按钮看不出哪个是【多】哪个是【空】 */
+.intel-dirfilter.dir-bull { color: var(--intel-dir-bull); }
+.intel-dirfilter.dir-bear { color: var(--intel-dir-bear); }
+.intel-dirfilter { font-weight: 600; }
+
+/* ---------- 可信度分数 + 可展开构成 ---------- */
 .cred {
   display: flex;
-  align-items: flex-start;
+  /* 数字与右侧的「较高 / 来源74+内容78」**垂直居中**对齐。
+     原来写的是 `flex-start`：那在环还在、两者等高时看不出问题；
+     环去掉后数字只有一行、右侧有两行，顶部对齐会让数字悬在上方
+     （用户口径 2026-09-25："其内部数字要靠左居中对齐"）。 */
+  align-items: center;
+  /* 靠左：不许被单元格的 text-align 或 flex 居中挤到中间 */
+  justify-content: flex-start;
+  text-align: left;
   gap: 7px;
   min-width: 0;
 }
+/* 可信度分数：**纯数字 + 分档颜色**，不要外圈。
+   用户口径（2026-09-25）："可信度的外轮廓不要用椭圆形，如图去掉"。
+
+   原来是一个 38×38 的圆环（`border-radius:50%` + 2px 边框）。问题有两层：
+     · 在表格单元格里它被拉成**椭圆**（实测约 90×38）—— 圆环一旦不圆，
+       看起来就像渲染坏了，比没有还糟；
+     · 环本身不携带信息（分数与分档另有文字），只白占宽度。
+   分数与分档色保留，仍可点开看构成（虚线下划线提示可点）。 */
 .cred-ring {
-  /* 44px：手机上也是可靠的触控目标（审计阈值 32px） */
-  width: 38px;
-  height: 38px;
   flex: 0 0 auto;
-  border-radius: 50%;
-  border: 2px solid var(--border);
+  width: auto;
+  height: auto;
+  padding: 0;
+  border: 0;
   background: transparent;
   color: var(--text);
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
+  line-height: 1.2;
+  /* 数字靠左贴齐列左边缘（`text-align:left` 防单元格继承居中） */
+  text-align: left;
+  /* ⚠️ 显式归零：全局 `button { border-radius: 8px }` 仍会作用到这个按钮。
+     当前 `border:0` + `background:transparent`，所以 8px 圆角**看不见**；
+     但只要将来有人给个背景色，它立刻变成一颗胶囊 —— 那是同一个"椭圆"
+     问题换个形状回来。归零比"靠两个属性互相抵消"更稳。 */
+  border-radius: 0;
+  /* 可点提示：点开是"这个分怎么算出来的"（来源轴 / 内容轴 / 佐证数） */
+  border-bottom: 1px dashed var(--table-line);
+  cursor: pointer;
 }
-/* 分档配色 —— 与后端 `credibility.LEVELS` 逐一对应 */
-.cred-ring.high { border-color: #2ea86e; color: #2ea86e; }
-.cred-ring.upper { border-color: #7cc47a; color: #7cc47a; }
-.cred-ring.mid { border-color: var(--medium); color: var(--medium); }
-.cred-ring.low { border-color: #e08a3c; color: #e08a3c; }
-.cred-ring.doubt { border-color: var(--low); color: var(--low); }
+.cred-ring:hover { border-bottom-color: currentColor; }
+/* 分档配色 —— 与后端 `credibility.LEVELS` 逐一对应。
+   ⚠️ 环去掉后必须落到 **color**（原来写的是 border-color，
+   环一没颜色就丢了）。 */
+.cred-ring.high { color: #2ea86e; }
+.cred-ring.upper { color: #7cc47a; }
+.cred-ring.mid { color: var(--medium); }
+.cred-ring.low { color: #e08a3c; }
+.cred-ring.doubt { color: var(--low); }
 .cred-meta {
   font-size: 10.5px;
   line-height: 1.45;
@@ -301,19 +354,33 @@
   color: var(--muted);
   font-size: 10.5px;
 }
-/* 展开后让表格单元格占满整行（构成面板需要宽度） */
-.intel-table .c-cred { width: 150px; }
+/* 展开后让构成面板占满可用宽度（`.cred.open` 自己 `flex-wrap: wrap`）。 */
 .cred.open { flex-wrap: wrap; }
 
-/* --- 手机卡片里的可信度 --- */
-.intel-card-foot {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 8px;
-  flex-wrap: wrap;
+/* --- 手机卡片 --- */
+/* 卡片底部原来还有一条"可信度 + 关联标的"（`.intel-card-foot` /
+   `.intel-card-target`）。2026-10-01 起这两样由 `IntelItemDetail` 的
+   「可信度 / 关联标的」两栏承担 —— 与桌面列表行、详情面板**同一份**，
+   所以那两条规则一起删掉了（留着就是同一个东西的第二套定义）。 */
+
+/* ---------- AI 摘要标记 ---------- */
+/* 模型生成的摘要与原文截断**视觉上要能区分** ——
+   用户有权知道这段是压过的还是原文切片（切片可能正好把结论截掉）。 */
+.intel-ai {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 0 5px;
+  margin-right: 5px;
+  border-radius: 4px;
+  border: 1px solid rgba(169,123,255,0.45);
+  background: rgba(169,123,255,0.1);
+  color: var(--intel-purple);
+  white-space: nowrap;
+  vertical-align: 1px;
 }
-.intel-card-foot .intel-card-target { margin-top: 0; margin-left: auto; }
+/* AI 摘要给正常正文色（它才是主体），原文截断保持次要色 */
+.intel-card-sum.ai { color: var(--text); }
 
 /* ---------- 关联新闻（同一件事的其他来源，点数字才展开） ---------- */
 .rel { margin-top: 6px; }
@@ -367,7 +434,90 @@
 .rel-time { flex: 0 0 auto; color: var(--muted); font-size: 10.5px; }
 .rel-more { color: var(--muted); }
 
-/* ---------- 原文倾向（第三方原文的语气，不是平台判断） ---------- */
+/* ⚠️ **红涨绿跌**（A 股约定，用户口径 2026-09-25）。
+   专用于"利好利空 / 涨跌"这一族配色，与数据质量用的 --high（绿）/--low（红）
+   **语义不同**，所以单独定义，不要复用那两个（那会让"可信度高"和"利空"同色）。
+   消费方：热度榜涨跌（`.heat-rank-*.up/.down`）。 */
+:root {
+  --intel-up: #e5484d;      /* 利好 / 上涨 → 红 */
+  --intel-down: #2ea86e;    /* 利空 / 下跌 → 绿 */
+}
+
+/* ---------- 方向标记【多】/【空】（用户口径 2026-10-01） ---------- */
+/*
+ * 用户口径："偏多（利多）→【多】显示绿色；偏空（利空）→【空】显示红色。"
+ *
+ * ⚠️⚠️ **它上面的 `--intel-up/--intel-down` 正好相反，这不是笔误。**
+ * 本页其余地方用的是 A 股约定「红涨绿跌」（`.up` 红 / `.down` 绿），
+ * 而用户对**这条标记**点名要的是绿=利多、红=利空。两套语义同时存在于
+ * 同一页，所以：
+ *
+ *   · 用**独立 token**（`--intel-dir-bull` / `--intel-dir-bear`），
+ *     不复用 `--intel-up` / `--intel-down` —— 复用会让"调一下涨跌配色"
+ *     顺手把方向标记调反，而且没有任何报错（颜色不会报错）；
+ *   · 用**独立 class**（`.intel-dir-*`），与 `.up` / `.down` / `.intel-hl`
+ *     都不共享：`.intel-hl` 的绿是"命中的个股/板块"（信号词），
+ *     与"这条原文偏多"是两件事，同色会把它们混成一条。
+ *
+ * 值刻意与既有色板对齐（绿 #35d07f 同 `.intel-hl`、红 #e5484d 同 `--intel-up`），
+ * 只借用**色值**、不借用**语义**：将来任何一边调整都不会连带改错另一边。
+ */
+:root {
+  --intel-dir-bull: #35d07f;   /* 【多】利多 → 绿（用户指定） */
+  --intel-dir-bear: #e5484d;   /* 【空】利空 → 红（用户指定） */
+}
+.intel-dir {
+  font-weight: 700;
+  /* 与后面的文字拉开一点点：标记是**附属**于标题的，不是标题的一部分 */
+  margin-right: 3px;
+  font-variant-numeric: tabular-nums;
+}
+.intel-dir-bull { color: var(--intel-dir-bull); }
+.intel-dir-bear { color: var(--intel-dir-bear); }
+
+/* ---------- 点击看全文（标题/摘要即入口） ---------- */
+/*
+ * 用户口径（2026-10-01）："点击可以看全文。"
+ *
+ * 入口是**标题/摘要本身**（不是另加一个"查看全文"按钮）：卡片上再多一个小按钮
+ * 会把本来就窄的一行挤满，而"点文字看原文"是用户对这个交互的默认预期。
+ * 视觉上只给一点点提示（hover 变色 + 虚线底），不改变排版。
+ */
+.intel-textbtn { cursor: pointer; border-radius: 4px; }
+.intel-textbtn:hover,
+.intel-textbtn:focus-visible { color: var(--accent); outline: none; }
+.intel-textbtn.open { color: var(--accent); }
+.intel-textbtn:focus-visible { box-shadow: 0 0 0 2px rgba(74,158,255,0.35); }
+
+.intel-fulltext {
+  margin-top: 6px;
+  padding: 8px 10px;
+  border-left: 2px solid var(--border);
+  background: rgba(255,255,255,0.02);
+  border-radius: 0 6px 6px 0;
+  /* 第三方原文：按纯文本渲染（React 文本节点，绝不用 innerHTML），
+     保留原文换行但不让长串撑破容器 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.75;
+  color: var(--text);
+  max-height: 420px;
+  overflow-y: auto;
+}
+.intel-fulltext-err { color: var(--medium); white-space: normal; }
+.intel-fulltext-retry {
+  margin-left: 8px;
+  font-size: 11.5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--text);
+}
+.intel-fulltext-retry:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ---------- 条目标签行（关联新闻等） ---------- */
 .intel-tags-row {
   display: flex;
   align-items: center;
@@ -375,97 +525,428 @@
   flex-wrap: wrap;
   margin-top: 6px;
 }
-.tone { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.tone-pending { font-size: 11px; }
-.tone-tag {
-  font-size: 11px;
-  padding: 2px 9px;
-  border-radius: 999px;
+
+/* ---------- 主从结构：左列表 + 右详情 ----------
+ *
+ * 用户口径（2026-10-01）：
+ *   "我在想情报中心的热点&研报小作文，为什么不能做成事件告警里那样的效果呢，
+ *    感觉那种更整齐，还有多空分析"
+ *
+ * 「事件告警」之所以整齐，是因为一张列表行只留三样东西（方向·级别、标题、
+ * 一行 meta），其余全部搬进右边的详情面板。这里照搬那个分工：
+ *
+ *   桌面 ≥1180px   `.intel-split.wide` = 两栏（列表自适应 + 详情 400px）
+ *   桌面 <1180px   单栏，详情就地展开在选中行**下面**
+ *   手机 ≤720px    `.intel-split` 整个藏起来，走 `.intel-cards`
+ *
+ * ⚠️ 为什么详情不能只靠 CSS 挪位置：它在右栏与"行下面"是两个**位置**，
+ * CSS 没法把一个 DOM 换地方。所以断点判定在 `IntelFeedTab.useWidePane()`，
+ * 这里只负责"给了 `.wide` 就排两栏"。
+ */
+.intel-split { display: block; }
+.intel-split.wide {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 400px;
+  gap: 14px;
+  align-items: start;
+}
+/* 右栏 `sticky`：列表长的时候滚到下面，详情仍在视野里 ——
+   这正是主从结构比"就地展开"省事的地方（不用来回滚）。
+   `max-height` + 自己滚动，保证详情再长也不会把页面顶得无限高。 */
+.intel-pane {
+  position: sticky;
+  top: 12px;
+  max-height: calc(100vh - 120px);
+  overflow-y: auto;
   border: 1px solid var(--border);
+  border-radius: var(--intel-radius, 10px);
+  background: rgba(255, 255, 255, 0.02);
+  padding: 12px;
+}
+.intel-pane-empty { font-size: 12.5px; line-height: 1.7; padding: 18px 4px; }
+
+.intel-rows { list-style: none; margin: 0; padding: 0; }
+.intel-row { border-bottom: 1px solid var(--table-line); }
+.intel-row.on { background: rgba(74, 158, 255, 0.08); }
+.intel-row-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
   background: transparent;
-  color: var(--muted);
-  white-space: nowrap;
+  border: 0;
+  border-radius: 0;
+  min-width: auto;
+  padding: 8px 9px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
 }
-.tone-tag b { font-weight: 600; }
-/* `未定` 刻意**不用**多空配色 —— 它既不是多也不是空，
-   给了颜色就等于给了倾向（用户会按颜色读） */
-.tone-tag.unknown { border-style: dashed; color: var(--muted); }
-.tone-tag.bull { border-color: rgba(46,168,110,0.5); color: var(--intel-green); }
-.tone-tag.bear { border-color: rgba(217,92,74,0.5); color: var(--low); }
-.tone-tag.neutral { border-color: rgba(139,152,165,0.4); color: var(--text); }
-.tone-conf { opacity: 0.7; margin-left: 4px; font-variant-numeric: tabular-nums; }
-.tone-detail {
-  flex: 1 1 100%;
-  margin-top: 5px;
-  padding: 7px 0 0;
-  border-top: 1px dashed var(--table-line);
-  font-size: 11px;
-  line-height: 1.6;
+.intel-row-btn:hover { background: rgba(74, 158, 255, 0.06); }
+.intel-row-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
-.tone-explain { margin-bottom: 4px; }
-.tone-evidence {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  align-items: baseline;
-  margin-bottom: 4px;
-}
-.tone-phrase {
-  border: 1px solid var(--table-line);
-  border-radius: 4px;
-  padding: 0 6px;
-  color: var(--text);
-  /* 逐字依据可能较长（整句），限两行 */
+/* 方向标记 + **一整段摘要**同一块文字，标记不许被压缩 ——
+   压缩后【多】会变成【…】，而它正是列表上最该一眼看到的东西。
+ *
+ * ★ 2026-10-01 三轮口径，最终形态是第三轮：
+ *
+ *   第一轮  只放 `item.title`、两行封顶 → 左侧三分之二宽度空着，
+ *           用户："有这么大空白空间……非要点一下……请把空间利用完"
+ *   第二轮  标题（加粗）+ 摘要拼起来铺满 → 实测**标题这一截本身就不该出现**：
+ *           星球帖的 title 是正文前 60 字再经修剪，常常是带省略号的残句
+ *           （`瑞银——美光科技（MU.US）…`），而紧跟的摘要开头又是同一句话
+ *           的前半段 —— 用户："直接显示摘录就行了，标题被裁剪严重"
+ *   第三轮  行内**只留一段文字：展示摘要/摘录**（就是这一条现在的样子）
+ *
+ * 三行封顶是按可用宽度算出来的，不是拍的：
+ *
+ *     列表列 ≈790px ÷ 12.5px 字宽 ≈ 63 字/行 × 3 行 ≈ 189 字
+ *
+ * 刚好覆盖服务端给的 `SUMMARY_MAX_CHARS`（200），也刚好把那一栏用完。
+ * 再高就变成"每条占半屏"，扫列表的效率反而下降 —— 列表的职责是**扫**，
+ * 逐条精读在右侧详情里（全文、多空分析、机构/分析师、可信度构成），
+ * 两者职责不重叠、也不冲突。
+ */
+.intel-row-text {
   display: -webkit-box;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
+  -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
-  max-width: 100%;
-}
-.tone-note { font-size: 10.5px; }
-
-/* --- 桌面表格 --- */
-.intel-tablewrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.intel-table {
-  width: 100%;
-  border-collapse: collapse;
   font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+  min-width: 0;
 }
-.intel-table th {
-  text-align: left;
-  font-weight: 500;
+/* 收容组那一行的标题（服务端合成的短标题，**不是**被截断的正文，
+   所以它与普通条目不同、保留标题 + 组说明两段）。 */
+.intel-row-group-title { color: var(--text); font-weight: 600; }
+/* 组说明：次要色紧接在标题后面铺满剩下的宽度。 */
+.intel-row-sum { color: var(--muted); margin-left: 5px; }
+.intel-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: 11px;
   color: var(--muted);
-  font-size: 11.5px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--table-line);
+}
+.intel-row-meta .intel-kind { font-size: 10px; padding: 0 5px; }
+.intel-row-cred { color: var(--muted); font-variant-numeric: tabular-nums; }
+.intel-row-target {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.intel-table td {
-  padding: 7px 8px;
-  border-bottom: 1px solid var(--table-line);
-  vertical-align: top;
+.intel-row-n { font-variant-numeric: tabular-nums; }
+.intel-row-group .intel-row-title { color: var(--muted); }
+/* 就地展开的详情（<1180px）：缩进一格，让"它属于上面那一行"看得出来 */
+.intel-row-detail { list-style: none; padding: 0 0 10px 9px; }
+
+/* ---------- 详情面板 ---------- */
+.intel-detail { font-size: 12.5px; }
+.intel-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
-.intel-table .c-time { width: 58px; white-space: nowrap; }
-.intel-table .c-kind { width: 84px; }
-.intel-table .c-target { width: 120px; color: var(--muted); }
-/* 相对日（今天/昨天/09-24）挂在时间下面 —— 分组标题被拿掉之后，
-   它就是"这条是不是今天的"的唯一线索（见 IntelFeedTab 的说明）。 */
+.intel-detail-time { font-size: 11px; color: var(--muted); margin-right: auto; }
+.intel-detail-close {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  min-width: auto;
+  padding: 0 6px;
+  font-size: 17px;
+  line-height: 1;
+  border-radius: 4px;
+}
+.intel-detail-close:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
+.intel-detail-title {
+  margin: 8px 0 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--text);
+}
+.intel-detail-sum {
+  margin: 7px 0 0;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text);
+  /* 详情里的摘要**允许换行**（与列表里的 `.intel-sum` 相反）：
+     列表要的是"一眼扫完不跳行"，详情要的是"能读"。
+     两者用同一个组件（`SummaryLine`）但不同 class，正是为此。 */
+  white-space: normal;
+}
+.intel-detail-sum.ai { color: var(--text); }
+.intel-detail-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin: 10px 0 0;
+  font-size: 11.5px;
+}
+.intel-detail-facts dt { color: var(--muted); margin-bottom: 2px; }
+.intel-detail-facts dd { margin: 0; }
+.intel-detail-open {
+  margin-top: 10px;
+  min-width: auto;
+  padding: 5px 14px;
+  font-size: 12.5px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.intel-detail-open:hover, .intel-detail-open.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* ---------- 多空分析 ---------- */
+.intel-analysis {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--table-line);
+}
+.intel-analysis-h {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: 0.4px;
+}
+.intel-analysis-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 7px;
+}
+.intel-analysis-k {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 52px;
+}
+.intel-analysis-explain { flex: 1 1 100%; line-height: 1.65; }
+/* 没有方向时"判定"那一格的文字（未定 / 中性 / 尚未抽取）。
+   刻意**不用** `.intel-dir-bull` / `.intel-dir-bear` 那套绿红 ——
+   那两个颜色在这一页的语义是"利多/利空"，而这一格说的恰恰是"没有方向"。
+   用中性灰 + 引号感让它读起来像一句结论，而不是一个缺失的标签。 */
+.intel-dir-none { color: var(--muted); }
+.intel-analysis-empty { font-size: 11.5px; line-height: 1.7; margin: 4px 0 0; }
+.intel-analysis-events { margin: 0; padding-left: 16px; line-height: 1.7; }
+.intel-analysis-events li { margin-bottom: 2px; }
+
+.intel-side {
+  margin: 8px 0;
+  padding: 7px 9px;
+  border-radius: 6px;
+  border-left: 3px solid var(--border);
+}
+/* ⚠️ 利好=绿、利空=红，与方向标记同一套 token（`--intel-dir-bull` / `-bear`）。
+   注意这与 A 股「红涨绿跌」**正好相反**，是用户点名要的口径 ——
+   所以只认这两个专用 token，绝不复用 `--intel-up` / `--intel-down`。 */
+.intel-side-bull {
+  border-left-color: var(--intel-dir-bull);
+  background: rgba(53, 208, 127, 0.06);
+}
+.intel-side-bear {
+  border-left-color: var(--intel-dir-bear);
+  background: rgba(229, 72, 77, 0.06);
+}
+.intel-side-h { font-size: 11.5px; font-weight: 600; margin-bottom: 4px; }
+.intel-side-bull .intel-side-h { color: var(--intel-dir-bull); }
+.intel-side-bear .intel-side-h { color: var(--intel-dir-bear); }
+.intel-side-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 3px;
+}
+.intel-side-k { flex: 0 0 auto; font-size: 10.5px; color: var(--muted); }
+.intel-side-tags { display: flex; flex-wrap: wrap; gap: 5px; }
+.intel-side-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--border);
+  color: var(--text);
+}
+.intel-side-stock {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 11.5px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--border);
+}
+.intel-side-stock b { font-weight: 600; }
+.intel-side-stock .code { font-size: 10.5px; color: var(--muted); }
+
+/* 列表里的 `AI` 小标（"这条点开还有一句模型压的摘要"）。 */
+.intel-ai-mini { font-size: 9.5px; padding: 0 4px; }
+
+/* --- 保留：相对日（今天/昨天/09-24）。
+   分组标题被拿掉之后，它就是"这条是不是今天的"的唯一线索
+   （见 IntelFeedTab 的说明）。 --- */
 .intel-daytag { font-size: 10.5px; color: var(--muted); }
-.intel-sum-cell { min-width: 0; }
-.intel-title { font-size: 12.5px; color: var(--text); line-height: 1.5; }
+/* 展开态标题（摘要**单行**，用户口径 2026-10-01："前端信息不要换行"、
+   "精简200字以内，用户没时间看全文，要效率"）。
+ *
+ * 这里用 `nowrap + ellipsis` 而**不是** `line-clamp: 1`：
+ * 前者的截断点由浏览器按容器宽度算（窄屏少显示几个字、宽屏多显示），
+ * 后者要先按字符数截断再画，窄屏上仍然会在中间断开。
+ *
+ * ⚠️ 换行**不靠这一条 CSS 处理**：`\n` 是字符串里的字符，
+ * `white-space` 只改变怎么画，压出来是"半导体。光伏"（没有空格）。
+ * 真正的折叠在 `intelApi.displaySummary()` / 后端 `one_line()` 里做，
+ * 这一条只是"再长也不许换行"的最后一道保险。
+ *
+ * 完整内容走**点击看全文**那条路（`GET /intel/item/{hash}`），
+ * 所以列表里**不需要**靠换行来放更多字。
+ *
+ * ⚠️ 它只服务**列表/组内**那几处（详情面板另有 `.intel-detail-sum`，
+ * 那里允许换行 —— 详情要的是"能读"，列表要的是"能扫"）。 */
 .intel-sum {
   margin-top: 3px;
   font-size: 11.5px;
   color: var(--muted);
   line-height: 1.55;
-  /* 两行封顶：摘要是"提示"不是"正文"，全展开会让一屏只放得下两三条 */
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  -webkit-box-orient: vertical;
+  white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
 }
+
+/* 摘录徽标：这段是**原文在句边界截断**的，不是模型压出来的摘要。
+   用户抱怨的正是"看到的是被截断的内容" —— 不标出来等于把缺陷藏起来。 */
+.intel-excerpt-tag {
+  display: inline-block;
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 0 4px;
+  margin-right: 4px;
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.18);
+  color: var(--muted);
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+
+/* ---------- 命中关键词高亮（概念板块 / 个股 / 外部标的 / AI） ---------- */
+/*
+ * 用户口径（2026-09-25）："涉及股票、概念板块、美股、AI 的…
+ * 把命中的词突出显示。"
+ *
+ * 词由**后端**给出（`item.highlights`，逐字出现在标题或摘要里），
+ * 前端只负责渲染 —— 判定规则只有一份，见 `vocabulary.highlights`。
+ *
+ * 配色用绿：情报流里红涨绿跌的语义已经被倾向标签占用（`.tone-*`），
+ * 而这里标的是"提到的东西"，不是涨跌。所以用**与涨跌无关的强调绿**，
+ * 并在字号上放大一档 —— 一屏几十条时，绿色大字是最先被扫到的。
+ */
+.intel-hl {
+  /* 去掉 <mark> 的浏览器默认黄底：那是"搜索命中"的语义，这里是强调 */
+  background: none;
+  color: #35d07f;
+  font-size: 1.08em;
+  font-weight: 600;
+  /* 关键词常常紧贴标点，加一点点内边距让绿色块不显得挤 */
+  padding: 0 1px;
+}
+
+/* ---------- 机构名 chip（`.intel-inst`，数据源 `item.institutions`） ---------- */
+/*
+ * 用户口径（2026-10-01）："券商名不一定要告警，但是一定要前端输出信息。"
+ *
+ * 所以机构名**不告警也要上屏**；但它与上面的 `.intel-hl` 是**两回事**，
+ * 视觉上必须一眼分得开：
+ *
+ *   · `.intel-hl` = **命中的个股 / 板块 / 美股 / AI**，绿色大字，是"信号"
+ *     —— 回答"哪些票在被打"；
+ *   · `.intel-inst` = **谁在说**（中泰证券 / 国金证券…），中性灰 chip，
+ *     是"背景" —— 回答"这话是谁说的"。
+ *
+ * 所以这里**刻意不沿用绿色、也不放大字号**：机构名一旦长得像个股高亮，
+ * 这一页最核心的那个问题（哪些票被吹）就被自己搅浑了。
+ *
+ * 区分手段有三层，缺一不可：
+ *   ① "机构："**前缀** —— 灰度打印、色弱、11px 小字下唯一仍成立的区分；
+ *   ② 灰底描边 chip —— 与正文、与绿色大字都不是一种东西；
+ *   ③ 独立一行（`.intel-inst-row`）—— 不插进标题/摘要中间冒充内容。
+ *
+ * ⚠️ 与热度榜的 `inst`（**机构参与度**，一个 0–100 的数，见 `.heat-rank-*`）
+ * 名字相近但毫无关系，不要互相复用。
+ */
+.intel-inst-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  /* 与正文拉开一点：chip 属于"附加信息"，不跟摘要粘在一起 */
+  margin-top: 5px;
+  min-width: 0;
+}
+/* 挂在 `.intel-tags-row` 里时（普通条目行）由父级给间距，别叠两份 */
+.intel-tags-row > .intel-inst-row { margin-top: 0; }
+.intel-inst {
+  display: inline-block;
+  max-width: 100%;
+  /* flex 子项默认 `min-width:auto`，长机构名会顶破行宽；
+     归零后 `max-width` + 省略号才真正生效 */
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1px 7px;
+  /* 与 `.intel-kind` 同一档圆角：chip 的观感全站一致 */
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: rgba(139,152,165,0.08);
+  /* 机构名本身用正文色：它是**内容**（谁在说），不是注释；
+     压暗的是前缀，见下 */
+  color: var(--text);
+  white-space: nowrap;
+  /* 机构名可能很长（"中国国际金融股份有限公司"），超宽时省略号收尾 ——
+     但不能换行，否则一排 chip 会高低不齐 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 前缀压暗：读起来是"机构：中泰证券"，而不是把"机构"当成名字的一部分 */
+.intel-inst-k { color: var(--muted); }
+/* `+N` 溢出计数：虚线边 = "还有，没列全"，与实体机构名区分开。
+   全量在 `title` 里（tooltip），见 `NameChips`。 */
+.intel-inst-more {
+  color: var(--muted);
+  border-style: dashed;
+  background: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 分析师名 chip（`.intel-analyst`，数据源 `item.analysts`） ---------- */
+/*
+ * 用户口径（2026-10-01）："如果有以下内容必须要输出：股票名 板块名 券商
+ * 孙潇雅、赵宇阳、武超则、陈果、刘晨明、洪灏 …… 推送到前端展示。"
+ *
+ * 这六个人原先**只用于告警触发**，界面上一个字都没有。现在与机构名并列上屏，
+ * 但**必须与机构名分得开**（两个字段回答不同的问题）：
+ *
+ *   `.intel-inst`     机构（哪家发的）—— 中性灰 chip
+ *   `.intel-analyst`  分析师（谁署的名）—— 描边带一点暖色
+ *
+ * 前缀文字（"机构：" / "分析师："）是**主要**区分手段（色弱、11px 小字下
+ * 颜色本身就不可靠），配色只是第二层。两者都**绝不复用** `.intel-hl` 的绿色
+ * —— 那个绿在这一页的语义是"命中的个股/板块"，是信号词，不是"谁在说"。
+ */
+.intel-analyst {
+  border-color: rgba(224,138,60,0.45);
+  background: rgba(224,138,60,0.08);
+}
+.intel-analyst.intel-inst-more { background: none; }
 
 /* --- 手机卡片（默认隐藏，窄屏才启用） --- */
 .intel-cards { display: none; }
@@ -480,13 +961,10 @@
   min-width: 0;
 }
 .intel-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.intel-card-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 5px;
-}
-.intel-card-time { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+/* ⚠️ `.intel-card-top` / `.intel-card-time` 已随 2026-10-01 的卡片改版删除 ——
+   卡片顶部那一行（类型徽标 + 时间）现在由**与桌面列表行共用的** `RowMeta`
+   渲染（`.intel-row-meta`），所以不再需要一套卡片专用的顶行样式。
+   同一条情报在手机与桌面上显示的字段与顺序必须一致（见 `RowMeta` 的说明）。 */
 .intel-card-title {
   margin: 0;
   font-size: 13.5px;
@@ -500,6 +978,26 @@
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+/*
+ * 手机卡片摘要：**两行**。
+ *
+ * ## 口径改过一次，这里如实记下来
+ *
+ * 2026-10-01 早些时候用户要的是"精简200字以内，用户没时间看全文，要效率"、
+ * "前端信息不要换行"，所以这里曾是**恒为单行**的 `nowrap`。
+ * 同一天的下一轮口径变了（看到实际界面之后）：
+ *
+ *   "目录里有这么大空白空间，为什么信息还被裁剪的这么多，可以显示200字的空间，
+ *    实际就显示一二十个字，太浪费了，非要点一下……请把信息目录的空间利用完"
+ *
+ * "不要换行"要防的是**字符串里带 `\n`**（那是数据问题，在
+ * `displaySummary()` / 后端 `one_line()` 里已经折叠掉了），
+ * 不是"不许自动折行铺满容器"。单行 `nowrap` 在 390px 上只剩二十来个字，
+ * 而这块位置本来就是给摘要的 —— 于是变成"有空间不用，逼用户点一下"。
+ *
+ * 所以：手机上给两行（桌面列表行给三行，那边一列约 790px）。
+ * 行高与可读性在窄屏是另一套取舍，但"不用点开就能读懂这条讲了什么"是一样的。
+ */
 .intel-card-sum {
   margin: 5px 0 0;
   font-size: 12px;
@@ -511,138 +1009,221 @@
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-/* 展开态：显示全文（摘要已在后端按类型截断到 ≤300 字，不会失控） */
-.intel-card.open .intel-card-title,
-.intel-card.open .intel-card-sum {
+/* 展开态：标题解除行数封顶（后端已把标题截断过，不会失控）。
+   ⚠️ `.intel-card-sum` **不在**这一组里：摘要恒为单行，见上面那段说明 ——
+   把它一起 unset 会让"展开卡片"顺带把摘要摊成多行，与用户的明确要求相反。 */
+.intel-card.open .intel-card-title {
   -webkit-line-clamp: unset;
   line-clamp: unset;
   display: block;
   overflow: visible;
 }
-.intel-card-target {
-  margin-top: 6px;
-  font-size: 11.5px;
-  color: var(--accent);
-}
+
+/* 卡片里的详情面板：`RowMeta` 与标题之间需要一点呼吸（桌面列表行靠
+   `.intel-row-btn` 的 padding，卡片没有那层）。 */
+.intel-card > .intel-row-meta { margin-top: 6px; }
+.intel-card > .intel-detail { margin-top: 8px; }
 
 /* ==================================================================
-   舆情热度监控
+   平台热议（原「舆情热度监控」子页签，已并入情报流顶部）
+
+   ⚠️ 这一段的样式是**重写**的。原来那些 `.heat-kpi` / `.heat-bar-*` /
+   `.heat-tags` 是给三个统计块（来源类型结构 / 按日分布 / 纯数字倾向分布）
+   用的 —— 那三个块已被用户点名删除："这没有意义，删除吧"、
+   "需求是具体的内容，而不是统计数量"。
+   留着它们的样式只会让后来的人以为那些块还在。
    ================================================================== */
 
-.heat-kpis {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: var(--intel-gap);
-}
-.heat-kpi {
-  background: rgba(255,255,255,0.02);
+.intel-heat {
   border: 1px solid var(--border);
   border-radius: var(--intel-radius);
-  padding: 10px 12px;
-  min-width: 0;
+  background: rgba(255,255,255,0.02);
+  margin-bottom: var(--intel-gap);
+  overflow: hidden;
 }
-.heat-lab { font-size: 11.5px; color: var(--muted); }
-.heat-val {
-  font-size: 21px;
-  line-height: 1.25;
+.intel-heat-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.intel-heat-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
   color: var(--text);
+  font-size: 13.5px;
+  cursor: pointer;
+  padding: 2px 0;
+  text-align: left;
+  min-height: 32px;
+}
+.intel-heat-counts { display: flex; gap: 8px; flex-wrap: wrap; }
+.intel-heat-counts span {
+  font-size: 11.5px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
   font-variant-numeric: tabular-nums;
 }
-.heat-val small { font-size: 11.5px; color: var(--muted); margin-left: 2px; }
-.heat-fo { font-size: 11px; color: var(--muted); }
-
-.heat-cols {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--intel-gap);
-  margin-bottom: var(--intel-gap);
+.intel-heat-caret { color: var(--muted); font-size: 12px; }
+.intel-heat-src { font-size: 11.5px; }
+.intel-heat-body { padding: 10px 12px 12px; }
+.intel-heat-none {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.7;
+  padding: 6px 0;
 }
-.heat-card {
-  background: rgba(255,255,255,0.015);
-  border: 1px solid var(--border);
-  border-radius: var(--intel-radius);
-  padding: 12px 14px;
-  min-width: 0;
-}
-.heat-card h3 { margin: 0 0 4px; font-size: 13.5px; color: var(--text); }
-.heat-hint { font-size: 11px; line-height: 1.55; margin: 0 0 10px; }
-
-.heat-bars { list-style: none; margin: 0; padding: 0; }
-.heat-bars li {
-  display: grid;
-  grid-template-columns: 76px minmax(0, 1fr) 40px;
-  align-items: center;
-  gap: 8px;
-  padding: 3px 0;
-  font-size: 12px;
-}
-.heat-bar-lab { color: var(--muted); white-space: nowrap; overflow: hidden;
-  text-overflow: ellipsis; }
-.heat-bar-track {
-  height: 7px;
-  background: rgba(139,152,165,0.14);
-  border-radius: 4px;
-  overflow: hidden;
-  min-width: 0;
-}
-.heat-bar-fill {
-  display: block;
-  height: 100%;
-  border-radius: 4px;
-  background: var(--intel-blue);
-  /* 0% 的条也要看得见"这一行存在"，但不该显示成一格色块 */
-  min-width: 2px;
-}
-.heat-bar-fill.alt { background: var(--intel-purple); }
-/* 倾向配色：与 `.tone-tag` 一致，多绿空红 —— 只表示**原文语气** */
-.heat-bar-fill.tone-bull { background: var(--intel-green); }
-.heat-bar-fill.tone-bear { background: var(--low); }
-.heat-tone-sum {
-  margin-top: 8px;
-  padding-top: 7px;
-  border-top: 1px dashed var(--table-line);
-  font-size: 12px;
+.intel-heat-sec { margin-bottom: 14px; }
+.intel-heat-sec:last-of-type { margin-bottom: 8px; }
+.intel-heat-sec h4 {
+  margin: 0 0 7px;
+  font-size: 12.5px;
+  color: var(--text);
   display: flex;
-  flex-wrap: wrap;
   align-items: baseline;
   gap: 8px;
+  flex-wrap: wrap;
 }
-.heat-tone-sum b { color: var(--text); }
-.heat-bar-n { text-align: right; font-variant-numeric: tabular-nums; color: var(--text); }
+.intel-heat-sec h4 .muted-text { font-size: 11px; font-weight: 400; }
 
-.heat-tags {
+/* ── 热议个股 ── */
+.heat-stocks {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 6px;
+}
+.heat-stock {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255,255,255,0.015);
+  min-width: 0;
+}
+.heat-stock-main {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  background: none;
+  border: 0;
+  color: var(--text);
+  padding: 7px 9px;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+  /* 触控目标：手机上不小于 36px（苹果 HIG 建议 44，但这里是密集列表，
+     36 是"可点"与"放得下"的折中 —— 实测 44 会让一屏只剩 5 行） */
+  min-height: 36px;
+}
+.heat-stock-name { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.heat-stock-code {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.heat-stock-n {
+  font-size: 11px;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 6px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.heat-stock-plats {
+  font-size: 11px;
+  color: var(--muted);
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 46%;
+}
+.heat-stock-ev {
+  border-top: 1px dashed var(--border);
+  padding: 7px 9px 8px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+.heat-stock-ev ul { margin: 0; padding-left: 16px; }
+.heat-stock-ev li { color: var(--text); margin-bottom: 3px; }
+.heat-stock-time { margin-top: 4px; font-size: 11px; }
+
+/* ── 热议事件 ── */
+.heat-topics { list-style: none; margin: 0; padding: 0; }
+.heat-topic {
+  border-left: 2px solid var(--border);
+  padding: 5px 0 5px 10px;
+  margin-bottom: 7px;
+}
+.heat-topic-title {
+  font-size: 13px;
+  color: var(--text);
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.heat-topic-detail { font-size: 12px; color: var(--muted); line-height: 1.65; margin-top: 2px; }
+.heat-topic-rel { font-size: 11.5px; color: var(--accent); margin-top: 2px; }
+
+/* ── 平台人气榜 ──
+   行内紧凑排布：一只票一个 `.heat-rank-item`，靠 `flex-wrap` 自动折行。
+   原来是一只票一行（`column` + 带边框卡片，`.heat-rank-plat` 还用 `margin-left:auto`
+   把来源顶到最右），十几只上榜股就要滚好几屏；现在按"最少行数"排，
+   一屏能看完。名次号写进项内，因为流式排布没有"自上而下"的顺序感了。 */
+.heat-rank {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-  margin-bottom: 8px;
+  gap: 4px 7px;
+  font-size: 12px;
 }
-.heat-tags-lab {
-  font-size: 11.5px;
-  color: var(--muted);
-  margin-right: 2px;
-}
-.heat-tag {
+.heat-rank-item {
   display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 11.5px;
-  padding: 2px 8px;
+  align-items: baseline;
+  gap: 5px;
+  padding: 1px 6px;
   border-radius: 5px;
-  border: 1px solid var(--border);
-  color: var(--text);
+  background: rgba(255,255,255,0.03);
+  white-space: nowrap;
+  min-width: 0;
 }
-.heat-tag b { color: var(--accent); font-variant-numeric: tabular-nums; }
-.heat-todo { border-style: dashed; }
-.heat-todo-list {
+/* 名次：人气榜的"榜"字全靠它 —— 流式排布下没有行序可依赖 */
+.heat-rank-no {
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  min-width: 12px;
+}
+.heat-rank-name { font-weight: 600; white-space: nowrap; }
+.heat-rank-code { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+/* 涨跌配色：**红涨绿跌**（A 股约定）—— 与 `--intel-up` / `--intel-down` 同口径 */
+.heat-rank-pct { font-variant-numeric: tabular-nums; }
+.heat-rank-pct.up, .heat-rank-chg.up { color: var(--intel-up); }
+.heat-rank-pct.down, .heat-rank-chg.down { color: var(--intel-down); }
+.heat-rank-focus, .heat-rank-heat { color: var(--muted); font-variant-numeric: tabular-nums; }
+.heat-rank-chg { font-variant-numeric: tabular-nums; font-size: 11px; }
+.intel-heat-note {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.65;
+  border-top: 1px dashed var(--border);
+  padding-top: 7px;
+}
+.intel-heat-gaps {
   margin: 6px 0 0;
   padding-left: 18px;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--muted);
-  line-height: 1.75;
+  line-height: 1.7;
 }
-.heat-todo-list b { color: var(--text); }
 
 /* ==================================================================
    投资日历
@@ -673,7 +1254,7 @@
 .cal-sum-fo { font-size: 10.5px; color: var(--muted); }
 
 /* --- 批量条目（同日同类合并成一行）--- */
-.cal-row.bulk { border-bottom: 1px solid var(--table-line); }
+.cal-row.bulk { border-bottom: 1px solid var(--cal-grid); }
 .cal-row.bulk.open { border-bottom-color: transparent; }
 .cal-bulk-n {
   font-size: 11.5px;
@@ -697,22 +1278,79 @@
   list-style: none;
   margin: 6px 0 0;
   padding: 6px 0 0;
-  border-top: 1px dashed var(--table-line);
+  border-top: 1px dashed var(--cal-grid);
   /* 一天可能几十只 —— 给上限并自己滚动，别把下面的日期推得很远 */
   max-height: 280px;
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
+/* ── 明细表的行界与列界（用户口径 2026-09-25："把行与行、列与列的边界搞清晰"）──
+   这张表 5 列、一天几十行，原来**既没有行分隔线、也没有列分隔线**，
+   数字一多就成了一片，读数时很容易串行串列。
+
+   ⚠️ 列分隔线必须让**表头与数据行用同一条规则**：两边共用
+   `grid-template-columns` 已经保证了列宽一致，但 `border-left` + `padding-left`
+   会推挤内容 —— 只给数据行加就会整体错位（本项目在列宽上踩过这个坑）。 */
+.cal-stocks li > * + *,
+.cal-stocks-head > * + * {
+  border-left: 1px solid var(--cal-grid);
+  padding-left: 8px;
+}
 .cal-stocks li {
   display: grid;
-  /* 代码 / 名称 / 市值 / 占比 / 类型 —— 手机上后两列会换行（见媒体查询） */
-  grid-template-columns: 52px minmax(64px, 1fr) 76px 60px minmax(0, 1fr);
+  /* 编码 / 名称 / 解禁市值 / 占流通股比例 / 解禁类型
+     ⚠️ 第 4 列原来是 60px，表头「占流通股比例」6 个字在那里会**折成两行**
+     （截图里就是"占流通股比 / 例"）。加宽到 96px 并让最后一列吃掉剩余宽度，
+     表头与数据行同时受益。
+     ⚠️ 名称列**给它上限**：不限的话在宽屏上它会拉得很长，
+     编码与股票名之间空出一大段（表头也一样空），看起来像错位。 */
+  grid-template-columns: 56px minmax(72px, 132px) 92px 96px minmax(0, 1fr);
   align-items: baseline;
   gap: 8px;
   padding: 3px 0;
   font-size: 12px;
   min-width: 0;
+  /* 行与行的分界线 */
+  border-bottom: 1px solid var(--cal-grid);
 }
+.cal-stocks li:last-child { border-bottom: none; }
+/* ── 解禁明细表头 ──
+   用户口径（2026-09-25）："解禁股的展开明细当前点开没有表头，
+   应该表头加上：编码 股票 解禁市值 占流通股比例 解禁类型"。
+
+   ⚠️ 列宽**不在这里定义**：表头与数据行共用 `.cal-stocks li` 的
+   `grid-template-columns`（下面用 `:extend` 式的同一条规则），
+   否则窄屏媒体查询改了行、忘了改表头 → 两行错位。
+   `.cal-stocks-head` 只是把同一个网格"长成表头的样子"。 */
+.cal-stocks-wrap { min-width: 0; }
+.cal-stocks-head {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 0 4px;
+  border-top: 1px dashed var(--cal-grid);
+  border-bottom: 1px solid var(--cal-grid-strong);
+  display: grid;
+  grid-template-columns: 56px minmax(72px, 132px) 92px 96px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--muted);
+  position: sticky;
+  top: 0;
+  /* 明细区自己滚动，表头必须**跟着滚** —— 用 sticky 钉在顶部，
+     否则滚到第 20 行时又不知道哪列是什么了（那就白加表头了）。
+     背景要实色：透明的话下面的行会从字缝里透出来。 */
+  background: var(--panel, #14161a);
+  z-index: 1;
+}
+.cal-stocks-head .cal-stock-cap,
+.cal-stocks-head .cal-stock-pct { text-align: right; color: var(--muted); }
+.cal-stocks-head .cal-stock-name,
+.cal-stocks-head .cal-stock-type { color: var(--muted); font-size: 11px; }
+/* 表头在滚动容器内：容器本身的 max-height 只作用于列表，
+   所以这里把滚动交给外层包裹，让表头与列表一起滚。 */
+.cal-stocks-wrap .cal-stocks { max-height: 250px; }
+
 .cal-stock-code { color: var(--muted); font-size: 11.5px; }
 .cal-stock-name {
   color: var(--text);
@@ -738,7 +1376,7 @@
   list-style: none;
   margin: 6px 0 0;
   padding: 6px 0 0;
-  border-top: 1px dashed var(--table-line);
+  border-top: 1px dashed var(--cal-grid);
   /* 一天可能有几十条 —— 给个上限并自己滚动，别把整页拉得很长
      （手机上会把下面的日期推到很远，翻起来很累） */
   max-height: 260px;
@@ -765,6 +1403,70 @@
   border-left: 2px solid var(--border);
 }
 
+/* ── 宽屏两列 ──
+   用户口径（2026-09-25）："投资日历可以分成两列显示，内容少，占单行左右
+   太远看不到。" 一天一行铺满宽屏时，左侧类型标签与右侧覆盖范围相距一整屏，
+   眼睛要在两端来回跳；分两列后同屏能看两天，横向距离回到可读范围。
+
+   为什么用 `column-count` 而不是 grid：日历是**高度不定**的日程块（一天的
+   事件数 1~4 条，展开后更高），grid 会把同一行的两块拉成等高、留下大片空白；
+   多列布局按内容自然流动、两列高度自动均衡。
+   `break-inside: avoid` 是必须的 —— 否则"某一天"会被拦腰截到下一列，
+   日期头留在上一列、日程跑到下一列。
+
+   为什么断点取 1024px：本文件已有的断点是 1023 / 720 / 420（见文件顶部
+   "断点只在一处"的约定），所以这里用它的补集，而不是新造一个 900。
+   手机端（≤1023px）保持单列 —— 那时宽度本来就是稀缺资源。 */
+/* ── 日历的网格线（行界 / 列界）──
+   用户口径（2026-09-25）："投资日历这个信息列表，你把行与行、列与列的边界
+   搞清晰，换个蓝色或白色、与黑色背景有明显颜色差的。"
+
+   原来用的是 `var(--table-line)` = `rgba(139,152,165,0.16)` —— **16% 不透明度**
+   压在近黑底上，实测基本看不见，于是整个列表是一整片没有分隔的文字；
+   两列布局里两条列之间更是完全没有界线。
+
+   ⚠️ 只改日历，**不动 `--table-line` 全局值**：那个变量被情报流、资金流等
+   十几个面板共用，它们的信息密度和阅读场景不同（背景行多、线太亮会显脏）。
+   所以这里在 `.intel-cal` 上就近定义两个变量，作用域只到日历。 */
+.intel-cal {
+  /* 行分隔线：蓝，与 `--accent` 同色系，在黑底上有明确对比但不刺眼 */
+  --cal-grid: rgba(74, 158, 255, 0.42);
+  /* 日期分组头下方的线：更强一档，用来区分"日"这一层与行 */
+  --cal-grid-strong: rgba(74, 158, 255, 0.72);
+}
+
+.cal-cols { display: block; }
+.cal-pair { display: block; }
+@media (min-width: 1024px) {
+  /* ── 两列成对网格（不是多列瀑布）──
+     ⚠️ 这里原来写的是 `column-count: 2` + `column-rule`。多列布局是
+     **按高度自动平衡**分栏的：左右两列各自从顶部往下流，同一横坐标上
+     两边落在不同的行，行分割线必然错开 —— 用户报障（2026-09-25）：
+     "左右两列的行分割线没对齐，很丑"。
+
+     多列布局在原理上就做不到左右对齐，所以改成成对网格：
+     每个 `.cal-pair` 是 grid 的一行，里面左右各一个 `.cal-group`；
+     同一行两格**等高**，行分割线自然落在同一水平线上。 */
+  .cal-cols { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .cal-pair {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    column-gap: 14px;
+    align-items: start;
+  }
+  /* 列间竖线：多列布局的 `column-rule` 在 grid 下失效，改由左格画右边框。
+     ⚠️ 只有**左右两格都在**时左格才带边框 —— 否则奇数个分组的最后一行
+     会在右半边孤零零多出一条竖线（右边没有内容）。
+     间距构成：14(gap) + 14(padding-right) = 竖线两侧各 14px，
+     线正好落在两列中间。 */
+  .cal-pair:has(> .cal-group:nth-child(2)) > .cal-group:first-child {
+    border-right: 1px solid var(--cal-grid);
+    padding-right: 14px;
+  }
+  /* 网格单元格内的分组要能收缩，否则长标题会把列撑宽 */
+  .cal-cols > .cal-pair > .cal-group { min-width: 0; }
+}
+
 .cal-group { margin-bottom: 14px; }
 .cal-group-head {
   display: flex;
@@ -772,7 +1474,8 @@
   gap: 8px;
   padding-bottom: 5px;
   margin-bottom: 6px;
-  border-bottom: 1px solid var(--table-line);
+  /* 日期分组头：用**更强**那档线，把"日"这一层与下面的日程行分开 */
+  border-bottom: 1px solid var(--cal-grid-strong);
 }
 .cal-group-day { font-size: 13px; font-weight: 600; color: var(--text); }
 .cal-group-rel { font-size: 11.5px; color: var(--accent); }
@@ -783,20 +1486,39 @@
   grid-template-columns: 74px minmax(0, 1fr);
   gap: 10px;
   padding: 8px 0;
-  border-bottom: 1px solid var(--table-line);
+  /* 行与行的分界线（原来是 `--table-line` 16% 不透明度，黑底上看不见） */
+  border-bottom: 1px solid var(--cal-grid);
   min-width: 0;
 }
+/* 分组内（有日期表头）的行**不给日期列** —— 日期已经由
+   `.cal-group-head` 说了，行内再说一遍是重复，而且白占 74px。
+   95% 的行都在分组内，所以省下的宽度直接给了内容。 */
+.cal-row:not(:has(.cal-date)) { grid-template-columns: minmax(0, 1fr); }
 .cal-row:last-child { border-bottom: none; }
 .cal-date { display: flex; flex-direction: column; gap: 2px; }
 .cal-day { font-size: 12.5px; color: var(--text); }
 .cal-rel { font-size: 11px; color: var(--accent); }
 .cal-body { min-width: 0; }
+/* ── 一条 = 一行 ──
+   用户口径（2026-09-25）："投资日历的每条信息内容尽可能不换行，
+   写成1行（详细展开的除外）"。
+
+   `nowrap` + "唯一弹性项是标题"是这条的实现方式：
+     · 徽标/指标/覆盖范围 `flex: 0 0 auto` —— 它们短，永远放得下；
+     · 标题 `flex: 1 1 auto; min-width: 0` 是**唯一**会被压缩的，
+       超长时省略号收尾并挂 `title`，悬停看全文。
+
+   ⚠️ 这里原来写的是 `flex-wrap: wrap`，于是"类型 + 标题"满了就换行，
+   指标块自然落到第二行 —— 一条占三行。窄屏仍然允许换行（见媒体查询）：
+   "尽可能"不等于"强制"，强行 nowrap 会把内容挤出容器。 */
 .cal-line {
   display: flex;
   align-items: center;
   gap: 7px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
 }
+.cal-line > * { flex: 0 0 auto; }
 .cal-kind {
   font-size: 11px;
   padding: 1px 7px;
@@ -808,7 +1530,17 @@
 .cal-kind.orange { color: var(--intel-orange); background: rgba(224,138,60,0.12); border-color: rgba(224,138,60,0.3); }
 .cal-kind.purple { color: var(--intel-purple); background: rgba(169,123,255,0.12); border-color: rgba(169,123,255,0.3); }
 .cal-kind.gray { color: var(--intel-gray); background: rgba(139,152,165,0.1); border-color: rgba(139,152,165,0.28); }
-.cal-title { font-size: 13px; color: var(--text); line-height: 1.5; min-width: 0; }
+.cal-title {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+  /* 唯一可压缩项：占满剩余宽度，超长省略（完整文本由 JSX 挂 title） */
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .cal-certain {
   font-size: 10.5px;
   color: var(--medium);
@@ -817,15 +1549,43 @@
   padding: 0 5px;
   white-space: nowrap;
 }
+/* 覆盖范围与改期记录：**行内**（原来是块级 + margin-top，各占一行）。
+   ⚠️ 2026-09-25 修换行：这里原是 `flex: 0 0 auto`（不可压缩），
+   `.cal-line` 又是 `nowrap` —— 内容一超宽就整体溢出/换行，
+   两列布局下每列只有半宽，于是"覆盖范围暂无"这类行尾小字被挤到第二行
+   （用户报障："能和上一行放在同一行就不要弄成两行展示"）。
+   改成**可压缩 + 省略号**：它是补充信息，压缩它比换行好；
+   完整内容仍在 `title` 里，一个字都不丢。 */
 .cal-scope {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 8px;
-  margin-top: 4px;
   font-size: 11.5px;
   color: var(--muted);
+  white-space: nowrap;
+  min-width: 0;
+  overflow: hidden;
+  flex: 0 1 auto;
 }
-.cal-changes { margin-top: 4px; display: flex; flex-wrap: wrap; gap: 6px; }
+/* `text-overflow` 对 flex 容器本身不生效 —— 省略号必须落在**装文字的
+   子元素**上。给 span 直接子项加上，被压缩时以省略号收尾。 */
+.cal-scope > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 标的预览（中文股票名）。
+   `.cal-line > *` 默认 `flex: 0 0 auto`（不可压缩），而中文名比 6 位编码宽得多
+   （"中国生物制药" vs "688387"），一行 5 个名字能把标题挤成 0 宽、整行溢出。
+   所以这里**破例允许收缩**并加省略号：完整清单在 `title` 里，一个字都不丢。
+   上限 42% 是为了保证标题始终有空间 —— 标题才是这一行要读的东西。 */
+.cal-scope-names {
+  flex: 0 1 auto;
+  max-width: 42%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cal-changes { display: flex; flex-wrap: nowrap; gap: 6px; white-space: nowrap; }
 .cal-change {
   font-size: 11px;
   color: var(--muted);
@@ -834,13 +1594,18 @@
   padding: 1px 6px;
 }
 
-/* --- 预期差（这个页签的核心） --- */
+/* --- 预期差（这个页签的核心） ---
+   ⚠️ 这三条原来都是**块级**布局（`margin-top: 6px` + `flex-wrap: wrap` +
+   `.cal-num` 竖排 dt/dd），于是"宏观发布"一条固定占三行：
+   标题 / 仅前值+上期 / 无预期值提示。用户口径是要一条一行，
+   所以改成行内：`margin-top` 去掉、`nowrap`、dt 与 dd **并排**。
+   竖排改并排是关键 —— 竖排天生就是两行高。 */
 .cal-metrics {
-  margin-top: 6px;
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
+  flex-wrap: nowrap;
+  align-items: baseline;
   gap: 8px;
+  min-width: 0;
 }
 .cal-state {
   font-size: 11px;
@@ -856,17 +1621,20 @@
 .cal-state.purple { color: var(--intel-purple); background: rgba(169,123,255,0.12); border-color: rgba(169,123,255,0.3); }
 .cal-nums {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 12px;
   margin: 0;
+  align-items: baseline;
 }
-.cal-num { display: flex; flex-direction: column; gap: 1px; }
-.cal-num dt { font-size: 10.5px; color: var(--muted); margin: 0; }
+/* dt/dd **并排**（原来是 column 竖排 —— 那就是多出来的一行） */
+.cal-num { display: flex; align-items: baseline; gap: 4px; }
+.cal-num dt { font-size: 10.5px; color: var(--muted); margin: 0; white-space: nowrap; }
 .cal-num dd {
   margin: 0;
   font-size: 13px;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .cal-num dd.strong { font-weight: 600; }
 /* 预期差的颜色：**只表示数值正负**，不表示利好利空 ——
@@ -881,7 +1649,9 @@
   padding: 1px 6px;
   cursor: help;
 }
-.cal-note { font-size: 11px; color: var(--muted); width: 100%; }
+/* `width: 100%` 会把提示语**顶到下一行**（它是撑满容器的强制换行），
+   改成行内小标签 + 悬停看全文 —— 一行与"不丢信息"两者都要。 */
+.cal-note { font-size: 11px; color: var(--muted); white-space: nowrap; cursor: help; }
 
 /* ==================================================================
    盘前简报
@@ -960,6 +1730,75 @@
 .brief-targets { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
 
 /* ==================================================================
+   「其他公开信息」收容组
+   ==================================================================
+   用户口径（2026-09-25）："无明确倾向的，可以聚合成一条，点开可查看。"
+
+   折叠时**只占一行** —— 这是整个改动的意义所在：不折叠的话它是
+   几十上百行宏观快讯，真正有信息的几条会被淹掉。
+
+   ⚠️ 2026-09-25 起界面**不再显示原文倾向**（词表映射多空判错、没意义），
+   所以这一组不再自称"无倾向"，改叫「其他公开信息」；
+   但折叠规则本身没变（快讯 + 不涉及个股/板块/美股/AI 的内容）。
+   ================================================================== */
+
+.intel-kind.group { border-color: rgba(139,152,165,0.45); color: var(--muted); }
+.intel-kind.small { font-size: 10.5px; padding: 0 5px; }
+
+/* 收容组容器现在也是一个**普通列表行**（`IntelGroupRow`），
+   所以原来那套 `<tr>` / 展开行 / 折叠按钮的样式全部删掉了 ——
+   留着它们只会变成"同一个东西有第二套定义"，改一处忘一处。
+   还在用的只有展开后的子条目列表（`.intel-group-list*`）。 */
+.intel-group-empty { font-size: 12px; padding: 6px 0; }
+
+.intel-group-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 460px;
+  overflow-y: auto;
+}
+.intel-group-list > li {
+  padding: 7px 2px;
+  border-bottom: 1px dashed var(--border);
+}
+.intel-group-list > li:last-child { border-bottom: 0; }
+.intel-group-li-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+.intel-group-plat { color: var(--muted); }
+.intel-group-cred {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0 5px;
+}
+.intel-group-tone { font-size: 11px; }
+.intel-group-li-title { font-size: 12.5px; color: var(--text); line-height: 1.6; }
+.intel-group-li-sum {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.65;
+  margin-top: 2px;
+  /* 收容组展开后的每一行同样单行摘要（与 `.intel-sum` 同一条口径：
+     "前端信息不要换行"）。组里几十条，靠换行放字会把页面拉得很长，
+     而用户要的是"扫一遍看哪条值得点开"。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 手机卡片形态：整卡可点，与普通卡片的观感区分开（虚线边） */
+.intel-group-card { border-style: dashed; }
+.intel-group-card .intel-group-list { max-height: 380px; margin-top: 6px; }
+
+/* ==================================================================
    响应式
    ==================================================================
 
@@ -970,25 +1809,28 @@
 
 /* -- 平板竖屏 / 手机横屏：KPI 两列，双栏改单栏 -- */
 @media (max-width: 1023px) {
-  .heat-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .heat-cols { grid-template-columns: minmax(0, 1fr); }
-  /* 表格收窄：来源类型列并到标题上方不值得，改为压窄时间与标的列 */
-  .intel-table .c-target { width: 96px; }
+  /* 热议个股：平板段收到两列，卡片才不至于窄到把来源平台截掉 */
+  .heat-stocks { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* 平板段（721~1023px）详情不能占 400px 的右栏：左边只剩 ~350px，
+     一行列表会退化成"标题每行两三个字"。这一段走"就地展开"——
+     断点在 `IntelFeedTab.useWidePane()` 的 1180，这里不用重复写规则。 */
+  .intel-pane { max-height: none; }
 }
 
 /* -- 手机竖屏（覆盖 iPhone 竖屏 393~440 与小平板）-- */
 @media (max-width: 720px) {
   .intel-root { --intel-gap: 11px; --intel-radius: 9px; }
 
-  /* 页头：标题一行、状态与刷新按钮另起一行 */
-  .intel-head { gap: 8px; }
-  .intel-title { flex: 1 1 100%; }
-  .intel-title h2 { font-size: 16px; }
-  .intel-head-right { margin-left: 0; flex: 1 1 100%; }
+  /* 页头已删除（2026-09-25）。刷新按钮现在跟着子页签行，这里只保证
+     它的触控目标 ≥40px（原页头版规则）。 */
   .intel-refresh { /* 触控目标 ≥40px */
     padding: 7px 14px;
     font-size: 13px;
+    margin-left: 0;
   }
+  /* 手机上页签行不再让刷新按钮独占整行：页签横向滑动、按钮跟在右侧 */
+  .intel-subtabs-row { flex-wrap: nowrap; }
+  .intel-subtabs-row > .intel-refresh { flex: 0 0 auto; }
 
   /* 子页签横向滑动（3 个子页签在 393px 下会折行，折了就把内容顶下去） */
   .intel-subtabs {
@@ -1002,8 +1844,9 @@
   .intel-subtabs::-webkit-scrollbar { display: none; }
   .intel-subtab { flex: 0 0 auto; padding: 7px 13px; font-size: 13px; }
 
-  /* ★ 表格 → 卡片：390px 里 4 列表格无论怎么压都会把标题折成竖排单字 */
-  .intel-tablewrap { display: none; }
+  /* ★ 列表 → 卡片：390px 里一行列表也放不下"方向标 + 标题 + meta"，
+     而卡片天然纵向堆叠；详情在两处是**同一个组件**（见 `IntelCard`）。 */
+  .intel-split { display: none; }
   .intel-cards { display: block; }
 
   /* 触控目标：`.intel-filter` 桌面是 30px 高的紧凑小片，手机上点不准
@@ -1020,22 +1863,43 @@
   .intel-sort { padding: 6px 12px; font-size: 12.5px; }
 
   /* 可信度环在卡片里给足触控尺寸 */
-  .cred-ring { width: 42px; height: 42px; font-size: 14px; }
+  /* 环已去掉（见 `.cred-ring`），这里只放大字号 —— 手机上分数要看得清，
+     同时它是个按钮，`min-height` 保证触控目标仍达标（审计阈值 32px） */
+  .cred-ring { font-size: 16px; min-height: 32px; }
   .cred-detail dt { flex-basis: 56px; }
 
-  .heat-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
-  .heat-val { font-size: 18px; }
-  /* 62px 会把「研究笔记」截成「研究笔…」（4 个中文字 ≈ 48px + padding）。
+  /* 热议个股：手机竖屏单列 —— 两列会把"名称+提及+平台"挤成两行 */
+  .heat-stocks { grid-template-columns: minmax(0, 1fr); }
+  .intel-heat-body { padding: 9px 10px 10px; }
+  /* 62px 会把「券商作文」截成「券商作…」（4 个中文字 ≈ 48px + padding）。
      放到 74px，把省下的宽度从数字列扣（数字最多 3 位，36px 够）。 */
-  .heat-bars li { grid-template-columns: 74px minmax(0, 1fr) 36px; font-size: 11.5px; }
+  .heat-stock-plats { max-width: 100%; }
+
+  /* 日历：窄屏一行确实放不下时**允许**换行。
+     "尽可能不换行"不等于"强制不换行" —— 强制会把内容挤出容器，
+     那正是用户投诉过的"错位/重叠"。标题同时恢复正常换行（省略号
+     在手机上会把"规模以上工业企业利润"截成"规模以上…"，那更没用）。 */
+  .cal-line { flex-wrap: wrap; row-gap: 3px; }
+  .cal-title { white-space: normal; overflow: visible; }
+  .cal-scope { flex-wrap: wrap; white-space: normal; }
 
   /* 日历：左边日期列再窄会截断 `09-27`，保持 58px */
   /* 解禁明细：手机上 5 列排不下 —— 拆成两行
-     （第 1 行 代码+名称+市值，第 2 行 占比+类型） */
-  .cal-stocks li {
+     （第 1 行 代码+名称+市值，第 2 行 占比+类型）
+
+     ⚠️ **表头必须跟着一起改**。表头与数据行共用同一套列定义，
+     只改一边的话手机上表头会与数据错位（"编码"对到股票名上），
+     而这正是用户投诉过的"错位/重叠"那一类问题。
+     表头列少一行，所以第二行的两个标签（占比/类型）在表头里
+     用同一组 `grid-column` 落到与数据行相同的位置。 */
+  .cal-stocks li,
+  .cal-stocks-head {
     grid-template-columns: 52px minmax(0, 1fr) 76px;
     row-gap: 2px;
   }
+  .cal-stocks-head { padding-bottom: 5px; }
+  .cal-stocks-head .cal-stock-pct { grid-column: 1 / 2; text-align: left; }
+  .cal-stocks-head .cal-stock-type { grid-column: 2 / 4; }
   .cal-stock-pct { grid-column: 1 / 2; text-align: left; }
   .cal-stock-type { grid-column: 2 / 4; }
 
@@ -1058,16 +1922,27 @@
 @media (max-width: 420px) {
   .intel-title h2 { font-size: 15px; }
   .intel-compliance { font-size: 11.5px; padding: 8px 10px; }
-  .heat-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .heat-val { font-size: 17px; }
+  /* 极窄屏：行内项再收紧一点，保证一行仍能放下 2 只以上 */
+  .heat-rank { gap: 3px 5px; }
+  .heat-rank-item { padding: 1px 4px; gap: 4px; }
+  .heat-stock-name { font-size: 12.5px; }
   /* 首页里 4 张 KPI 在 375px 下每张只剩 ~170px，`heat-fo` 的说明文字
      会折成 3 行把卡片撑高不一致 —— 收掉它，信息在标题里已有 */
-  .heat-fo { display: none; }
+  /* 极窄屏：来源平台换行显示，不要截断成"东方财…" */
+  .heat-stock-plats { display: none; }
   .cal-row { grid-template-columns: 54px minmax(0, 1fr); }
 }
 
 /* -- 横屏手机 / 矮视口：保证内容不被压成一条缝 -- */
 @media (max-height: 480px) and (orientation: landscape) {
-  .intel-subtabs { position: sticky; top: 0; z-index: 5;
-    background: var(--bg); padding: 4px 0; }
+  /* 页签行吸顶（原来只吸 `.intel-subtabs`；刷新按钮现在与它同排，
+     所以把吸顶移到行容器上，否则滚动时按钮会脱开页签）。
+     ⚠️ 行容器吸顶时它的 `margin-bottom` 会跟着滚，用 padding 补间距。 */
+  .intel-subtabs-row {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    background: var(--bg);
+    padding: 4px 0;
+  }
 }

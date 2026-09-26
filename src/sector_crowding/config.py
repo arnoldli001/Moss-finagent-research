@@ -47,6 +47,9 @@ CONFIG_PATH = Path(os.environ.get(
 class DatabaseConfig:
     path: str = "data/moss_finagent.db"
     warehouse_path: str = "data/quant/warehouse.db"
+    #: 主线挖掘缓存库（只读）。拥挤度从这里取**提纯后**的成分股
+    #: （`ml_member_pure`），保证两个子系统用的是同一份名单。
+    mainline_cache_path: str = "data/mainline_cache.db"
 
 
 @dataclass
@@ -75,6 +78,49 @@ class PerformanceConfig:
 
 
 @dataclass
+class MetricConfig:
+    """周频异动指标（前端 4 列）的窗口与口径。
+
+    "近 N 日"一律用**交易日**计数（不是自然日）：`window_calendar` 用来把
+    "近 1 个月"换成交易日，改它会同时影响 1 月/2 月两列与资金净流入口径。
+    """
+
+    #: "近 1 个月"折算多少个交易日
+    month_trading_days: int = 20
+    #: 短窗口（近 5 个交易日）
+    short_days: int = 5
+    #: 2 个月 = 2 × month_trading_days
+    long_month_multiplier: int = 2
+    #: 算变化率要求基准日水位**不低于**这个值，否则该列写 NULL。
+    #:
+    #: 为什么需要：水位 = 平滑拥挤度 / 近 6 年最高，冷门板块的基准水位可以低到
+    #: 0.04%，于是"从 0.0004 涨到 0.02"就得到 +5000% —— 数学上没错，但它只是
+    #: 从"几乎没成交"变成"有一点成交"，不是资金异动，却会在按列降序时把小涨幅
+    #: 的真异动板块全挤到后面。实测 2026-W38：基准水位 < 0.001 的有 6 个板块，
+    #: 其中 871016.TI 算出 +14472%、875185.TI 算出 +705%，而中位数只有个位数。
+    #: 0.005（= 0.5%）是"这个板块确实有过成交热度"的最低门槛。
+    min_base_water: float = 0.005
+    #: 板块成分股（`ths_member`）并发抓取线程数
+    member_workers: int = 6
+    #: 成分股抓取的重试次数 / 板块成分股缓存的有效天数
+    member_retry_times: int = 2
+    member_cache_days: int = 30
+    #: 资金净流入的分钟间隔/口径：主力净流入 = 大单+超大单净额（Tushare moneyflow）
+    flow_weekday: int = 2      # 每周几自动算（cron 周字段：1=周一 … 6=周六）
+    #: 是否优先用主线挖掘的**提纯后**成分股（`ml_member_pure`）。
+    #:
+    #: 关掉它只是为了做「提纯前后」的对照回测，生产口径应当保持 `True`：
+    #: 原始 `ths_member` 名单里大量沾边个股会把主力集中度稀释掉
+    #: （见 `members.py` 里的压缩比实测）。
+    use_purified_members: bool = True
+    #: 提纯后 `relevant=1` 的只数低于这个值就回退原始名单。
+    #:
+    #: 为什么要有下限：提纯里存在"退化"结果（885699 原始 256 只压到 1 只），
+    #: 拿单只股票算资金流，噪声远大于信号。实测全池只有 3 个板块低于 5 只。
+    min_purified_members: int = 3
+
+
+@dataclass
 class LoggingConfig:
     level: str = "INFO"
     dir: str = "logs"
@@ -87,6 +133,7 @@ class SectorCrowdingConfig:
     window: WindowConfig = field(default_factory=WindowConfig)
     data: DataConfig = field(default_factory=DataConfig)
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
+    metrics: MetricConfig = field(default_factory=MetricConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
 
     @property
@@ -96,6 +143,11 @@ class SectorCrowdingConfig:
     @property
     def warehouse_path(self) -> Path:
         return _resolve(self.database.warehouse_path)
+
+    @property
+    def mainline_cache_path(self) -> Path:
+        """主线挖掘缓存库路径（只读；提纯成分股的来源）。"""
+        return _resolve(self.database.mainline_cache_path)
 
     @property
     def log_path(self) -> Path:
@@ -125,11 +177,14 @@ def _build(raw: dict[str, Any]) -> SectorCrowdingConfig:
     window = section("window")
     data = section("data")
     perf = section("performance")
+    metric = section("metrics")
     log = section("logging")
     return SectorCrowdingConfig(
         database=DatabaseConfig(
             path=str(db.get("path", "data/moss_finagent.db")),
             warehouse_path=str(db.get("warehouse_path", "data/quant/warehouse.db")),
+            mainline_cache_path=str(
+                db.get("mainline_cache_path", "data/mainline_cache.db")),
         ),
         window=WindowConfig(
             max_lookback_years=int(window.get("max_lookback_years", 6)),
@@ -151,6 +206,18 @@ def _build(raw: dict[str, Any]) -> SectorCrowdingConfig:
             worker_threads=int(perf.get("worker_threads", 8)),
             retry_times=int(perf.get("retry_times", 2)),
             progress_every=int(perf.get("progress_every", 5)),
+        ),
+        metrics=MetricConfig(
+            month_trading_days=int(metric.get("month_trading_days", 20)),
+            short_days=int(metric.get("short_days", 5)),
+            long_month_multiplier=int(metric.get("long_month_multiplier", 2)),
+            min_base_water=float(metric.get("min_base_water", 0.005)),
+            member_workers=int(metric.get("member_workers", 6)),
+            member_retry_times=int(metric.get("member_retry_times", 2)),
+            member_cache_days=int(metric.get("member_cache_days", 30)),
+            flow_weekday=int(metric.get("flow_weekday", 2)),
+            use_purified_members=bool(metric.get("use_purified_members", True)),
+            min_purified_members=int(metric.get("min_purified_members", 3)),
         ),
         logging=LoggingConfig(
             level=str(log.get("level", "INFO")),
@@ -267,6 +334,51 @@ def is_concept_board(code: str, name: str,
     return True
 
 
+@lru_cache(maxsize=1)
+def _cached_exclusions(mtime: float, path: str) -> frozenset[str]:
+    """按 (mtime, path) 缓存 —— 文件没改就不重复解析。"""
+    import yaml
+
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    out = set()
+    for item in (raw.get("entries") or []):
+        if isinstance(item, dict) and item.get("code"):
+            out.add(str(item["code"]))
+    return frozenset(out)
+
+
+def load_crowding_exclusions(filename: str = "crowding_exclusions.yaml"
+                             ) -> frozenset[str] | None:
+    """拥挤度功能的剔除清单；`None` 表示**清单不可用**（调用方不过滤）。
+
+    ## 与 `sector_blacklist.yaml` 的分工（两个开关，不要混）
+
+        `sector_blacklist.yaml`  → **主线池级**排除：不进 `ml_board`、不参与打分
+        本清单                    → **拥挤度功能**排除：不显示 / 不下载 / 不算指标
+
+    用户 2026-09-22 的指示是「**板块拥挤度功能里**，删除以下概念板块」——
+    明确是拥挤度口径。所以两边**故意分开**：混在一起会把板块顺带踢出
+    主线打分池，那是用户没要求的副作用。
+
+    ## 为什么返回 `None` 而不是空集
+
+    与 `load_sector_blacklist` 同一约定：`None` 表达"清单读不到"，
+    由调用方决定怎么办。三处调用方（`refresh` / `metrics` / `db`）都选择
+    **不过滤** —— 把"读不到"当成"排除全部"会让拥挤度一个板块都不算、
+    前端一片空白，比"多算几个"严重得多。
+    """
+    path = PROJECT_ROOT / "configs" / str(filename or "")
+    if not path.exists():
+        logger.warning("拥挤度剔除清单不存在：%s（本次不剔除任何板块）", path)
+        return None
+    try:
+        return _cached_exclusions(path.stat().st_mtime, str(path))
+    except Exception as exc:  # noqa: BLE001 清单坏了不该让整条链路挂掉
+        logger.warning("拥挤度剔除清单解析失败：%s（本次不剔除任何板块）",
+                       type(exc).__name__)
+        return None
+
+
 __all__ = [
     "CONFIG_PATH",
     "PROJECT_ROOT",
@@ -279,4 +391,5 @@ __all__ = [
     "clear_config_cache",
     "is_concept_board",
     "load_config",
+    "load_crowding_exclusions",
 ]

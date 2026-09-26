@@ -209,8 +209,60 @@ class AuthService:
         self._lock_seconds = login_lock_seconds
         #: 邮箱配额（本轮的"短信配额"对应物）。`0` = 不允许发送。
         self.email_monthly_quota = 2000
+        # ---- "账号不存在的登录"审计去重（见 `_should_log_login_miss`）----
+        #: `{(account_hash, ip): [首次时间, 被折叠次数]}`
+        self._login_miss_seen: dict[tuple[str, str], list[float]] = {}
+        #: 同一 (账号, IP) 在该窗口内只写**一行**审计。
+        self._login_miss_window = 300.0
+        #: 去重表上限（条）。**必须有界**：无界的缓存会被攻击者用
+        #: 随机账号名撑爆内存 —— 那就把"磁盘填充"换成了"内存填充"。
+        self._login_miss_max_keys = 2048
 
     # ---------------- 内部工具 ----------------
+
+    def _should_log_login_miss(self, account: str, ip: str) -> bool:
+        """这次"账号不存在的登录"要不要写审计行？（同 key 在窗口内只写一次）
+
+        返回 True 表示"写"（首次），False 表示"折叠掉"。
+
+        ## 为什么按 (账号, IP) 去重而不是只按 IP
+
+        只按 IP 会把"同一台 NAT 后面的多个用户在扫不同账号"折叠成一行，
+        安全审计要看的是"谁在扫哪些账号"这个**配对**，折叠成 IP 粒度会
+        丢掉账号维度。而只按账号去重则挡不住分布式（每个 IP 各扫一遍）。
+        两者组合才是既有信号又有上界。
+
+        ## 为什么"首行立即写"而不是"攒够 N 次再写"
+
+        立即写保证 `grep NO_SUCH_ACCOUNT` 仍能第一时间看到可疑扫描；
+        攒批会让"第一次攻击"在日志里消失一段时间，那对安全响应是倒退。
+
+        ## 有界性
+
+        `_login_miss_seen` 按 `_login_miss_max_keys` 截断（丢弃最早插入的）。
+        没有这个上界，攻击者用随机账号名就能把内存撑爆 ——
+        那只是把磁盘填充换成了内存填充。
+
+        ⚠️ 这是**进程内**状态（重启即清空）。它只用于削峰，不承担
+        精确计数；跨重启的长期增长由保留策略兜底
+        （`retention_notify_log_days`，默认 180 天）。
+        """
+        import hashlib
+        import time
+
+        key = (hashlib.sha256(str(account or "").encode("utf-8")).hexdigest()[:16],
+               str(ip or "-"))
+        now = time.monotonic()
+        entry = self._login_miss_seen.get(key)
+        if entry is not None and now - entry[0] < self._login_miss_window:
+            entry[1] += 1.0                     # 折叠：只累计，不写库
+            return False
+        if len(self._login_miss_seen) >= self._login_miss_max_keys:
+            # 超上限：丢掉最早插入的一批（dict 保序），保持有界。
+            for stale in list(self._login_miss_seen)[: self._login_miss_max_keys // 4]:
+                self._login_miss_seen.pop(stale, None)
+        self._login_miss_seen[key] = [now, 0.0]
+        return True
 
     async def _dummy_verify(self, password: str) -> None:
         """账号不存在时也走一次**等价耗时**的哈希校验。
@@ -447,9 +499,21 @@ class AuthService:
 
         if user is None:
             await self._dummy_verify(password)      # ← 等价耗时，防时序侧信道
-            await self._repo.a_log_notify(
-                channel="email", target=account_text, scene="login",
-                status="failed", error_code="NO_SUCH_ACCOUNT", user_id="")
+            # ★ 审计**去重后**再写（2026-09-25 数据库审计后新增）
+            #
+            # 这一行原来是**无条件写**的，而它不受验证码月配额约束 ——
+            # 任何人都能用任意不存在的账号 POST /auth/login，每次写一行
+            # `fact_notify_log`。唯一的护栏是路由层的**进程内** IP 限流
+            # （重启即清空、多实例不共享），实测单 IP 上限约 1.7 万行/天
+            # （每行含 error_msg，约 5 MB/天/IP）。多 IP 或反复重启即可放大。
+            #
+            # 现在：同一 (账号, IP) 在窗口内只写一行，重复次数折叠进
+            # 首行的 `error_msg`。审计信号（"谁在扫账号"）完整保留，
+            # 只是不再让同一次扫描按请求数线性放大行数。
+            if self._should_log_login_miss(account_text, ip):
+                await self._repo.a_log_notify(
+                    channel="email", target=account_text, scene="login",
+                    status="failed", error_code="NO_SUCH_ACCOUNT", user_id="")
             return AuthOutcome.fail("账号或密码错误", "credentials")
 
         locked = await self._lock_remaining(user.user_id)

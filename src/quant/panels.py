@@ -30,9 +30,25 @@ from src.core.errors import (
     brief,
 )
 from src.quant.dataset_store import DEFAULT_ROOT, DatasetStore
+from src.quant.liquidity import (
+    LiquidityFilter,
+    describe_effect,
+    liquidity_exclusion,
+    select_codes,
+)
+from src.quant.panel_needs import PanelNeeds
 from src.quant.pit import PitPanel
 
 logger = logging.getLogger(__name__)
+
+
+class MissingPanelField(RuntimeError):
+    """严格模式下取了一个**没有按需加载**的面板字段。
+
+    这个异常存在的意义就是"让漏配表现为失败"：如果未加载的字段返回空表，
+    因子会静默变成一列 NaN（IC = 0/None，看起来像"这个因子没用"），
+    而真正的原因是面板少装了字段 —— 这正是本项目反复踩过的那类错误。
+    """
 
 PRICE_SOURCES: dict[str, tuple[str, str]] = {
     # field → (数据集, 列名)
@@ -65,10 +81,16 @@ BAK_FIELDS = ("swing", "selling", "buying", "strength", "activity",
               "bak_vol_ratio", "bak_turnover")
 FLOW_FIELDS = ("net_mf_amount", "buy_lg_amount", "sell_lg_amount",
                "buy_elg_amount", "sell_elg_amount")
-PRICE_FIELDS = ("open", "high", "low", "close", "volume_lot", "amount")
+#: 行情仓库 `daily` 面板的列。
+#:
+#: ⚠️ 量列名是 `volume_lot`（**手**，Tushare `daily.vol` 口径），
+#: 与 `quant/price_panel.py` 的 `BAR_PRICE_FIELDS`（`volume`，**股**）**不是同一套**。
+#: 两者曾同名 `PRICE_FIELDS`，import 错一个就会在很远的地方抛 KeyError，
+#: 所以按数据源显式区分命名。
+WAREHOUSE_PRICE_FIELDS = ("open", "high", "low", "close", "volume_lot", "amount")
 
 PANEL_FIELDS: dict[str, tuple[str, ...]] = {
-    "daily": PRICE_FIELDS,
+    "daily": WAREHOUSE_PRICE_FIELDS,
     "adj_factor": ("adj_factor",),
     "daily_basic": BASIC_FIELDS,
     "moneyflow": FLOW_FIELDS,
@@ -97,28 +119,54 @@ class FactorPanels:
     # 每个字段的取数来源（db:sqlite.quant_daily / csv:daily(171 个分区)）。
     # 回测复现性依赖它：不说清"读的是库还是文件"，环境一变结果就无法解释。
     origins: list[str] = field(default_factory=list)
+    #: 股票池过滤的**逐日剔除掩码**（True = 该日该票被剔除）。
+    #: 列子集只决定"装哪些票"，每一天的口径由它保证。
+    excluded: pd.DataFrame | None = None
+    #: 严格模式（显式给了 `needs` 时为 True）：取未加载字段**直接抛错**。
+    strict: bool = False
+    #: 本次真正装载了哪些字段（`"basic:pb"` 这类限定名），供体检与报错。
+    loaded: frozenset[str] = frozenset()
 
     # ---------- 取用接口 ----------
 
     def price(self, field_name: str) -> pd.DataFrame:
-        return self._get(self.prices, field_name, "行情")
+        return self._get("price", self.prices, field_name, "行情")
 
     def basic(self, field_name: str) -> pd.DataFrame:
-        return self._get(self.basics, field_name, "估值")
+        return self._get("basic", self.basics, field_name, "估值")
 
     def flow(self, field_name: str) -> pd.DataFrame:
-        return self._get(self.flows, field_name, "资金流")
+        return self._get("flow", self.flows, field_name, "资金流")
 
     def bak_field(self, field_name: str) -> pd.DataFrame:
-        return self._get(self.bak, field_name, "备用行情")
+        return self._get("bak", self.bak, field_name, "备用行情")
 
-    def _get(self, pool: dict[str, pd.DataFrame], name: str,
+    def limit(self, field_name: str) -> pd.DataFrame:
+        return self._get("limits", self.limits, field_name, "涨跌停")
+
+    def _get(self, scope: str, pool: dict[str, pd.DataFrame], name: str,
              label: str) -> pd.DataFrame:
         frame = pool.get(name)
         if frame is None:
+            if self.strict:
+                raise MissingPanelField(
+                    f"面板没有按需加载 {scope}.{name}（{label}）——"
+                    f"说明这次装配的 needs 漏了它。"
+                    f"用 `panel_needs.needs_for_factors(...)` 生成 needs，"
+                    f"或手工把它加进 `PanelNeeds.{scope}`。"
+                    f"本次已加载 {len(self.loaded)} 个字段："
+                    f"{sorted(self.loaded)[:10]}"
+                    + ("…" if len(self.loaded) > 10 else ""))
             empty = pd.DataFrame(index=self.dates, columns=self.codes, dtype="float64")
             return empty
         return frame.reindex(index=self.dates, columns=self.codes)
+
+    def exclusion_mask(self) -> pd.DataFrame | None:
+        """股票池过滤掩码（对齐到本面板的日期/代码轴）。没有则 None。"""
+        if self.excluded is None or self.excluded.empty:
+            return None
+        return self.excluded.reindex(index=self.dates,
+                                     columns=self.codes).fillna(False)
 
     def fundamental_frame(self, date: str) -> pd.DataFrame:
         """某个交易日的 PIT 财务截面（index=code）。缺数据返回空表。"""
@@ -318,6 +366,8 @@ def build_panels(
     codes: Sequence[str] | None = None,
     fundamentals: PitPanel | None = None,
     source: str = "auto",
+    needs: PanelNeeds | None = None,
+    liquidity: LiquidityFilter | None = None,
 ) -> FactorPanels:
     """从本地数据装配因子面板（不联网）。
 
@@ -327,12 +377,50 @@ def build_panels(
     `codes`：只要这几只票。**会给下游两条路径都省下大量工作**：
     走库时把过滤下推到 SQL（实测快 ~225 倍），走 CSV 时在拼长表后立刻裁剪
     （少做几百万行的 pivot）。只看一只票做单股票回测时，这是 28s → 数秒的差别。
+
+    `needs`：**只装这些字段**（`panel_needs.PanelNeeds`）。不传 = 全字段装配
+    （历史行为，也是单票回测的路径）。传了则进入**严格模式**：取未加载的字段
+    会抛 `MissingPanelField`，而不是返回空表 —— 漏配必须表现为失败，
+    否则因子会静默变成一列 NaN。
+    实测收益（2026-09-25）：35 个因子实际只需要 17 个字段（全量 43 个），
+    且不再读 `bak_daily`（950 万行，一个因子都没用它）、`stk_limit`（1400 万行）、
+    `suspend_d`。
+
+    `liquidity`：股票池流动性过滤（**显式选项，默认关闭**）。开启后先只取
+    成交额算出逐日掩码与"常驻列"名单，后面的字段只装这些列 —— 列少了，
+    内存同比例下降；逐日口径的差异由 `FactorPanels.excluded` 掩码兜住。
     """
     days = [str(day) for day in dates]
+    explicit_needs = needs is not None
+    needs = (needs or PanelNeeds.everything()).normalized()
     gaps: list[str] = []
     origins: list[str] = []
+    loaded: set[str] = set()
     code_filter = ({str(code).split(".")[0].zfill(6) for code in codes}
                    if codes else set())
+
+    # ---------- 本次要装的字段（决定 SELECT 的列，也就决定内存） ----------
+    price_fields = set(needs.price) - {"close_raw"}
+    basic_fields = set(needs.basic)
+    flow_fields = set(needs.flow)
+    bak_fields = set(needs.bak)
+    limit_fields = set(needs.limits)
+    need_adj = bool(price_fields & {"open", "high", "low", "close"})
+
+    def dataset_fields(dataset: str) -> tuple[str, ...]:
+        if dataset == "daily":
+            return tuple(sorted(price_fields))
+        if dataset == "daily_basic":
+            return tuple(sorted(basic_fields))
+        if dataset == "moneyflow":
+            return tuple(sorted(flow_fields))
+        if dataset == "bak_daily":
+            return tuple(sorted(bak_fields))
+        if dataset == "stk_limit":
+            return tuple(sorted(limit_fields))
+        if dataset == "adj_factor":
+            return ("adj_factor",)
+        return ()
 
     def store(dataset: str) -> DatasetStore:
         return DatasetStore(dataset, root=root, universe=universe)
@@ -345,24 +433,28 @@ def build_panels(
     # 先定位来源、再按字段取，是"库优先"真正省钱的前提。
     backend: dict[str, str] = {}
     warehouse_client: Any = None
-    long_cache: dict[tuple[str, str], pd.DataFrame] = {}
+    long_cache: dict[str, pd.DataFrame] = {}
+
+    def ensure_warehouse() -> Any:
+        nonlocal warehouse_client
+        if warehouse_client is None:
+            from src.quant.warehouse import QuantWarehouse
+
+            warehouse_client = QuantWarehouse(root=root, universe=universe)
+        return warehouse_client
 
     def dataset_backend(dataset: str) -> str:
         if dataset in backend:
             return backend[dataset]
         choice = "csv"
         if source in ("auto", "db", "mysql"):
-            nonlocal warehouse_client
             try:
-                if warehouse_client is None:
-                    from src.quant.warehouse import QuantWarehouse
-
-                    warehouse_client = QuantWarehouse(root=root, universe=universe)
+                client = ensure_warehouse()
                 # 用 covers 而不是 has_rows：入库是顺序进行的，库里随时可能只是
                 # 缓存的一个前缀。只看"有没有一行"会让灌到一半的数据集被判为
                 # "走库"，回测因此静默丢掉后半段数据。
-                if (warehouse_client.available()
-                        and warehouse_client.covers(dataset, days[0], days[-1])):
+                if (client.available()
+                        and client.covers(dataset, days[0], days[-1])):
                     choice = "db"
             except Exception as exc:  # noqa: BLE001 库不可用就走 CSV
                 logger.debug("探测 %s 的仓库来源失败：%s", dataset, brief(exc, BRIEF_TIGHT))
@@ -370,59 +462,55 @@ def build_panels(
         backend[dataset] = choice
         return choice
 
-    db_cache: dict[str, pd.DataFrame] = {}
-
     def db_frame(dataset: str) -> pd.DataFrame:
-        """按数据集取一次库（缓存键是**数据集**，不是字段）。
+        """按数据集取一次库（缓存键 = 数据集 + 本次要的列）。
 
-        缓存键必须是数据集：按字段缓存会让 `daily_basic` 的 16 个字段
-        各发起一次 88 万行的查询，比整表读一次慢得多。
+        缓存键不能只是数据集：不同调用要的列不同（主装配要 17 列，
+        股票池预探只要 `amount` 一列），混用会让"先探后装"拿到缺列的表。
         """
-        if dataset in db_cache:
-            return db_cache[dataset]
+        columns = dataset_fields(dataset)
+        cache_key = f"{dataset}:{','.join(columns)}"
+        if cache_key in long_cache:
+            return long_cache[cache_key]
         frame = pd.DataFrame()
-        if dataset_backend(dataset) == "db":
+        if columns and dataset_backend(dataset) == "db":
             from src.quant.warehouse import DATASET_TABLES
 
             date_column = DATASET_TABLES[dataset][2]
-            wanted = [date_column, "code", *PANEL_FIELDS.get(dataset, ())]
+            wanted = [date_column, "code", *columns]
             try:
-                available = set(warehouse_client.columns_of(dataset))
-                columns = [name for name in wanted if name in available]
+                client = ensure_warehouse()
+                available = set(client.columns_of(dataset))
+                use = [name for name in wanted if name in available]
                 # **股票池过滤下推到 SQL**：实测按代码筛选比取全市场再筛快 ~225 倍
                 # （250 日区间 10.3ms vs 2313ms），这是"只看一只票"能秒开的关键。
-                frame = warehouse_client.load(
+                frame = client.load(
                     dataset, start=days[0], end=days[-1],
                     codes=list(code_filter) if code_filter else None,
-                    columns=columns or None, order=False)
+                    columns=use or None, order=False)
                 if len(frame):
                     origins.append(
-                        f"{dataset}←db:{warehouse_client.config.dialect}"
-                        f".{DATASET_TABLES[dataset][0]}({len(columns)} 列)")
+                        f"{dataset}←db:{client.config.dialect}"
+                        f".{DATASET_TABLES[dataset][0]}({len(use)} 列)")
             except Exception as exc:  # noqa: BLE001 取失败就退回分区文件
                 logger.debug("仓库取 %s 失败，回退 CSV：%s",
                              dataset, brief(exc, BRIEF_TIGHT))
                 frame = pd.DataFrame()
-        db_cache[dataset] = frame
+        long_cache[cache_key] = frame
         return frame
 
     def field_long(dataset: str, field: str) -> pd.DataFrame:
         """走库时**按数据集一次取回需要的列**，之后在内存里切字段。"""
-        cache_key = (dataset, field)
-        if cache_key in long_cache:
-            return long_cache[cache_key]
-        frame = db_frame(dataset)
-        long_cache[cache_key] = frame
-        return frame
+        return db_frame(dataset)
 
     def field_wide(dataset: str, field: str) -> pd.DataFrame:
         long = field_long(dataset, field)
-        if len(long):
+        if len(long) and field in long.columns:
             wide = _wide_from_long(long, field, days)
             if not wide.empty:
                 return wide
         long = dataset_frame(dataset)
-        if len(long):
+        if len(long) and field in long.columns:
             wide = _wide_from_long(long, field, days)
             if not wide.empty:
                 return wide
@@ -469,6 +557,12 @@ def build_panels(
             if code_filter and "code" in long.columns:
                 long = long[long["code"].astype(str).str.zfill(6)
                             .isin(code_filter)]
+            # 按需装配时**再裁一次列**：分区文件带着整个数据集的所有列，
+            # 不裁的话"只用一个字段"也要把 16 列都留在内存里。
+            wanted = set(dataset_fields(dataset)) | {"trade_date", "code"}
+            keep = [name for name in long.columns if name in wanted]
+            if keep and len(keep) < len(long.columns):
+                long = long[keep]
         else:
             long = pd.DataFrame()
         # 来源按数据集记一次（逐字段记会把 origins 撑成 40 行噪音）
@@ -476,84 +570,172 @@ def build_panels(
         partition_cache[dataset] = long
         return long
 
+    # ================= 阶段一：股票池过滤（可选，必须在装字段之前） =================
+    #
+    # 顺序是关键：面板是"日期 × 代码"的矩形，列一旦装进来就占内存。
+    # 所以先只取**一列**成交额算出逐日掩码与"常驻列"名单，后面所有字段
+    # 都只装这些列（走库时过滤下推到 SQL，走 CSV 时拼完长表立刻裁行）。
+    excluded: pd.DataFrame | None = None
+    if liquidity is not None and liquidity.enabled:
+        # 多取 window 个前置交易日：滚动均值在窗口头部需要历史，
+        # 否则头 20 天算不出均值 → 那几天会"全员被剔除"（实测会这样）。
+        probe_days = list(days)
+        try:
+            prior = [key for key in store("daily").keys() if key < days[0]]
+            probe_days = prior[-max(1, liquidity.window):] + list(days)
+        except Exception as exc:  # noqa: BLE001 拿不到前置区间就只用请求区间
+            logger.debug("取前置交易日失败：%s", brief(exc, BRIEF_TIGHT))
+        amount_long = pd.DataFrame()
+        if dataset_backend("daily") == "db":
+            from src.quant.warehouse import DATASET_TABLES
+
+            try:
+                client = ensure_warehouse()
+                use = [name for name in
+                       [DATASET_TABLES["daily"][2], "code", "amount"]
+                       if name in set(client.columns_of("daily"))]
+                amount_long = client.load("daily", start=probe_days[0],
+                                          end=probe_days[-1], codes=None,
+                                          columns=use or None, order=False)
+            except Exception as exc:  # noqa: BLE001 失败退回 CSV
+                logger.debug("股票池过滤：库取成交额失败，回退 CSV：%s",
+                             brief(exc, BRIEF_TIGHT))
+                amount_long = pd.DataFrame()
+        if not len(amount_long):
+            frames = []
+            daily_store = store("daily")
+            for key in probe_days:
+                frame = daily_store.read(key)
+                if frame is None or len(frame) == 0 or "amount" not in frame.columns:
+                    continue
+                if "trade_date" not in frame.columns:
+                    frame = frame.assign(trade_date=key)
+                columns = [name for name in ("trade_date", "code", "amount")
+                           if name in frame.columns]
+                frames.append(frame[columns])
+            if frames:
+                amount_long = pd.concat(frames, ignore_index=True)
+        if len(amount_long) and "code" in amount_long.columns:
+            amount_wide = _wide_from_long(amount_long, "amount", probe_days)
+            full_mask = liquidity_exclusion(
+                amount_wide, drop_pct=liquidity.drop_pct,
+                window=liquidity.window, min_days=liquidity.min_days)
+            if full_mask.empty:
+                gaps.append("股票池过滤：成交额面板为空，未生效")
+            else:
+                kept = select_codes(full_mask, keep_ratio=liquidity.keep_ratio,
+                                    dates=days)
+                if code_filter:
+                    kept = [code for code in kept if code in code_filter]
+                gaps.append(describe_effect(full_mask, kept,
+                                            universe=len(full_mask.columns),
+                                            dates=days))
+                excluded = full_mask.reindex(index=days)
+                code_filter = set(kept)
+        else:
+            gaps.append("股票池过滤：没有成交额数据（daily.amount 缺失），未生效")
+
+    # ================= 阶段二：按需装配字段 =================
     prices: dict[str, pd.DataFrame] = {}
     raw: dict[str, pd.DataFrame] = {}
-    for name in ("open", "high", "low", "close", "volume_lot", "amount"):
+    for name in sorted(price_fields):
         wide = field_wide("daily", name)
         if wide.empty:
             gaps.append(f"daily.{name} 无数据（可能未下载）")
         raw[name] = wide
+        loaded.add(f"price:{name}")
 
     # **复权**：Tushare 的 daily 是未复权价，除权除息日会出现假跳空（10 送 10 → −50%），
     # 直接拿它算动量/波动率/ATR 会得到完全错误的因子值。
     # 这里用 adj_factor 转成后复权（close × adj_factor）：收益率与真实持有收益一致。
     # 同时保留 close_raw —— 市值类因子（自由流通市值 = 股本 × 价格）必须用未复权价。
-    adj = field_wide("adj_factor", "adj_factor")
-    if adj.empty:
-        gaps.append("adj_factor 无数据 → 价格未复权（除权日会产生假跳空，"
-                    "动量/波动率因子不可信）")
-        prices.update(raw)
-    else:
-        adj_aligned = adj.reindex(index=raw["close"].index, columns=raw["close"].columns)
-        for name in ("open", "high", "low", "close"):
-            prices[name] = raw[name] * adj_aligned
-        prices["volume_lot"] = raw["volume_lot"]
-        prices["amount"] = raw["amount"]
-    prices["close_raw"] = raw["close"]
+    adjusted = sorted(price_fields & {"open", "high", "low", "close"})
+    if adjusted:
+        adj = field_wide("adj_factor", "adj_factor")
+        anchor = raw["close"] if "close" in raw else raw[adjusted[0]]
+        if adj.empty:
+            gaps.append("adj_factor 无数据 → 价格未复权（除权日会产生假跳空，"
+                        "动量/波动率因子不可信）")
+            for name in adjusted:
+                prices[name] = raw[name]
+        else:
+            adj_aligned = adj.reindex(index=anchor.index, columns=anchor.columns)
+            for name in adjusted:
+                prices[name] = raw[name] * adj_aligned
+        if "close" in raw:
+            # 未复权收盘：`free_float_mv` 之类的市值口径必须用它
+            prices["close_raw"] = raw["close"]
+            loaded.add("price:close_raw")
+    for name in sorted(price_fields - set(adjusted)):
+        prices[name] = raw[name]
 
     basics: dict[str, pd.DataFrame] = {}
-    for name in BASIC_FIELDS:
+    for name in sorted(basic_fields):
         wide = field_wide("daily_basic", name)
         if wide.empty and name in ("pe_ttm", "pb", "total_mv"):
             gaps.append(f"daily_basic.{name} 无数据（可能未下载）")
         basics[name] = wide
+        loaded.add(f"basic:{name}")
 
     flows: dict[str, pd.DataFrame] = {}
-    for name in ("net_mf_amount", "buy_lg_amount", "sell_lg_amount",
-                 "buy_elg_amount", "sell_elg_amount"):
+    for name in sorted(flow_fields):
         flows[name] = field_wide("moneyflow", name)
+        loaded.add(f"flow:{name}")
 
     limits: dict[str, pd.DataFrame] = {}
-    for name in ("up_limit", "down_limit"):
+    for name in sorted(limit_fields):
         limits[name] = field_wide("stk_limit", name)
+        loaded.add(f"limits:{name}")
 
     bak: dict[str, pd.DataFrame] = {}
-    for name in ("swing", "selling", "buying", "strength", "activity",
-                 "avg_turnover", "attack", "interval_3", "interval_6",
-                 "bak_vol_ratio", "bak_turnover"):
+    for name in sorted(bak_fields):
         bak[name] = field_wide("bak_daily", name)
+        loaded.add(f"bak:{name}")
 
     # 停牌集合（(date, code)）。走 dataset_long 而不是 dataset_frame：
     # 后者只读 CSV 分区，在 5030 天的全历史区间上光解压就要好几秒，
     # 而这两个数据集同样已经在库里了（`covers` 已经判过）。
     suspended: set[tuple[str, str]] = set()
-    suspend_long = dataset_long("suspend_d")
-    if len(suspend_long) and "code" in suspend_long.columns:
-        suspended = set(zip(suspend_long["trade_date"].astype(str),
-                            suspend_long["code"].astype(str), strict=False))
+    if needs.suspended:
+        suspend_long = dataset_long("suspend_d")
+        if len(suspend_long) and "code" in suspend_long.columns:
+            frame = suspend_long
+            if "suspend_type" in frame.columns and frame["suspend_type"].notna().any():
+                # **只把 S（停牌）算停牌**：`suspend_d` 同时含 R（复牌）记录，
+                # 按"出现在这张表里 = 停牌"会把**复牌当天也当成不能交易**。
+                # 实测这个字段曾被 `normalize` 的数字强转清成全 NaN（见
+                # `tushare_source._TEXT_COLUMNS`），所以这里必须留兜底分支：
+                # 只有确认有值时才按类型过滤，否则退回"有记录即停牌"（更保守）。
+                frame = frame[frame["suspend_type"].astype(str).str.upper() == "S"]
+            suspended = set(zip(frame["trade_date"].astype(str),
+                                frame["code"].astype(str), strict=False))
+        loaded.add("suspend_d")
 
     # 指数收益（相对强度基准）：整段读一次再按 ts_code 分组，
     # 原实现是 3 个指数 × 171 个分区 = 513 次读同一个文件。
     index_returns: dict[str, pd.Series] = {}
-    index_long = dataset_long("index_daily")
-    if len(index_long) and "ts_code" in index_long.columns:
-        index_long = index_long.copy()
-        index_long["date"] = index_long["trade_date"].astype(str)
-        for ts_code in ("000300.SH", "000001.SH", "399006.SZ"):
-            hit = index_long[index_long["ts_code"] == ts_code]
-            if len(hit):
-                index_returns[ts_code] = pd.Series(
-                    hit["close"].astype(float).to_numpy(),
-                    index=hit["date"].astype(str)).sort_index()
+    if needs.index:
+        index_long = dataset_long("index_daily")
+        if len(index_long) and "ts_code" in index_long.columns:
+            index_long = index_long.copy()
+            index_long["date"] = index_long["trade_date"].astype(str)
+            for ts_code in ("000300.SH", "000001.SH", "399006.SZ"):
+                hit = index_long[index_long["ts_code"] == ts_code]
+                if len(hit):
+                    index_returns[ts_code] = pd.Series(
+                        hit["close"].astype(float).to_numpy(),
+                        index=hit["date"].astype(str)).sort_index()
+        loaded.add("index_daily")
 
-    if fundamentals is None:
+    if fundamentals is None and needs.fundamentals:
         # 只回测一只票时也只需要那一只的财务行 —— 但财务面板本身很小（十来个报告期），
         # 且 PitPanel 的构造是全局一次性的，这里不做过滤（过滤反而会多一次拷贝）。
         fundamentals = load_fundamental_panel(root=root, universe=universe,
                                               gaps=gaps)
+        loaded.add("fina_indicator_vip")
 
     # 代码全集：优先行情，其次估值
-    if codes is not None:
+    if codes is not None and not code_filter:
         code_list = [str(code).zfill(6) for code in codes]
     else:
         code_list = []
@@ -564,9 +746,13 @@ def build_panels(
                     break
             if code_list:
                 break
+    if code_filter:
+        # 股票池过滤把列裁窄了：以**实际装进来的列**为准
+        code_list = [code for code in code_list if code in code_filter]
 
     return FactorPanels(
         dates=days, codes=code_list, prices=prices, basics=basics,
         flows=flows, limits=limits, bak=bak, fundamentals=fundamentals,
         index_returns=index_returns, suspended=suspended, gaps=gaps,
-        origins=origins)
+        origins=origins, excluded=excluded, strict=explicit_needs,
+        loaded=frozenset(loaded))

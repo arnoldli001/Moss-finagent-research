@@ -60,11 +60,15 @@ export default function SectorCrowdingRefreshBar({
 
   useEffect(() => () => stopPolling(), [stopPolling]);
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (poolOnly = true) => {
     setError("");
     setBusy(true);
     try {
-      const started = await sectorCrowdingApi.refreshAll(false);
+      // poolOnly=true（默认）：只刷**关注板块池**（清单里可见的板块，与主线挖掘同源）。
+      // 2026-09-24 用户报障："一键刷新显示 1850 个板块，可我关注的池子只有几百个" ——
+      // 全量扫（含行业/地区）既慢又与"关注"这个词不符，改成默认只刷池子，
+      // 需要行业/地区口径时用旁边的「全量刷新」。
+      const started = await sectorCrowdingApi.refreshAll(false, 0, poolOnly);
       taskRef.current = started.task_id;
       setStatus(started);
       stopPolling();
@@ -82,11 +86,20 @@ export default function SectorCrowdingRefreshBar({
   return (
     <div className="crowding-refreshbar">
       <button className="btn-ghost primary" disabled={running}
-              onClick={() => void start()}
-              title="从各板块上次更新日期的下一个交易日起增量拉取到最新交易日；
-                     首次使用会自动全量回填近 6 年（约几分钟）">
-        {running ? "刷新中…" : "一键刷新全部板块拥挤度"}
+              onClick={() => void start(true)}
+              title="只刷新**关注板块池**（清单里可见的板块，与主线挖掘同一份池子）；
+                     从各板块上次更新日期的下一个交易日起增量拉取到最新交易日，
+                     首次使用会自动回填近 6 年（约几分钟）">
+        {running ? "刷新中…" : "一键刷新关注板块池"}
       </button>
+
+      {!running && (
+        <button className="btn-ghost" onClick={() => void start(false)}
+                title="全量刷新（含行业/地区，约 1850 个板块）：数据先全量落库，
+                       以后想看行业拥挤度不必重跑 6 年。日常增量用左边那个就够">
+          全量刷新（含行业/地区）
+        </button>
+      )}
 
       {running && (
         <div className="crowding-progress" role="status" aria-live="polite">

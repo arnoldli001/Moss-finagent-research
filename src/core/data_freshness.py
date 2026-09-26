@@ -34,11 +34,26 @@ _FREQ_BY_PREFIX: list[tuple[tuple[str, ...], int, int, int]] = [
       "mkt:turnover", "mkt:margin_balance", "mkt:north_flow",
       "mkt:all_a_turnover", "mkt:chg_board", "mkt:kcb_board",
       "mkt:market_breadth", "mkt:turnover_rate:all_a", "mkt:turnover:hist",
-      "mkt:turnover_rate:hist", "ind:sw_first", "ind:sw_second",
+      "mkt:turnover_rate:hist", "mkt:cybkcb:val", "mkt:cybkcb:turnover_hist",
+      "ind:sw_first", "ind:sw_second",
       "ind:sw_third", "idx_val:", "sw_ind:",
+      # 双创板块：成交额/涨跌家数截面是盘中实时（每 5 分钟作业采），
+      # 估值/成交额日序列是日频。两类都按日频判，显式列出避免落到月频默认值。
+      "mkt:cybkcb:",
       "fed:"), 1, 7, 30),
 
     # === 月频（周期 30 天，3 个月滞后，12 个月过期）===
+    #
+    # ⚠️ `ind:` 必须**排在日频规则之后**（它确实在后面，但原因值得写下来）：
+    # 日频段里有 `ind:sw_first/sw_second/sw_third`，靠"更具体的 `ind:` 前缀"
+    # 先命中；若把裸 `ind:` 提到日频段，`ind:penetration:`（年频）等也会被
+    # 误判成日频。
+    #
+    # `mkt:cybkcb:` 必须**显式列出**（2026-09-26 修）：原来它不在任何规则里，
+    # 于是落到 `_DEFAULT_FREQ`(30,90,365) 被当成**月频** —— 而 `mkt:cybkcb:turnover:all`
+    # 是盘中每 5 分钟采的实时成交额！误判的直接后果是
+    # `_is_db_fresh()` 认为"30 天前的都算新鲜"，同时 `_DB_SKIP_PREFIXES`
+    # 又把它标成实时型，两边口径互相矛盾。
     (("CPI", "PPI", "M2", "社融", "PMI", "US_CPI", "US_CORE",
       "US_NONFARM", "US_unemp", "US_PCE", "us_fed", "ind:"),
      30, 90, 365),

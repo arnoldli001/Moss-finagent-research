@@ -205,6 +205,153 @@ def drop_snapshot(*, cache_dir: str | Path = DEFAULT_CACHE_DIR) -> bool:
         return False
 
 
+# ======================================================================
+# 单票**完整快照**的落盘热加载（重启后首屏毫秒级出图）
+# ======================================================================
+#
+# 上面那份是"自选概览"（几十条行摘要）。用户重启后真正盯的是**当前这一只票**
+# 的四面板完整快照 —— 它要跑完整取数链（分钟线/分时/日线/板块/估值/消息面），
+# 冷进程实测 QMT 在时 6.8 秒、QMT 关闭后 11.1 秒。冷启动首屏就被这一项卡住。
+#
+# 做法与自选概览同源：把每次算好的完整快照按代码落盘，重启后**第一次**请求
+# 先返回这份旧快照（带明确时间戳 + 面板上写明"重启前缓存，正在刷新"），
+# 同时后台真算一遍覆盖 —— 首屏从 11 秒降到毫秒级，新鲜度由随后的
+# WS 推送/轮询补齐。
+#
+# 与自选概览的差别（为什么不能照抄字段级校验）：
+# - 快照是**深度嵌套**结构（趋势/逐bar档位/打分卡/板块/情绪），不做字段白名单，
+#   整份 payload 原样存取；版本号变了就整份丢弃（不做迁移）。
+# - 多一道**口径指纹**：权重/阈值/档位/因子参数/自选绑定任一变化，
+#   旧快照的分数就不再是当前口径下的分数 —— 必须丢弃，否则用户会看到
+#   "改了权重但分数没变"（`configs/intraday.yaml` 是热重载的，很容易踩）。
+
+#: 单票完整快照的缓存格式版本；字段语义变化时 +1，旧文件直接丢弃。
+PAYLOAD_VERSION = 1
+
+
+@dataclass
+class PayloadLoad:
+    """单票快照热加载结果（供日志/测试断言）。"""
+
+    loaded: bool = False
+    payload: dict[str, Any] = field(default_factory=dict)
+    saved_at: float = 0.0
+    age_seconds: float = 0.0
+    trade_date: str = ""
+    fingerprint: str = ""
+    reason: str = ""
+
+
+def snapshot_payload_dir(cache_dir: str | Path = DEFAULT_CACHE_DIR) -> Path:
+    """单票快照的存放目录（一个代码一个文件，便于按代码失效/清理）。"""
+    return Path(cache_dir) / "snapshots"
+
+
+def snapshot_payload_path(code: Any,
+                          cache_dir: str | Path = DEFAULT_CACHE_DIR) -> Path:
+    return snapshot_payload_dir(cache_dir) / f"{_normalize_code(code)}.json"
+
+
+def save_snapshot_payload(
+    code: Any, payload: dict[str, Any], *,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    fingerprint: str = "", trade_date: str = "", now: float | None = None,
+) -> bool:
+    """把一只票的完整快照落盘（原子替换）。失败只记日志，绝不影响请求。"""
+    if not isinstance(payload, dict) or not payload:
+        return False
+    path = snapshot_payload_path(code, cache_dir)
+    envelope = {
+        "version": PAYLOAD_VERSION,
+        "code": _normalize_code(code),
+        "saved_at": float(now if now is not None else time.time()),
+        "trade_date": str(trade_date or ""),
+        "fingerprint": str(fingerprint or ""),
+        "payload": payload,
+    }
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(envelope, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, path)          # 原子替换：读方永远看到完整文件
+        logger.debug("单票快照已落盘：%s → %s", envelope["code"], path)
+        return True
+    except Exception as exc:  # noqa: BLE001 落盘失败绝不影响请求
+        logger.info("单票快照落盘失败（不影响服务）：%s", brief(exc, BRIEF_DEFAULT))
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+
+
+def load_snapshot_payload(
+    code: Any, *,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    fingerprint: str | None = None,
+    max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
+    now: float | None = None,
+) -> PayloadLoad:
+    """读一只票的完整快照；不可用时 `loaded=False` 并给出原因（不抛异常）。
+
+    Args:
+        fingerprint: 当前**口径指纹**。给了就必须与文件里的一致 ——
+            不一致说明权重/阈值/档位/自选绑定被改过，旧快照的分数已经
+            不是当前口径下的分数，必须丢弃（宁可多等一次真算）。
+        max_age_seconds: 超过这个时长视为不可用（默认 24 小时，与自选概览同口径）。
+    """
+    path = snapshot_payload_path(code, cache_dir)
+    current = float(now if now is not None else time.time())
+    if not path.exists():
+        return PayloadLoad(reason="没有这只票的快照缓存")
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 文件坏了就当没有
+        return PayloadLoad(reason=f"快照文件不可读：{brief(exc, BRIEF_TIGHT)}")
+
+    if not isinstance(raw, dict) or raw.get("version") != PAYLOAD_VERSION:
+        return PayloadLoad(
+            reason=f"快照版本不匹配（文件 "
+                   f"{raw.get('version') if isinstance(raw, dict) else '?'}"
+                   f" ≠ 当前 {PAYLOAD_VERSION}）")
+
+    saved_at = float(raw.get("saved_at") or 0.0)
+    age = max(0.0, current - saved_at) if saved_at else float("inf")
+    if max_age_seconds > 0 and age > max_age_seconds:
+        return PayloadLoad(
+            saved_at=saved_at, age_seconds=age,
+            reason=f"快照过旧（{age / 3600:.1f} 小时 > "
+                   f"{max_age_seconds / 3600:.1f} 小时）")
+
+    stored = str(raw.get("fingerprint") or "")
+    if fingerprint is not None and stored != str(fingerprint):
+        return PayloadLoad(
+            saved_at=saved_at, age_seconds=age, fingerprint=stored,
+            reason="打分口径已变化（权重/阈值/档位/自选绑定被改过），旧快照作废")
+
+    payload = raw.get("payload")
+    if not isinstance(payload, dict) or not payload:
+        return PayloadLoad(saved_at=saved_at, age_seconds=age,
+                           reason="快照里没有内容")
+
+    return PayloadLoad(
+        loaded=True, payload=payload, saved_at=saved_at, age_seconds=age,
+        trade_date=str(raw.get("trade_date") or ""), fingerprint=stored,
+        reason=f"已热加载 {age / 60:.1f} 分钟前的快照")
+
+
+def drop_snapshot_payload(code: Any, *,
+                          cache_dir: str | Path = DEFAULT_CACHE_DIR) -> bool:
+    """删除一只票的快照缓存（口径变化/人工清理时用）。"""
+    try:
+        snapshot_payload_path(code, cache_dir).unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def _to_plain(item: Any) -> dict[str, Any]:
     """`WatchItem`（pydantic）或 dict → 纯叶子字段 dict。"""
     if isinstance(item, dict):
@@ -215,7 +362,8 @@ def _to_plain(item: Any) -> dict[str, Any]:
         data = item.dict()
     else:
         fields = ("code", "name", "boards", "total_score", "signal_strength",
-                  "signal_kind", "price", "change_pct", "quote_ts", "pinned")
+                  "signal_kind", "price", "change_pct", "quote_ts", "pinned",
+                  "valuation_label", "valuation_bucket")
         data = {name: getattr(item, name, None) for name in fields}
     # 只留叶子类型：list[str]/str/float/bool/None
     plain: dict[str, Any] = {}
@@ -230,10 +378,17 @@ def _to_plain(item: Any) -> dict[str, Any]:
 __all__ = [
     "DEFAULT_CACHE_DIR",
     "DEFAULT_MAX_AGE_SECONDS",
+    "PAYLOAD_VERSION",
     "SNAPSHOT_VERSION",
+    "PayloadLoad",
     "SnapshotLoad",
     "drop_snapshot",
+    "drop_snapshot_payload",
     "load_snapshot",
+    "load_snapshot_payload",
     "save_snapshot",
+    "save_snapshot_payload",
     "snapshot_path",
+    "snapshot_payload_dir",
+    "snapshot_payload_path",
 ]

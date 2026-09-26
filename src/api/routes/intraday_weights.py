@@ -2,7 +2,7 @@
 
 接口一览（前缀 `/api/v1`）：
   GET    /intraday/factors                       因子目录 + 权重模板（前端权重编辑器用）
-  GET    /intraday/character?code=300308         个股股性画像 + 推荐权重/档位
+  GET    /intraday/character?code=300308         个股股性画像 + 预填权重/档位
   GET    /intraday/market-cycle                  市场情绪周期（涨停家数/炸板率/连板高度）
   GET    /intraday/weight-profiles               档案列表
   GET    /intraday/weight-profiles/{code}        单只票的档案（含当前生效口径）
@@ -177,7 +177,7 @@ async def character(
     mode: Annotated[Mode, Query()] = "intraday",
     refresh: Annotated[bool, Query(description="true=忽略进程内缓存重算")] = False,
 ) -> dict:
-    """个股股性画像：做T友好度 + 推荐权重模板 + 推荐档位。
+    """个股股性画像：做T友好度 + 预填权重模板 + 预填档位。
 
     这是「根据个股股性自定义权重」的默认值来源：
     高波动震荡票加重箱体/VWAP/布林，趋势票加重缠论/MACD，
@@ -193,7 +193,7 @@ async def character(
             status_code=502, detail=f"股性画像失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     payload = profile.to_dict()
     payload["mode"] = mode
-    # 推荐权重的模板说明（前端展示"为什么推荐这套"）
+    # 预填权重的模板说明（前端展示"为什么推荐这套"）
     chosen = get_template(profile.template, mode)
     payload["template_label"] = "" if chosen is None else chosen.label
     payload["template_description"] = "" if chosen is None else chosen.description
@@ -214,7 +214,7 @@ async def market_cycle(request: Request,
     payload = cycle.to_dict()
     payload["verdict"] = (
         f"周期阶段「{cycle.stage}」，做T环境温度 {cycle.temperature}/100，"
-        + ("允许做T" if cycle.t_allowed else "禁止低吸做T（退潮/冰点）")
+        + ("允许做T" if cycle.t_allowed else "禁止回踩区间提示（退潮/冰点）")
         if cycle.available else (cycle.gap or "不可用"))
     return payload
 
@@ -232,7 +232,7 @@ class PreviewRequest(BaseModel):
     levels: dict[str, float] = Field(default_factory=dict)
     # 「改动前」那一列的价格线：前端把**面板上此刻**的档位传回来。
     #
-    # 为什么不让服务端自己再算一遍基准：预览本身要 1~3 秒，而低吸/高抛/止损是
+    # 为什么不让服务端自己再算一遍基准：预览本身要 1~3 秒，而回踩/冲高/止损是
     # 时刻量（随 VWAP/布林每分钟重算）。服务端自己再取一次，前后两次的 VWAP 会差
     # 0.1% 量级，于是在"变动"列里凭空冒出一行 `VWAP −0.93（−0.10%）` ——
     # 用户会以为调某个参数动到了 VWAP，而那根本不是他改出来的。
@@ -258,7 +258,7 @@ class ProfileRequest(BaseModel):
     daily_weights: dict[str, float] | None = None
     thresholds: dict[str, float] | None = None
     levels: dict[str, float] | None = Field(
-        default=None, description="低吸/高抛/止损档位覆盖")
+        default=None, description="回踩/冲高/止损档位覆盖")
     daily_thresholds: dict[str, float] | None = None
     template: str | None = None
     source: str | None = Field(
@@ -276,7 +276,7 @@ def _baseline_levels(
 ) -> Any:
     """把前端回传的「面板此刻档位」拼成对照用的基准 LevelSet。
 
-    只取四个价格字段（低吸/高抛/止损/VWAP）：它们是用户眼睛看到的、也是"变动"
+    只取四个价格字段（回踩/冲高/止损/VWAP）：它们是用户眼睛看到的、也是"变动"
     这一列需要比较的量。基准的来源说明沿用**该票当前生效口径**的标注
     （即用 `baseline` 那一份的参数去 annotate 同一批价格），因此"由谁决定"
     这一列讲的仍是"改动前这条线是怎么来的"，不会张冠李戴。
@@ -299,7 +299,7 @@ async def level_fit(
     code: Annotated[str, Query(description="6位证券代码")] = "300308",
     refresh: Annotated[bool, Query(description="true=忽略缓存重新拟合")] = False,
 ) -> dict:
-    """关键价位**神经网络拟合**：用 7 个客观维度拟合低吸/高抛/止损三条线。
+    """关键价位**神经网络拟合**：用 7 个客观维度拟合回踩/冲高/止损三条线。
 
     返回三个必须一起看的东西（少一个都会误导）：
 
@@ -308,7 +308,7 @@ async def level_fit(
       3. `metrics.gate_passed` —— 是否允许启用拟合档位（不达标就回退规则口径）。
 
     拟合口径与「成功」的定义见 `src/intraday/level_fit.py` 模块 docstring：
-    触及低吸后、在 H 根 bar 内**先**到高抛且不破止损 = 成功；只统计"触及过"的样本。
+    触及回踩后、在 H 根 bar 内**先**到冲高且不破止损 = 成功；只统计"触及过"的样本。
     """
     service = _service(request)
     target = _validate_code(code)
@@ -322,7 +322,22 @@ async def level_fit(
     try:
         bars, bars_source, _attempts = await service.data_provider.fetch_bars(
             target, days=service._intraday_days)  # noqa: SLF001
-        quote = await service.data_provider.fetch_quote(target)
+        # ⚠️ `IntradayDataProvider.fetch_quote` 返回的是 **3 元组**
+        #    `(Quote, 源名, 尝试记录)`（多源容灾链），**不是 Quote 本身** ——
+        #    和上面那行 `fetch_bars` 一样要解包。
+        #
+        #    这里原来漏了解包，直接把元组当 Quote 往下传，于是
+        #    `service._fit_levels_sync` 里的 `quote.price` 抛
+        #    `AttributeError: 'tuple' object has no attribute 'price'`；
+        #    而 `level_fit` 把这个异常吞成 `None` → 本路由报 503
+        #    「档位拟合结果不可用」（2026-09-23 用户实测「重新拟合」必现）。
+        #
+        #    为什么只有 `refresh=true` 会犯：`refresh=false` 时 `level_fit`
+        #    会**先命中当日缓存**直接返回，根本走不到那个同步拟合函数 ——
+        #    缓存是快照路径用**正确解包过的** Quote 写进去的。
+        #    所以「不点重新拟合就正常、一点就 503」正是这个漏解包的指纹。
+        quote, _quote_source, _quote_attempts = \
+            await service.data_provider.fetch_quote(target)
         daily = await service._fetch_daily_bars(target)  # noqa: SLF001
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
@@ -357,7 +372,7 @@ async def level_fit(
         "round_trip_cost_pct": config.factors.level_fit.round_trip_cost_pct,
     }
     payload["notice"] = (
-        f"拟合线：低吸 −{_mix_pct(fit, 'low'):.2f}% / 高抛 +{_mix_pct(fit, 'high'):.2f}% "
+        f"拟合线：回踩 −{_mix_pct(fit, 'low'):.2f}% / 冲高 +{_mix_pct(fit, 'high'):.2f}% "
         f"/ 止损 −{_mix_pct(fit, 'stop'):.2f}%（相对当日均价）"
         if fit.metrics.available else f"拟合不可用：{fit.metrics.reason}")
     return payload
@@ -504,13 +519,13 @@ async def save_profile(code: str, body: ProfileRequest, request: Request) -> dic
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502,
-                detail=("取股性画像失败（无法按股性推荐）："
+                detail=("取股性画像失败（无法按股性预填）："
                         + brief(exc, BRIEF_DEFAULT)),
             ) from exc
         if not character.available:
             raise HTTPException(
                 status_code=400,
-                detail=f"该票股性画像不可用，无法按股性推荐权重：{character.gap}")
+                detail=f"该票股性画像不可用，无法按股性预填权重：{character.gap}")
         if "weights" not in provided:
             weights = dict(character.weights)
             provided = provided | {"weights"}
@@ -675,7 +690,7 @@ async def preview(body: PreviewRequest, request: Request) -> dict:
                                "hint": scoped.daily_thresholds.hint},
                 "levels": {},
                 "level_set": None,
-                # 日K模式没有「低吸档位」这套线（止损/保护线由量价体系自算），
+                # 日K模式没有「回踩档位」这套线（止损/保护线由量价体系自算），
                 # 只给权重影响度，别硬套分时的解释。
                 "impact": build_trigger_impact(
                     scorecard=card, levels=None, config=scoped).model_dump(),

@@ -51,25 +51,40 @@ TIER_ORDER: tuple[str, ...] = ("admin", "vip", "trial")
 #: ★ key 必须与前端页签一一对应，否则"配了权限但页面还是进得去"。
 #: 子功能（竞价选股/量化选股/辅助做T）是**量化交易**页内的模块，
 #: 单独列出来是因为它们可以分别售卖。
+#:
+#: ## ⚠️ 这里**只放可售卖的项**，运维面能力一律不放
+#:
+#: 用户口径（2026-09-25）：
+#:
+#:   "功能权限 里，默认只有管理员有运行指标、调度管理的权限，
+#:    不用加在功能权限设置的选项里"
+#:   "可以不删除，但是不用显示或者写死默认管理员有这两个权限，
+#:    其他用户都没这个权限且不可选择。"
+#:
+#: 所以 `scheduler`（调度管理）与 `metrics`（运行指标）**不在本表**：
+#: 它们不进权限矩阵、不可勾选，由 `my_features.ADMIN_ONLY_VIEWS`
+#: **写死**给管理员、其他人一律没有（那是规则层，不是可改的默认值）。
+#: `configs/platform_tiers.json` 里仍留着这两个键 —— 按用户口径
+#: **不删**（删了反而要在多处补"为什么没有"），但它们已不被任何判据读取。
 FEATURES: dict[str, str] = {
     "research": "投研分析",
-    "scheduler": "调度管理",
-    "metrics": "运行指标",
     "backtest": "策略回测",
     "mainline": "主线挖掘",
     "fundflow": "资金流监控",
     "quant.auction": "量化交易 · 竞价选股",
     "quant.select": "量化交易 · 量化选股",
     "quant.intraday": "量化交易 · 辅助做T",
-    # ── 舆情情报（2026-09-25 新增）──
-    # 命名沿用既有分组惯例（`quant.*`），且**刻意拆成三项**：
-    # 情报雷达是核心卖点（试用要能体验），告警是执行抓手（试用只读）。
+    # ── 舆情情报 ──
+    # `intel.hot` 一个售卖项对应**两个**顶级页签
+    # （「热点&研报小作文」与「投资日历」）—— 它们共用同一份公开信息，
+    # 只是两种看法（"现在在说什么" vs "接下来会发生什么"），
+    # 拆成两个售卖项只会让矩阵变长而没有区分度。
     #
     # ⚠️ 改这里之后**必须同步** `src/api/routes/my_features.py` 的
-    # `VIEW_FEATURE`，否则出现"矩阵里能勾、用户侧看不到页签"的静默故障
-    # —— 有单测断言两者是包含关系。
-    "intel.radar": "舆情情报 · 情报雷达",
-    "intel.brief": "舆情情报 · 盘前简报",
+    # `VIEW_FEATURE` **以及** `src/api/routes/intel.py` 的 `FEATURE_*` 常量，
+    # 否则出现"矩阵里能勾、用户侧 403"或"配了权限但页面进不去"的静默故障。
+    # 有单测断言这几处是包含关系。
+    "intel.hot": "舆情情报 · 热点&研报小作文",
     "intel.alerts": "舆情情报 · 事件告警中心",
 }
 
@@ -115,27 +130,34 @@ class TierPlan:
 
 
 def _default_config() -> dict[str, Any]:
-    """出厂默认套餐（与设计 §4.6 的口径一致）。"""
+    """出厂默认套餐（与设计 §4.6 的口径一致）。
+
+    ## ⚠️ 这里只覆盖 `FEATURES`（可售卖项），不含管理员专属项
+
+    `scheduler` / `metrics` **不在**本函数产出的 features 里 ——
+    它们已从 `FEATURES` 移出（管理员专属，不进权限矩阵）。
+    `tests/unit/test_platform_config.py::test_defaults_cover_all_tiers_and_features`
+    断言"每档的 features 键集合恰好等于 FEATURES"，所以这里多写一个键
+    就会失败 —— 那条断言正是防止"出厂默认与售卖口径漂移"的。
+    """
     all_features = dict.fromkeys(FEATURES, True)
     # 试用：只给"看"的能力，不给重资源功能
     trial_features = dict.fromkeys(FEATURES, False)
     trial_features.update({
-        "research": True, "intraday_placeholder": False,
+        "research": True,
         "quant.intraday": True,   # 做T是核心卖点，试用必须能体验
         "quant.auction": False,   # 竞价选股最贵，试用不开
         "quant.select": False,
         "backtest": False,        # 回测吃 CPU，试用不放
-        # 舆情情报：雷达与盘前简报是**每日价值锚点**，试用要能体验；
-        # 告警是**执行抓手**（不是展示品），试用只读 —— 不给自己配置告警的能力。
-        "intel.radar": True,
-        "intel.brief": True,
+        # 舆情情报：`intel.hot`（热点&研报小作文 + 投资日历）是**每日价值锚点**，
+        # 试用要能体验；告警是**执行抓手**（不是展示品），试用只读 ——
+        # 不给自己配置告警的能力。
+        "intel.hot": True,
         "intel.alerts": False,
     })
-    trial_features.pop("intraday_placeholder", None)
 
     vip_features = dict.fromkeys(FEATURES, True)
     vip_features["quant.auction"] = False   # 竞价选股按项加购
-    # 舆情情报三项 VIP 全开（用户口径 2026-09-25：不单列加购项）
 
     return {
         "version": 1,

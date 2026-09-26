@@ -241,6 +241,76 @@ async def test_expired_or_revoked_session_is_invalid(
     assert (await repo.a_get_session("s3")).is_valid() is False
 
 
+async def test_online_count_is_consistent_with_per_user_validity(
+    repo: AuthSqliteRepository,
+) -> None:
+    """★★ 管理台"在线设备"列的 SQL 口径必须与 `is_valid()` **逐条一致**。
+
+    ## 这条测试的由来（实测缺口）
+
+    用户管理里管理员账号显示「在线 3」，而一个账号当时只有 1 个会话真正有效。
+    原因是**两份判据分叉**了：
+
+        count_active_sessions_by_user()  → revoked_at IS NULL
+                                           AND absolute_expires_at > now
+        SessionRecord.is_valid()         → 未撤销 AND 未过滑动窗口
+                                           AND 未过绝对上限
+
+    批量统计**漏了 `idle_expires_at`**，于是滑动窗口（30 分钟）早过、
+    12 小时绝对上限还没到的旧会话也被算成"在线"。实测 pilot 库里那个账号
+    4 条未撤销会话里 3 条已过滑动窗口（最久的一条 `last_seen_at` 在 2.8 小时前）。
+
+    这正是 `login_gate` 文档里那句"两份实现一定会分叉"。所以这里用四种
+    会话形态把两条路径钉在一起：
+      ① 完全有效            ② 滑动窗口已过（本次的 bug）
+      ③ 绝对上限已过        ④ 已撤销
+    任何一侧再被改动，这条测试就会红。
+    """
+    # ① 有效：滑动 30 分钟 + 绝对 12 小时
+    await repo.a_create_session(
+        session_id="ok", user_id="u1", tenant_id="vip", access_jti="j1",
+        refresh_hash="rh", idle_seconds=1800, absolute_seconds=43200)
+    # ② 滑动窗口已过、绝对上限未到 —— **就是那个 bug 的多算项**
+    await repo.a_create_session(
+        session_id="idle_gone", user_id="u1", tenant_id="vip",
+        access_jti="j2", refresh_hash="rh",
+        idle_seconds=-60, absolute_seconds=43200)
+    # ③ 绝对上限已过
+    await repo.a_create_session(
+        session_id="abs_gone", user_id="u1", tenant_id="vip",
+        access_jti="j3", refresh_hash="rh",
+        idle_seconds=1800, absolute_seconds=-60)
+    # ④ 已撤销（但两个过期点都还在未来）
+    await repo.a_create_session(
+        session_id="revoked", user_id="u1", tenant_id="vip",
+        access_jti="j4", refresh_hash="rh",
+        idle_seconds=1800, absolute_seconds=43200)
+    await repo.a_revoke_session("revoked", "logout")
+    # 另一个用户：只有一条有效会话
+    await repo.a_create_session(
+        session_id="u2ok", user_id="u2", tenant_id="trial",
+        access_jti="j5", refresh_hash="rh",
+        idle_seconds=1800, absolute_seconds=43200)
+
+    counts = repo.count_active_sessions_by_user()
+    assert counts.get("u1", 0) == 1, (
+        f"u1 只有 1 条真正有效（其余滑动/绝对已过或已撤销），实际 {counts}")
+    assert counts.get("u2", 0) == 1
+
+    # 与**逐用户**的权威口径（`is_valid()`）逐条对齐
+    for user_id in ("u1", "u2"):
+        assert counts.get(user_id, 0) == repo.count_active_sessions(user_id), \
+            f"{user_id} 的批量统计与 is_valid() 口径分叉了"
+    # 明细里必须能看到那几条"未撤销但已失效"的（界面要把它们列出来）。
+    # `list_sessions` 只排除**已撤销**的 → 3 条（有效、滑动过期、绝对过期），
+    # 其中只有 1 条 `is_valid()`。
+    detail = repo.list_sessions("u1")
+    assert len(detail) == 3, "已撤销的不该出现在设备列表里"
+    assert sum(1 for s in detail if s.is_valid()) == 1
+    assert "idle_gone" in {s.session_id for s in detail}, \
+        "滑动窗口已过期的会话仍在列表里（界面要如实标成「已失效」）"
+
+
 # ======================================================================
 # 仓储：验证码一次性 + 尝试次数（防暴力枚举 6 位码）
 # ======================================================================

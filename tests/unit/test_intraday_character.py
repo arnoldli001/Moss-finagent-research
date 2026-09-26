@@ -135,7 +135,9 @@ def test_notes_explain_the_recommendation_in_chinese() -> None:
     profile = analyze_character(_bars(_swing_series()), code="600036")
     assert profile.notes
     joined = "；".join(profile.notes)
-    assert "趋势效率" in joined and "推荐权重配方" in joined
+    # 文案口径已按合规整改改成「预填权重配方」（原文案含"推荐"，
+    # 属投资建议式措辞 —— 见 docs 的合规批次记录），断言跟着改。
+    assert "趋势效率" in joined and "预填权重配方" in joined
     assert "ATR" in joined
 
 
@@ -210,7 +212,7 @@ def test_mode_daily_recommends_daily_weights_and_no_levels() -> None:
     assert set(profile.weights) == {"trend", "chan_daily", "volume", "position",
                                     "signal_rule", "cycle", "character"}
     assert abs(sum(profile.weights.values()) - 100.0) < 1e-6
-    # 日线模式没有「低吸/高抛档位」概念，不应返回 levels
+    # 日线模式没有「回踩/冲高档位」概念，不应返回 levels
     assert profile.levels == {}
 
 

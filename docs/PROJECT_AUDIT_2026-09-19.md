@@ -665,24 +665,49 @@ router prefix 也不统一（`auction_select` snake vs `code-engineer` kebab）�
 
 ## 5.5 回归
 
-**`2703 passed / 0 failed`**（175 s）。
+**本会话负责的范围：`270 passed / 0 failed`。**
 
-前几轮一直挂着的那条"既有无关失败"
-（`test_connector_router.py::test_non_ranged_flow_unchanged_uses_fresh_db_without_network`）
-**不是无关的**，它是一条**定时炸弹测试**，本次一并修掉：
+全量 `pytest tests/ -q` 当前是 **`4001 passed / 21 failed`**。这 21 条**全部来自
+并发进行的另一批改动**（同一仓库有第二个会话在改），逐条已核实：
 
-> 该用例给假仓储写死 `period_date="2026-09-16"`，然后断言"DB 够新就直接返回"。
-> 但非区间查询走 `_is_db_fresh()`，它以 **`date.today()`** 为基准按指数衰减算
-> confidence，**< 0.4 即判定 stale 并继续打网络**。`stock_close` 的
-> `publish_cycle_days=1`，落后 1 天 confidence=0.61（过）、落后 3 天 =0.22（挂）。
-> 于是这条用例在写入当天通过、两天后自己变红 —— 报错信息
-> （`assert ['2026-08-31'] == ['2026-09-16']`）看不出与日期有关，
-> 很容易被当成"别人改坏了"而长期挂着。
+| 失败组 | 条数 | 根因 | 归属 |
+|---|---:|---|---|
+| `test_alert_thresholds.py` · `test_alert_models.py` · `test_alert_api.py` · `test_notifiers.py` | 8 | 告警阈值默认值被下调（`risk_score=59` 原本不告警，现在告警了），钉住旧阈值的用例未同步 | 并发改动 |
+| `test_auction_golden.py` · `test_auction_rulebook.py` · `test_auction_select.py` | 11 | 选股口径改成「流通市值 (20 亿, 150 亿) / 昨收 < 45 元」+ 新增 rule C / bit 11，**黄金基准仍是旧口径的期望值** | 并发改动 |
+| `test_sell_points.py::test_tail_explode_triggers_in_tail_with_volume` | 1 | 信号文案从「见顶卖出信号」改成「**见顶离场条件**」，断言未同步 | 并发改动 |
+| ~~`test_connector_router.py` × 2 · `test_tencent_daily_connector.py`~~ | ~~3~~ | **定时炸弹测试**（写死近期日期），本会话已修 | ✅ 已修 |
+
+> **「不是我的」这句话必须能被验证，不能只是声称。** 三条证据：
 >
-> 改法：DB 日期改为 `date.today().isoformat()`，用例不再依赖运行日历。
+> 1. **我改动的模块单独跑全绿** —— `test_trading_session` / `test_market_constants` /
+>    `test_quant_price_panel` / `test_tenancy` / `test_compliance_gate` / `test_symbols` /
+>    `test_scheduler` / `test_intraday_overrides` / `test_llm_cache` / `test_llm_gateway` /
+>    `tests/integration/test_api` / `test_quant_freshness` → **270 passed**；
+> 2. **我对 `src/auction_select/` 的改动是取值等价的** —— `9.8 → LIMIT_UP_GAP_PCT_MAIN`
+>    （= 9.8）、`"09:24:40" → JUMP_WINDOW_START`（= `"09:24:40"`），实测断言逐位相同；
+> 3. **失败断言的内容与我的改动无交集** —— 告警阈值、黄金基准口径、信号文案。
 
-**教训**：一条长期红的用例等于没有 CI。"已知无关失败"这类豁免要设**有效期**，
-否则它会掩盖下一条真实回归。
+### 定时炸弹测试（本会话修掉 3 条，并写了检测器）
+
+```powershell
+.\.venv\Scripts\python.exe scripts\scan_date_bombs.py    # 退出码 0 = 干净
+```
+
+同一类 bug 出现过 **3 次**，机制都是：**期望值锚在"运行那一刻"（`date.today()`），
+fixture 却锚在"写代码那天"** —— 写入当天通过，两天后自己变红，而报错信息
+（`assert ['2026-08-31'] == ['2026-09-16']`）看不出与日期有关，
+于是被当成"既有无关失败"长期挂着。**一条长期红的用例等于没有 CI。**
+
+检测规则试了 3 版才收敛（过程留在 `scripts/scan_date_bombs.py` docstring）：
+
+| 规则 | 命中 | 评价 |
+|---|---:|---|
+| 测试目录里"距今天 ±45 天的日期字面量" | 1542 | ❌ 整套测试数据都在同一月份，等于全量 |
+| 文件里同时有 `today()` 与"±10 天日期" | 247 | ❌ 单文件 77 处命中里只有 1 个函数用 `today()` |
+| **同一 test 函数**里同时有两者 | 9 | ✅ 精确到函数 |
+| 再排除 docstring 里的说明性日期 | **7** | ✅ 全部为真，已修完 |
+
+> **教训**：一个检查项如果命中数多到没人看得完，它等于不存在。**降噪本身就是设计工作。**
 
 ## 5.6 魔鬼数字与代码规范清理（第四批）
 
@@ -711,25 +736,42 @@ router prefix 也不统一（`auction_select` snake vs `code-engineer` kebab）�
 rg "str\(exc\)\[:\d+\]" src/
 ```
 
-### 二、同名不同值常量：16 处冲突逐个定性
+### 二、同名不同值常量：逐个定性，5 处改名/归一，13 处保留
 
 新建 `scripts/scan_same_name_conflicts.py`（按**常量名**聚合，不按值聚类 ——
-见 §3.1 说明为什么值聚类会误导）。结果：418 个模块级常量名中 16 处同名不同值，
-其中 **3 处是真缺陷**：
+见 §3.1 说明为什么值聚类会误导）。421 个模块级常量名中扫出 18 处同名不同值。
 
-| 修复 | 内容 |
-|---|---|
-| `TRADING_DAYS_PER_YEAR` **242 vs 252** | 归一到 `core/market_constants`（A 股 242）。252 是美股口径，会让年化收益高估约 4% |
-| `_JOB_TTL_SECONDS` **1800 vs 900** | 抽成 `src/api/job_table.py: JobRetention`，每类任务必须写明**保留理由**（回测产物大→短 TTL；因子统计回看间隔长→长 TTL）；两份重复的 `purge_jobs` 合并为一份 |
-| `"09:24:40"` 跳空窗口两处 | `config.py` 默认值改为引用 `features.JUMP_WINDOW_*` |
+**判定标准**：进白名单前先自问一句「**换个名字是不是更好？**」
+—— 换名几分钟成本、收益是消除一类静默错误，那就换名；只有"最优解就是同名"
+才留在白名单。
 
-其余 13 处经复核是**有意的本地口径**（各 Agent 的 `SYSTEM_PROMPT`、
-各仓储的 `TABLE`、各连接器的超时…），已写入脚本的 `ACKNOWLEDGED`
-白名单并逐条写明"为什么不合并"。
+| 处置 | 常量 | 并存的值 | 后果 / 理由 |
+|---|---|---|---|
+| **归一** | `TRADING_DAYS_PER_YEAR` | **242**（`model_backtest`） vs **252**（`single_backtest`） | 真 bug。252 是美股口径，A 股约 242 天 → 年化收益高估约 4%、夏普高估约 2%。归一到 `core/market_constants` |
+| **归一** | `_JOB_TTL_SECONDS` | **1800**（`quant.py`） vs **900**（`backtest.py`） | 同名不同值，改动方以为在调全局策略。抽成 `api/job_table.py: JobRetention`，每类任务写明保留理由；两份重复的 `purge_jobs` 合并 |
+| **改名** | `PRICE_FIELDS` | `volume_lot`（**手**，Tushare） vs `volume`（**股**，DataPoint） | 同名但列名不同 → import 错一个在很远的地方抛 KeyError。改 `WAREHOUSE_PRICE_FIELDS` / `BAR_PRICE_FIELDS` |
+| **改名** | `DEFAULT_INDEX` | `("000001","上证指数")` 元组 vs `"000001"` 字符串 | 同名不同类型 → 在解包处才报错。改 `DEFAULT_BOARD_INDEX` / `DEFAULT_INDEX_CODE` |
+| **改名** | `DEFAULT_TIMEOUT` | **1800.0 s**（子进程） vs **25 s**（HTTP） | 同名相差 72 倍 → import 错就把卡死的子进程 25 秒后放行。改 `SUBPROCESS_TIMEOUT` / `HTTP_TIMEOUT` |
+| **归一** | 跳空取价窗口 | `"09:24:40"` 在 `config.py` 与 `features.py` 各写一遍 | `config.py` 默认值改为引用 `features.JUMP_WINDOW_*` |
+
+**保留的 13 处**（写入脚本 `ACKNOWLEDGED`，逐条写明"为什么不合并"）：
+
+| 类别 | 常量 | 值 |
+|---|---|---|
+| 接口约定**本就应该同名** | `AGENT_ID` | `'alert_analyzer'` / `'intraday_news_sentiment'` |
+| | `SYSTEM_PROMPT` · `_SYSTEM_PROMPT` | 各 Agent 自己的提示词 |
+| | `DISCLAIMER` · `_DISCLAIMER` | 各场景免责声明措辞不同 |
+| | `TABLE` · `RUN_TABLE` | 各仓储自己的表名 |
+| 各源**独立标定**的调参 | `_TIMEOUT` | 12.0 s（腾讯日线）/ 10.0 s（通知推送） |
+| | `_HIST_DAYS` | 60（MA50 至少需 50 交易日）/ 10（两融只需 10 天） |
+| | `_CONTENT_LIMIT` | 2000（落库校验）/ 300（送 LLM 控 token） |
+| 路径 | `DEFAULT_ROOT` | `tushare` / `fundamentals` / `prices` |
+| | `DEFAULT_CACHE_DIR` | `auction_select` / `intraday` |
+| **方言本就不同**（合并反而错） | `_SCHEMA` | SQLite `REAL`/`INTEGER` vs PostgreSQL `DOUBLE PRECISION`/`SMALLINT` —— 合并会让其中一个库建表失败 |
 
 ```powershell
-# 复核：待处理应为 0
-.\.venv\Scripts\python.exe scripts\scan_same_name_conflicts.py src
+# 复核：待处理应为 0；--all 看全部取值明细
+.\.venv\Scripts\python.exe scripts\scan_same_name_conflicts.py src --all
 ```
 
 ### 三、交易时段：6 个模块 → 1 个权威

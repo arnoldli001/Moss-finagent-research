@@ -352,7 +352,7 @@ function DailyCandleChart({
         })}
 
         {/* 买卖信号标记（最近 30 个交易日因果回放）：
-            买点画在K线下方（红▲），卖点/风控画在上方（绿▼/橙▼）。
+            多方触发画在K线下方（红▲），空方触发/风控画在上方（绿▼/橙▼）。
             与分时图的三角标记同一套视觉语言，一眼能分辨方向。 */}
         {markers.map((mark) => {
           const index = indexByDate.get(mark.date);
@@ -370,13 +370,13 @@ function DailyCandleChart({
           const path = isBuy
             ? `M${cx},${base - 9} L${cx - 5},${base + 1} L${cx + 5},${base + 1} Z`
             : `M${cx},${base + 9} L${cx - 5},${base - 1} L${cx + 5},${base - 1} Z`;
-          const label = `${mark.date} ${isBuy ? "买点" : mark.side === "risk" ? "风控" : "卖点"} `
+          const label = `${mark.date} ${isBuy ? "多方触发" : mark.side === "risk" ? "风控" : "空方触发"} `
             + `${mark.code} ${mark.name}`.trim()
-            + (mark.entry !== null ? `｜建议买点 ${mark.entry.toFixed(2)}` : "")
+            + (mark.entry !== null ? `｜触发价 ${mark.entry.toFixed(2)}` : "")
             + (mark.stop_loss !== null ? `｜止损 ${mark.stop_loss.toFixed(2)}` : "")
             + (mark.price !== null ? `｜当日收盘 ${mark.price.toFixed(2)}` : "");
-          // 标记旁直接给**可操作价位**：买点给建议买价（没有则给当日收盘），
-          // 卖点/风控给止损位。只画 B8 这种编号用户还得去下面表格里找价。
+          // 标记旁直接给**可操作价位**：多方触发给触发价（没有则给当日收盘），
+          // 空方触发/风控给止损位。只画 B8 这种编号用户还得去下面表格里找价。
           const priceText = isBuy
             ? (mark.entry ?? mark.price)
             : (mark.stop_loss ?? mark.price);
@@ -455,10 +455,10 @@ function DailyCandleChart({
             <span className="legend" style={{ color: "var(--high)" }}>
               ┄ 绿点线=止损保护
             </span>
-            <span className="legend" style={{ color: "var(--low)" }}>▲ 买点</span>
-            <span className="legend" style={{ color: "var(--high)" }}>▼ 卖点</span>
+            <span className="legend" style={{ color: "var(--low)" }}>▲ 多方触发</span>
+            <span className="legend" style={{ color: "var(--high)" }}>▼ 空方触发</span>
             <span className="legend" style={{ color: "var(--medium)" }}>▼ 风控</span>
-            <span className="legend muted-text">标记旁数字=建议买价/止损位</span>
+            <span className="legend muted-text">标记旁数字=触发价/止损位</span>
           </>
         )}
       </div>

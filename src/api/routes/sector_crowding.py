@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -21,7 +23,7 @@ from src.core.errors import (
     BRIEF_DEFAULT,
     brief,
 )
-from src.sector_crowding import db, refresh
+from src.sector_crowding import db, metrics, refresh
 from src.sector_crowding.config import load_config
 
 logger = logging.getLogger(__name__)
@@ -43,9 +45,15 @@ def _ensure_tables() -> None:
 # ================================================================
 
 class RefreshRequest(BaseModel):
+    pool_only: bool = Field(
+        default=True,
+        description=("只刷**关注板块池**（`sector_crowding_list` 里可见的板块，"
+                     "也就是主线挖掘复用的那份池子）。默认 True —— "
+                     "2026-09-24 用户口径：一键刷新不该扫全市场 1850 个板块。"
+                     "False = 全量（含行业/地区，约 1850 个），想看行业拥挤度时用"))
     concepts_only: bool = Field(
         default=False,
-        description="只刷概念板块（默认 False=全刷；数据先全量落库，告警再按概念过滤）")
+        description="在池子之上再过滤：只保留概念板块（默认 False=池内全部）")
     max_sectors: int = Field(
         default=0, ge=0, le=5000,
         description="限制刷新板块数（0=全部；调试用）")
@@ -53,11 +61,17 @@ class RefreshRequest(BaseModel):
 
 @router.post("/refresh_all")
 async def refresh_all(request: Request, body: RefreshRequest | None = None) -> dict:
-    """一键刷新全部板块拥挤度（立即返回 task_id，后台执行）。"""
+    """一键刷新拥挤度（立即返回 task_id，后台执行）。
+
+    默认只刷**关注板块池**：`sector_crowding_list` 里可见的板块（当前约 554 个），
+    与主线挖掘的板块池同源。需要行业/地区口径时显式传 `pool_only=false`。
+    """
     _ensure_tables()
+    _invalidate_max_cache()
     payload = body or RefreshRequest()
     outcome = refresh.start_refresh_all(
-        concepts_only=payload.concepts_only, max_sectors=payload.max_sectors)
+        concepts_only=payload.concepts_only, max_sectors=payload.max_sectors,
+        pool_only=payload.pool_only)
     return {"ok": True, **outcome}
 
 
@@ -76,6 +90,7 @@ async def recompute() -> dict:
     而不必重新抓一遍 2517 个板块（约十分钟）。
     """
     _ensure_tables()
+    _invalidate_max_cache()
     outcome = await asyncio.to_thread(refresh.recompute_stored_water_levels)
     return {"ok": True, **outcome}
 
@@ -84,17 +99,93 @@ async def recompute() -> dict:
 # 查询
 # ================================================================
 
+#: "近 6 年最高平滑拥挤度"按板块一次 GROUP BY 要扫 217 万行（实测 1.7s），
+#: 不能每个请求都算。清单/告警面板整表渲染要用它，所以在进程内缓存；
+#: 数据只可能被刷新/重算改动，那两处会主动清掉它（见 `_invalidate_max_cache`）。
+_MAX_MA5_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
+_MAX_MA5_TTL = 300.0
+
+
+def _invalidate_max_cache() -> None:
+    _MAX_MA5_CACHE["at"] = 0.0
+    _MAX_MA5_CACHE["map"] = {}
+
+
+def _cached_max_ma5(conn) -> dict[str, float]:
+    now = time.monotonic()
+    if _MAX_MA5_CACHE["map"] and now - float(_MAX_MA5_CACHE["at"]) < _MAX_MA5_TTL:
+        return _MAX_MA5_CACHE["map"]  # type: ignore[return-value]
+    mapping = db.max_ma5_map(conn)
+    _MAX_MA5_CACHE["at"] = now
+    _MAX_MA5_CACHE["map"] = mapping
+    return mapping
+
+
+@router.get("/sectors_max_ma5")
+async def sectors_max_ma5() -> dict:
+    """各板块历史最高平滑拥挤度（面板"近6年最高"列）。
+
+    单独一个接口 + 进程内缓存：这个值是**全历史聚合**，跟"最新交易日"无关，
+    每次读清单都重算 1.7s 不划算。刷新/重算完成后缓存会被清掉。
+    """
+    _ensure_tables()
+    conn = _conn()
+    try:
+        mapping = _cached_max_ma5(conn)
+        return {"count": len(mapping), "cached_at": _MAX_MA5_CACHE["at"],
+                "max_ma5": mapping}
+    finally:
+        conn.close()
+
+
+@router.post("/metrics/compute")
+async def metrics_compute(
+    force: bool = Query(
+        default=False,
+        description="同一周已算过时是否强制重算（默认 False=跳过，避免每天白跑）"),
+) -> dict:
+    """立即重算周频异动指标（立即返回 task_id，后台线程执行）。
+
+    正常节奏由调度器每周自动跑一次（`crowding_metrics_weekly`）；这个接口是
+    给"刚刷完拥挤度、想立刻看到 4 列"用的。一轮约 3~5 分钟（要按板块抓成分股），
+    所以同样走"后台任务 + 进度轮询"，不要同步等。
+    """
+    _ensure_tables()
+    outcome = metrics.start_metric_compute(force=bool(force))
+    return {"ok": True, **outcome}
+
+
+@router.get("/metrics/status")
+async def metrics_status(task_id: str = Query(default="")) -> dict:
+    """周频指标的计算进度 / 最近一次结果。"""
+    _ensure_tables()
+    return metrics.get_metric_progress(task_id)
+
+
+@router.get("/metrics/summary")
+async def metrics_summary() -> dict:
+    """周频指标的元信息：最新周、各基准日、4 列各自的覆盖板块数。"""
+    _ensure_tables()
+    return metrics.metrics_summary()
+
+
 @router.get("/latest")
 async def latest(
     concepts_only: bool = Query(default=False),
     trade_date: str = Query(default=""),
+    use_list: bool = Query(
+        default=False,
+        description="只返回持久化清单里**可见**的板块（散点总览用；未配置过时=全部）"),
 ) -> dict:
     """全板块最新交易日的水位（散点总览）。"""
     _ensure_tables()
     conn = _conn()
     try:
+        codes = db.list_visible_codes(conn, concepts_only=concepts_only) \
+            if use_list else None
         rows = db.query_all_latest_water_level(
-            conn, concepts_only=concepts_only, trade_date=trade_date)
+            conn, concepts_only=concepts_only, trade_date=trade_date,
+            sector_codes=codes)
         return {
             "trade_date": db.latest_trade_date(conn),
             "count": len(rows),
@@ -112,23 +203,457 @@ async def alerts(
                              description="水位阈值（0=用配置默认 0.8）"),
     concepts_only: bool = Query(default=True),
     trade_date: str = Query(default=""),
+    use_list: bool = Query(default=False,
+                           description="按持久化清单里可见的板块过滤"),
+    all: bool = Query(default=False,
+                      description="返回清单**全部板块**（≥阈值标红、置顶在前），"
+                                  "而不是只返回触发告警的"),
 ) -> dict:
-    """水位 ≥ 阈值的板块列表（按水位降序）。"""
+    """水位 ≥ 阈值的板块列表；`all=1` 时返回清单全量并标记告警。"""
     _ensure_tables()
     config = load_config()
     cut = float(threshold) if threshold > 0 else config.window.alert_threshold
     conn = _conn()
     try:
-        rows = db.query_alerts(conn, threshold=cut, concepts_only=concepts_only,
-                              trade_date=trade_date)
+        codes = db.list_visible_codes(conn, concepts_only=concepts_only) \
+            if use_list else None
+        target = db.latest_trade_date(conn)
+        if all:
+            # 全量清单：基准行来自"清单"本身（`sector_meta` 里有的板块），
+            # 而不是当日 K 线 —— 否则刚加入、当天还没数据的板块会凭空消失，
+            # 用户会以为"添加没生效"。
+            view = db.query_list_view(conn, concepts_only=False)
+            # 最新交易日的水位/成交额（按板块索引）
+            snapshots = {row["sector_code"]: row for row in
+                         db.query_all_latest_water_level(
+                             conn, concepts_only=False, trade_date=target)}
+            maxima = db.max_ma5_map(conn)
+            # 本周的周频异动指标（4 列）
+            weekly = db.query_metrics(conn)
+            wanted = None if codes is None else set(codes)
+            rows: list[dict] = []
+            for item in view:
+                code = str(item["sector_code"])
+                if not int(item["visible"]):
+                    continue
+                if wanted is not None and code not in wanted:
+                    continue
+                if concepts_only and not int(item["is_concept"]):
+                    continue
+                merged = {**item, **{key: value for key, value in
+                                     snapshots.get(code, {}).items()
+                                     if key not in ("sector_name",)}}
+                merged["max_ma5_crowding"] = maxima.get(code)
+                for key in ("chg_5d", "chg_1m", "chg_2m", "flow_ratio",
+                            "net_inflow", "circ_mv_base"):
+                    merged[key] = (weekly.get(code) or {}).get(key)
+                water = merged.get("water_level")
+                merged["is_alert"] = bool(
+                    water is not None and float(water) >= cut)
+                rows.append(merged)
+            rows.sort(key=lambda row: (
+                -int(row.get("pinned") or 0),
+                0 if row.get("is_alert") else 1,
+                -(row["water_level"] if row.get("water_level") is not None else -1),
+                str(row.get("sector_code") or "")))
+            alert_count = sum(1 for row in rows if row["is_alert"])
+        else:
+            rows = db.query_alerts(conn, threshold=cut,
+                                   concepts_only=concepts_only,
+                                   trade_date=trade_date, sector_codes=codes)
+            for row in rows:
+                row["is_alert"] = True
+            alert_count = len(rows)
         return {
             "threshold": cut,
             "high_threshold": config.window.high_alert_threshold,
-            "trade_date": db.latest_trade_date(conn),
+            "trade_date": target,
             "updated_at": refresh.get_refresh_progress().get("finished_at", ""),
             "count": len(rows),
+            "alert_count": alert_count,
+            "all": bool(all),
             "alerts": rows,
         }
+    finally:
+        conn.close()
+
+
+# ================================================================
+# 看板清单（总览散点图 + 告警面板共用的持久化配置）
+# ================================================================
+
+class ListUpsertRequest(BaseModel):
+    sector_code: str
+    sector_name: str = ""
+    pinned: bool | None = None
+
+
+class ListDeleteRequest(BaseModel):
+    sector_codes: list[str] = Field(default_factory=list)
+
+
+def _list_view_row(row: dict, metric: dict | None = None) -> dict:
+    """清单视图行 → 前端需要的最小字段集（不夹带内部结构）。
+
+    `metric` 是本周的周频异动指标（`sector_crowding_metric`，见 metrics.py）。
+    没有时 4 列一律为 **None**（前端显示"—"）—— 不填 0，否则"还没算"会被
+    读成"没有变化"。
+    """
+    metric = metric or {}
+    return {
+        "sector_code": str(row.get("sector_code") or ""),
+        "sector_name": str(row.get("sector_name") or ""),
+        "is_concept": int(row.get("is_concept") or 0),
+        "bars": int(row.get("bars") or 0),
+        "visible": bool(row.get("visible", True)),
+        "pinned": bool(row.get("pinned", False)),
+        "source": str(row.get("source") or ""),
+        "missing": bool(row.get("missing", False)),
+        "in_watchlist": bool(row.get("in_watchlist", False)),
+        "trade_date": row.get("trade_date") or "",
+        "sector_amount": row.get("sector_amount"),
+        "market_amount": row.get("market_amount"),
+        "raw_crowding": row.get("raw_crowding"),
+        "ma5_crowding": row.get("ma5_crowding"),
+        "water_level": row.get("water_level"),
+        # --- 自定义告警阈值（"告警"列）---
+        "alert_mode": str(row.get("alert_mode") or ""),
+        "alert_threshold": row.get("alert_threshold"),
+        "alert_on": db.alert_triggered(
+            str(row.get("alert_mode") or ""), row.get("alert_threshold"),
+            row.get("water_level")),
+        # --- 周频异动指标（4 列）---
+        "chg_5d": metric.get("chg_5d"),
+        "chg_1m": metric.get("chg_1m"),
+        "chg_2m": metric.get("chg_2m"),
+        "flow_ratio": metric.get("flow_ratio"),
+        "net_inflow": metric.get("net_inflow"),
+        "circ_mv_base": metric.get("circ_mv_base"),
+        "metric_week": str(metric.get("compute_week") or ""),
+        "base_date_5d": str(metric.get("base_date_5d") or ""),
+        "base_date_1m": str(metric.get("base_date_1m") or ""),
+        "base_date_2m": str(metric.get("base_date_2m") or ""),
+        "flow_base_date": str(metric.get("flow_base_date") or ""),
+        "flow_last_date": str(metric.get("flow_last_date") or ""),
+    }
+
+
+def _read_list(conn, *, concepts_only: bool = False,
+               with_metrics: bool = True) -> list[dict]:
+    metrics = db.query_metrics(conn) if with_metrics else {}
+    return [_list_view_row(row, metrics.get(str(row.get("sector_code"))))
+            for row in db.query_list_view(conn, concepts_only=concepts_only)]
+
+
+@router.get("/config_list")
+async def config_list(
+    concepts_only: bool = Query(
+        default=True,
+        description="只返回概念板块（前端「只看概念板块」开关的默认口径）"),
+) -> dict:
+    """看板清单（可见/隐藏/置顶 + 最新水位）。
+
+    "该看哪些板块"的**唯一真相来源**：散点总览与告警面板都读它。
+    返回全量（含隐藏项），前端需要时自行过滤，便于做"已隐藏"回显。
+
+    首次调用会把当前默认可见的板块**种子化落库**（幂等）：落库之后
+    "用户删掉全部板块"（全 visible=0）与"从没配置过"才区分得开 ——
+    否则用户清空清单后界面又会长回全量。
+    """
+    _ensure_tables()
+    config = load_config()
+    conn = _conn()
+    try:
+        seeded = db.seed_list(conn, concepts_only=True)
+        # 顺带把**存量**的空壳板块（`bars=0`）软删一次。
+        # 用 `force=False`：只标记从未标记过的行，所以跑多少次结果都一样，
+        # 也不会把"用户手动恢复过"的空壳又自动藏回去 —— 自动清理只做一次，
+        # 之后要不要再藏，由用户点「清理空壳板块」决定。
+        hidden = db.hide_dead_boards(conn, force=False)
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {
+            "items": rows,
+            "count": len(rows),
+            "visible_count": sum(1 for row in rows if row["visible"]),
+            "pinned_count": sum(1 for row in rows if row["pinned"]),
+            "hidden_count": sum(1 for row in rows if not row["visible"]),
+            "dead_hidden_count": db.count_hidden_dead(conn),
+            "seeded": seeded,
+            "hidden_dead": hidden,
+            "trade_date": db.latest_trade_date(conn),
+            "threshold": config.window.alert_threshold,
+            "high_threshold": config.window.high_alert_threshold,
+            # 水位需要的最少日线根数。前端用它把"水位为空"显示成
+            # 「数据不足（563/750）」而不是一个光秃秃的"—" ——
+            # 空值看起来像故障，实际是**有意的样本量门槛**（见
+            # `sector_crowding/config.yaml` 里 `min_bars_for_water_level`
+            # 的说明：分母是"近 6 年最高值"，历史不足 3 年时板块的
+            # "历史最高"就是最近几天，水位恒为 100%、一上线就误告警）。
+            "min_bars_for_water_level": int(
+                config.window.min_bars_for_water_level),
+        }
+    finally:
+        conn.close()
+
+
+class AlertUpsertRequest(BaseModel):
+    sector_code: str
+    #: above = 水位高于阈值告警；below = 低于阈值告警
+    mode: str = Field(default="above", description="above | below")
+    threshold: float = Field(ge=0.0, le=1.0,
+                             description="告警水位阈值，取值 [0, 1]")
+    note: str = ""
+
+
+@router.post("/alert/clear_all")
+async def alert_clear_all(
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """清除全部自定义告警阈值。
+
+    **必须注册在 `/alert/{sector_code}` 之前** —— 否则 `clear_all` 会被当成
+    sector_code 匹配掉（FastAPI 按注册顺序匹配）。
+    """
+    _ensure_tables()
+    conn = _conn()
+    try:
+        cleared = 0
+        for code in list(db.query_alerts_config(conn)):
+            db.delete_alert(conn, code)
+            cleared += 1
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, "cleared": cleared, "items": rows,
+                "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"])}
+    finally:
+        conn.close()
+
+
+@router.post("/alert/{sector_code}")
+async def alert_set(
+    sector_code: str,
+    body: AlertUpsertRequest,
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """设置/更新某板块的自定义告警阈值。
+
+    阈值范围 `[0, 1]`（水位本身就是 0~1 的比例量），前端支持 3 位小数。
+    方向二选一：`above`（水位涨到阈值以上告警，看拥挤风险）/
+    `below`（跌到阈值以下告警，看冷清下来的机会）。
+    """
+    _ensure_tables()
+    conn = _conn()
+    try:
+        try:
+            outcome = db.upsert_alert(
+                conn, sector_code, mode=body.mode,
+                threshold=body.threshold, note=body.note)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=brief(exc, BRIEF_DEFAULT)) from exc
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, **outcome, "items": rows, "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"])}
+    finally:
+        conn.close()
+
+
+@router.delete("/alert/{sector_code}")
+async def alert_clear(
+    sector_code: str,
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """清除某板块的自定义告警阈值（回到"不设告警"）。"""
+    _ensure_tables()
+    conn = _conn()
+    try:
+        removed = db.delete_alert(conn, sector_code)
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, "removed": removed, "items": rows,
+                "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"])}
+    finally:
+        conn.close()
+
+
+@router.get("/config_list/hidden")
+async def config_list_hidden(
+    keyword: str = Query(default="", description="按名称/代码过滤"),
+    limit: int = Query(default=0, ge=0, le=2000, description="0=全部"),
+) -> dict:
+    """已隐藏的板块（系统隐藏的空壳 + 用户手动删除），供恢复列表用。
+
+    单独一个接口而不是塞进 `/config_list`：后者是每 60 秒轮询的，
+    把几百个不可见行一起带上会让每次轮询都白传一大截数据。
+
+    `bars=0` 的是**空壳板块**（从未刷到过数据，同花顺 865xxx 段居多）；
+    `bars>0` 的是用户自己删掉的。两者都列出来，恢复口径一致。
+    """
+    _ensure_tables()
+    conn = _conn()
+    try:
+        rows = db.query_hidden_boards(conn, keyword=keyword, limit=limit)
+        dead = sum(1 for row in rows if int(row.get("bars") or 0) == 0)
+        return {
+            "items": rows,
+            "count": len(rows),
+            "dead_count": dead,
+            "revivable_count": len(rows) - dead,
+        }
+    finally:
+        conn.close()
+
+
+@router.post("/config_list/hidden/cleanup")
+async def config_list_hidden_cleanup() -> dict:
+    """把当前**可见**的空壳板块（`bars=0`）重新隐藏一次。
+
+    启动时会自动跑一次（只标记从未标记过的行）；这个接口是 `force=True` 版本，
+    用于"我手动恢复了一批空壳，想再藏回去"。
+    """
+    _ensure_tables()
+    conn = _conn()
+    try:
+        hidden = db.hide_dead_boards(conn, force=True)
+        rows = _read_list(conn)
+        return {"ok": True, "hidden": hidden, "items": rows,
+                "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"]),
+                "pinned_count": sum(1 for row in rows if row["pinned"])}
+    finally:
+        conn.close()
+
+
+@router.post("/config_list/restore")
+async def config_list_restore(
+    body: ListDeleteRequest,
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """恢复被隐藏/删除的板块（批量）。与 `batch_delete` 正好相反。"""
+    _ensure_tables()
+    if not body.sector_codes:
+        raise HTTPException(status_code=422, detail="sector_codes 不能为空")
+    conn = _conn()
+    try:
+        restored = 0
+        for code in body.sector_codes:
+            text = str(code or "").strip()
+            if not text:
+                continue
+            db.upsert_list_item(conn, text, visible=True, source=db.SOURCE_MANUAL)
+            restored += 1
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, "restored": restored, "items": rows,
+                "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"]),
+                "pinned_count": sum(1 for row in rows if row["pinned"])}
+    finally:
+        conn.close()
+
+
+@router.post("/config_list")
+async def config_list_add(
+    body: ListUpsertRequest,
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """新增/恢复一个板块到清单（幂等）。"""
+    _ensure_tables()
+    conn = _conn()
+    try:
+        try:
+            outcome = db.upsert_list_item(
+                conn, body.sector_code, sector_name=body.sector_name,
+                visible=True, pinned=body.pinned,
+                source=db.SOURCE_MANUAL)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail=brief(exc, BRIEF_DEFAULT)) from exc
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, **outcome, "items": rows, "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"]),
+                "pinned_count": sum(1 for row in rows if row["pinned"])}
+    finally:
+        conn.close()
+
+
+@router.delete("/config_list/{sector_code}")
+async def config_list_remove(
+    sector_code: str,
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """从清单移除（软删：`visible=0`，不删历史拥挤度数据）。"""
+    _ensure_tables()
+    conn = _conn()
+    try:
+        outcome = db.upsert_list_item(conn, sector_code, visible=False)
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, **outcome, "items": rows, "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"]),
+                "pinned_count": sum(1 for row in rows if row["pinned"])}
+    finally:
+        conn.close()
+
+
+@router.post("/config_list/batch_delete")
+async def config_list_batch_delete(
+    body: ListDeleteRequest,
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """批量从清单移除（散点图框选/多选后一次删除）。"""
+    _ensure_tables()
+    if not body.sector_codes:
+        raise HTTPException(status_code=422, detail="sector_codes 不能为空")
+    conn = _conn()
+    try:
+        removed = 0
+        for code in body.sector_codes:
+            text = str(code or "").strip()
+            if not text:
+                continue
+            db.upsert_list_item(conn, text, visible=False)
+            removed += 1
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, "removed": removed, "items": rows,
+                "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"]),
+                "pinned_count": sum(1 for row in rows if row["pinned"])}
+    finally:
+        conn.close()
+
+
+@router.post("/config_list/{sector_code}/pin")
+async def config_list_pin(
+    sector_code: str,
+    pinned: bool = Query(default=True),
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """置顶/取消置顶（置顶板块在两个面板里都排最前）。"""
+    _ensure_tables()
+    conn = _conn()
+    try:
+        outcome = db.upsert_list_item(conn, sector_code, pinned=bool(pinned))
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, **outcome, "items": rows, "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"]),
+                "pinned_count": sum(1 for row in rows if row["pinned"])}
+    finally:
+        conn.close()
+
+
+@router.post("/config_list/reset")
+async def config_list_reset(
+    concepts_only: bool = Query(default=True),
+) -> dict:
+    """清空清单配置 → 回到"默认显示全部板块"（用户的删除与置顶一起清掉）。"""
+    _ensure_tables()
+    conn = _conn()
+    try:
+        cleared = db.reset_list(conn)
+        rows = _read_list(conn, concepts_only=concepts_only)
+        return {"ok": True, "cleared": cleared, "items": rows,
+                "count": len(rows),
+                "visible_count": sum(1 for row in rows if row["visible"]),
+                "pinned_count": sum(1 for row in rows if row["pinned"])}
     finally:
         conn.close()
 

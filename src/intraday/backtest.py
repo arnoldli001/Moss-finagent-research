@@ -3,7 +3,7 @@
 用户需求明确要求「先做回测，再实盘做T」。本模块回答三个问题：
   1. 总分突破 ±20 / ±30 之后，未来 N 根5分钟bar的方向性收益是多少（命中率/平均收益）？
   2. 与「随机/全程买入持有」的基准相比是否有超额？
-  3. 按「低吸信号买入、高抛信号卖出」的机械做T规则跑一遍，累计收益与最大回撤如何？
+  3. 按「回踩信号买入、冲高信号卖出」的机械做T规则跑一遍，累计收益与最大回撤如何？
 
 方法学与项目 backtest 子系统保持一致（无未来函数、纯本地规则、含交易成本）：
   - 每根bar的总分只使用截至该bar的数据（features.replay_totals 全因果指标）；
@@ -75,8 +75,8 @@ def compute_threshold_stats(
 ) -> ThresholdStat:
     """单阈值档位的信号后验统计。
 
-    direction="long"：总分 ≥ threshold 视为看多信号（做T低吸）；
-    direction="short"：总分 ≤ -threshold 视为看空信号（做T高抛）。
+    direction="long"：总分 ≥ threshold 视为看多信号（做T回踩）；
+    direction="short"：总分 ≤ -threshold 视为看空信号（做T冲高）。
     命中判定：看多信号前瞻收益 > 0；看空信号前瞻收益 < 0。
     """
     if frame is None or len(frame) == 0 or "total" not in frame.columns:
@@ -163,7 +163,7 @@ def run_threshold_backtest(
         replay, threshold=action, horizon=horizon, direction="short")
     short_hint = compute_threshold_stats(
         replay, threshold=hint, horizon=horizon, direction="short")
-    # 高抛侧两档都并入 by_threshold 扫描结果，供前端对比展示
+    # 冲高侧两档都并入 by_threshold 扫描结果，供前端对比展示
     high_side = [short_action, short_hint]
 
     # 基准：全样本前瞻收益（相当于随机时点做T的期望）
@@ -286,7 +286,7 @@ def _scan_thresholds(frame: pd.DataFrame, horizon: int) -> list[ThresholdStat]:
 def _simulate_t_trades(
     replay: pd.DataFrame, *, config: IntradayConfig, initial_capital: float,
 ) -> tuple[list[BacktestTrade], float | None, float | None, float | None]:
-    """机械做T模拟：总分≥动手线且价格≤低吸线→买入；总分≤-动手线且价格≥高抛线→卖出。
+    """机械做T模拟：总分≥动手线且价格≤回踩线→买入；总分≤-动手线且价格≥冲高线→卖出。
 
     单标的、单笔满仓底仓做T（日内回转），含佣金/印花税/滑点。
     止损位按「建仓价下方 stop_loss_pct%」硬执行（与实时引擎同一硬约束口径）。
@@ -306,7 +306,7 @@ def _simulate_t_trades(
     max_dd = 0.0
     position: dict[str, Any] | None = None
 
-    # 逐日重算低吸档位（箱体下沿），保证与实时档位口径一致
+    # 逐日重算回踩档位（箱体下沿），保证与实时档位口径一致
     replay = replay.copy()
     replay["day"] = replay["ts"].str.slice(0, 10)
     day_low: dict[str, float] = {}
@@ -324,7 +324,7 @@ def _simulate_t_trades(
         if low is None or high is None:
             continue
 
-        # 1) 跨日即平仓：当日未触发高抛/止损 → 以**上一交易日最后一根bar**的
+        # 1) 跨日即平仓：当日未触发冲高/止损 → 以**上一交易日最后一根bar**的
         #    价格与时间平掉，绝不隔夜（做T为日内回转，隔夜属于波段而非做T）。
         if position is not None and day != position["day"]:
             trades.append(_close_position(
@@ -335,7 +335,7 @@ def _simulate_t_trades(
             peak = max(peak, equity)
             max_dd = max(max_dd, (peak - equity) / peak if peak else 0.0)
 
-        # 2) 空仓 → 找低吸入场点
+        # 2) 空仓 → 找回踩入场点
         if position is None:
             stop_price = low * (1.0 - stop_pct)
             if total >= action and price <= low * (
@@ -346,7 +346,7 @@ def _simulate_t_trades(
                             "last_ts": str(row.ts)}
             continue
 
-        # 3) 持仓中：止损优先（硬约束），其次高抛
+        # 3) 持仓中：止损优先（硬约束），其次冲高
         exit_reason = None
         if price <= position["stop"]:
             exit_reason = "stop_loss"
@@ -423,7 +423,7 @@ def _verdict(action_stat: ThresholdStat, hint_stat: ThresholdStat,
             f"命中率{_rate(hint_stat.hit_rate)}")
     if short_action.signals > 0:
         parts.append(
-            f"高抛侧±{config.thresholds.action:g}：{short_action.signals}次信号，"
+            f"冲高侧±{config.thresholds.action:g}：{short_action.signals}次信号，"
             f"下跌命中率{_rate(short_action.hit_rate)}")
     parts.append(
         f"基准（全样{baseline.signals}个样本）命中率{_rate(baseline.hit_rate)}、"

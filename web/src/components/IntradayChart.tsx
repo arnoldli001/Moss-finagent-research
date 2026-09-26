@@ -28,8 +28,6 @@ const PAD = { top: 18, right: 88, bottom: 46, left: 62 };
 const MINUTES_TOTAL = 240; // 上午120 + 下午120
 const MIN_SPAN_MINUTES = 10;
 const HEIGHT = H - PAD.top - PAD.bottom;
-// 分时波动的自然量程最多允许被"可执行档位"拉伸的倍数（防止箱体远档位压扁价格线）
-const MAX_LEVEL_STRETCH = 1.6;
 
 /** "YYYY-MM-DD HH:MM" → 当日交易分钟序号（0~240），午休折叠。 */
 function sessionMinute(ts: string): number | null {
@@ -88,8 +86,8 @@ type Hover = {
 type LevelKey = "high_sell" | "low_buy" | "stop_loss" | "boll";
 
 const LEVEL_META: Record<LevelKey, { label: string; color: string; cls: string }> = {
-  high_sell: { label: "高抛", color: "#d95c4a", cls: "lv-sell" },
-  low_buy: { label: "低吸", color: "#2ea86e", cls: "lv-buy" },
+  high_sell: { label: "冲高", color: "#d95c4a", cls: "lv-sell" },
+  low_buy: { label: "回踩", color: "#2ea86e", cls: "lv-buy" },
   stop_loss: { label: "止损", color: "#e0b020", cls: "lv-stop" },
   boll: { label: "布林", color: "#4a9eff", cls: "lv-boll" },
 };
@@ -116,7 +114,7 @@ function IntradayChart({
    *
    * 为什么给开关：Y轴是按"可执行档位"伸缩的（见 domain 里的自适应护栏），
    * 止损线有时离现价很远（高波动股 ATR 口径下 4~5%），纳入定标会把分时线压扁。
-   * 给用户一个「只看低吸高抛 / 连止损一起看」的选择，比替他决定更诚实。
+   * 给用户一个「只看回踩冲高 / 连止损一起看」的选择，比替他决定更诚实。
    */
   const [showLevels, setShowLevels] = useState<Record<LevelKey, boolean>>(
     { high_sell: true, low_buy: true, stop_loss: true, boll: true });
@@ -216,46 +214,68 @@ function IntradayChart({
           }
         });
     }
-    const span = max - min;
-    // 以昨收为中心对称取范围（同花顺/东财分时口径）：只算分时数据的偏离幅度
-    if (prevClose && !fitLevels) {
-      let reach = Math.max(
-        Math.abs(prevClose - min), Math.abs(max - prevClose),
-        prevClose * 0.002, // 极窄幅时给个下限，避免"一条直线"没有刻度
-      );
-      // 把**可执行档位**纳入可见范围：止损线是最该看见的一条线，
-      // 不能因为"按分时波动定标"而被裁到图外（用户报的"没有画出低吸/高抛/止损"
-      // 就是它被裁掉导致的 —— 数据在，只是落在 y 轴范围之外 30~40 元）。
-      //
-      // 但不能无条件纳入：300308 的箱体 804~950 若全部纳入，分时线会被压成一条直线。
-      // 折中：
-      //   · 取「当前档位」与「逐bar档位曲线在可见窗口内的极值」两者中更近的一个
-      //     （曲线会漂移到离现价很远的地方，用它会把图压扁）；
-      //   · 允许的拉伸倍数随**时间窗变窄**而放宽（放到 10 分钟窗口时，本来就该
-      //     看清这一小段里的档位，而不是死守 1.6×）；
-      //   · 实在超出范围时右边的档位清单会标「（图外）」并说明原因。
-      const windowRatio = spanMinutes / MINUTES_TOTAL;
-      const stretchLimit = Math.max(
-        MAX_LEVEL_STRETCH, 1 + (3.2 - 1) * Math.max(0, 1 - windowRatio));
-      // 够得着就纳入；够不着（例如高波动股 ATR 口径的止损离现价 5%+）就交给
-      // 下面的"贴边指示线"—— 那时若强行纳入，全天分时会被压成中间一条细带。
-      const NEAR_MISS = 1.15;
-      const candidates: number[] = [];
-      visibleLevelLines.forEach((line) => candidates.push(line.price));
-      if (driftRange) candidates.push(driftRange.min, driftRange.max);
-      candidates.forEach((value) => {
-        const distance = Math.abs(value - prevClose);
-        if (distance > reach && distance <= reach * Math.min(stretchLimit, NEAR_MISS)) {
-          reach = distance;
+    // ★ Y 轴范围：**动态取"当天所有相关数值"的极值**（用户口径 2026-09-24，
+    //   原话："分时图的 Y 坐标范围动态设置为（当天盘中股价最高值和最低值、
+    //   冲高、回踩、止损、布林线）这些数值的最大值*1.015 和最小值*0.985"）。
+    //
+    //   与旧实现的三点差别（都是有意的）：
+    //     ① **不再以昨收为中心对称展开** —— 改成按真实极值取区间，
+    //        于是"股价在昨收上方运行"时，下方不会白白留一半空间；
+    //     ② **档位与布林线无条件纳入**（回踩/冲高/止损/布林上下轨），
+    //        不再有 `1.6` / `NEAR_MISS` 那套"够得着才纳入"的折中 ——
+    //        用户明确要求它们必须在轴内，代价是极端行情下分时线会被压扁一点；
+    //     ③ 留白从 `×1.08` 对称缩放改成 **上 ×1.015 / 下 ×0.985**（按用户给的公式）。
+    //
+    //   连带效果：`outViewLevels`（贴边"↑在图上方/↓在图下方"指示）基本不会再触发 ——
+    //   档位既然总在轴内，就没有"图外"可标。那段代码保留（防数据异常），不删。
+    let dayMin = Math.min(...prices);
+    let dayMax = Math.max(...prices);
+    /* ⚠️ **箱体上下沿不纳入**（用户口径里的清单本来就没有它）：
+       实测（2026-09-24 截图）主板票 昨收 86.36，箱体下沿落到 ~70 一带，
+       轴被拉到 -19.68% —— 而主板单日跌幅上限就是 -10%，那段空间**永远到不了**，
+       于是止损线到量能柱之间出现一大片空白。清单核准为：
+       当天分时价/均价 + 冲高 + 回踩 + 止损 + 布林上下轨。 */
+    [levels?.high_sell, levels?.low_buy, levels?.stop_loss,
+     levels?.boll_upper, levels?.boll_lower]
+      .forEach((value) => {
+        if (typeof value === "number" && Number.isFinite(value)) {
+          dayMin = Math.min(dayMin, value);
+          dayMax = Math.max(dayMax, value);
         }
       });
-      reach *= 1.08;
-      return { min: prevClose - reach, max: prevClose + reach,
-               span: reach * 2, centered: true as const };
+    // 兜底：极窄幅或数据异常时给一个下限，避免"一条直线 + 除零"
+    if (!Number.isFinite(dayMin) || !Number.isFinite(dayMax)
+        || dayMax - dayMin < 1e-6) {
+      const base = Number.isFinite(dayMax) ? dayMax : (prevClose ?? 1);
+      dayMin = base * 0.985;
+      dayMax = base * 1.015;
     }
-    const pad = (span || (prevClose ?? max) * 0.01) * 0.12;
-    return { min: min - pad, max: max + pad, span: (max - min) + pad * 2,
-             centered: false as const };
+    /* ★ 再夹一层**涨跌幅限制带**：主板 ±10%、创业板/科创 ±20%、北交所 ±30%。
+       为什么必须夹：把所有档位无条件纳入之后，只要有一条档位落在很远处
+       （箱体/布林在极端行情下会离谱），Y 轴就会出现"永远到不了"的区间 ——
+       表现就是用户截图里的"止损线下面一大片空白 + -19.68%"。
+       夹完之后，超出的档位会走**已有的"贴边指示"分支**（↑在图上方/↓在图下方），
+       既不浪费图面，也不丢信息。 */
+    const limitPct = (() => {
+      const code = String((series as { code?: string }).code || "");
+      if (/^(30|68)/.test(code)) return 0.20;          // 创业板 / 科创板
+      if (/^(4|8|92)/.test(code)) return 0.30;         // 北交所
+      // 拿不到代码时的兜底：**看当日实际振幅** —— 主板不可能超过 10%，
+      // 一旦超过，说明这不是主板（或数据异常），放宽到 20% 更安全。
+      const reach = prevClose
+        ? Math.max(Math.abs(prevClose - dayMin), Math.abs(dayMax - prevClose))
+          / prevClose : 0;
+      return reach > 0.105 ? 0.20 : 0.10;
+    })();
+    if (prevClose) {
+      const bandLo = prevClose * (1 - limitPct);
+      const bandHi = prevClose * (1 + limitPct);
+      dayMin = Math.max(dayMin, bandLo);
+      dayMax = Math.min(dayMax, bandHi);
+    }
+    const lo = dayMin * 0.985;
+    const hi = dayMax * 1.015;
+    return { min: lo, max: hi, span: hi - lo, centered: false as const };
   }, [visible, series.boardLines, view, prevClose, levels, fitLevels,
       visibleLevelLines, driftRange, spanMinutes]);
 
@@ -286,9 +306,9 @@ function IntradayChart({
   /**
    * 逐bar档位**漂移曲线**：把 low_buy / high_sell / stop_loss 画成随时间变化的线。
    *
-   * 档位是**时刻量**（每分钟随 VWAP/布林重算）：实测 300308 当日低吸线从 862 抬到
+   * 档位是**时刻量**（每分钟随 VWAP/布林重算）：实测 300308 当日回踩线从 862 抬到
    * 898、603083 从 215.42 抬到 221.91。画成横贯全天的直线会让人误以为"开盘就在
-   * 低吸线以下"（那只是当前值的错觉），也会把后来的高位止损误读成早盘就该止损。
+   * 回踩线以下"（那只是当前值的错觉），也会把后来的高位止损误读成早盘就该止损。
    *
    * `minute` 与 `price` 都必须过滤成有限数字：`x(null)` → NaN 会让整条 `d`
    * 变成 `MNaN,NaN`，浏览器会**静默丢弃**该 path —— 表现出来就是"档位线根本不画"。
@@ -404,7 +424,7 @@ function IntradayChart({
    * 鼠标 Y 位置 → 价格（供十字光标的**横线**用）。
    *
    * 为什么横线要跟鼠标而不是吸附到数据点：用户要的是"我指的这个价位是多少、
-   * 它离低吸/高抛线差多少"，横线粘在 1 分钟数据点上就失去这个能力。
+   * 它离回踩/冲高线差多少"，横线粘在 1 分钟数据点上就失去这个能力。
    * 纵线仍吸附到最近的分钟点（读时间与均价用），两者各司其职。
    */
   const priceAt = (clientY: number): number | null => {
@@ -456,12 +476,25 @@ function IntradayChart({
   const endDrag = () => { dragRef.current = null; };
 
   if (!domain || !visible.length) {
+    /* ⚠️ 这句原来写的是"分时数据不可用（数据源缺口）"——**把两种完全不同的情况
+       混成一句**，实测误导：用户点两次「＋」放大后，窗口被缩到当天**还没走到的时段**
+       （10:24 的数据，窗口却落在 61~179 分钟），`visible` 为空 → 走到这里 →
+       界面说"数据源缺口"，于是去查数据健康度，而数据其实是好的。
+       现在按「窗口内没有数据」优先说，并给出可操作的出口（双击复位）。 */
     return (
       <div className="empty-tip muted-text">
-        分时数据不可用（数据源缺口，见下方数据健康度）
+        当前时间窗内没有分时数据 —— 可能是放大/平移到了当天尚未走到的时段，
+        双击图面可复位到全天；若全天也无数据才是数据源缺口（见下方数据健康度）
       </div>
     );
   }
+
+  /* ★ 放大锚点必须取**数据所在的中间时刻**，不能取"窗口中点"。
+     实测（用户报障 2026-09-24）：全天窗口中点 = 第 120 分钟（午盘），
+     而当天 10:24 时数据只到第 54 分钟 —— 从 240 分钟连续放大两次（×0.7、×0.7）
+     得到 [61, 179] 分钟，整段落在**还没发生的时段**里，`visible` 直接为空。
+     锚在数据的中间时刻则永远"缩向已有数据"。 */
+  const dataFocus = visible[Math.floor((visible.length - 1) / 2)].minute;
 
   const pctOf = (price: number) =>
     prevClose ? ((price / prevClose) - 1) * 100 : null;
@@ -473,9 +506,9 @@ function IntradayChart({
         <span className="muted-text">
           滚轮缩放 · 拖拽平移 · 双击复位
         </span>
-        <button className="btn-ghost chart-btn" onClick={() => zoomAt(0.7, (view.start + view.end) / 2)}
+        <button className="btn-ghost chart-btn" onClick={() => zoomAt(0.7, dataFocus)}
                 title="放大时间轴（Y轴自动跟随）">＋</button>
-        <button className="btn-ghost chart-btn" onClick={() => zoomAt(1.4, (view.start + view.end) / 2)}
+        <button className="btn-ghost chart-btn" onClick={() => zoomAt(1.4, dataFocus)}
                 title="缩小时间轴">－</button>
         <button className="btn-ghost chart-btn" onClick={reset}
                 disabled={!zoomed}>复位</button>
@@ -544,13 +577,28 @@ function IntradayChart({
           </g>
         ))}
 
-        {/* 成交量（底部小柱，只按可见区间定标） */}
+        {/* 成交量（底部小柱，只按可见区间定标）
+            ★ 红绿着色（用户口径 2026-09-24："分时线内的量能柱要做成红绿色，
+              和股票软件里的一样的颜色效果"）。
+            股票软件的惯例是**按这一分钟相对上一分钟的价格方向**着色：
+              · 价涨 → 红（#e06a5a，与 K 线/分时线的"红涨"同一支色）
+              · 价跌 → 绿（#2ea86e）
+              · 持平 / 首根 → 灰（不硬套颜色，避免"没动也显示红绿"）
+            用 `p.price` 而不是收盘价序列：分时点本身就是"这一分钟的价"，
+            相邻两点比较即得方向，与券商分时界面口径一致。 */}
         {visible.map((point, i) => {
           const barHeight = ((point.volume || 0) / volumeMax) * 36;
+          const prev = i > 0 ? visible[i - 1] : null;
+          const dir = prev === null || prev.price === point.price
+            ? 0 : (point.price > prev.price ? 1 : -1);
+          const color = dir > 0 ? "#e06a5a" : dir < 0 ? "#2ea86e" : "#8b98a5";
           return (
             <rect key={i} x={x(point.minute) - 1.2} width={2.4}
                   y={H - PAD.bottom - barHeight} height={barHeight}
-                  fill="var(--border)" opacity={0.5} />
+                  fill={color} opacity={dir === 0 ? 0.45 : 0.85}>
+              <title>{`${timeLabel(point.minute)} 量 ${Math.round(point.volume || 0)}`
+                      + (dir === 0 ? "" : dir > 0 ? "（价涨）" : "（价跌）")}</title>
+            </rect>
           );
         })}
 
@@ -563,15 +611,15 @@ function IntradayChart({
 
         {/* 关键价位线（**只画可见范围内的**）。
             有逐bar档位序列时画**随时间漂移的曲线**，而不是一条横贯全天的直线 ——
-            档位（低吸/高抛/止损）是每分钟随 VWAP/布林重算的时刻量：
-            实测 300308 当日低吸线从 862 抬到 898、603083 从 215.42 抬到 221.91。
-            画成横线会让人以为"开盘就在低吸线以下"（那只是当前值的错觉），
+            档位（回踩/冲高/止损）是每分钟随 VWAP/布林重算的时刻量：
+            实测 300308 当日回踩线从 862 抬到 898、603083 从 215.42 抬到 221.91。
+            画成横线会让人以为"开盘就在回踩线以下"（那只是当前值的错觉），
             也会让人把后来的高位止损误读成早盘就该止损。
 
             ⚠️ stroke 必须**显式内联**：早期版本只给了 className，
             而 CSS 里只有 `.lv-sell line {}`（元素选择器）—— 对 `<path>` 无效，
             于是三条档位曲线全部按 SVG 默认的 `stroke:none` 渲染 = 图上看不见。
-            这正是"低吸/高抛/止损虚线没画出来"的直接原因之一。 */}
+            这正是"回踩/冲高/止损虚线没画出来"的直接原因之一。 */}
         {(["high_sell", "low_buy", "stop_loss"] as LevelKey[]).map((key) => {
           const d = driftPaths[key];
           if (!d || !showLevels[key]) return null;
@@ -583,41 +631,63 @@ function IntradayChart({
             </path>
           );
         })}
-        {/* 档位**当前值**参考线（低吸/高抛/止损）。
+        {/* 档位**当前值**参考线（回踩/冲高/止损）。
             与上面的漂移曲线并存：曲线回答"这条线今天怎么走的"，参考线回答
             "此刻它在哪" —— 交易软件（同花顺/东财）也是这两个一起给的。
 
             ⚠️ stroke 必须**显式给**：早期版本只写了 className，
             而 CSS 里只有 `.lv-sell line {}`（元素选择器）—— 对 `<path>` 无效，
             于是档位线全部按 SVG 默认 `stroke:none` 渲染，图上一个点都看不到。
-            「低吸/高抛/止损虚线没画出来」就是这个原因。 */}
-        {inViewLevels.map((line) => (
-          <g key={`flat-${line.key}-${line.price}`}>
-            <line x1={PAD.left} x2={W - PAD.right} y1={y(line.price)}
-                  y2={y(line.price)} stroke={line.color} strokeWidth="1.5"
-                  strokeDasharray="7 3" opacity={0.95}>
-              <title>{`${line.label}线 ${line.price.toFixed(2)}（当前值）`}</title>
-            </line>
-            <text x={PAD.left + 4} y={y(line.price) - 4} fontSize="10"
-                  fill={line.color}>
-              {line.label} {line.price.toFixed(2)}
-            </text>
-          </g>
-        ))}
+            「回踩/冲高/止损虚线没画出来」就是这个原因。 */}
+        {(() => {
+          /* ★ 标签**纵向去重叠**（用户口径 2026-09-24："止损文字提示和回踩提示
+             重叠了，需要左右错开"）。
+             根因：所有档位标签原本都画在同一个 x（PAD.left + 4），y 只跟价位走；
+             回踩/止损价位常常很接近，两条标签就直接叠在一起，谁也读不出。
+             修法：按 y 从上到下排一遍，凡是与已放置标签距离 < 12px 的就往上顶 12px —— 
+             这是图表标注的常规做法，比"固定左右各放一半"更稳（档位数量会变）。 */
+          const rows = inViewLevels
+            .map((line) => ({ line, ly: y(line.price) - 4 }))
+            .sort((a, b) => a.ly - b.ly);
+          const placed: number[] = [];
+          for (const row of rows) {
+            while (placed.some((py) => Math.abs(py - row.ly) < 12)) row.ly -= 12;
+            placed.push(row.ly);
+          }
+          return rows.map(({ line, ly }) => (
+            <g key={`flat-${line.key}-${line.price}`}>
+              <line x1={PAD.left} x2={W - PAD.right} y1={y(line.price)}
+                    y2={y(line.price)} stroke={line.color} strokeWidth="1.5"
+                    strokeDasharray="7 3" opacity={0.95}>
+                <title>{`${line.label}线 ${line.price.toFixed(2)}（当前值）`}</title>
+              </line>
+              <text x={PAD.left + 4} y={ly} fontSize="10" fill={line.color}>
+                {line.label} {line.price.toFixed(2)}
+              </text>
+            </g>
+          ));
+        })()}
         {/* 档位线**图外**时的贴边指示：一条贴在上下边缘的箭头线 + 数值。
             这比"什么都不画"诚实得多 —— 用户至少知道止损位在哪一侧、离多远，
             点一下档位清单里的开关就能把它真正画进来。 */}
-        {outViewLevels.map((line) => {
+        {outViewLevels.map((line, li) => {
           const above = line.price > domain.max;
           const edgeY = above ? PAD.top + 3 : H - PAD.bottom - 3;
           const gapPct = lastPrice ? ((line.price / lastPrice) - 1) * 100 : null;
+          /* ★ 贴边标签**左右分侧**：同一侧的档位（比如止损与回踩都在图下方）
+             edgeY 完全相同，纯纵向错开会钻出绘图区，所以改成奇偶分到左右两侧 ——
+             两条一定不重叠，三条时同侧的两条再各自让 12px。 */
+          const leftSide = li % 2 === 0;
+          const dy = Math.floor(li / 2) * 12;
           return (
             <g key={`edge-${line.key}-${line.price}`}>
               <line x1={PAD.left} x2={W - PAD.right} y1={edgeY} y2={edgeY}
                     stroke={line.color} strokeWidth="1.2"
                     strokeDasharray="2 4" opacity={0.6} />
-              <text x={W - PAD.right - 4} y={above ? edgeY + 11 : edgeY - 4}
-                    fontSize="10" textAnchor="end" fill={line.color}>
+              <text x={leftSide ? PAD.left + 4 : W - PAD.right - 4}
+                    y={above ? edgeY + 11 + dy : edgeY - 4 - dy}
+                    fontSize="10" textAnchor={leftSide ? "start" : "end"}
+                    fill={line.color}>
                 {line.label} {line.price.toFixed(2)}
                 {gapPct === null ? "" : `（${gapPct >= 0 ? "+" : ""}${gapPct.toFixed(2)}%）`}
                 {above ? " ↑在图上方" : " ↓在图下方"}
@@ -796,7 +866,7 @@ function IntradayChart({
 
       {/* 档位清单：**所有**档位都列出来（含未显示的），并给出显示开关与"图外"提示。
           为什么把开关放这里而不是藏进设置：止损线有时离现价 4~5%（ATR 口径），
-          纳入定标会把分时线压扁；给用户一个"只看低吸高抛 / 连止损一起看"的选择，
+          纳入定标会把分时线压扁；给用户一个"只看回踩冲高 / 连止损一起看"的选择，
           比替他决定更诚实。 */}
       <div className="level-strip">
         {allLevels.map((line, index) => {

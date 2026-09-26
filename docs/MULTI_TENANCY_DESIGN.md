@@ -202,7 +202,7 @@ def require_principal() -> Principal:                     # 业务代码统一�
 **门禁上线当天就抓到三个真问题**（都在 `.env.example`）：
 
 1. `POSTGRES_PASSWORD=moss_finagent` —— 一个**能用的默认密码**，会诱导部署时直接照抄；
-2. `ALERT_EMAIL_TO=1027312283@qq.com` —— **真实个人邮箱**进了版本库；
+2. `ALERT_EMAIL_TO=2693888583@qq.com` —— **真实个人邮箱**进了版本库；
 3. `DEEPSEEK_API_KEY=sk-your-deepseek-key-here` —— 形似真 key，
    且让"占位符该长什么样"没有明确约定。
 

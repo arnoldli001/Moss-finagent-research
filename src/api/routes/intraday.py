@@ -79,17 +79,76 @@ async def snapshot(
     request: Request,
     code: str = Query(default="300308", description="6位证券代码"),
     refresh: bool = Query(default=False, description="强制刷新（忽略缓存TTL）"),
+    light: bool = Query(
+        default=False,
+        description=("轻量快照：只要行情/分时/关键价位/总分/信号，"
+                     "跳过消息面LLM、估值、板块分时、大盘、海外映射。"
+                     "用于「先出图，再补全」的两段式首屏")),
 ) -> dict:
-    """做T辅助完整快照：估值空间/分时与提示点/多因子打分/消息面情绪。"""
+    """做T辅助完整快照：估值空间/分时与提示点/多因子打分/消息面情绪。
+
+    `light=true` 时返回的子集仍是一个完整 `IntradaySnapshot`（被跳过的字段为
+    null/空数组），前端可以直接渲染分时图与分数，等完整版到达再补齐其余面板。
+    实测冷标的一次完整快照 4.5~7 秒，而用户点开一只票**第一眼要看的就是分时图**。
+    """
     service = _service(request)
     target = _validate_code(code)
     try:
-        result = await service.snapshot(target, force_refresh=refresh)
+        result = await service.snapshot(target, force_refresh=refresh, light=light)
     except Exception as exc:  # noqa: BLE001 取数失败转502而非500
         logger.warning("做T快照失败(%s): %s", target, brief(exc, BRIEF_DEFAULT))
         raise HTTPException(
             status_code=502, detail=f"做T快照组装失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return result.model_dump()
+
+
+@router.get("/intraday/quotes")
+async def quotes(
+    request: Request,
+    codes: str = Query(default="", description="逗号分隔的 6 位代码，一次取一批"),
+) -> dict:
+    """**批量**实时快照（只读；给自定义板块的成分行显示涨跌幅用）。
+
+    为什么单开一个：自选池的行情走 `/intraday/watchlist`，那个**只覆盖自选**；
+    而自定义板块的成分里没进自选的票，前端手上一点价格都没有（成分表本身不带行情）。
+
+    口径与代价：走 `IntradayDataProvider.fetch_quotes()` —— **一次请求取一批**
+    （实测 9 只约 54ms），不是逐只循环。前端再按 `code` 缓存，于是"同一只票
+    出现在多个自定义板块里"只抓一次（用户口径 2026-09-23 明确点到这一点）。
+
+    ⚠️ 坏代码**逐条跳过**而不是整批 400：一行脏数据不该让整列变成"—"
+    （实测踩过：板块里存了 `00兆易创新` 这种把文字当代码的行，会让快照接口 400）。
+    取不到的票**不出现**在结果里（前端保留上次的值）。
+    """
+    service = _service(request)
+    wanted: list[str] = []
+    for raw in (codes or "").split(","):
+        text = raw.strip()
+        if not text:
+            continue
+        try:
+            wanted.append(_validate_code(text))
+        except HTTPException:
+            logger.info("批量快照跳过非法代码：%s", text)
+    if not wanted:
+        return {"items": [], "count": 0}
+    try:
+        found = await service.data_provider.fetch_quotes(wanted)
+    except Exception as exc:  # noqa: BLE001 行情是展示增强项，失败不该让整页报错
+        logger.warning("批量快照失败：%s", brief(exc, BRIEF_TIGHT))
+        return {"items": [], "count": 0}
+    items = []
+    for code in wanted:
+        quote = found.get(code)
+        if quote is None:
+            continue
+        items.append({
+            "code": code,
+            "name": getattr(quote, "name", "") or "",
+            "price": getattr(quote, "price", None),
+            "change_pct": getattr(quote, "change_pct", None),
+        })
+    return {"items": items, "count": len(items)}
 
 
 @router.post("/intraday/auto-select")
@@ -104,7 +163,7 @@ async def auto_select(
     prescreen: int = Query(default=30, ge=5, le=120,
                            description="粗筛后进入精算的票数上限（控制单轮耗时）"),
 ) -> dict:
-    """**自动选股**：日K买入信号 + 分时打分 > 阈值 → 按综合分排序取前 N。
+    """**自动选股**：日K多方条件 + 分时打分 > 阈值 → 按综合分排序取前 N。
 
     候选池 = 热门股前 50 ∪ 昨日涨停 ∪ 昨日成交额前 200（并集去重）。
     只在交易日的 9:25–9:40 与 14:45–15:00 由后台定时触发（每分钟一次）；
@@ -197,6 +256,55 @@ class WatchRequest(BaseModel):
         default=True, description="name留空时是否自动向行情源取证券简称")
 
 
+@router.get("/intraday/stock-bindings")
+async def stock_bindings(request: Request) -> dict:
+    """**全部**已保存的「关联板块 / 海外映射」绑定（用户口径 2026-09-23）。
+
+    用途：前端在关联板块/海外映射输入框上做**联想下拉**，提示"你以前给哪些票
+    配过什么"。数据来自服务进程内的热map（启动时 `warm_bindings()` 灌好），
+    所以这个接口**不打数据库**。
+
+    返回 `{"items": [{code, name, boards, overseas}], "count": n}`；
+    `name` 取自当前自选池（配过的票可能已不在自选里，那时 name 为空串）。
+    """
+    service = _service(request)
+    try:
+        rows = service.all_bindings()
+    except Exception as exc:  # noqa: BLE001 绑定是增强项，读不到就给空的
+        logger.info("读取个股绑定失败：%s", brief(exc, BRIEF_TIGHT))
+        rows = {}
+    names = {}
+    try:
+        names = {item.code: item.name for item in service.config.watchlist}
+    except Exception:  # noqa: BLE001 名字只是展示，取不到不影响主信息
+        names = {}
+    items = [
+        {"code": code, "name": names.get(code, ""),
+         "boards": boards, "overseas": overseas}
+        for code, (boards, overseas) in sorted(rows.items())
+    ]
+    return {"items": items, "count": len(items)}
+
+
+@router.get("/intraday/stock-bindings/{code}")
+async def stock_binding(code: str, request: Request) -> dict:
+    """某只票已保存的绑定 —— 前端**切换/加入自选时预填输入框**用。
+
+    ⚠️ 与 `POST /intraday/watchlist` 的分工：那个接口的 `boards`/`overseas`
+    为空时后端也会自动回落到这里存的值（所以**不预填也不会丢配置**）；
+    这个接口只是让用户**看得见**已存了什么、还能直接改。
+    """
+    service = _service(request)
+    target = _validate_code(code)
+    boards, overseas = service.binding_for(target)
+    return {
+        "ok": True, "code": target,
+        "boards": boards, "overseas": overseas,
+        # 空 = 这只票还没配过（前端据此决定要不要覆盖输入框）
+        "saved": bool(boards or overseas),
+    }
+
+
 @router.post("/intraday/watchlist")
 async def add_watch(body: WatchRequest, request: Request) -> dict:
     """新增自选标的（写回 configs/intraday.yaml，保留文件注释，进程内即时生效）。"""
@@ -263,7 +371,7 @@ async def pin_watch(
     try:
         config = service.set_watch_pinned(target, pinned)
     except ConfigError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=brief(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=400, detail=f"置顶失败：{brief(exc, BRIEF_DEFAULT)}") from exc
@@ -370,10 +478,29 @@ async def scan(request: Request) -> dict:
     }
 
 
+@router.get("/intraday/market-turnover")
+async def market_turnover(request: Request, refresh: bool = False) -> dict:
+    """大盘量能（**独立小接口**，前端可单独轮询，不依赖个股快照）。
+
+    详见 `IntradayService.market_turnover_now` 的说明：原来量能只搭在个股快照里，
+    冷启动/数据源熔断时会整段消失；这个端点让前端能把它**单独实时读**出来，
+    取不到时如实返回 `available=False` + 原因，而不是静默空白。
+    """
+    service = _service(request)
+    return await service.market_turnover_now(refresh=refresh)
+
+
 @router.websocket("/ws/intraday")
 async def intraday_ws(websocket: WebSocket,
                       code: str = "300308") -> None:
     """按周期推送最新快照（服务端主动推，前端无需轮询）。"""
+    # ★ 登录门槛：WebSocket **不经过** `LoginGateMiddleware`
+    #   （那是 BaseHTTPMiddleware，只管 http scope）。实测公网匿名连上
+    #   `/ws/intraday` 就能收到整套快照，所以这里单独校验会话。
+    from src.api.session_ctx import ws_allow
+
+    if not await ws_allow(websocket):
+        return
     service = getattr(websocket.app.state.runtime, "intraday", None)
     if service is None:
         await websocket.close(code=1013)  # 模块不可用
@@ -387,15 +514,30 @@ async def intraday_ws(websocket: WebSocket,
     # 用版号而不是"每轮都推"，避免同一份数据被每 15 秒重发一遍。
     pushed: tuple[Any, Any] = (-1, -1)
     last_snapshot = 0.0
+    # ── 两段式首帧：先轻量出图，再完整补面板 ──────────────────────────────
+    # 用户实测「点开一只票的分时图要六七秒」。原因不在图，而在**完整快照**里
+    # 那几段与图无关的重活：消息面 LLM 打分、估值空间、板块分时、大盘指数、
+    # 海外映射（实测冷标的完整快照 4.5~7 秒，其中板块分时单次可到 20 秒）。
+    # 轻量快照只算行情 + 分时 + 关键价位 + 总分 + 信号，这些正是首屏要看的，
+    # 连上后**第一帧就发轻量**，完整版在下一拍（1 秒后）补上 —— 图先出来，
+    # 消息面/估值面板随后自己填满，而不是让用户盯着整个面板转圈。
+    light_pending = True
+    full_pending = True
     try:
         while True:
             now = time.monotonic()
-            if now - last_snapshot >= _WS_INTERVAL_SECONDS:
-                last_snapshot = now
+            due = now - last_snapshot >= _WS_INTERVAL_SECONDS
+            if light_pending or full_pending or due:
+                use_light = light_pending
+                light_pending = False
+                if not use_light:
+                    full_pending = False
+                    last_snapshot = now
                 try:
-                    snapshot = await service.snapshot(target)
+                    snapshot = await service.snapshot(target, light=use_light)
                     await websocket.send_json({
-                        "type": "snapshot", "data": snapshot.model_dump()})
+                        "type": "snapshot", "light": use_light,
+                        "data": snapshot.model_dump()})
                 except Exception as exc:  # noqa: BLE001 单次失败不断开连接
                     await websocket.send_json({
                         "type": "error", "detail": brief(exc, BRIEF_DEFAULT)})

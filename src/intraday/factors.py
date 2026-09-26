@@ -7,8 +7,8 @@
      用于分时图三角标记与阈值回测（保证「图中标记的分数」与「实时分数」同源同口径）。
 
 符号约定（全模块统一）：
-  得分 > 0 → 对「低吸做T」有利（超跌/超卖/情绪暖/消息多）
-  得分 < 0 → 对「高抛做T」有利（超买/冲高/跑输/消息空）
+  得分 > 0 → 对「回踩区间提示」有利（超跌/超卖/情绪暖/消息多）
+  得分 < 0 → 对「冲高区间提示」有利（超买/冲高/跑输/消息空）
 
 因子分四批接入：
   ① 原七因子：box/vwap/boll/macd/kdj_rsi/sentiment/news
@@ -304,8 +304,8 @@ def score_box(ctx: FactorContext, params: BoxParams) -> FactorOutcome:
         )
     p = ctx.box_position
     score = box_score_from_position(p, params.exponent)
-    zone = "贴近下沿（低吸空间）" if p < 0.35 else (
-        "贴近上沿（高抛/透支）" if p > 0.65 else "箱体中枢（方向不明）")
+    zone = "贴近下沿（回踩空间）" if p < 0.35 else (
+        "贴近上沿（冲高/透支）" if p > 0.65 else "箱体中枢（方向不明）")
     detail = (
         f"箱体 {_fmt(ctx.box_low)}~{_fmt(ctx.box_high)}（{ctx.box_span_days}日），"
         f"现价处于 {p * 100:.0f}% 位 → {zone}"
@@ -746,7 +746,7 @@ def chan_score_from(
     没有这个上限时，一只连续拉升的强势股会被算出 p=8，判成"极端超买"，
     而实际上那不是超买、是趋势 —— 饱和后再由背驰项决定要不要反手。
 
-    背驰分：底背驰 +strength（一买，低吸最有力的结构证据），顶背驰 -strength。
+    背驰分：底背驰 +strength（一买，回踩最有力的结构证据），顶背驰 -strength。
     两项**加权相加而非取其一**：位置与背驰方向冲突时（例如顶背驰却在中枢下方）
     得分自动互相抵消 —— 这正是「信号矛盾时降低把握」的期望行为，
     比强行裁决成某一侧更诚实。
@@ -838,8 +838,8 @@ def chip_score_from(
       幅度因子 = `0.5 + 0.5 × 强度` ∈ [0,1]，**量能只放大方向，不单独给方向** ——
       放量本身既可能是吸筹也可能是派发，位置才决定它是哪一种：
 
-        低位倍量（+0.8 × 1.00） → +0.80  吸筹/承接，低吸最有利
-        高位倍量（−0.8 × 1.00） → −0.80  派发/出货，该高抛
+        低位倍量（+0.8 × 1.00） → +0.80  吸筹/承接，回踩最有利
+        高位倍量（−0.8 × 1.00） → −0.80  派发/出货，该冲高
         低位平量（+0.8 × 0.50） → +0.40  位置略偏多，但缺乏量能确认
         高位缩量（−0.8 × 0.25） → −0.20  无量滞涨，方向保留但强度大幅衰减
         任意位置极度缩量（×0）  →   0    没有量能信息 → 中性
@@ -904,7 +904,7 @@ def cycle_score_from(
 ) -> float | None:
     """情绪周期温度 → 做T环境分：以中性温度为原点的分段线性映射。
 
-        温度 100 → +1（环境极好，低吸胜率高）
+        温度 100 → +1（环境极好，回踩胜率高）
         温度  50 →  0（中性）
         温度   0 → −1（退潮/冰点，做T大概率 T 反）
 
@@ -940,7 +940,7 @@ def score_cycle(ctx: FactorContext, params: CycleParams) -> FactorOutcome:
         "；⛔ 一票否决：" + "、".join(ctx.cycle_gates) if ctx.cycle_gates else "")
     veto_text = ""
     if params.veto_signals and ctx.cycle_t_allowed is False and not ctx.cycle_gates:
-        veto_text = "；⛔ 该阶段禁止低吸做T（退潮/冰点）"
+        veto_text = "；⛔ 该阶段禁止回踩区间提示（退潮/冰点）"
     detail = (
         f"周期阶段「{ctx.cycle_stage or '未知'}」，做T环境温度 "
         f"{ctx.cycle_temperature:.0f}/100 → {tone}{gate_text}{veto_text}")

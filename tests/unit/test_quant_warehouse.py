@@ -79,6 +79,45 @@ def test_config_rejects_placeholder_credentials(
     assert "占位符" in config.description
 
 
+def test_app_db_override_does_not_move_quant_warehouse(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """★ `MOSS_SQLITE_PATH` 是**应用库**开关，不能把行情仓一起带跑（2026-09-23 报障）。
+
+    `manage.py --env dev`（缺省就是 dev）会把它指到 `data/dev/moss_dev.db` 做应用库隔离。
+    行情仓曾经也认这个变量 → dev 实例读到一个几乎空的行情仓：股票字典只剩 4 条，
+    **中文名 / 拼音首字母联想整段失效**（用户报障：汇成真空 301392、大亚圣象 000910
+    都"识别不了"）。行情仓是只读的 15~31 GiB 行情数据，不该跟着应用库隔离走。
+    """
+    for key in ("MOSS_DB_URL", "MOSS_QUANT_DB_URL", "QUANT_DB_URL",
+                "MOSS_MYSQL_HOST", "MYSQL_HOST", "MOSS_MYSQL_USER", "MYSQL_USER",
+                "MOSS_MYSQL_PASSWORD", "MYSQL_PASSWORD",
+                "MOSS_QUANT_SQLITE", "MOSS_SQLITE_PATH"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("MOSS_SQLITE_PATH", str(tmp_path / "moss_dev.db"))
+
+    config = WarehouseConfig.from_env(root="data/quant/tushare")
+
+    assert config.dialect == "sqlite"
+    assert "warehouse.db" in config.url, "行情仓必须仍是 <root>/../warehouse.db"
+    assert "moss_dev" not in config.url and "dev" not in config.description
+
+
+def test_quant_specific_override_still_moves_warehouse(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """要把行情仓指到别处，用 quant 专属的 `MOSS_QUANT_SQLITE`（语义明确）。"""
+    for key in ("MOSS_DB_URL", "MOSS_QUANT_DB_URL", "QUANT_DB_URL",
+                "MOSS_MYSQL_HOST", "MYSQL_HOST", "MOSS_MYSQL_USER", "MYSQL_USER",
+                "MOSS_MYSQL_PASSWORD", "MYSQL_PASSWORD", "MOSS_SQLITE_PATH"):
+        monkeypatch.delenv(key, raising=False)
+    target = tmp_path / "quant_copy.db"
+    monkeypatch.setenv("MOSS_QUANT_SQLITE", str(target))
+
+    config = WarehouseConfig.from_env()
+
+    assert target.as_posix() in config.url
+    assert "MOSS_QUANT_SQLITE" in config.description
+
+
 def test_mask_hides_password() -> None:
     masked = _mask("mysql+pymysql://root:hunter2@127.0.0.1:3306/db")
     assert "hunter2" not in masked

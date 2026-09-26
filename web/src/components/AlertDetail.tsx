@@ -3,14 +3,28 @@ import { Alert } from "../api";
 type Props = {
   alert: Alert | null;
   onClose: () => void;
+  /** 免责声明文案。由调用方传入（设置接口的 `disclaimer`）。
+   *
+   * 为什么不再是 `alert.disclaimer`：那条 91 字节文案在列表里**每条都重复
+   * 一遍**（95 条 = 8,645 B，占整个载荷 7.7%），而隧道实测只有 ~51 KB/s
+   * —— 重复 95 遍的同一句话要从用户的等待时间里扣掉好几秒。
+   * 所以服务端在列表投影里把它去掉了（`alert_to_public(for_list=True)`），
+   * 改由**响应级**的 `settings.disclaimer` 传一次。
+   *
+   * 兜底给一句常量：拿不到设置时也不能让合规声明消失。 */
+  disclaimer?: string;
 };
+
+/** 拿不到设置接口时的兜底文案（与后端 `DISCLAIMER` 同义，不含新信息）。 */
+const FALLBACK_DISCLAIMER =
+  "事件告警由AI基于公开信息自动生成，仅供参考，不构成投资建议。";
 
 const IMPACT_LABEL: Record<string, string> = {
   positive: "受益", negative: "受损", mixed: "影响分化",
 };
 
 /** 告警详情：评分/置信度/受影响个股表/影响路径/溯源外链/免责声明。 */
-export default function AlertDetail({ alert, onClose }: Props) {
+export default function AlertDetail({ alert, onClose, disclaimer }: Props) {
   if (!alert) {
     return (
       <div className="panel alert-detail empty">
@@ -28,7 +42,9 @@ export default function AlertDetail({ alert, onClose }: Props) {
       </div>
       <div className="detail-badges">
         <span className={`badge alert-tag-${alert.alert_type}`}>
-          {riskType ? "风险" : "机会"}·{alert.alert_level}
+          {/* 展示词：利空 / 利多（底层枚举仍是 risk/opportunity）。
+              理由见 `AlertsPanel.TYPE_LABEL` 的说明。 */}
+          {riskType ? "利空" : "利多"}·{alert.alert_level}
         </span>
         <span className={`badge ${alert.status === "active"
           ? "conf-low" : "conf-medium"}`}>
@@ -40,11 +56,11 @@ export default function AlertDetail({ alert, onClose }: Props) {
 
       <div className="score-row">
         <div className="score-cell risk">
-          <label>风险分</label>
+          <label>利空分</label>
           <strong>{Math.round(alert.risk_score)}</strong>
         </div>
         <div className="score-cell opp">
-          <label>机会分</label>
+          <label>利多分</label>
           <strong>{Math.round(alert.opportunity_score)}</strong>
         </div>
         <div className="score-cell conf">
@@ -113,7 +129,7 @@ export default function AlertDetail({ alert, onClose }: Props) {
         )}
       </div>
 
-      <p className="disclaimer">{alert.disclaimer}</p>
+      <p className="disclaimer">{disclaimer || FALLBACK_DISCLAIMER}</p>
     </div>
   );
 }

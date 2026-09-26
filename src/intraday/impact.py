@@ -4,13 +4,13 @@
 
 权重编辑面板上有一排滑杆和一排档位输入框，但用户拖完之后最常见的困惑是：
 
-1. **「我把这个因子调到 8，低吸线会变成多少？」** —— 答案是：**不会变**。
-   低吸线/高抛线/止损位来自**箱体 / 布林 / VWAP / ATR**，与因子权重完全无关；
+1. **「我把这个因子调到 8，回踩线会变成多少？」** —— 答案是：**不会变**。
+   回踩线/冲高线/止损位来自**箱体 / 布林 / VWAP / ATR**，与因子权重完全无关；
    权重只决定总分（够不够格动手）。这不是设计缺陷而是分工：权重管"该不该动"，
    档位管"在哪个价格动"。所以 `examples` 里把这句话直接写出来，而不是让用户
    自己从两条链路里悟。
 2. **「那我现在离动手还差多少？」** —— 这需要把两条链路**合起来**看：
-   价格要走到 `低吸线×(1+贴线带宽)` 以内，且总分要 ≥ 提示线/动手线。
+   价格要走到 `回踩线×(1+贴线带宽)` 以内，且总分要 ≥ 提示线/动手线。
    两者各自给出「还差多少」，并把先卡住的那一条指出来。
 
 ## 口径来源
@@ -66,10 +66,10 @@ def annotate_level_basis(levels: LevelSet, config: IntradayConfig) -> LevelSet:
     box_low, box_high = float(levels.box_low), float(levels.box_high)
     boll_lower = _finite(levels.boll_lower)
     boll_upper = _finite(levels.boll_upper)
-    # 与 engine 同口径：低吸线低于「现价 - 0.2%」才算落到了现价下方
+    # 与 engine 同口径：回踩线低于「现价 - 0.2%」才算落到了现价下方
     # （_MIN_LEVEL_GAP=0.002），否则就是走了 ATR 兜底分支。
     below_price = price * (1.0 - 0.002)
-    # 候选值：与 engine.compute_levels 依次取 max（低吸）/ min（高抛）的顺序一致，
+    # 候选值：与 engine.compute_levels 依次取 max（回踩）/ min（冲高）的顺序一致，
     # 这样"这条线是谁定的"能用「与候选值相等」直接判出来，不靠猜。
     low_candidates: list[tuple[str, float]] = [(f"箱体下沿 {box_low:.2f}", box_low)]
     if params.blend_boll_bands and boll_lower is not None and boll_lower < price:
@@ -87,7 +87,7 @@ def annotate_level_basis(levels: LevelSet, config: IntradayConfig) -> LevelSet:
 
     buffer_text = ""
     if params.take_profit_buffer_pct:
-        buffer_text = f"，再加高抛缓冲 {params.take_profit_buffer_pct:g}%"
+        buffer_text = f"，再加冲高缓冲 {params.take_profit_buffer_pct:g}%"
     blended = box_high * (1.0 + params.take_profit_buffer_pct / 100.0)
     high_candidates: list[tuple[str, float]] = [
         (f"箱体上沿 {box_high:.2f}{buffer_text}", blended)]
@@ -212,13 +212,13 @@ def _impact_note(factor: FactorScore) -> str:
 def level_deltas(
     current: LevelSet | None, preview: LevelSet | None,
 ) -> list[TriggerLevelDelta]:
-    """「改动前 → 改动后」逐线对照（高抛 / 低吸 / 止损 / VWAP）。
+    """「改动前 → 改动后」逐线对照（冲高 / 回踩 / 止损 / VWAP）。
 
     放在服务端算而不是前端各算一遍：两份档位都是服务端产出的对象，
     差异口径（用哪些字段、怎么算百分比）只该有一处定义 ——
-    否则同一个「低吸线变动」在面板和接口里迟早会给出两个不一样的数。
+    否则同一个「回踩线变动」在面板和接口里迟早会给出两个不一样的数。
 
-    ⚠️ 口径说明（必须在面板上写清楚）：低吸/高抛/止损是**时刻量**，随
+    ⚠️ 口径说明（必须在面板上写清楚）：回踩/冲高/止损是**时刻量**，随
     VWAP/布林/现价每分钟重算。这里的两份值都基于**同一份行情**，
     比的是「参数与阈值改动」的效果，不是"上一分钟那条线在哪"。
 
@@ -230,8 +230,8 @@ def level_deltas(
     if preview is None:
         return []
     pairs = [
-        ("high_sell", "高抛线", "high_sell"),
-        ("low_buy", "低吸线", "low_buy"),
+        ("high_sell", "冲高线", "high_sell"),
+        ("low_buy", "回踩线", "low_buy"),
         ("stop_loss", "止损位", "stop_loss"),
         ("vwap", "当日均价(VWAP)", "vwap"),
     ]
@@ -301,8 +301,8 @@ def build_trigger_impact(
 
     notes: list[str] = []
     examples: list[str] = [
-        "档位线（低吸/高抛/止损）只由 箱体 / 布林 / VWAP / ATR / 档位参数 决定，"
-        "**与因子权重无关** —— 调权重不会让低吸线移动一分钱；",
+        "档位线（回踩/冲高/止损）只由 箱体 / 布林 / VWAP / ATR / 档位参数 决定，"
+        "**与因子权重无关** —— 调权重不会让回踩线移动一分钱；",
         "权重决定的是总分：总分够不够 提示线/动手线，决定价格触线时是"
         "「空心软提示」还是「实心正式信号」；",
         "所以本页的两张表要合起来读：上面的价格线告诉你「在哪个价位动手」，"
@@ -318,14 +318,14 @@ def build_trigger_impact(
 
     if annotated.band_clamped:
         notes.append(
-            f"档位差 {annotated.band_width_pct:.2f}%（原始候选 低吸 "
-            f"{annotated.pre_clamp_low:.2f} / 高抛 {annotated.pre_clamp_high:.2f}）"
-            f"{annotated.band_clamped}，最终落在 低吸 {annotated.low_buy:.2f} / "
-            f"高抛 {annotated.high_sell:.2f}"
+            f"档位差 {annotated.band_width_pct:.2f}%（原始候选 回踩 "
+            f"{annotated.pre_clamp_low:.2f} / 冲高 {annotated.pre_clamp_high:.2f}）"
+            f"{annotated.band_clamped}，最终落在 回踩 {annotated.low_buy:.2f} / "
+            f"冲高 {annotated.high_sell:.2f}"
             " —— 护栏的用意是「别让一轮做T被双边成本吃掉」与「别让线远到永不触发」。")
     if annotated.atr is not None and annotated.stop_loss is not None:
         notes.append(
-            f"止损距离取「低吸线×{annotated.stop_loss_pct:g}%」与"
+            f"止损距离取「回踩线×{annotated.stop_loss_pct:g}%」与"
             f"「{annotated.atr_stop_mult:g}×ATR」中更宽的那个：{annotated.stop_basis}。")
     if coverage_blocked:
         notes.append(
@@ -334,7 +334,7 @@ def build_trigger_impact(
     if cycle_veto:
         notes.append(
             f"市场情绪周期「{cycle_stage or '未知'}」为一票否决阶段："
-            "本模块禁止正式低吸做T（低吸胜率极低），总分再高也不会出实心信号。")
+            "本模块禁止正式回踩区间提示（回踩胜率极低），总分再高也不会出实心信号。")
 
     weak = [row for row in impacts if not row.available]
     if weak:
@@ -360,42 +360,42 @@ def build_trigger_impact(
 
 
 def _level_rows(levels: LevelSet, price: float) -> list[TriggerLevelRow]:
-    low_note = "低吸：先接后抛（做T的买入腿）"
-    high_note = "高抛：先减后接（做T的卖出腿）"
+    low_note = "回踩：先接后抛（做T的买入腿）"
+    high_note = "冲高：先减后接（做T的卖出腿）"
     if levels.band_clamped:
         low_note += f"；当前值已被档位差护栏调整（候选位置 {_fmt(levels.pre_clamp_low)}）"
         high_note += f"；当前值已被档位差护栏调整（候选位置 {_fmt(levels.pre_clamp_high)}）"
     rows = [
         TriggerLevelRow(
-            key="high_sell", label="高抛线",
+            key="high_sell", label="冲高线",
             price=round(float(levels.high_sell), 4),
             distance_pct=_distance_pct(price, float(levels.high_sell)),
             source=levels.high_source or f"箱体上沿 {levels.box_high:.2f}",
             trigger_price=levels.high_trigger_price,
             trigger_note=(
                 f"价格涨到 {levels.high_trigger_price:.2f} 及以上即「触及」"
-                "，此时总分 ≤ −提示线才出高抛信号"
+                "，此时总分 ≤ −提示线才出冲高信号"
                 if levels.high_trigger_price is not None else ""),
             note=high_note),
         TriggerLevelRow(
-            key="low_buy", label="低吸线",
+            key="low_buy", label="回踩线",
             price=round(float(levels.low_buy), 4),
             distance_pct=_distance_pct(price, float(levels.low_buy)),
             source=levels.low_source or f"箱体下沿 {levels.box_low:.2f}",
             trigger_price=levels.low_trigger_price,
             trigger_note=(
                 f"价格跌到 {levels.low_trigger_price:.2f} 及以下即「触及」"
-                "，此时总分 ≥ 提示线才出低吸信号"
+                "，此时总分 ≥ 提示线才出回踩信号"
                 if levels.low_trigger_price is not None else ""),
             note=low_note),
         TriggerLevelRow(
             key="stop_loss", label="止损位",
             price=round(float(levels.stop_loss), 4),
             distance_pct=_distance_pct(price, float(levels.stop_loss)),
-            source=levels.stop_basis or f"低吸线下方 {levels.stop_loss_pct:g}%",
+            source=levels.stop_basis or f"回踩线下方 {levels.stop_loss_pct:g}%",
             trigger_price=round(float(levels.stop_loss), 4),
             trigger_note=(
-                "现价跌破即为强制卖出警告（forced_exit），且**禁止一切低吸信号**"
+                "现价跌破即为止损提示（forced_exit），且**禁止一切回踩信号**"
                 "；逐bar回放还要求跌破此前最低价的 0.3% 才算「真实破位」"),
             note="风控线：不是预测线，必须低于当日已成交区间"),
     ]
@@ -418,7 +418,7 @@ def _level_rows(levels: LevelSet, price: float) -> list[TriggerLevelRow]:
             source=(f"下轨 {_fmt(levels.boll_lower)} / 中轨 {_fmt(levels.boll_mid)}"
                     f" / 上轨 {_fmt(levels.boll_upper)}，带宽 {_fmt(levels.bandwidth, 4)}"),
             trigger_price=None,
-            trigger_note="开启 blend_boll_bands 时，下轨/上轨会参与低吸线/高抛线的取高/取低",
+            trigger_note="开启 blend_boll_bands 时，下轨/上轨会参与回踩线/冲高线的取高/取低",
             note="强势股刚突破时带宽会窄到 1% 以内，护栏只采纳**在现价下方/上方**的那一侧"))
     return rows
 
@@ -440,16 +440,16 @@ def _gate_rows(
     if coverage_blocked:
         blocks.append("有效权重<70 → 实心降级为空心")
     if cycle_blocked:
-        blocks.append(f"情绪周期「{cycle_stage}」禁止低吸做T")
+        blocks.append(f"情绪周期「{cycle_stage}」禁止回踩区间提示")
     cycle_gate_note = "；".join(blocks)
-    # 高抛不受情绪周期否决（退潮期更需要减仓），因此只有覆盖度能拦它
+    # 冲高不受情绪周期否决（退潮期更需要减仓），因此只有覆盖度能拦它
     high_gate_note = ("有效权重<70 → 实心降级为空心" if coverage_blocked else "")
 
     price_to_low = _price_need_pct(price, annotated.low_trigger_price, falling=True)
     price_to_high = _price_need_pct(price, annotated.high_trigger_price, falling=False)
     return [
         TriggerGateRow(
-            key="low_buy", label="低吸做T",
+            key="low_buy", label="回踩区间提示",
             ready=low_ready and not cycle_blocked,
             score_need=round(max(0.0, hint - total), 2),
             price_need_pct=price_to_low,
@@ -461,9 +461,9 @@ def _gate_rows(
                      else f"，距动手线 +{action:g} 还差 {action - total:.1f} 分"))
             + ("" if price_to_low is None
                else f"；价格需再跌 {abs(price_to_low):.2f}% 到 "
-                    f"{annotated.low_trigger_price:.2f} 才触及低吸线")),
+                    f"{annotated.low_trigger_price:.2f} 才触及回踩线")),
         TriggerGateRow(
-            key="high_sell", label="高抛做T",
+            key="high_sell", label="冲高区间提示",
             ready=high_ready,
             score_need=round(max(0.0, total + hint), 2),
             price_need_pct=price_to_high,
@@ -475,19 +475,19 @@ def _gate_rows(
                      else f"，距动手线 -{action:g} 还差 {total + action:.1f} 分"))
             + ("" if price_to_high is None
                else f"；价格需再涨 {abs(price_to_high):.2f}% 到 "
-                    f"{annotated.high_trigger_price:.2f} 才触及高抛线")),
+                    f"{annotated.high_trigger_price:.2f} 才触及冲高线")),
         TriggerGateRow(
-            key="stop_loss", label="止损（强制卖出）",
+            key="stop_loss", label="止损（止损触发）",
             ready=price <= float(annotated.stop_loss) + 1e-9,
             score_need=0.0,
             price_need_pct=_distance_pct(price, float(annotated.stop_loss)),
             blocked_by="",
             note=(f"止损位 {annotated.stop_loss:.2f}"
-                  + ("：**现价已跌破**，禁止任何低吸信号"
+                  + ("：**现价已跌破**，禁止任何回踩信号"
                      if price <= float(annotated.stop_loss) + 1e-9
                      else f"：现价距它还有 "
                           f"{abs(_distance_pct(price, float(annotated.stop_loss)) or 0.0):.2f}%"
-                          " 的空间；跌破即强制卖出警告并禁止低吸"))),
+                          " 的空间；跌破即止损提示并禁止回踩"))),
     ]
 
 
@@ -504,7 +504,7 @@ def _price_need_pct(price: float, target: float | None,
         return None
     delta = (float(target) - price) / price * 100.0
     if falling:
-        # 低吸：目标在下方，已在线下则无需再跌（0）
+        # 回踩：目标在下方，已在线下则无需再跌（0）
         return round(min(0.0, delta), 3)
     return round(max(0.0, delta), 3)
 

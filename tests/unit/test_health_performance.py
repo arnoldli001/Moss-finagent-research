@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import time
 
@@ -89,7 +91,7 @@ def test_warehouse_health_uses_disk_cache(tmp_path, monkeypatch) -> None:
              "first": "20060104", "last": "20260915"}]}
 
     monkeypatch.setattr("src.quant.warehouse.warehouse_status", fake_status)
-    monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE",
+    monkeypatch.setattr(data_health, "_warehouse_stats_file", lambda:
                         tmp_path / "warehouse_stats.json")
 
     # 预热路径（force）：算出来并落盘，冷启动后第一次请求就是热的
@@ -111,7 +113,7 @@ def test_warehouse_health_survives_corrupt_cache(tmp_path, monkeypatch) -> None:
 
     broken = tmp_path / "warehouse_stats.json"
     broken.write_text("{不是JSON", encoding="utf-8")
-    monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE", broken)
+    monkeypatch.setattr(data_health, "_warehouse_stats_file", lambda: broken)
     monkeypatch.setattr("src.quant.warehouse.warehouse_status",
                         lambda root="": {"tables": []})
     result = data_health._warehouse_health()  # noqa: SLF001
@@ -126,7 +128,7 @@ def test_warehouse_health_reports_errors_without_raising(monkeypatch) -> None:
     def boom(root: str = ""):
         raise RuntimeError("库坏了")
 
-    monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE",
+    monkeypatch.setattr(data_health, "_warehouse_stats_file", lambda:
                         __import__("pathlib").Path("/nonexistent/x.json"))
     monkeypatch.setattr("src.quant.warehouse.warehouse_status", boom)
     result = data_health._warehouse_health(force=True)  # noqa: SLF001
@@ -142,7 +144,7 @@ def test_warehouse_health_cold_request_does_not_block(tmp_path, monkeypatch) -> 
     """
     from src.api import data_health
 
-    monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE",
+    monkeypatch.setattr(data_health, "_warehouse_stats_file", lambda:
                         tmp_path / "warehouse_stats.json")
     started = {"n": 0}
 
@@ -207,6 +209,61 @@ def test_health_route_runs_health_build_off_the_event_loop() -> None:
         "健康度组装必须放到关键路径线程池里，不能在事件循环里同步跑"
 
 
+# ======================================================================
+# 存活探针 /health/live：把"进程还在吗"与"依赖都好吗"分开
+# ======================================================================
+
+def test_health_live_is_cheap_and_does_no_io() -> None:
+    """★ 核心：`/health/live` 必须**不联网、不查库**，毫秒级返回。
+
+    为什么单独钉死这条：前端拿它当"后端还在吗"的判据。一旦有人图省事
+    把 `build_data_health()` 塞进来（本文件上面记录过它 142.8s / 300s
+    的历史），探针就会在服务只是"忙"的时候超时 —— 于是前端对着一个
+    完全正常的后端弹"无法连接到服务器"。**误报比不报更伤信任。**
+    """
+
+    from src.api.routes.research import health_live
+
+    source = inspect.getsource(health_live)
+    for forbidden in ("build_data_health", "ChainVerifier", "httpx",
+                      "AsyncClient", "_runtime", "get_settings"):
+        assert forbidden not in source, (
+            f"/health/live 里出现了 {forbidden} —— 存活探针不能有依赖，"
+            f"否则服务一忙就误报宕机")
+
+    t = time.perf_counter()
+    payload = asyncio.run(health_live())
+    elapsed = time.perf_counter() - t
+    assert payload["ok"] is True
+    assert elapsed < 0.05, f"存活探针耗时 {elapsed:.3f}s，不可能没有 I/O"
+
+
+def test_health_live_leaks_no_deployment_details() -> None:
+    """它**免鉴权**，所以返回体只能是"我在"。
+
+    pid 能看出进程重启历史、环境名（dev/prod）直接告诉攻击者该用哪套
+    弱配置 —— 这两样都不该给匿名调用者。
+    """
+    from src.api.routes.research import health_live
+
+    payload = asyncio.run(health_live())
+    assert set(payload) == {"ok", "ts"}, f"多返回了字段：{sorted(payload)}"
+
+
+def test_health_live_is_public_but_readiness_is_not() -> None:
+    """免鉴权清单必须**只**加存活探针，不能顺手把聚合健康度也放进去。
+
+    `/api/v1/health` 会返回 Ollama/DeepSeek 配置状态、数据源健康度、
+    库表行数 —— 那是内部拓扑，匿名可读等于给攻击者一份踩点清单。
+    而 `/health/live` 在**登录页**就要能用（那时还没有会话）。
+    """
+    from src.api.tenancy_middleware import _PUBLIC_PATHS  # noqa: SLF001
+
+    assert "/api/v1/health/live" in _PUBLIC_PATHS
+    assert "/api/v1/health" not in _PUBLIC_PATHS, (
+        "聚合健康度不能匿名可读（返回内部数据源/模型配置状态）")
+
+
 @pytest.fixture(autouse=True)
 def _reset_refresh_flags():
     """每例前后清掉"后台刷新中"标记：它们是模块级全局量，跨例会互相抑制。"""
@@ -233,7 +290,7 @@ def test_tushare_health_uses_disk_cache(tmp_path, monkeypatch) -> None:
         calls["n"] += 1
         return {"source": "tushare", "partitions": 35711, "datasets": []}
 
-    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE",
+    monkeypatch.setattr(data_health, "_tushare_stats_file", lambda:
                         tmp_path / "tushare_stats.json")
     monkeypatch.setattr(data_health, "_build_tushare_health", fake_build)
 
@@ -261,7 +318,7 @@ def test_tushare_health_refreshes_in_background_when_stale(
     from src.api import data_health
 
     path = tmp_path / "tushare_stats.json"
-    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE", path)
+    monkeypatch.setattr(data_health, "_tushare_stats_file", lambda: path)
     monkeypatch.setattr(data_health, "_TUSHARE_TTL", 60.0)
     path.write_text(json.dumps({"_cached_at": time.time() - 3600,
                                 "partitions": 1, "datasets": [],
@@ -292,7 +349,7 @@ def test_tushare_health_survives_corrupt_cache(tmp_path, monkeypatch) -> None:
 
     broken = tmp_path / "tushare_stats.json"
     broken.write_text("{不是JSON", encoding="utf-8")
-    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE", broken)
+    monkeypatch.setattr(data_health, "_tushare_stats_file", lambda: broken)
     monkeypatch.setattr(data_health, "_build_tushare_health",
                         lambda root, universe: {"source": "tushare",
                                                 "partitions": 3, "datasets": []})
@@ -309,7 +366,7 @@ def test_tushare_health_cold_request_does_not_block(tmp_path, monkeypatch) -> No
     """
     from src.api import data_health
 
-    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE",
+    monkeypatch.setattr(data_health, "_tushare_stats_file", lambda:
                         tmp_path / "tushare_stats.json")
     started = {"n": 0}
 
@@ -342,8 +399,8 @@ def test_invalidate_cache_include_disk_clears_both_stats_files(
     ts = tmp_path / "tushare_stats.json"
     wh.write_text("{}", encoding="utf-8")
     ts.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(data_health, "_WAREHOUSE_STATS_FILE", wh)
-    monkeypatch.setattr(data_health, "_TUSHARE_STATS_FILE", ts)
+    monkeypatch.setattr(data_health, "_warehouse_stats_file", lambda: wh)
+    monkeypatch.setattr(data_health, "_tushare_stats_file", lambda: ts)
 
     data_health.invalidate_cache(include_disk=True)
 

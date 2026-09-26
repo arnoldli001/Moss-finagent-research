@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -36,8 +37,8 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8100"
-ACCOUNT = "admin"
-PASSWORD = "MossDev2026x"
+ACCOUNT = os.environ.get("SHOT_ACCOUNT", "admin")
+PASSWORD = os.environ.get("SHOT_PASSWORD", "MossDev2026x")
 
 #: 要验的视口。前两个是**用户点名要覆盖**的机型。
 VIEWPORTS: list[tuple[str, int, int]] = [

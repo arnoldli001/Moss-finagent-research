@@ -95,6 +95,71 @@ class EventRepository(ABC):
     ) -> str | None:
         """查询跨源内容抑制键最近一次告警时间（异源同文冷却，按租户）。"""
 
+    async def delete_alerts(
+        self, alert_key_prefix: str, tenant_id: str = DEFAULT_TENANT,
+    ) -> dict[str, int]:
+        """按 alert_key 前缀删除告警（**只服务试验数据的回滚**）。
+
+        ## 为什么是"具体方法"而不是 `@abstractmethod`
+
+        这条能力只有**试验副本**（`scripts/intel_copy_to_alerts.py` 写进去的
+        `intelcopy:` 数据）会用到，它不属于生产告警链路。写成抽象方法会把
+        **所有**现有实现一起打挂：`tests/unit/test_alert_service.py` 里有手写的
+        假仓储（`FakeRepo`，约 78 行起），以及将来可能有的 postgres 实现 ——
+        它们不关心回滚，却会因为"没有实现一个用不到的接口"而无法实例化，
+        表现是**大量与本次改动无关的测试突然报 TypeError**。
+        默认实现抛 `NotImplementedError` 而不是静默返回 0：静默的
+        `{"alerts": 0, "events": 0}` 会让回滚脚本报告"清理完成"，
+        而数据一条没少 —— 那是本次改动最危险的失败方式。
+
+        ## 契约
+
+        - 只删 `tenant_id` 下 `alert_key` **以此前缀开头**的行；
+        - 前缀按**字面**匹配，`%` / `_` 不是通配符（见 SQLite 覆写里的说明）；
+        - 返回 `{"alerts": n, "events": m}`，即两侧**实际受影响的行数**；
+        - `alert_key_prefix` 为空串时抛 `ValueError`（空前缀 = 删光该租户全部告警）。
+        """
+        raise NotImplementedError("该仓储不支持按前缀删除告警")
+
+    async def prune_alerts_before(
+        self, cutoff_text: str, tenant_id: str | None = None,
+        *, delete_orphan_events: bool = True,
+    ) -> dict[str, int]:
+        """删除触发时间早于 `cutoff_text` 的告警（保留期清理 /"溢出删除"）。
+
+        用户口径（2026-09-26）："事件告警的信息最多保留三天，超过3天的
+        信息自动溢出删除。"
+
+        ## 与 `expire_time` / `_expire_due` 的分工（**别混**）
+
+        两者都要，缺一不可：
+
+        | 机制 | 动作 | 何时 | 目的 |
+        |---|---|---|---|
+        | `expire_time` + 懒过期 | `status='expired'` | 读路径 | 到期**不再显示** |
+        | **本方法** | `DELETE` | 保留作业 | 数据**真正释放** |
+
+        只做懒过期的话 `fact_alerts` 会**无限增长**（过期行永远留着）——
+        表小的时候看不出来，攒够了就是一次查询变慢 + 库文件膨胀。
+
+        ## 契约
+
+        - 只删 `trigger_time < cutoff_text` 的行；`tenant_id=None` 表示全部租户；
+        - `cutoff_text` 为空串时抛 `ValueError`（空 = 删光全表，绝不该发生）；
+        - `delete_orphan_events=True` 时，**顺带删掉因此不再被任何告警引用的
+          事件行**（理由同 `delete_alerts`：孤儿事件会被
+          `list_unanalyzed_events` 当"未评估积压"反复捞出来）；
+        - 返回 `{"alerts": n, "events": m}`，即两侧**实际删除的行数**。
+
+        ## 为什么默认实现抛 NotImplementedError
+
+        与 `delete_alerts` 同一理由：写成 `@abstractmethod` 会把所有现有实现
+        （含测试里手写的 `FakeRepo`）一起打挂，报错看起来与本次改动无关。
+        抛错而不是静默返回 0 —— 静默的 `{"alerts": 0}` 会让保留作业报告
+        "清理完成"而数据一条没少，那是这类改动最危险的失败方式。
+        """
+        raise NotImplementedError("该仓储不支持按保留期清理告警")
+
     async def close(self) -> None:
         """释放资源（默认无操作；SQLite连接每操作即关，无需覆写）。"""
         return None

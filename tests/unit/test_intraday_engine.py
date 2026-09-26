@@ -1,7 +1,7 @@
 """做T模块 · 信号引擎单元测试（阈值触发 + 止损硬约束 + 数据覆盖度护栏）。
 
 安全关键：止损硬约束必须"任何情况下都不可绕过"——本文件用参数化用例覆盖
-"高总分 + 跌破止损位"的组合，确保不会出现"越跌越买"的低吸信号。
+"高总分 + 跌破止损位"的组合，确保不会出现"越跌越买"的回踩信号。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _scorecard(total: float, available_weight: float = 100.0) -> ScoreCard:
 
 
 def test_levels_stop_loss_is_below_low_buy() -> None:
-    """止损位 = 低吸线下方 stop_loss_pct%；三档满足 止损 < 低吸 < 高抛。"""
+    """止损位 = 回踩线下方 stop_loss_pct%；三档满足 止损 < 回踩 < 冲高。"""
     config = IntradayConfig()
     levels = compute_levels(
         price=10.0, box_high=10.3, box_low=9.7, box_span_days=20,
@@ -53,7 +53,7 @@ def test_levels_stop_loss_is_below_low_buy() -> None:
 
 
 def test_levels_blend_takes_earlier_touch() -> None:
-    """融合布林带后取「更早被触及」的档位：低吸取较高者，高抛取较低者。
+    """融合布林带后取「更早被触及」的档位：回踩取较高者，冲高取较低者。
 
     本用例专门校验融合规则本身，故把档位差护栏放宽以免其介入。
     """
@@ -108,7 +108,7 @@ def test_levels_max_band_width_keeps_levels_reachable() -> None:
 
 
 def test_levels_shrink_centers_on_price_when_box_is_offset() -> None:
-    """现价贴近箱体下沿且箱体过宽时，档位必须围绕现价（否则低吸线会高于现价）。"""
+    """现价贴近箱体下沿且箱体过宽时，档位必须围绕现价（否则回踩线会高于现价）。"""
     config = IntradayConfig()
     config.levels.blend_boll_bands = False
     levels = compute_levels(
@@ -133,7 +133,7 @@ def test_levels_box_position_none_when_flat() -> None:
     (30.0, "solid"), (45.0, "solid"), (29.9, "hollow"), (20.0, "hollow"),
 ])
 def test_low_buy_thresholds(total: float, expected_strength: str) -> None:
-    """低吸：≥动手线→实心，提示线~动手线→空心。"""
+    """回踩：≥动手线→实心，提示线~动手线→空心。"""
     signal = decide_signal(
         price=9.5, scorecard=_scorecard(total), levels=_levels(),
         config=IntradayConfig(), ts="2026-09-15 10:35")
@@ -146,7 +146,7 @@ def test_low_buy_thresholds(total: float, expected_strength: str) -> None:
     (-30.0, "solid"), (-55.0, "solid"), (-29.9, "hollow"), (-20.0, "hollow"),
 ])
 def test_high_sell_thresholds(total: float, expected_strength: str) -> None:
-    """高抛：≤-动手线→实心，-动手线~-提示线→空心。"""
+    """冲高：≤-动手线→实心，-动手线~-提示线→空心。"""
     signal = decide_signal(
         price=10.5, scorecard=_scorecard(total), levels=_levels(),
         config=IntradayConfig(), ts="2026-09-15 14:00")
@@ -155,7 +155,7 @@ def test_high_sell_thresholds(total: float, expected_strength: str) -> None:
 
 
 def test_score_below_hint_never_triggers_even_at_level() -> None:
-    """价格触及低吸线但总分未达提示线 → 不触发（截图口径：震荡区间不动手）。"""
+    """价格触及回踩线但总分未达提示线 → 不触发（截图口径：震荡区间不动手）。"""
     signal = decide_signal(
         price=9.45, scorecard=_scorecard(2.6), levels=_levels(),
         config=IntradayConfig(), ts="2026-09-15 10:35")
@@ -170,7 +170,7 @@ def test_score_above_hint_but_price_not_touching() -> None:
         price=10.2, scorecard=_scorecard(35.0), levels=_levels(),
         config=IntradayConfig(), ts="2026-09-15 10:35")
     assert signal.kind == "none"
-    assert "未触及低吸线" in signal.reason
+    assert "未触及回踩线" in signal.reason
 
 
 def test_vwap_extreme_counts_as_touch() -> None:
@@ -184,7 +184,7 @@ def test_vwap_extreme_counts_as_touch() -> None:
 
 
 def test_touch_band_allows_near_touch() -> None:
-    """触及带宽：价格略高于低吸线但在 band 内仍算触及。"""
+    """触及带宽：价格略高于回踩线但在 band 内仍算触及。"""
     config = IntradayConfig()
     band = config.levels.touch_band_pct / 100.0
     signal = decide_signal(
@@ -198,7 +198,7 @@ def test_touch_band_allows_near_touch() -> None:
 
 @pytest.mark.parametrize("total", [100.0, 60.0, 30.0, 0.0, -100.0])
 def test_stop_loss_overrides_every_score(total: float) -> None:
-    """跌破止损位 → 强制卖出警告；即使总分满分也绝不产生低吸信号。"""
+    """跌破止损位 → 强制卖出警告；即使总分满分也绝不产生回踩信号。"""
     signal = decide_signal(
         price=9.0, scorecard=_scorecard(total), levels=_levels(),
         config=IntradayConfig(), ts="2026-09-15 10:35")
@@ -206,7 +206,7 @@ def test_stop_loss_overrides_every_score(total: float) -> None:
     assert signal.strength == "forced_exit"
     assert signal.triggered is True
     assert signal.blocked_by_stop_loss is True
-    assert "禁止任何低吸信号" in signal.reason
+    assert "禁止任何回踩信号" in signal.reason
 
 
 def test_stop_loss_boundary_is_inclusive() -> None:
@@ -218,7 +218,7 @@ def test_stop_loss_boundary_is_inclusive() -> None:
 
 
 def test_above_stop_loss_still_allows_low_buy() -> None:
-    """止损位之上，低吸逻辑照常工作（约束只向下生效）。"""
+    """止损位之上，回踩逻辑照常工作（约束只向下生效）。"""
     signal = decide_signal(
         price=9.45, scorecard=_scorecard(45.0),
         levels=_levels(low_buy=9.5, stop_loss=9.4), config=IntradayConfig(),
@@ -300,7 +300,7 @@ def test_scorecard_zone_mapping() -> None:
 
 
 def test_build_markers_from_replay() -> None:
-    """逐bar重放 → 三角标记：低吸/高抛/止损三类都能落点。"""
+    """逐bar重放 → 三角标记：回踩/冲高/止损三类都能落点。"""
     replay = pd.DataFrame({
         "ts": ["2026-09-15 09:35", "2026-09-15 10:00", "2026-09-15 10:30",
                "2026-09-15 14:00"],
@@ -316,7 +316,7 @@ def test_build_markers_from_replay() -> None:
     assert "stop_loss" in kinds
     low = next(m for m in markers if m.kind == "low_buy")
     assert low.strength == "solid"
-    assert low.label.startswith("低吸")
+    assert low.label.startswith("回踩")
 
 
 def test_build_markers_hollow_when_between_thresholds() -> None:

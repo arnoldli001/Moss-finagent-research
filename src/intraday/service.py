@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import math
 import time
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -81,6 +83,7 @@ from src.intraday.level_fit import (
     build_dataset,
     fit_levels,
 )
+from src.intraday.market_amount import MarketTurnoverProvider
 from src.intraday.market_cycle import MarketCycle, MarketCycleProvider
 from src.intraday.models import (
     BacktestResult,
@@ -106,11 +109,13 @@ from src.intraday.sources import (
     close_indicator,
     daily_bars_from_points,
 )
-from src.intraday.valuation import ValuationProvider
+from src.intraday.valuation import HEADROOM_LABELS, ValuationProvider
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_INDEX = "000001"
+#: 大盘基准指数代码（纯代码；带名称的兜底在 `intraday/market.py:DEFAULT_BOARD_INDEX`）。
+#: 两者曾同名 `DEFAULT_INDEX` —— 一个 str 一个元组，故显式区分命名。
+DEFAULT_INDEX_CODE = "000001"
 # 5分钟上下文天数（腾讯单次接口上限约320根 ≈ 6.6 个交易日）。
 # 档位拟合还想要更长窗口（用户口径是"过去 10 个交易日"），见 `_intraday_days`：
 # 数据源能吃多少就取多少，拟合侧按**实际拿到的天数**如实标注。
@@ -189,6 +194,83 @@ def watchlist_refresh_window(now: datetime | None = None) -> tuple[bool, str]:
     return True, "盘中自动刷新中"
 
 
+def _push_allowed_now(now: datetime | None = None) -> tuple[bool, str]:
+    """推送闸门之二：明确的"这个时点不该推送" → (是否允许, 人话原因)。
+
+    ## 为什么不能直接用 `auto_select.is_trading_day()`（2026-09-25 实测）
+
+    `is_trading_day()` 的兜底语义是"市场时钟取不到 / 时钟没推进 → 按交易日处理"，
+    反过来说：**时钟停在上一交易日时它会判 False**。而"时钟停在上一交易日"有两种
+    完全不同的原因，它区分不了（实测两个场景返回值相同）：
+
+    | 场景 | 真交易日 09:20（竞价期） | 节假日 09:20 |
+    |---|---|---|
+    | `is_trading_day()` | **False** | **False** |
+
+    竞价期当天第一笔成交还没产生，tick 的 timetag 不会前进（`watchlist_refresh_window`
+    的 docstring 专门解释过这一点）。真把 `is_trading_day()` 当**推送**闸门，
+    **每个正常交易日的 09:15~09:30 都会被误杀** —— 而那正是做T里"开盘定方向"
+    最关键的时段。所以这里只用**不会误杀**的判据：
+
+    1. 周末 —— `weekday()` 无歧义；
+    2. 15:05 盘后 —— 当天行情已定稿，这时再冒出来的"信号"必然是重算在旧数据上
+       重复触发的，推给用户只会让他对着收盘价做动作。
+
+    ## 11:30~13:00 午休为什么**不**拦
+
+    午休推的信号仍然是**当天**的，拦掉会损失"下午开盘前提醒"；而且午休期间
+    市场时钟回落到上一交易日也是正常现象，拿来判"休市"同样会误杀。
+    数据归属由闸门一（`SignalNotifier._stale_guard`）把关，这里不重复承担。
+
+    ## 与闸门一的分工
+
+    - **闸门一**（`should_push` 的 stale 检查）："这份数据属于哪一天" —— 主力防线。
+      节假日拿上一交易日收盘数据算出的信号，**任何时刻**都会被它拦下；
+    - **闸门二**（本函数）："这个时点还该不该推送" —— 兜底，覆盖 stale 判据失灵的
+      情况（行情源给出假日期、快照来自旧版缓存等）。
+    """
+    moment = now or datetime.now()
+    if moment.weekday() >= 5:
+        return False, "周末休市"
+    from src.core.trading_session import POST_CLOSE
+
+    if moment.hour * 60 + moment.minute >= POST_CLOSE:
+        return False, "已收盘后不再推送（当日行情已定稿）"
+    return True, ""
+
+
+def _is_trading_day_for_refresh() -> bool:
+    """完整交易日判定（周末 + 市场时钟），供「整表重算」闸门使用。
+
+    ## 为什么不直接用 `watchlist_refresh_window()` 的返回值
+
+    那个函数的时钟判据在 **09:15~09:30 竞价时段刻意失效**（见它自己的 docstring：
+    当天第一笔成交前 tick 的 timetag 不会前进）。这个取舍对"交易日的早盘要不要
+    刷新"是对的，但**它不能回答"今天到底开不开市"** —— 2026-09-25 中秋节
+    （周五休市）正是靠这个缺口，在早盘窗口里把上一交易日的收盘信号又推了一遍。
+
+    ## 这里的 False 只用来"少做一轮重算"，不用来拦推送
+
+    `is_trading_day()` 在真交易日的 09:15~09:30 也会返回 False（竞价期时钟没推进），
+    所以它**不适合**当推送闸门（会误杀早盘信号，那一职责由 `_push_allowed_now` +
+    `SignalNotifier._stale_guard` 承担）。但用作"这一轮整表重算值不值得跑"没问题：
+
+      - 真交易日竞价期误跳过一轮：没有损失 —— 竞价还没结束，自选股也没定下来；
+      - 节假日跳过：正是要的效果（48 只 × 3~5 秒的 CPU 与随之而来的推送都没了）；
+      - 时钟完全取不到时会 fail-open（`is_trading_day` 自身语义），下一轮照常。
+
+    失败一律按"是交易日"处理：判错方向的代价只是多跑一轮（有缓存、成本可控），
+    而误判成休市会让正常交易日漏掉整表刷新。
+    """
+    try:
+        from src.intraday.auto_select import is_trading_day
+
+        return bool(is_trading_day())
+    except Exception as exc:  # noqa: BLE001 判定不可用 → 放行（fail-open）
+        logger.debug("交易日判定失败，按交易日处理：%s", brief(exc, BRIEF_TIGHT))
+        return True
+
+
 def _seconds_until_next_tick(interval: float,
                              now: datetime | None = None) -> float:
     """到下一个刷新时刻的秒数：对齐整分钟刻度 **+2 秒**。
@@ -221,6 +303,13 @@ _FULL_RECOMPUTE_MIN_INTERVAL = 30.0
 #: 等到了给真数据；等不到就先给占位列表，重算在后台继续 ——
 #: 冷启动 50 只实测 199 秒，绝不能让它挂住首屏（用户目标：10 秒内可用）。
 _COLD_WATCHLIST_WAIT = 3.0
+
+#: 全市场量能预测在**逐票快照**里最多等多久（秒）。
+#:
+#: 见 `IntradayService._market_turnover`：它要打 3~4 个腾讯接口，而自选池 46 只
+#: 每只票都会取一次快照。等不到就不显示这一段的结论（provider 的 30 秒缓存
+#: 在后台继续填充），也不能让每只票都快照变慢。
+_TURNOVER_WAIT = 2.5
 
 
 class IntradayService:
@@ -270,6 +359,11 @@ class IntradayService:
         # 而不是抛异常 —— 做T主链路不该因为"档案库没配"而整体不可用。
         self._profile_repo = profile_repo
         self._profile_cache: dict[str, Any] | None = None
+        # 个股绑定（关联板块/海外映射）**内存热map**：`None` = 还没热加载过。
+        # 用户口径 2026-09-23：启动时 `warm_bindings()` 灌满，之后加自选是纯内存读。
+        # 存 `None` 而不是 `{}` 是有意的 —— 那样 `binding_for` 能区分
+        # "还没加载"与"加载了但一只都没配"，前者要触发一次懒加载。
+        self._bindings: dict[str, tuple[list[str], list[str]]] | None = None
         # 股性画像缓存：日线级特征，同一交易日内不必重算（键=代码，值=(时间戳, 画像)）
         self._character_cache: dict[str, tuple[float, CharacterProfile]] = {}
         # 档位拟合缓存：键=代码，值=(交易日, 单调时钟, 拟合结果)。
@@ -283,6 +377,11 @@ class IntradayService:
         # 都要打一次数据源），前端每分钟取一次若都重算，就会和刷新循环重复取数。
         self._watch_cache: tuple[float, list[WatchItem]] | None = None
         self._watch_lock = asyncio.Lock()
+        # 单只增删自选期间置 True：让 `invalidate_watchlist_cache()` 早退，
+        # 改由 `_invalidate_watch_entry()` 按"一只"的粒度动缓存。
+        # 否则"加一只票"会放大成"整张缓存作废 + 全表重算"（实测 12.4s 空跑 /
+        # 真实数据源约 200s）—— 见 `_invalidate_watch_entry` 的说明。
+        self._watch_cache_single_change = False
         # 创建时刻与"上次整表重算完成时刻"（都取单调钟）：
         # - `_boot_at` 用于启动宽限期（见 `_WATCHLIST_STARTUP_GRACE`）；
         # - `_full_recompute_at` 用于去重（见 `_FULL_RECOMPUTE_MIN_INTERVAL`）。
@@ -293,7 +392,41 @@ class IntradayService:
         # 版本号：每写一次概览缓存 +1（增删自选也 +1）。WS 推送据此判断"有没有新版"，
         # 否则每 15 秒都会把同一份列表重复推给前端。
         self._watch_generation = 0
+        # ---- 多用户「按用户分片的自选概览缓存」**已随自选池功能一起删除** ----
+        #
+        # 用户口径 2026-09-23："我的自选池很鸡肋，不需要了"。那份按
+        # `(tenant_id, user_id)` 分片的缓存只服务于"某用户自己的池"这条路径；
+        # 「加自选/删自选」一直是直接写 `configs/intraday.yaml`（共享清单，
+        # 见 `IntradayTPanel.addToWatch`），因此删掉它没有动到日常路径。
+        # 现在只有下面这一份共享概览缓存。
         self._refresh_task: asyncio.Task[None] | None = None
+        # 估值结论缓存：键=代码，值=(单调钟, label, bucket)。
+        #
+        # 用户口径 2026-09-23：估值结论从主区域整块面板收成自选列表里的一个标签，
+        # 因此每轮自选重算都要拿到它。PE/PB 是**日频**序列，一天之内不会变，
+        # 但它要经采集链取「三年日频序列」——实测冷取 1.3~1.9 秒/票，
+        # 45 只就是一分多钟，绝不能每分钟重付一遍（整表重算本身已经约 200 秒）。
+        # 用 `config.data.valuation_cache_ttl`（默认 3600 秒）兜住：
+        # 同一小时内每只票只取一次，之后是纯内存命中。
+        # warm 情况下 0.00~0.08 秒/票（采集链/本地库命中），整表只多付几秒。
+        self._valuation_cache: dict[str, tuple[float, str, str]] = {}
+        # 正在后台补算估值的代码（去重）与其任务强引用集合。
+        self._valuation_refreshing: set[str] = set()
+        self._valuation_tasks: set[asyncio.Task[Any]] = set()
+        # 全市场成交额预测量能（沪深京三市，同时间同比昨日）。
+        #
+        # 用户口径 2026-09-23：在「市场环境」行右侧给出「缩量XX亿 不追高 /
+        # 放量XX亿 可做T」。它与情绪周期**并列**进入同一枚徽标（见 `_cycle_decision`）。
+        #
+        # ⚠️ 它一次取数要打 3~4 个腾讯接口，而自选池会给**每只票**各取一次快照
+        # （46 只）。所以这里做两层保护：
+        #   ① provider 内部的 TTL 缓存（30 秒，全市场口径不需要更快）；
+        #   ② `_turnover_task` 单飞 —— 并发调用共享同一次取数，且**最多等
+        #      `_TURNOVER_WAIT` 秒**，等不到就不显示这一段（宁可少一段结论，
+        #      也不能把每只票的快照都拖慢）。
+        self._turnover = MarketTurnoverProvider()
+        self._turnover_task: asyncio.Task[Any] | None = None
+        self._turnover_tasks: set[asyncio.Task[Any]] = set()
         # 自动选股循环 + 最近一轮结果（窗口 9:25-9:40 / 14:45-15:00 + 盘后一次）
         self._auto_select_task: asyncio.Task[None] | None = None
         self._auto_select_state: dict[str, Any] = {}
@@ -304,6 +437,21 @@ class IntradayService:
         # 只有这个标记能让"读请求触发的后台重算"看出循环正在跑、别叠加。
         self._full_recompute_inflight = False
         self._watch_refresh_tasks: set[Any] = set()
+        # ── 轻量快照缓存：让「点开一只票」的首帧变成一次内存读 ────────────────
+        # 背景：自选整表刷新循环本来就会给**每只票**算一份轻量快照
+        # （`_gather_light_snapshots`，46 只 × 3~5 秒 CPU，一轮约 200 秒，
+        # 而循环间隔 60 秒 —— 等于**一直在算**）。原先算完只拿去拼自选列表就丢了，
+        # 用户点开某只票时再从头算一遍，于是与循环抢同一份 CPU：
+        # 实测（2026-09-24）稳态下「未开过的自选票」轻量快照要 5~17 秒，
+        # 用户报障"点中控技术分时图六七秒才出来"。
+        # 现在把循环算出来的那份按代码留一份，交互首帧直接命中（毫秒级），
+        # 随后 WS 的完整帧照常覆盖 —— 图先出来，其余面板后补。
+        self._light_cache: dict[str, tuple[float, Any]] = {}
+        # TTL 取 10 分钟：循环一轮（46 只 × 3~5 秒 CPU）本身要 150~230 秒，
+        # 而循环间隔只有 60 秒 —— 排在队尾的票两次刷新之间就可能隔 3 分钟以上，
+        # TTL 太短等于"刚填上就过期"。首帧用一份几分钟前的轻量快照是可接受的：
+        # 它只负责"图先出来"，紧接着的完整帧与 15 秒一次的 WS 推送会立刻纠正。
+        self._LIGHT_CACHE_TTL = 600.0
         self._refresh_state: dict[str, Any] = {
             "last_run_at": "", "last_seconds": 0.0,
             "last_count": 0, "last_error": "",
@@ -331,6 +479,23 @@ class IntradayService:
             "loaded": False, "reason": "", "count": 0, "saved_at": 0.0,
             "age_seconds": 0.0,
         }
+        # ── 单票**完整快照**的落盘热加载（重启后首屏毫秒级出图）─────────────
+        # 上面那份热加载只管"自选概览"（几十条行摘要）；用户重启后真正盯的是
+        # **当前这一只票**的四面板完整快照 —— 它要跑完整取数链，冷进程实测
+        # QMT 在时 6.8 秒、QMT 关闭后 11.1 秒，首屏就被这一项卡住。
+        # 现在每次算完按代码落盘（`hot_cache.save_snapshot_payload`），重启后
+        # **第一次**请求先返回这份旧快照（面板上写明"重启前缓存，正在刷新"），
+        # 后台真算一遍覆盖 —— 首屏从 11 秒降到毫秒级。
+        #
+        # `_snapshot_fresh_at` 是关键：它记"本进程已经给这只票算过新鲜快照"，
+        # 一旦算过就**不再吃落盘缓存**（稳态下重复快照只要 ~3 秒，没必要
+        # 拿旧数据糊弄已经热起来的进程）。
+        self._snapshot_fresh_at: dict[str, float] = {}
+        self._snapshot_refresh_inflight: set[str] = set()
+        self._snapshot_refresh_tasks: set[asyncio.Task[Any]] = set()
+        #: 单票快照热加载的最大可用时长（秒）。与自选概览同口径 24 小时：
+        #: 更旧的一律不加载（宁可等一次真算，也不把昨天的分时当今天的画）。
+        self._snapshot_payload_max_age = hot_cache.DEFAULT_MAX_AGE_SECONDS
 
     @property
     def config(self) -> IntradayConfig:
@@ -384,9 +549,18 @@ class IntradayService:
         items: list[WatchItem] = []
         for raw in outcome.items:
             try:
-                items.append(WatchItem(**raw))
+                item = WatchItem(**raw)
             except Exception:  # noqa: BLE001 单条坏了就丢这条，不影响其它
                 continue
+            # 估值结论**不跟着热缓存走**：它是"这一小时算出来的"，落盘的那条可能
+            # 是十几小时前的（快照最长可用 24 小时）。热缓存的契约是"先给旧的价格
+            # 与分数，后台补新的"，而价格/分数都带 `quote_ts` 让前端标明新鲜度；
+            # 估值标签只有四个字、没有时间戳可挂 —— 显示隔夜的估值档次会被当成此刻的。
+            # 因此这里清空，由随即触发的后台重算补上（估值有 1 小时 TTL 缓存，
+            # 补这一轮最多几十秒）。
+            item.valuation_label = ""
+            item.valuation_bucket = ""
+            items.append(item)
         if not items:
             self._snapshot_state = {
                 "loaded": False, "reason": "快照条目无法反序列化", "count": 0,
@@ -414,6 +588,134 @@ class IntradayService:
         if not items:
             return
         hot_cache.save_snapshot(items, cache_dir=self._snapshot_dir)
+
+    # ----------------------------------------------------------------
+    # 单票完整快照的落盘热加载（重启后首屏毫秒级出图）
+    # ----------------------------------------------------------------
+
+    def _snapshot_fingerprint(self, code: str, config: IntradayConfig) -> str:
+        """口径指纹：权重/阈值/档位/因子参数/自选绑定任一变化 → 旧快照作废。
+
+        为什么必须有这一道：`configs/intraday.yaml` 是**按 mtime 热重载**的，
+        用户改完权重不用重启。若还把重启前的快照端上去，面板上的分数是旧口径算的
+        —— 正是"改了权重但分数没变"那种最容易被当成 bug 的现象。
+
+        `config.snapshot()` 是确定性字典（无时间戳，实测），直接拿它做材料即可。
+        自选绑定（关联板块/海外映射/同业）影响板块类与海外类维度，也要进指纹。
+        """
+        try:
+            material = {
+                "config": config.snapshot(),
+                "boards": list(config.board_names(code)),
+                "overseas": list(config.overseas_for(code)),
+                "peers": list(getattr(config.watch(code), "peers", []) or []),
+            }
+            blob = json.dumps(material, ensure_ascii=False, sort_keys=True,
+                              default=str)
+        except Exception as exc:  # noqa: BLE001 指纹算不出来就当作"无法校验"
+            logger.info("快照口径指纹计算失败(%s)：%s",
+                        code, brief(exc, BRIEF_TIGHT))
+            return ""
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+    def _load_persisted_snapshot(self, code: str,
+                                 config: IntradayConfig) -> IntradaySnapshot | None:
+        """读这只票上次落盘的完整快照（标为"重启前缓存"，附刷新中说明）。
+
+        不可用时返回 None，调用方按原有路径真算 —— 热加载永远是**优化**，
+        不能成为新的失败点。
+        """
+        outcome = hot_cache.load_snapshot_payload(
+            code, cache_dir=self._snapshot_dir,
+            fingerprint=self._snapshot_fingerprint(code, config),
+            max_age_seconds=self._snapshot_payload_max_age)
+        if not outcome.loaded:
+            logger.info("单票快照热加载未生效(%s)：%s", code, outcome.reason)
+            return None
+        try:
+            snapshot = IntradaySnapshot.model_validate(outcome.payload)
+        except Exception as exc:  # noqa: BLE001 结构对不上就当没有
+            logger.info("单票快照反序列化失败(%s)：%s",
+                        code, brief(exc, BRIEF_TIGHT))
+            return None
+        snapshot = snapshot.model_copy(deep=True)
+        # **不伪造新鲜度**：原样保留 generated_at / trade_date / health.stale /
+        # session_label（前端本来就按它们显示"更新 14:31:02（快照 14:30:58）"
+        # 与"非当日"警告），并额外在 gaps 里把"这是重启前缓存"写明。
+        age = outcome.age_seconds
+        age_text = (f"{age / 60:.0f} 分钟前" if age < 3600
+                    else f"{age / 3600:.1f} 小时前")
+        snapshot.health.gaps.append(
+            f"⚠️ 本面板是**上次运行缓存的快照**（{age_text}生成于 "
+            f"{snapshot.generated_at}），正在后台刷新，完成后自动覆盖 —— "
+            "分数/信号/信号三角请以刷新后的为准")
+        logger.info("单票快照热加载成功(%s)：%s", code, outcome.reason)
+        return snapshot
+
+    def _schedule_snapshot_refresh(self, code: str) -> None:
+        """后台把这只票的完整快照真算一遍（去重；不阻塞请求）。
+
+        用 `force_refresh=True`：热加载上来的是旧数，必须**绕过数据源 TTL 缓存**
+        重新取一遍，否则"刷新"只是把同一份旧数又算一遍。
+        """
+        if code in self._snapshot_refresh_inflight:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:      # 无事件循环（同步调用）时不做后台刷新
+            return
+        self._snapshot_refresh_inflight.add(code)
+
+        async def _refresh() -> None:
+            try:
+                await self.snapshot(code, force_refresh=True)
+            except Exception as exc:  # noqa: BLE001 后台失败只记日志
+                logger.warning("后台刷新单票快照失败(%s)：%s",
+                               code, brief(exc, BRIEF_DEFAULT))
+            finally:
+                self._snapshot_refresh_inflight.discard(code)
+
+        # 任务强引用必须留下：asyncio 只持弱引用，被 GC 掉会在运行中静默取消
+        task = loop.create_task(_refresh(),
+                                name=f"intraday-snapshot-refresh-{code}")
+        self._snapshot_refresh_tasks.add(task)
+        task.add_done_callback(self._snapshot_refresh_tasks.discard)
+
+    def _remember_snapshot(self, code: str, snapshot: IntradaySnapshot,
+                           config: IntradayConfig) -> None:
+        """记下"本进程已算过这只票的新鲜快照"，并落盘供下次重启热加载。"""
+        self._snapshot_fresh_at[code] = time.monotonic()
+        # 只留最近若干只：自选轮动久了不该让这个字典无限长大
+        if len(self._snapshot_fresh_at) > 200:
+            self._snapshot_fresh_at.clear()
+            self._snapshot_fresh_at[code] = time.monotonic()
+        if not self._snapshot_is_worth_caching(snapshot):
+            return
+        try:
+            payload = snapshot.model_dump(mode="json")
+        except Exception as exc:  # noqa: BLE001 序列化失败就不落盘
+            logger.info("单票快照序列化失败（不落盘）：%s",
+                        brief(exc, BRIEF_TIGHT))
+            return
+        hot_cache.save_snapshot_payload(
+            code, payload, cache_dir=self._snapshot_dir,
+            fingerprint=self._snapshot_fingerprint(code, config),
+            trade_date=snapshot.trade_date)
+
+    @staticmethod
+    def _snapshot_is_worth_caching(snapshot: IntradaySnapshot) -> bool:
+        """只把**算全了**的快照落盘（几分钟的图 vs 一次重启的首屏）。
+
+        为什么要有这道闸（2026-09-24 实测踩到）：落盘的这份会在下次启动时被
+        **当作首屏第一帧**端给用户。若某次快照是降级的（数据源全挂时快照照样
+        生成，只是 trend/bars 为空、分数为 None），把它缓存下来就等于
+        "重启后先给用户看一屏空白图"。宁可这一轮不缓存（下次启动多等一次真算），
+        也不让空图占住首屏。
+
+        判据取"有分时序列 + 有快照行情"：这两项在取数链正常时一定有
+        （`trend` 是前端主图的数据源，`quote` 是所有面板的前提）。
+        """
+        return bool(snapshot.trend) and snapshot.quote is not None
     @property
     def notifier(self) -> SignalNotifier:
         return self._notifier
@@ -455,6 +757,7 @@ class IntradayService:
             gateway, fetcher, cache_ttl=config.data.news_cache_ttl,
             task_tier=news.news_task_tier, llm_retries=news.llm_retries,
             item_text_chars=news.item_text_chars,
+            gateway_cache_ttl_hours=news.gateway_cache_ttl_hours,
             reuse_when_unchanged=news.reuse_when_unchanged)
 
     def _reload_config(self) -> IntradayConfig:
@@ -510,14 +813,128 @@ class IntradayService:
         resolved = (name or "").strip()
         if not resolved or resolved == code:
             resolved = self._lookup_name(code)
+
+        # ---- 关联板块 / 海外映射：**已存的优先**（用户口径 2026-09-23）----
+        #
+        # 用户原话："后续不管删除自选还是新加自选，都可以自动加载之前的配置，
+        # 当有手动输入关联板块或海外映射时，配置再跟随刷新。"
+        #
+        # 规则：**调用方（前端输入框）给了值就用给的**；没给（空）才回落到库里
+        # 已存的绑定。于是：
+        #   - 删了自选再加回来 → 输入框是空的 → 自动还原上次配的板块/映射；
+        #   - 手动填了新的 → 用新的，并**回写**覆盖旧绑定（"配置跟随刷新"）。
+        #
+        # ⚠️ 这里读的是**内存热map**（见 `warm_bindings`），不查库 ——
+        #    `add_watch` 是同步方法、且加一只票必须立刻返回，不能等 SQLite。
+        saved_boards, saved_overseas = self.binding_for(code)
+        final_boards = list(boards or []) or saved_boards
+        final_overseas = list(overseas or []) or saved_overseas
+
         item = WatchConfig(
-            code=code, name=resolved, boards=list(boards or []),
+            code=code, name=resolved, boards=list(final_boards),
             peers=list(peers or []), industry=industry,
-            overseas=list(overseas or []))
-        saved = upsert_watch(item, self._config_path)
-        self._config = saved
-        self._reset_components(saved)
+            overseas=list(final_overseas))
+        # ⚠️ **单只粒度**：`_reset_components` 内部会调 `invalidate_watchlist_cache()`，
+        # 那是"整张作废"的语义 —— 加一只票不该让另外 45 只的分数一起失效
+        # （实测：整表重算 12.4s 空跑 / 真实数据源约 200s，而重算一只 0.08s）。
+        # 这里用护栏让它早退，改由 `_invalidate_watch_entry()` 精确处理。
+        #
+        # 本方法是**同步**的（路由层直接调用），所以不能在这里等单只快照：
+        # 只写入一行**身份字段**（与前端乐观插入同一套路），分数由前端随后那次
+        # `force=true&active=<新票>` 触发 `_refresh_one_watch()` 补上。
+        with self._watch_cache_single_change_guard():
+            saved = upsert_watch(item, self._config_path, prepend=True)
+            self._config = saved
+            self._reset_components(saved)
+        # 绑定落库 + 立刻更新内存热map（本次调用之后就该读得到新值）。
+        self._remember_binding(code, final_boards, final_overseas)
+        row = next((watch for watch in saved.watchlist
+                    if watch.code == code), None)
+        self._invalidate_watch_entry(code, fresh=WatchItem(
+            code=code,
+            name=(row.name if row and row.name != code else "") or self._lookup_name(code),
+            boards=list(row.boards) if row else list(boards or []),
+            pinned=bool(getattr(row, "pinned", False))))
         return saved
+
+    @contextmanager
+    def _watch_cache_single_change_guard(self):
+        """在"单只增删自选"期间抑制"整张缓存作废"（见 `_invalidate_watch_entry`）。"""
+        previous = getattr(self, "_watch_cache_single_change", False)
+        self._watch_cache_single_change = True
+        try:
+            yield
+        finally:
+            self._watch_cache_single_change = previous
+
+    # ==================== 个股绑定（关联板块 / 海外映射） ====================
+    #
+    # 用户口径 2026-09-23："加自选时把关联板块、海外映射保存到数据库里，
+    # 后续无论删自选还是新加自选都自动加载之前的配置。这个配置加载最好自动联想，
+    # **启动系统时就热加载**，避免加自选时无法迅速读取。"
+
+    def warm_bindings(self, *, force: bool = False) -> int:
+        """把"已配过板块/映射的票"一次性灌进内存（**启动时调用**）。
+
+        为什么必须预热：`add_watch` 是**同步**方法（路由直接调用、加一只票要立刻
+        返回），它没法 `await` 一次 SQLite 查询。把这批数据常驻内存后，
+        加自选就是纯内存读 —— 这正是用户要的"迅速读取，别等库"。
+
+        Returns:
+            这次装进内存的条数；没注入档案仓储时返回 0（降级不报错）。
+        """
+        if self._bindings is not None and not force:
+            return len(self._bindings)
+        rows: dict[str, tuple[list[str], list[str]]] = {}
+        repo = self._profile_repo
+        if repo is not None and hasattr(repo, "all_bindings"):
+            try:
+                rows = dict(repo.all_bindings())
+            except Exception as exc:  # noqa: BLE001 绑定是增强项，读不到就空跑
+                logger.warning("个股绑定热加载失败（降级为空）：%s",
+                               brief(exc, BRIEF_TIGHT))
+                rows = {}
+        self._bindings = rows
+        if rows:
+            logger.info("个股绑定已热加载 %d 只（关联板块/海外映射）", len(rows))
+        return len(rows)
+
+    def binding_for(self, code: str) -> tuple[list[str], list[str]]:
+        """取某只票已存的 `(关联板块, 海外映射)`；没配过 → 两个空列表。
+
+        首次调用会**顺带**热加载一次（懒预热），避免"忘了调 `warm_bindings`
+        就整条功能静默失效"——启动路径与运行路径都能自愈。
+        """
+        if self._bindings is None:
+            self.warm_bindings()
+        rows = self._bindings or {}
+        return rows.get(str(code).strip().zfill(6), ([], []))
+
+    def all_bindings(self) -> dict[str, tuple[list[str], list[str]]]:
+        """全部已配绑定（前端"联想下拉提示历史配置"用）。"""
+        if self._bindings is None:
+            self.warm_bindings()
+        return dict(self._bindings or {})
+
+    def _remember_binding(self, code: str, boards: list[str],
+                          overseas: list[str]) -> None:
+        """内存热map + 数据库**双写**（内存先行，保证本次调用之后立刻读得到）。
+
+        ⚠️ 落库失败**只告警不抛**：绑定是增强项，而"加自选"是主功能 ——
+        不能因为写绑定失败就让用户加不进自选（自选本身已写进 YAML）。
+        """
+        key = str(code).strip().zfill(6)
+        if self._bindings is None:
+            self.warm_bindings()
+        if self._bindings is not None:
+            self._bindings[key] = (list(boards), list(overseas))
+        repo = self._profile_repo
+        if repo is None or not hasattr(repo, "set_binding"):
+            return
+        try:
+            repo.set_binding(key, boards, overseas)
+        except Exception as exc:  # noqa: BLE001 见上：不阻断加自选
+            logger.warning("个股绑定落库失败(%s)：%s", key, brief(exc, BRIEF_TIGHT))
 
     def add_watch_many(self, items: list[dict[str, str]]) -> dict[str, Any]:
         """批量加入自选池：**一次落盘、一次重建子组件**。
@@ -610,21 +1027,32 @@ class IntradayService:
 
         现在：配置与子组件照常重置，但概览缓存**按代码精确剔除** ——
         列表其余部分完全有效，没必要重算。
+
+        ⚠️ 上面这段设计原先**没有生效**：`_reset_components()` 会先调
+        `invalidate_watchlist_cache()` 把 `_watch_cache` 置空，于是按旧缓存做剔除的
+        分支永远走不到，"精确剔除"是一段死代码。2026-09-23 用
+        `_watch_cache_single_change_guard()` 抑制那次整张作废后才真正生效。
         """
         from src.intraday.config import remove_watch as remove_from_yaml
 
-        cached = self._watch_cache
-        saved = remove_from_yaml(code, self._config_path)
-        self._config = saved
-        self._reset_components(saved)
-        if cached is not None:
-            target = str(code).strip().split(".")[0].zfill(6)
-            remaining = [item for item in cached[1] if item.code != target]
-            if len(remaining) != len(cached[1]):
-                self._watch_cache = (time.monotonic(), remaining)
-                self._watch_generation += 1
-                logger.info("自选概览缓存已精确剔除 %s（剩 %d 只，无需重算）",
-                            target, len(remaining))
+        # ⚠️ 2026-09-23 修：这段"精确剔除"**过去一直是死代码** ——
+        # `_reset_components()` 先把 `_watch_cache` 置空，于是按 `cached` 做剔除
+        # 的分支永远不成立，"删一只票"照样退化成"下次读触发整表重算"。
+        # 现在用护栏抑制"整张作废"，剔除才真正生效。
+        target = str(code).strip().split(".")[0].zfill(6)
+        # 先记下"缓存里有没有它"：`remove_watch` 是**幂等**的，删一个不存在的
+        # 代码必须**什么都不做** —— 既不动缓存对象、也不递增代次（否则前端会收到
+        # 一次无意义的"列表变了"推送）。以**缓存**为准而不是 `_reload_config()`：
+        # 缓存才是前端看到的列表，而配置可能已被外部改写。
+        cached_codes = ({item.code for item in self._watch_cache[1]}
+                        if self._watch_cache is not None else set())
+        with self._watch_cache_single_change_guard():
+            saved = remove_from_yaml(code, self._config_path)
+            self._config = saved
+            self._reset_components(saved)
+        if target in cached_codes:
+            self._invalidate_watch_entry(target)
+            logger.info("自选概览缓存已精确剔除 %s（无需重算整表）", target)
         return saved
 
     def set_watch_pinned(self, code: str, pinned: bool) -> IntradayConfig:
@@ -708,7 +1136,8 @@ class IntradayService:
     async def snapshot(self, code: str, *,
                        force_refresh: bool = False,
                        light: bool = False,
-                       config_patch: IntradayConfig | None = None) -> IntradaySnapshot:
+                       config_patch: IntradayConfig | None = None,
+                       use_light_cache: bool = True) -> IntradaySnapshot:
         """组装做T辅助完整快照（前端四面板唯一数据源）。
 
         light=True 为「轻量快照」：只算行情 + 关键价位 + 七因子总分 + 信号，
@@ -719,7 +1148,20 @@ class IntradayService:
         config_patch：前端「权重预览」用的**临时口径**（不落库、不影响这只票
         已有的档案）。给了它就完全按它算，不再解析个股覆盖 ——
         否则预览结果会变成"档案 + 你的改动"的叠加，用户看不出改动本身的效果。
+
+        use_light_cache：`light=True` 时是否可以先吃「自选循环刚算好的那份」。
+        交互路径（HTTP/WS 首帧）用默认 True：图要立刻出；生产路径
+        （`_gather_light_snapshots` 本身）必须传 False，否则循环会一直读到自己的
+        旧结果、自选列表再也不刷新。
         """
+        if light and use_light_cache and not force_refresh and config_patch is None:
+            cached = self._light_cache.get(code)
+            if cached is not None:
+                age = time.monotonic() - cached[0]
+                if age <= self._LIGHT_CACHE_TTL:
+                    logger.debug("轻量快照命中缓存 %s（%.1fs 前算的）", code, age)
+                    # 浅拷贝后返回：调用方（含前端序列化）不该拿到循环里的同一份对象
+                    return cached[1].model_copy()
         config = self._reload_config()
         # 个股口径优先级：**数据库权重档案 > YAML overrides > 全局配置**。
         # 两者同时存在时必须明说是哪一份在生效 —— 同一只票两套参数下结论不同，
@@ -734,6 +1176,19 @@ class IntradayService:
         if force_refresh:
             self._data.invalidate()
             self._sentiment.invalidate()
+            # 强制刷新是显式要求"现在这一刻"的数据：连"本进程已算过"的记录也清掉，
+            # 免得后续非 force 请求又把刚被否定的那份当新鲜数据。
+            self._snapshot_fresh_at.pop(code, None)
+        # ---- 完整快照的落盘热加载（只服务"本进程还没算过这只票"的第一帧）----
+        # 放在 config 解析之后：指纹要用**生效口径**（含个股权重档案）。
+        # 交互路径（HTTP/WS 首帧）会命中它，冷启动首屏因此从 ~11 秒降到毫秒级；
+        # 后台随后的真算会覆盖面板，并让后续请求走正常路径。
+        if (not light and not force_refresh and config_patch is None
+                and code not in self._snapshot_fresh_at):
+            persisted = self._load_persisted_snapshot(code, config)
+            if persisted is not None:
+                self._schedule_snapshot_refresh(code)
+                return persisted
         watch = config.watch(code)
         attempts: list[SourceAttempt] = []
         gaps: list[str] = []
@@ -772,6 +1227,9 @@ class IntradayService:
             # 市场情绪周期：自选池里所有标的共用同一份（Provider 内部按 TTL 缓存），
             # 放在基础任务里 —— 轻量快照也要它，因为它是「今天能不能做T」的闸门。
             self._market_cycle(),
+            # 全市场成交额预测量能：与周期一样是"今天能不能做T"的闸门，
+            # 轻量快照也要（自选列表的每一行都会带上它）。见 `_market_turnover`。
+            self._market_turnover(),
             *[self._board.fetch_snapshot(n, _board_kind(config, n))
               for n in board_names],
         ]
@@ -787,11 +1245,14 @@ class IntradayService:
                 *[self._board.fetch_series(n, _board_kind(config, n), peer_codes,
                                            wait=False)
                   for n in board_names],
-                self._board.fetch_index(DEFAULT_INDEX),
+                self._board.fetch_index(DEFAULT_INDEX_CODE),
                 self._sentiment.analyze(
                     code=code, name=watch.name if watch else "",
                     limit=config.factors.news.max_items,
-                    max_items=config.factors.news.max_items),
+                    max_items=config.factors.news.max_items,
+                    # 强制刷新必须一路穿到 LLM 网关（否则只会绕开进程内缓存，
+                    # 磁盘缓存照样命中 → 前端看到"刷新了但数据没变"）
+                    force=force_refresh),
                 self._valuation.fetch(
                     code, name=watch.name if watch else "", watch=watch),
                 self._fetch_index_volume(code, config),
@@ -815,6 +1276,7 @@ class IntradayService:
         quote_result = take("快照")
         daily_result = take("日线")
         cycle_result = take("市场情绪周期")
+        turnover_result = take("全市场量能预测")
         board_snapshots = [take(f"板块快照[{n}]") for n in board_names]
         if light:
             # 轻量模式不取板块分时，直接给空列表（前端列表页不渲染分时图）
@@ -879,13 +1341,16 @@ class IntradayService:
         if market_cycle is not None and not market_cycle.available:
             gaps.append(f"市场情绪周期：{market_cycle.gap or '不可用'}"
                         "（该维度不计入总分，有效权重相应减少）")
-        elif market_cycle is not None:
-            for gate in market_cycle.gates:
-                gaps.append(f"⛔ 情绪周期一票否决：{gate}（退潮/冰点不做T降本）")
-            if not market_cycle.t_allowed and config.factors.cycle.veto_signals:
-                gaps.append(
-                    f"⛔ 周期阶段「{market_cycle.stage}」：禁止低吸做T（做T大概率 T 反），"
-                    "高抛减仓方向不禁止")
+        # 全市场量能预测（沪深京三市，同时间同比昨日）→ 并入顶部决策徽标。
+        # ⚠️ 同样**不塞进 gaps**：它是操作结论（"缩量XX亿 不追高"），不是数据缺口。
+        # 取不到时只是徽标里少一段，不在这里报"缺口"（否则每条自选都会多一行噪声）。
+        turnover_forecast = (
+            turnover_result if getattr(turnover_result, "available", False) else None)
+
+        # 情绪周期的结论（一票否决 / 退潮期禁止回踩）**不再塞进 gaps**：
+        # 它不是"数据缺口"，而是**决策依据** —— 用户口径 2026-09-23 要求把它
+        # 显示到顶部「市场环境」行右侧（见 `cycle_decision`），
+        # 而不是混在底部"数据健康度"的缺口列表里。
         character = self._character_for(
             code, name=name, daily_bars=daily_bars, config=config)
         if character is not None and not character.available and character.gap:
@@ -933,7 +1398,7 @@ class IntradayService:
             raw_levels = self._compute_levels(
                 quote=quote, today_features=today_features,
                 daily_bars=daily_bars, config=config)
-            # 只给**当前**这一份档位补来源标注（低吸线由箱体还是布林下轨决定、
+            # 只给**当前**这一份档位补来源标注（回踩线由箱体还是布林下轨决定、
             # 触发价在哪、档位差被护栏动过没有）：面板上那条横线要说得出出处，
             # 否则用户只能对着一个数字猜。逐bar的 levels_series 刻意不标 ——
             # 那是 240 个对象，标注字段会让 WS 每 15 秒推的载荷无谓变大。
@@ -959,8 +1424,8 @@ class IntradayService:
                 levels, fit, ctx, adjustment_scale=adjustment,
                 blend=config.factors.level_fit.blend)
             # 逐bar档位：回放与画图都要按"当时那一刻"的档位，而不是当前值
-            # （实测 300308 低吸线当日从 862 抬到 898、603083 从 215 抬到 222；
-            #  拿当前值横贯全天会把早盘正常回踩误判成破位/误读成"开盘在低吸线下"）
+            # （实测 300308 回踩线当日从 862 抬到 898、603083 从 215 抬到 222；
+            #  拿当前值横贯全天会把早盘正常回踩误判成破位/误读成"开盘在回踩线下"）
             levels_series = replay_levels(
                 today_features,
                 box_high=levels.box_high, box_low=levels.box_low,
@@ -1083,6 +1548,8 @@ class IntradayService:
                 index_volume.to_dict() if hasattr(index_volume, "to_dict") else None),
             overseas=(
                 _overseas_to_dict(overseas) if overseas is not None else None),
+            cycle_decision=_cycle_decision(
+                market_cycle, config, turnover=turnover_forecast),
             level_fit=(
                 None if fit is None else {
                     **fit.to_dict(),
@@ -1105,13 +1572,43 @@ class IntradayService:
                 f"分时与分钟K线来自不同数据源（{trend_source} / {intraday_source}）")
 
         if signal is not None and signal.triggered and snapshot.scorecard is not None:
-            await self._push(snapshot, signal)
+            # ---- 推送闸门之二：这个时点不该推送 → 不发（2026-09-25 中秋事故）----
+            # 闸门一（`SignalNotifier.should_push()` 的 stale 检查）才是主力防线：
+            # 它判"这份数据属于哪一天"，节假日拿上一交易日收盘数据算出的信号
+            # **任何时刻**都会被它拦下。这里再加一道**时点**兜底，覆盖 stale 判据
+            # 失灵的情况（行情源给出假日期、快照来自旧版缓存等）。
+            # ⚠️ 判据必须用 `_push_allowed_now()` 而不是 `is_trading_day()` ——
+            # 后者在真交易日的 09:15~09:30 竞价期也会判 False（时钟还没推进），
+            # 拿来当推送闸门会把每天最关键的早盘信号整段误杀（见该函数 docstring）。
+            allowed, why = _push_allowed_now()
+            if allowed:
+                await self._push(snapshot, signal, trade_date=trade_date)
+            else:
+                logger.info(
+                    "不推送（%s）：%s %s %s，数据日 %s，信号时间 %s，stale=%s",
+                    why, snapshot.code, signal.kind, signal.strength,
+                    trade_date or "?", signal.ts, stale)
+        if light and use_light_cache:
+            # 交互路径算出来的那份也留档：同一只票**第二次点开**就是毫秒级
+            # （第一次仍要真算 —— 那份 CPU 躲不掉，但只需付一次）。
+            self._light_cache[code] = (time.monotonic(), snapshot)
+        if not light and config_patch is None:
+            # 完整快照：记"本进程已算过这只票"并落盘，供下次重启热加载。
+            # ⚠️ 权重预览（config_patch）**不能落盘**：那是临时口径，落盘会让
+            # 重启后的首帧显示一份"不属于任何已保存口径"的分数。
+            self._remember_snapshot(code, snapshot, config)
         return snapshot
 
-    async def _push(self, snapshot: IntradaySnapshot, signal: Any) -> None:
-        """推送（失败仅记录，不影响面板返回）。"""
+    async def _push(self, snapshot: IntradaySnapshot, signal: Any, *,
+                    trade_date: str = "") -> None:
+        """推送（失败仅记录，不影响面板返回）。
+
+        `trade_date` 透传给 `SignalNotifier.push()` —— 当日去重按**行情所属
+        交易日**分桶，而不是本机日期（见 `notify_dedup` 模块）。
+        """
         try:
-            results, pushed = await self._notifier.push(snapshot, signal)
+            results, pushed = await self._notifier.push(
+                snapshot, signal, trade_date=trade_date)
             signal.pushed = pushed
             snapshot.notifier["last_push"] = [r.model_dump() for r in results]
         except Exception as exc:  # noqa: BLE001
@@ -1121,10 +1618,22 @@ class IntradayService:
     # ==================== 数据装配 ====================
 
     async def _fetch_daily_bars(self, code: str) -> tuple[pd.DataFrame | None, str]:
-        """日线上下文（复用项目采集链：QMT→本地CSV→AkShare）。"""
+        """日线上下文（复用项目采集链：AkShare→腾讯→Tushare→baostock→本地CSV）。
+
+        **带市场时钟做新鲜度下限**（`min_date`）：不带区间时路由会走"本地 DB 命中
+        就直接返回"的短路，而盘中 DB 里最新就是**昨天** —— 于是分时的日线上下文
+        （量价/均线/前期高低点）永远停在昨天，而日K面板（显式区间）却已经是当天的
+        形成中bar，两条路的口径就分裂了（同一个 app 里两个"最新日线"）。
+        下限取"行情源自己走到的交易日"：盘中=今天、盘前/节假日=上一交易日，
+        取不到时是 None（fail-open，退回原行为）。
+        """
         if self._backend is None:
             raise DataFetchError("日线上下文不可用：未注入数据采集链")
-        points = await self._backend.fetch(close_indicator(code))
+        # 延迟导入：与 `daily()` 里那条 `fetch_daily_snapshot` 的导入方式保持一致
+        from src.intraday.daily import _session_min_date
+
+        points = await self._backend.fetch(
+            close_indicator(code), min_date=_session_min_date())
         frame = daily_bars_from_points(points or [])
         if frame.empty:
             raise DataFetchError(f"日线数据为空({code})")
@@ -1146,11 +1655,27 @@ class IntradayService:
             stamp, cached = self._profile_cache
             if now - stamp < _PROFILE_CACHE_TTL:
                 return cached
-        try:
-            items = await self._profile_repo.list(limit=500)
-        except Exception as exc:  # noqa: BLE001 档案库故障不该让做T面板整体不可用
-            logger.warning("读取做T权重档案失败（按无档案继续）：%s", brief(exc, BRIEF_DEFAULT))
-            self._profile_cache = (now, {})
+        items = None
+        last_error: Exception | None = None
+        for _attempt in (1, 2):
+            try:
+                items = await self._profile_repo.list(limit=500)
+                break
+            except Exception as exc:  # noqa: BLE001 档案库故障不该让做T面板整体不可用
+                last_error = exc
+        if items is None:
+            logger.warning("读取做T权重档案失败（按上一次结果继续）：%s",
+                           brief(last_error, BRIEF_DEFAULT))
+            # ⚠️ **绝不把"读失败"缓存成"没有档案"**（2026-09-24 实测踩到）。
+            # 原实现是 `self._profile_cache = (now, {})` —— 于是档案库抖一下，
+            # 接下来 5 秒内所有快照都退回**全局口径**：有档案的票分数直接是错的，
+            # 而且"单票快照落盘热加载"的口径指纹会因此与磁盘上那份对不上、
+            # 整份缓存作废（表现为冷启动首屏偶尔从 1 秒退化成 6~11 秒）。
+            # 失败只影响"这一次"：沿用上一次成功的结果（没有就空），不污染缓存，
+            # 下一次调用立刻重试。所以上面还做了一次立即重试 —— 冷启动的第一次
+            # 调用正是最要紧的那一次（它决定口径指纹）。
+            if self._profile_cache is not None:
+                return self._profile_cache[1]
             return {}
         mapping = {item.code: item for item in items}
         self._profile_cache = (now, mapping)
@@ -1366,7 +1891,7 @@ class IntradayService:
     async def current_levels(
         self, code: str, *, force_refresh: bool = False,
     ) -> Any:
-        """该票**当前口径**下的关键价位（低吸/高抛/止损），命中快照缓存时几乎零成本。
+        """该票**当前口径**下的关键价位（回踩/冲高/止损），命中快照缓存时几乎零成本。
 
         用途：权重预览的「改动前」那一列。为什么不另算一遍档位：
         `compute_levels` 需要当日分钟特征 + 日线箱体 + 布林 + ATR，
@@ -1430,6 +1955,99 @@ class IntradayService:
 
     # ==================== 技能库四因子的取数入口 ====================
 
+    async def market_turnover_now(self, *, refresh: bool = False) -> dict:
+        """大盘量能：**独立、只读、不等待**，供前端实时小接口使用。
+
+        ## 为什么需要它（用户口径 2026-09-24）
+
+        用户："量能可以前端实时显示，不可能量能变化为空，今天缩量 2117 亿。"
+        原来量能只搭在**个股快照**里，而那条路为了让 46 只票的整表重算不变慢，
+        最多只等 `_TURNOVER_WAIT`(2.5s)，等不到就**整段不显示**（见
+        `_market_turnover` 的取舍说明）。冷启动或数据源熔断时，用户看到的就是
+        "量能那段凭空消失" —— 而它其实正在后台取，几十秒后就有了。
+
+        所以单独开一个"随时可问"的读法：
+          · 有缓存 → 直接给（`available=True`）；
+          · 没缓存 → **立刻返回 `available=False` 并起后台取数**，前端显示
+            "量能取数中"，而不是让这一段静默消失。
+        `refresh=True` 时强制重取（前端手动刷新用）。
+        """
+        forecast = None if refresh else self._turnover.snapshot_cached()
+        if forecast is None or not getattr(forecast, "available", False):
+            # 起后台任务但**不等**：单飞复用已有句柄，避免并发重复打腾讯接口
+            try:
+                import asyncio as _aio
+
+                if self._turnover_task is None or self._turnover_task.done():
+                    self._turnover_task = _aio.create_task(
+                        self._turnover.snapshot(force=refresh))
+                    self._turnover_tasks.add(self._turnover_task)
+                    self._turnover_task.add_done_callback(
+                        self._turnover_tasks.discard)
+            except Exception:  # noqa: BLE001 起任务失败也不能让接口 500
+                pass
+            return {"available": False, "text": "", "turnover": {},
+                    "reason": "量能取数中（数据源可能正在熔断冷却），后台自动重试"}
+        block = _turnover_decision(forecast) or {}
+        return {
+            "available": True,
+            "text": str(block.get("text") or ""),
+            "t_allowed": bool(block.get("t_allowed", True)),
+            "chase_allowed": bool(block.get("chase_allowed", True)),
+            "reasons": list(block.get("reasons") or []),
+            "turnover": forecast.to_dict(),
+            "reason": "",
+        }
+
+    async def _market_turnover(self) -> Any:
+        """全市场成交额预测量能（单飞 + 限时等待）。
+
+        ## 为什么不能直接 `await provider.snapshot()`
+
+        这个方法在**每只票的快照**里都会被调到（自选池 46 只 = 46 次），而它背后
+        是 3~4 个腾讯接口。provider 的 TTL 只有 30 秒，冷启动那一轮必然穿透 ——
+        若在这里同步等网络，每只票都要多等一次取数，自选整表重算（本来就约 200
+        秒）会被显著拖长，报价快车道也跟着变慢。
+
+        所以：
+
+        1. **单飞**：并发调用共享同一个 `_turnover_task`（腾讯那几个接口是同一个
+           全市场口径，重复取没有意义）；
+        2. **最多等 `_TURNOVER_WAIT` 秒**：等不到就返回 `None`，这一轮不显示量能
+           那一段（徽标少一段结论，但不影响其它任何东西）。下一次快照/刷新时
+           provider 缓存已热，直接命中。
+
+        代价是"服务重启后的第一份快照可能没有量能那一段"，这在诚实性上是可接受
+        的（宁可不显示，也不要为了显示而拖慢整表）。
+        """
+        # 已经有缓存（含"上一轮后台任务刚写好"）就直接给，不再建任务
+        cached = self._turnover.snapshot_cached()
+        if cached is not None:
+            return cached
+        task = self._turnover_task
+        if task is None or task.done():
+            task = asyncio.get_running_loop().create_task(
+                self._turnover.snapshot(), name="intraday-market-turnover")
+            self._turnover_task = task
+        # 强引用 + 异常兜底：超时返回后任务仍在后台跑，抛异常而没人取结果时
+        # asyncio 会打 "never retrieved" 噪声。
+        self._turnover_tasks.add(task)
+        task.add_done_callback(self._turnover_tasks.discard)
+        try:
+            return await asyncio.wait_for(asyncio.shield(task), timeout=_TURNOVER_WAIT)
+        except asyncio.TimeoutError:
+            # 首次取数要打 3~4 个腾讯接口，超过 _TURNOVER_WAIT 是正常的：
+            # 这一轮先不显示量能那一段，任务继续在后台跑完并写缓存，
+            # **下一次**快照/刷新就直接命中（`snapshot_cached` 在上面）。
+            return None
+        except Exception as exc:  # noqa: BLE001 取数失败同样只表现为"少一段结论"
+            logger.info("全市场量能预测取数失败：%s", brief(exc, BRIEF_TIGHT))
+            return self._turnover.snapshot_cached()
+
+    async def market_turnover(self) -> Any:
+        """对外接口：当前全市场量能预测（供接口/诊断直接取）。"""
+        return await self._turnover.snapshot()
+
     async def _market_cycle(self, *, force: bool = False) -> MarketCycle:
         """市场情绪周期快照（Provider 内部按 TTL 缓存，自选池共用一份）。"""
         if not self._config.factors.cycle.enabled:
@@ -1463,7 +2081,7 @@ class IntradayService:
 
     async def character(self, code: str, *, mode: str = "intraday",
                         refresh: bool = False) -> CharacterProfile:
-        """对外接口：取该标的的股性画像（含推荐权重与档位）。"""
+        """对外接口：取该标的的股性画像（含预填权重与档位）。"""
         config = self._reload_config()
         bars, _source = await self._fetch_daily_bars(code)
         name = self._lookup_name(code)
@@ -1733,9 +2351,9 @@ class IntradayService:
         if score is None:
             verdict = "情绪面数据不足，本维度未计入总分"
         elif score > 0.15:
-            verdict = "板块与个股情绪偏暖（利于低吸做T）"
+            verdict = "板块与个股情绪偏暖（利于回踩区间提示）"
         elif score < -0.15:
-            verdict = "板块与个股情绪偏冷（利于高抛做T）"
+            verdict = "板块与个股情绪偏冷（利于冲高区间提示）"
         else:
             verdict = "板块情绪中性"
         return SentimentPanel(
@@ -1804,6 +2422,22 @@ class IntradayService:
             fresh = await self._refresh_one_watch(active)
             if fresh is not None:
                 base_items = list(cached[1]) if cached is not None else []
+                if not base_items:
+                    # ⚠️ 缓存为空时**不能把 `[fresh]` 当整表** —— 那会让自选列表
+                    # 从 46 只缩成 1 只（前端此后只能看到这只票）。
+                    # 正确做法：铺出配置里的**完整清单**（身份字段 + 空分数），
+                    # 把刚算好的那一只替换进去，再整表写回缓存。
+                    # 分数留空由下一次整表重算补齐 —— 与 `_placeholder_watchlist`
+                    # 同一口径：宁可先没有分数，也不能把列表变短。
+                    full = self._placeholder_watchlist(self._watch_cache_size)
+                    merged_full = [fresh if item.code == active else item
+                                   for item in full]
+                    if not any(item.code == active for item in merged_full):
+                        merged_full.insert(0, fresh)
+                    self._watch_cache = (time.monotonic(), merged_full)
+                    self._watch_generation += 1
+                    self._schedule_watchlist_refresh()
+                    return self._apply_quote_overlay(merged_full[:limit])
                 merged = [fresh if item.code == active else item
                           for item in base_items]
                 if not any(item.code == active for item in merged):
@@ -2040,11 +2674,155 @@ class IntradayService:
 
     def invalidate_watchlist_cache(self) -> None:
         """自选池增删后必须调用：否则刚加的票最长 60 秒不出现（"加了没反应"）。"""
+        # ⚠️ `getattr` 兜底而不是直接读属性：部分测试用 `IntradayService.__new__`
+        # 之类的轻量构造（不跑 `__init__`），直接访问会 AttributeError。
+        if getattr(self, "_watch_cache_single_change", False):
+            # ⚠️ 单只增删正在接管作废逻辑（见 `_invalidate_watch_entry`）：
+            # 这里**必须早退**。否则"加一只票"会退化成"作废整张缓存 → 下一次读
+            # 触发 46 只全表重算（真实数据源约 200 秒）"，而重算一只只要几秒。
+            return
         self._watch_cache = None
         self._watch_generation += 1
 
+    def _invalidate_watch_entry(self, code: str, *, fresh: WatchItem | None = None
+                                ) -> None:
+        """**只**作废/替换缓存里的某一只（自选池增删一只时的正确粒度）。
+
+        ## 为什么要专门做这个（2026-09-23 用户报障"加自选要十秒"）
+
+        实测（45 只自选）：
+
+            add_watch（写盘 + 重建子组件）      0.20s
+            作废整张缓存 → 后台整表重算（46 只） 12.4s    ← 真实数据源约 200s（见
+                                                          `_gather_light_snapshots`）
+            只重算新加的那一只                  0.08s    ← 差两个数量级
+
+        根因是一条放大链：`save_watchlist` → `reset_config_cache()` →
+        每次 `_reload_config()` 都拿到**新对象** → `invalidate_watchlist_cache()`
+        清空整张缓存 → 下一次读发现无缓存 → 触发全表重算。
+        **改一只票却要重算全部**，这就是"加载十秒"的来源
+        （`_recompute_into_cache` 期间进程在跑 46 只的 pandas 计算）。
+
+        ## 语义
+
+        - `fresh=None`（删除）：把它从缓存列表里**摘掉**；
+        - `fresh=<行>`（新增）：插到**最前面**（与 `upsert_watch(prepend=True)`
+          的配置顺序一致，否则下一次全量重算会让它跳回末尾），其余行原样保留。
+
+        缓存里其余 45 行的分数**保持有效** —— 它们和这只新票毫无关系，
+        没有任何理由跟着一起作废。
+        """
+        cached = self._watch_cache
+        if cached is None:
+            return                      # 本来就没缓存，无需处理
+        stamp, items = cached
+        kept = [item for item in items if item.code != code]
+        if fresh is not None:
+            # 插到**最后一个置顶项之后**，与 `upsert_watch(prepend=True)` 的
+            # 配置顺序规则完全一致 —— 硬插到 index 0 会把用户显式钉住的票挤下去，
+            # 而 `sort_watch_items()` 的契约是"置顶项永远在最前"。
+            last_pinned = -1
+            for index, item in enumerate(kept):
+                if getattr(item, "pinned", False):
+                    last_pinned = index
+            kept.insert(last_pinned + 1, fresh)
+        self._watch_cache = (stamp, kept)
+        self._watch_generation += 1
+
+    async def _valuation_label(self, code: str, ttl: float) -> tuple[str, str]:
+        """单只票的估值结论 `(label, bucket)`。
+
+        **过期时永不阻塞调用方**：缓存里有值就先给（哪怕已过 TTL），过期的那些
+        改为 `_schedule_valuation_refresh` 在后台补 —— 与自选概览的
+        stale-while-revalidate 同一套路子。
+
+        为什么必须这样：实测这一批（45 只）**冷取 42.4 秒**、命中缓存 0.00 秒。
+        若在 TTL 到期时同步重取，那 42 秒会直接叠加在"自选整表重算"（本身约
+        200 秒）上，把报价刷新从 60 秒一次拖成 5 分钟一次 —— 而估值结论是
+        **日频**量（PE/PB 三年序列），一个小时前的那四个字完全够用。
+        """
+        cached = self._valuation_cache.get(code)
+        if cached is not None:
+            if ttl <= 0 or (time.monotonic() - cached[0]) < ttl:
+                return cached[1], cached[2]
+            self._schedule_valuation_refresh([code])   # 过期：先给旧的，后台补新的
+            return cached[1], cached[2]
+        # 从没算过（冷启动 / 新加自选）：这一次必须等 —— 但只在**第一次**
+        # 遇到这只票时等，之后都走上面的缓存分支。
+        return await self._fetch_valuation_label(code)
+
+    async def _fetch_valuation_label(self, code: str) -> tuple[str, str]:
+        """真的去取一次并写缓存（只在冷启动/新加自选/后台补算时被调到）。"""
+        try:
+            space = await self._valuation.fetch(code)
+        except Exception as exc:  # noqa: BLE001 估值缺失绝不能拖垮自选列表
+            logger.info("自选估值结论取数失败(%s)：%s", code, brief(exc, BRIEF_TIGHT))
+            return "", ""
+        bucket = str(getattr(space, "headroom", "") or "")
+        label = HEADROOM_LABELS.get(bucket, "")
+        if not label:
+            # 拿不到档位就整块不显示（宁可不显示，也不要给一个编出来的结论）
+            return "", ""
+        self._valuation_cache[code] = (time.monotonic(), label, bucket)
+        return label, bucket
+
+    def _schedule_valuation_refresh(self, codes: list[str]) -> None:
+        """后台补算这些票的估值结论（去重；不阻塞调用方）。
+
+        与 `_schedule_watchlist_refresh` 同样"排了就要跑"，但在补算中的代码不重复排
+        —— 否则每个读请求都会再起一轮 42 秒的取数。
+        """
+        todo = [code for code in codes if code not in self._valuation_refreshing]
+        if not todo:
+            return
+        self._valuation_refreshing.update(todo)
+
+        async def _run() -> None:
+            try:
+                await self._valuation_labels(todo, ttl=0.0, force=True)
+            except Exception as exc:  # noqa: BLE001 后台补算失败只记日志
+                logger.info("估值结论后台补算失败：%s", brief(exc, BRIEF_TIGHT))
+            finally:
+                self._valuation_refreshing.difference_update(todo)
+
+        task = asyncio.get_running_loop().create_task(
+            _run(), name="intraday-valuation-refresh")
+        # 强引用：任务只被弱引用时可能被 GC 掉（与自选刷新任务同样的处理）。
+        self._valuation_tasks.add(task)
+        task.add_done_callback(self._valuation_tasks.discard)
+
+    async def _valuation_labels(self, codes: list[str], ttl: float,
+                                *, force: bool = False) -> dict[str, tuple[str, str]]:
+        """批量取估值结论：**限并发 + 批间让路**（与轻量快照同一套路子）。
+
+        为什么不能简单地 for 循环串行：实测冷取（45 只）串行要一分多钟，
+        全部压在同一轮自选重算里。分 4 只一批并发实测降到 **42.4 秒**，
+        同时批间 `await asyncio.sleep(0)` 把事件循环让出去（否则 WS 推送会被饿死）。
+
+        `force=True` 时绕过 TTL 直接重取（后台补算用；此时没有"先给旧值"的问题）。
+        单只失败不影响其它票：`return_exceptions=True` 后失败的记成空结论。
+        """
+        out: dict[str, tuple[str, str]] = {}
+        batch = 4
+        for start in range(0, len(codes), batch):
+            chunk = codes[start:start + batch]
+            results = await asyncio.gather(
+                *((self._fetch_valuation_label(code) if force
+                   else self._valuation_label(code, ttl)) for code in chunk),
+                return_exceptions=True)
+            for code, result in zip(chunk, results, strict=True):
+                out[code] = ("", "") if isinstance(result, BaseException) else result
+            if start + batch < len(codes):
+                await asyncio.sleep(0)
+        return out
+
     async def _compute_watchlist(self, *, limit: int = 20,
                                  only: list[str] | None = None) -> list[WatchItem]:
+        """共享自选列表（**配置来源**）—— 语义与原实现完全一致。
+
+        多用户路径见 `_compute_watchlist_for_codes`：这里只是把"代码从配置里取"
+        这一步做完，再交给同一个计算核，避免两份取数逻辑漂移。
+        """
         config = self._reload_config()
         codes = [item.code for item in config.watchlist][:limit]
         if only:
@@ -2054,23 +2832,66 @@ class IntradayService:
                      if str(item.code) in wanted]
         if not codes:
             return []
+        return await self._compute_watchlist_for_codes(codes)
+
+    async def _compute_watchlist_for_codes(
+        self, codes: list[str], *,
+        meta: dict[str, dict[str, Any]] | None = None,
+    ) -> list[WatchItem]:
+        """自选概览计算核：**代码由调用方给定**。
+
+        ## 为什么把这一步单独抽出来（多用户改造的关键切口）
+
+        原实现把"从 `configs/intraday.yaml` 取代码"与"计算概览"揉在一个函数里，
+        于是**任何**想换数据来源的尝试都得复制整段计算 —— 而那段里有
+        估值批量、限并发轻量快照、失败兜底、排序等一整套口径，
+        复制一份必然漂移（改了 A 忘了 B）。
+
+        拆开之后：
+          - 共享路径（`_compute_watchlist`）传配置里的代码；
+          - 多用户路径传**该用户自己池里的代码**（+ 他的板块/置顶元数据）。
+        两条路走的是同一套计算，所以"取数口径"只有一处。
+
+        `meta` 为 `{code: {"boards": [...], "name": "...", "pinned": bool}}`：
+        DB 用户每只票的板块/置顶存在 `dim_user_watchlist_v2`，
+        **不能**去 YAML 里查（那是别人的配置）。
+        """
+        if not codes:
+            return []
+        config = self._reload_config()
+        meta = meta or {}
+        # 估值结论与轻量快照**互不依赖**，但估值要打采集链，先把它拿到
+        # （带 TTL 缓存，热的时候是纯内存命中，几乎不占时间）。
+        valuations = await self._valuation_labels(
+            codes, float(getattr(config.data, "valuation_cache_ttl", 3600) or 0))
         snapshots = await self._gather_light_snapshots(codes)
         items: list[WatchItem] = []
         for code, result in zip(codes, snapshots, strict=True):
-            watch = config.watch(code)
-            boards = list(watch.boards) if watch else []
+            # 元数据优先用调用方给的（DB 用户的板块/置顶在库里），
+            # 没给才回落到配置 —— 多用户路径**绝不能**去 YAML 查别人的配置。
+            given = meta.get(code)
+            watch = None if given is not None else config.watch(code)
+            if given is not None:
+                boards = [str(x) for x in (given.get("boards") or [])]
+                given_name = str(given.get("name") or "")
+                pinned = bool(given.get("pinned"))
+            else:
+                boards = list(watch.boards) if watch else []
+                given_name = (watch.name if watch and watch.name != code else "")
+                pinned = bool(getattr(watch, "pinned", False))
+            valuation_label, valuation_bucket = valuations.get(code, ("", ""))
             if isinstance(result, BaseException) or result is None:
-                # 快照失败时也不能把名称丢掉：配置里的名字 / 字典里的名字都行，
+                # 快照失败时也不能把名称丢掉：配置/库里的名字、字典里的名字都行，
                 # 实在没有就留空（**不要用代码冒充名称**）。
                 items.append(WatchItem(
                     code=code,
-                    name=(watch.name if watch and watch.name != code else "")
-                         or self._lookup_name(code),
+                    name=given_name or self._lookup_name(code),
                     boards=boards,
-                    pinned=bool(getattr(watch, "pinned", False))))
+                    valuation_label=valuation_label,
+                    valuation_bucket=valuation_bucket,
+                    pinned=pinned))
                 continue
-            resolved = result.name or (
-                watch.name if watch and watch.name != code else "")
+            resolved = result.name or given_name
             items.append(WatchItem(
                 code=code, name=resolved or self._lookup_name(code),
                 boards=boards,
@@ -2080,7 +2901,9 @@ class IntradayService:
                 signal_kind=result.signal.kind if result.signal else "none",
                 price=result.quote.price if result.quote else None,
                 change_pct=result.quote.change_pct if result.quote else None,
-                pinned=bool(getattr(watch, "pinned", False))))
+                valuation_label=valuation_label,
+                valuation_bucket=valuation_bucket,
+                pinned=pinned))
         return sort_watch_items(items)
 
     async def _gather_light_snapshots(self, codes: list[str]) -> list[Any]:
@@ -2123,9 +2946,20 @@ class IntradayService:
         results: list[Any] = []
         for start in range(0, len(codes), batch):
             chunk = codes[start:start + batch]
-            results.extend(await asyncio.gather(
-                *(self.snapshot(code, light=True) for code in chunk),
-                return_exceptions=True))
+            # use_light_cache=False：这里是**生产者**，必须真算；
+            # 算完把结果留一份给交互首帧（见 `snapshot` 的 use_light_cache 说明）。
+            computed = await asyncio.gather(
+                *(self.snapshot(code, light=True, use_light_cache=False)
+                  for code in chunk),
+                return_exceptions=True)
+            now = time.monotonic()
+            # `gather(..., return_exceptions=True)` 保序且保长，`strict=True` 把这个
+            # 不变量写进代码：万一以后改成 `as_completed` 之类的乱序收集，
+            # 这里会立刻报错，而不是把 A 的行情缓存到 B 的代码下。
+            for code, item in zip(chunk, computed, strict=True):
+                if not isinstance(item, BaseException):
+                    self._light_cache[code] = (now, item)
+            results.extend(computed)
             if start + batch < len(codes):
                 await asyncio.sleep(self._WATCH_COMPUTE_YIELD)
         return results
@@ -2171,6 +3005,22 @@ class IntradayService:
         while True:
             try:
                 allowed, reason = watchlist_refresh_window()
+                if allowed and not _is_trading_day_for_refresh():
+                    # ---- 整表重算闸门：非交易日不做这轮重算（2026-09-25 中秋事故）----
+                    # `watchlist_refresh_window()` 的行情时钟判据在 **09:15~09:30**
+                    # 刻意失效（竞价期 tick 还没推进，怕误杀正常交易日），于是节假日
+                    # 的这个时段会放行。而一次整表重算是 48 只 × 3~5 秒的 CPU，
+                    # 且每只票的 `snapshot()` 都可能触发推送 —— 2026-09-25 中秋节
+                    # （周五休市）就是这样在早盘窗口里把 9/24 的收盘信号又推了一遍，
+                    # 叠加飞书 webhook 失败回落，变成持续发邮件。
+                    # 这里换成**完整交易日判定**（周末 + 市场时钟都查），非交易日直接
+                    # 跳过整轮：既不发信，也不再空烧几十分钟 CPU。下一轮照常再判。
+                    self._refresh_state.update(
+                        last_run_at=datetime.now().strftime("%H:%M:%S"),
+                        last_error="")
+                    logger.debug("非交易日跳过自选池整表重算（%s）", reason)
+                    await asyncio.sleep(_seconds_until_next_tick(interval))
+                    continue
                 if allowed:
                     if self._recompute_already_running():
                         # 已有一次整表重算在进行 / 刚完成：这一轮**跳过**。
@@ -2215,10 +3065,10 @@ class IntradayService:
         用户口径（2026-09-17）：
           - 触发时段：**9:25–9:40**（开盘定方向）与 **14:45–15:00**（尾盘定隔夜）；
           - 频率：**1 分钟一次**；
-          - 盘后：日K触发买入信号的票也自动加自选（15:05 后一次）。
+          - 盘后：日K触发多方条件的票也自动加自选（15:05 后一次）。
 
         为什么只在窗口内跑：一轮要精算几十只票（每只 2~4 秒），全天跑既没人看，
-        又会持续抢数据源 —— 这两个窗口才是低吸决策真正发生的时候。
+        又会持续抢数据源 —— 这两个窗口才是回踩决策真正发生的时候。
         """
         if not bool(getattr(self._config.data, "auto_select_enabled", True)):
             logger.info("自动选股未启用（auto_select_enabled=false）")
@@ -2561,6 +3411,125 @@ def _overseas_to_dict(snapshot: Any) -> dict[str, Any]:
         "quotes": [
             quote.to_dict() for quote in (getattr(snapshot, "quotes", None) or [])
         ],
+    }
+
+
+def _cycle_decision(cycle: Any, config: Any,
+                    turnover: Any = None) -> dict[str, Any] | None:
+    """情绪周期 + 全市场量能 → **今日做T决策**（纯 JSON），供「市场环境」行右侧。
+
+    用户口径 2026-09-23：原来这三条以"数据缺口"的形式堆在底部数据健康度里 ——
+
+        ⛔ 情绪周期一票否决：大面 13 家 ≥ 10（一票否决）（退潮/冰点不宜区间操作）
+        ⛔ 情绪周期一票否决：跌停 13 家 > 10（一票否决）（退潮/冰点不宜区间操作）
+        ⛔ 周期阶段「退潮期」：禁止回踩区间提示（做T大概率 T 反），冲高减仓方向不禁止
+
+    它们本来就不是"缺数据"，而是**今天的操作结论**。现在压缩成一句
+    `XX期 ·（不）做T降本 · 禁止追高`，逐条依据留在 tooltip 里可核对。
+
+    2026-09-23 追加：**全市场量能预测**（用户口径："缩量XX亿不追高，放量XX亿可做T"）
+    并入同一个徽标。为什么合成一枚而不是并排两枚：两者回答的是同一个问题
+    （"今天能不能做T/追高"），并排会让人以为是两套独立结论，而实际上
+    它们是**两个否决来源**——任一条否决就整体否决。
+
+    Returns:
+        `{available, stage, temperature, t_allowed, no_chase, summary, reasons,
+          turnover, turnover_text, turnover_verdict}`；
+        周期不可用时返回 `None`（不显示徽标，也不编造结论）。
+    """
+    turnover_block = _turnover_decision(turnover)
+    if cycle is None:
+        # 周期取不到但量能取到了：仍然给出量能那一段（它是独立结论，
+        # 不该因为"情绪周期缺数"就一起消失）。
+        if turnover_block is None:
+            return None
+        return {
+            "available": True, "stage": "", "temperature": None,
+            "t_allowed": bool(turnover_block["t_allowed"]),
+            "no_chase": bool(not turnover_block["chase_allowed"]),
+            "veto_signals_on": False,
+            "summary": turnover_block["text"],
+            "reasons": list(turnover_block["reasons"]),
+            "trade_date": str(getattr(turnover_block["raw"], "trade_date", "") or ""),
+            "turnover": turnover_block["raw"].to_dict(),
+            "turnover_text": turnover_block["text"],
+            "turnover_verdict": turnover_block["verdict"],
+        }
+    if not getattr(cycle, "available", False):
+        if turnover_block is None:
+            return None
+        return {
+            "available": True, "stage": "", "temperature": None,
+            "t_allowed": bool(turnover_block["t_allowed"]),
+            "no_chase": bool(not turnover_block["chase_allowed"]),
+            "veto_signals_on": False,
+            "summary": turnover_block["text"],
+            "reasons": list(turnover_block["reasons"]),
+            "trade_date": str(getattr(cycle, "trade_date", "") or ""),
+            "turnover": turnover_block["raw"].to_dict(),
+            "turnover_text": turnover_block["text"],
+            "turnover_verdict": turnover_block["verdict"],
+        }
+    stage = str(getattr(cycle, "stage", "") or "")
+    gates = [str(gate) for gate in (getattr(cycle, "gates", None) or [])]
+    # 配置里关掉"周期否决正式信号"时，t_allowed 不再作为禁止依据（与打分链路口径一致）
+    veto_on = bool(getattr(getattr(config, "factors", None), "cycle", None)
+                   and getattr(config.factors.cycle, "veto_signals", True))
+    t_allowed = bool(getattr(cycle, "t_allowed", True)) or not veto_on
+    # 一票否决（大面/跌停家数超阈值）时明确禁止追高：
+    # 这种环境里追高当天的回撤概率最高，且禁止做T降本时没有日内纠错手段
+    no_chase = bool(gates) or not t_allowed
+    reasons = list(gates)
+
+    # ---- 并入量能结论（两个否决来源取"最严"）----
+    turnover_text = ""
+    if turnover_block is not None:
+        turnover_text = turnover_block["text"]
+        t_allowed = t_allowed and bool(turnover_block["t_allowed"])
+        no_chase = no_chase or bool(not turnover_block["chase_allowed"])
+        reasons.extend(turnover_block["reasons"])
+
+    flags = [("适合区间操作" if t_allowed else "不宜区间操作")]
+    if no_chase:
+        flags.append("禁止追高")
+    # 量能那一段插在周期与做T之间：读起来是「退潮期 · 缩量 1,180 亿 · 不宜区间操作 · 禁止追高」
+    parts = [stage] if stage else []
+    if turnover_text:
+        parts.append(turnover_text.replace(" 不追高", "").replace(" 可做T", ""))
+    parts.extend(flags)
+    return {
+        "available": True,
+        "stage": stage,
+        "temperature": getattr(cycle, "temperature", None),
+        "t_allowed": t_allowed,
+        "no_chase": no_chase,
+        "veto_signals_on": veto_on,
+        "summary": " · ".join(part for part in parts if part),
+        "reasons": reasons,
+        "trade_date": str(getattr(cycle, "trade_date", "") or ""),
+        "turnover": (turnover_block["raw"].to_dict()
+                     if turnover_block is not None else None),
+        "turnover_text": turnover_text,
+        "turnover_verdict": (turnover_block["verdict"]
+                             if turnover_block is not None else ""),
+    }
+
+
+def _turnover_decision(turnover: Any) -> dict[str, Any] | None:
+    """量能预测 → `{text, verdict, t_allowed, chase_allowed, reasons, raw}`。
+
+    不可用时返回 `None`（不显示"量能"这一段，也不编造结论）—— 与情绪周期同一
+    原则：宁可少一段，也不要给一个没有数据支撑的操作建议。
+    """
+    if turnover is None or not getattr(turnover, "available", False):
+        return None
+    return {
+        "text": str(getattr(turnover, "verdict_text", "") or ""),
+        "verdict": str(getattr(turnover, "verdict", "") or ""),
+        "t_allowed": bool(getattr(turnover, "t_allowed", True)),
+        "chase_allowed": bool(getattr(turnover, "chase_allowed", True)),
+        "reasons": list(getattr(turnover, "reasons", None) or []),
+        "raw": turnover,
     }
 
 

@@ -16,11 +16,12 @@ from src.domain.alerts.service import AlertScanService
 from src.domain.alerts.thresholds import AlertEngine
 
 
-def _raw(title: str, content: str = "相关内容", hint: str = "") -> dict:
+def _raw(title: str, content: str = "相关内容", hint: str = "",
+         publish_time: str = "2026-09-14 08:00:00") -> dict:
     return {
         "title": title, "content": content,
         "source_name": "测试快讯", "source_url": "https://x/1",
-        "publish_time": "2026-09-14 08:00:00", "type_hint": hint,
+        "publish_time": publish_time, "type_hint": hint,
     }
 
 
@@ -99,7 +100,7 @@ class FakeAnalyzer:
         self.high_titles = set(high_titles)
         self.calls: list[int] = []
 
-    async def analyze(self, events):
+    async def analyze(self, events, force: bool = False):
         self.calls.append(len(events))
         out = []
         for e in events:
@@ -144,12 +145,23 @@ class FakeEmailer:
             alert_id=alert.alert_id, status="sent", detail="已发送")
 
 
-def _service(collectors, repo, analyzer, emailer=None, settings=None):
+def _service(collectors, repo, analyzer, emailer=None, settings=None,
+             popup_gate=None):
+    """构造被测服务。
+
+    `popup_gate` 默认注入"永远可以弹" —— 生产默认是
+    `in_trading_window()`（非交易时段只入库不弹窗），直接用它会让
+    **测试结果取决于跑测试时的墙上时间**：白天通过、晚上失败，
+    而失败信息是 `assert 0 == 1`，完全看不出与时间有关。
+    时段闸门本身由 `tests/unit/test_intel_alert_bridge.py` 的
+    参数化用例专门验证，这里只关心"该推的时候推了没有"。
+    """
     return AlertScanService(
         collectors=collectors, repo=repo, analyzer=analyzer,
         engine=AlertEngine(settings or get_settings()),
         hub=FakeHub(), emailer=emailer or FakeEmailer(),
-        settings=settings or get_settings())
+        settings=settings or get_settings(),
+        popup_gate=popup_gate or (lambda _now=None: True))
 
 
 @pytest.mark.asyncio
@@ -174,6 +186,29 @@ async def test_full_run_one_high_one_low():
     assert result.email_results[0].status == "unconfigured"
     assert any("邮件通道未配置" in g for g in result.data_gaps)
     assert len(repo.alerts) == 1
+
+
+@pytest.mark.asyncio
+async def test_quiet_hours_store_but_do_not_popup():
+    """非交易时段：告警**照常入库**，只是不弹窗（用户口径 2026-09-25）。
+
+    为什么两者都要断言：
+      · 只断言"没弹" → 实现可能连库都没写，用户第二天在列表里也看不到，
+        那才是真丢信息；
+      · 只断言"入库了" → 可能连弹窗一起做了闸门，等于功能没生效。
+    """
+    title = "国务院发布固态电池产业重大扶持政策"
+    analyzer = FakeAnalyzer(high_titles={title})
+    repo = FakeRepo()
+    svc = _service([FakeCollector(items=[_raw(title)])], repo, analyzer,
+                   popup_gate=lambda _now=None: False)
+
+    result = await svc.run("schedule")
+
+    assert result.alerts_created == 1, "非交易时段也必须产出告警记录"
+    assert len(repo.alerts) == 1, "告警必须落库（第二天在列表里看得到）"
+    assert len(svc._hub.sent) == 0, "非交易时段不该弹窗"  # type: ignore[attr-defined]
+    assert any("非交易时段" in g for g in result.data_gaps), result.data_gaps
 
 
 @pytest.mark.asyncio
@@ -224,6 +259,30 @@ async def test_cooldown_blocks_repeat_alert():
     result = await cool_svc.run()
     assert result.alerts_created == 0
     assert len(cool_svc._hub.sent) == 0  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_future_dated_schedule_does_not_starve_fresh_news():
+    """2026-09-24 事故回归：未来日程不得挤掉当天快讯（否则告警恒 0）。
+
+    实测：库里 87 条已分析事件 **100%** 是「百度财经-财报披露日程」，
+    `publish_time` 全在未来（09-28~10-01），而 184 条当天 policy/sector 快讯
+    一条都没轮到 —— 候选窗口被"未来时间"占满，扫描天天 success 但 0 告警。
+    """
+    settings = get_settings().model_copy(update={"alert_scan_candidate_limit": 1})
+    fresh = "国务院发布固态电池产业重大扶持政策"
+    analyzer = FakeAnalyzer(high_titles={fresh})
+    svc = _service(
+        [FakeCollector(items=[
+            _raw("示例公司财报披露日程", publish_time="2099-01-01 09:00:00"),
+            _raw(fresh, publish_time=now_iso()),
+        ])],
+        FakeRepo(), analyzer, settings=settings)
+
+    result = await svc.run()
+
+    assert analyzer.calls == [1]        # 候选上限 1 条
+    assert result.alerts_created == 1   # 放行的是当天快讯，不是 2099 年的日程
 
 
 @pytest.mark.asyncio

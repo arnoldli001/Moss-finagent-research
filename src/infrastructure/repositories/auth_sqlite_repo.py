@@ -574,6 +574,27 @@ class _Cache:
 # 主仓储
 # ======================================================================
 
+#: 「这条会话现在还有效吗」的 **SQL 孪生**。参数按顺序传 `(now, now)`。
+#:
+#: ⚠️ **必须与 `SessionRecord.is_valid()` 逐条对齐**（已撤销 + 滑动窗口 +
+#: 绝对上限三者都要判）。这里踩过一次真实的坑：管理台用户列表的"在线"列
+#: 只判了 `revoked_at IS NULL` 与 `absolute_expires_at`，**漏了 `idle_expires_at`**
+#: —— 于是一个账号显示"在线 3"，而按全站唯一的那份判据（`is_valid()`）
+#: 只有 1 个会话有效：另外 2 个是滑动窗口（30 分钟）早过了、但 12 小时
+#: 绝对上限还没到的**旧会话**（实测 `data/pilot/moss_pilot.db`：
+#: 4 行里 3 行 `idle_expires_at` 已过期，最久的一条 `last_seen_at` 在 2.8 小时前）。
+#:
+#: 这正是 `src/api/login_gate.py` 文档里警告过的那种事（"会话算不算有效
+#: 如果有两份实现，它们**一定**会在某次改动后分叉，而分叉的那一侧就是
+#: 漏网之门"）。所以把它抽成**一个常量**供所有批量统计使用，并由
+#: `tests/unit/test_auth_service.py` 的
+#: `test_online_count_is_consistent_with_per_user_validity` 钉住
+#: "SQL 口径 == Python 口径"。
+ACTIVE_SESSION_WHERE: str = (
+    "revoked_at IS NULL AND idle_expires_at > ? AND absolute_expires_at > ?"
+)
+
+
 class AuthSqliteRepository:
     """认证仓储：同步实现 + `asyncio.to_thread` 异步端口。
 
@@ -788,14 +809,20 @@ class AuthSqliteRepository:
 
         **一次聚合查完整张列表**，而不是每行一次查询：管理台一屏 200 行，
         逐行查就是 200 次 SQLite 往返（在 6.8 GB 库上这种 N+1 很明显）。
+
+        ⚠️ 判据用 `ACTIVE_SESSION_WHERE`（**同一个常量**），不再手写条件 ——
+        手写的那一版漏了 `idle_expires_at`，于是"在线"列把滑动窗口已过期的
+        旧会话也算成在线（实测管理员账号显示 3，实际只有 1 个有效）。
+        这一列是"**设备**数"而不是"人数"：同一账号多端登录本来就会 >1，
+        但前提是每个都**真的还有效**。
         """
         self._ready()
         now = iso(utc_now())
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT user_id, COUNT(*) AS n FROM {TABLE_SESSION} "
-                f"WHERE revoked_at IS NULL AND absolute_expires_at > ? "
-                f"GROUP BY user_id", (now,)).fetchall()
+                f"WHERE {ACTIVE_SESSION_WHERE} "
+                f"GROUP BY user_id", (now, now)).fetchall()
         return {str(r["user_id"]): int(r["n"]) for r in rows}
 
     def update_user_status(

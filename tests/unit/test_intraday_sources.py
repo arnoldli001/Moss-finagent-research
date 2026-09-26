@@ -199,7 +199,33 @@ def test_tencent_period_map_covers_configured_periods() -> None:
 
 
 def test_source_failure_message_lists_every_attempt() -> None:
-    """全源失败时的错误信息必须列出每个源的失败原因（便于定位是哪一层挂了）。"""
+    """全源失败时的错误信息必须列出每个源的失败原因（便于定位是哪一层挂了）。
+
+    2026-09 起 `IntradayConfig` 默认 `qmt_enabled=False`，所以这里显式打开，
+    把一个**完整的四源池**都放进错误信息 —— 排查时最怕"少了一个源却看不出来"。
+    """
+    from src.intraday.config import IntradayConfig
+    from src.intraday.sources import IntradayDataProvider
+
+    config = IntradayConfig()
+    config.data.qmt_enabled = True
+    provider = IntradayDataProvider(config)
+
+    async def _fail(source, method, code, period, days, min_date=""):
+        from src.intraday.models import SourceAttempt
+        return None, SourceAttempt(source=f"src-{source}", ok=False,
+                                   detail=f"{source} 挂了")
+
+    provider._try_source = _fail  # type: ignore[method-assign]  # noqa: SLF001
+    with pytest.raises(DataFetchError) as excinfo:
+        asyncio_run(provider.fetch_bars("300308", days=1))
+    message = str(excinfo.value)
+    for source in ("qmt", "tencent", "eastmoney", "sina"):
+        assert f"src-{source}" in message
+
+
+def test_default_config_excludes_qmt_from_failure_message() -> None:
+    """QMT 默认关闭：它的失败原因不该再出现在错误信息里（它根本没被调用）。"""
     from src.intraday.config import IntradayConfig
     from src.intraday.sources import IntradayDataProvider
 
@@ -214,7 +240,8 @@ def test_source_failure_message_lists_every_attempt() -> None:
     with pytest.raises(DataFetchError) as excinfo:
         asyncio_run(provider.fetch_bars("300308", days=1))
     message = str(excinfo.value)
-    for source in ("qmt", "tencent", "eastmoney", "sina"):
+    assert "src-qmt" not in message
+    for source in ("tencent", "eastmoney", "sina"):
         assert f"src-{source}" in message
 
 

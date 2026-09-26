@@ -138,7 +138,11 @@ async def execute_job(
                 detail = (
                     f"数据点删除{outcome['points_deleted']}"
                     f"（截止{outcome['points_cutoff']}），"
-                    f"新闻删除{outcome['news_deleted']}"
+                    f"新闻删除{outcome['news_deleted']}，"
+                    # 告警这一档在流水档里（`fact_alerts` pass，按 expire_time
+                    # 删除并级联 user_alert_read）。这里报出**截止日** ——
+                    # 保留是"静默失效"风险最高的功能，作业详情要能看出它跑没跑。
+                    f"告警截止{outcome.get('alerts_cutoff', '?')}"
                     + ("；错误:" + ",".join(outcome["errors"])
                        if outcome["errors"] else "")
                 )
@@ -162,6 +166,28 @@ async def execute_job(
                 if errors:
                     return run_log.finish(
                         record, status="failed", records_processed=processed,
+                        error_message="; ".join(errors)[:500])
+                return run_log.finish(
+                    record, status="success", records_processed=processed)
+            if spec.kind == "generic_indicator_snapshot":
+                # 通用预采集：指标清单来自 JobSpec.params["indicators"]。
+                # 用于补齐"有分析需求但没有定期作业"的指标（美国宏观/财务比率），
+                # 让它们也进数据库、后续分析直接命中而不必现打网络。
+                # 清单为空时按作业语义动态解析（财务比率的标的从库里反查）。
+                plan_indicators = tuple(spec.params.get("indicators") or ())
+                if not plan_indicators:
+                    plan_indicators = await _resolve_financial_ratio_indicators(runtime)
+                processed, errors = await _generic_indicator_snapshot(
+                    runtime, plan_indicators,
+                    str(spec.params.get("task_prefix") or "generic_snap"),
+                )
+                if errors and not processed:
+                    return run_log.finish(
+                        record, status="failed", records_processed=processed,
+                        error_message="; ".join(errors)[:500])
+                if errors:
+                    return run_log.finish(
+                        record, status="partial", records_processed=processed,
                         error_message="; ".join(errors)[:500])
                 return run_log.finish(
                     record, status="success", records_processed=processed)
@@ -232,6 +258,16 @@ async def execute_job(
                     record, status="success",
                     records_processed=scan.alerts_created,
                     error_message=detail if scan.data_gaps else "")
+            if spec.kind == "mainline_warm":
+                # 与 `mainline_daily` 同一形态：detail 是 dict，失败时带 `failed`
+                processed, warm_detail = await _mainline_warm()
+                if warm_detail.get("failed"):
+                    return run_log.finish(
+                        record, status="failed", records_processed=processed,
+                        error_message=str(warm_detail.get("message") or "")[:500])
+                return run_log.finish(
+                    record, status="success", records_processed=processed,
+                    error_message=str(warm_detail.get("message") or "")[:500])
             if spec.kind == "mainline_daily":
                 processed, detail = await _mainline_daily(spec)
                 if detail.get("failed"):
@@ -321,6 +357,24 @@ async def execute_job(
                 return run_log.finish(
                     record, status=status, records_processed=processed,
                     error_message="" if status == "success" else detail[:500])
+            if spec.kind == "intel_hot_topics":
+                processed, detail = await _intel_hot_topics(spec)
+                status = "success" if not detail.startswith("失败") else "failed"
+                return run_log.finish(
+                    record, status=status, records_processed=processed,
+                    error_message="" if status == "success" else detail[:500])
+            if spec.kind == "intel_hot_rank":
+                processed, detail = await _intel_hot_rank(spec)
+                status = "success" if not detail.startswith("失败") else "failed"
+                return run_log.finish(
+                    record, status=status, records_processed=processed,
+                    error_message="" if status == "success" else detail[:500])
+            if spec.kind == "intel_signal_alert":
+                processed, detail = await _intel_signal_alert(spec, runtime)
+                status = "success" if not detail.startswith("失败") else "failed"
+                return run_log.finish(
+                    record, status=status, records_processed=processed,
+                    error_message="" if status == "success" else detail[:500])
             if spec.kind == "dynamic_collection":
                 indicators = spec.params.get("indicators") or []
                 processed, errors = await _collect_through_pipeline(
@@ -362,7 +416,8 @@ async def _intel_zsxq_collect(spec: Any) -> tuple[int, str]:
     """
     from src.domain.intel.service import watchlist_codes
     from src.infrastructure.connectors.zsxq_incremental import (
-        fetch_incremental, save_watermark,
+        fetch_incremental,
+        save_watermark,
     )
 
     max_fetch = int(spec.params.get("max_fetch") or 30)
@@ -405,7 +460,7 @@ async def _intel_token_alert(spec: Any) -> tuple[int, str]:
     通知过期，或者写个脚本定时提醒我更新。"
 
     所以这个任务的产出是**邮件 + 管理员提示**，用户侧无感 ——
-    前端永远只显示"研究笔记暂无更新"。
+    前端永远只显示"券商作文暂无更新"。
 
     ⚠️ 阈值（5 天预警 / 7 天失效）由 `token_alerts` 模块自己的常量决定，
     **不从这个任务的 `params` 传进去** —— 第一版按 `warn_after_days=` 传，
@@ -462,11 +517,37 @@ async def _intel_tone_extract(spec: Any) -> tuple[int, str]:
     from src.domain.intel.service import build_feed
 
     try:
-        feed = await build_feed(limit=500)
+        # ⚠️ `group_undetermined=False` **必须传**：收容组是**展示层**的东西，
+        # 而这里要的是"有哪些条目"。不传的话拿到的是"1 条信号 + 1 个组"，
+        # 抽取只处理 2 条就收工，而日志显示"抽取 0 条"，
+        # 看起来像"没有可抽的"（实测踩过）。
+        feed = await build_feed(limit=500, group_undetermined=False)
     except Exception as exc:  # noqa: BLE001
         from src.core.redaction import sanitize_error
+
         logger.warning("倾向抽取取数失败：%s", sanitize_error(exc))
         return 0, f"失败：{sanitize_error(exc)}"
+
+    # ── 全文落库（用户口径 2026-10-01："点击可以看全文"）──
+    #
+    # 为什么**在这里**做，而不是在接口里现取：
+    #
+    #   · 全文只存在于这一批 item 的 `extract_text`（进程内字段，
+    #     `IntelFeed.to_public()` 会剥掉它）——接口拿不到；
+    #   · 接口路径**不许**有任何解析/网络成本，只能按 `content_hash` 读文件；
+    #   · 本任务每 2 小时跑一次，是唯一"同时拿得到全文与指纹"的地方。
+    #
+    # ⚠️ **放在抽取之前**，而且**不看抽取结果**：本地模型挂掉时倾向会退回
+    # 规则层，但"用户点开看原文"这件事与模型毫无关系 —— 顺序反过来
+    # （模型失败就 return）会让"模型挂了"连带把全文功能一起打掉，
+    # 而那种缺失没有任何报错，只表现为"点开说全文不可用"。
+    from src.domain.intel import body_store
+
+    bodies: dict[str, int] = {}
+    try:
+        bodies = await asyncio.to_thread(body_store.persist, feed.items)
+    except Exception as exc:  # noqa: BLE001 存储失败不该让抽取任务记 failed
+        logger.warning("全文落库失败：%s", type(exc).__name__)
 
     try:
         stats = await tone_job.run_once(gateway=gateway, items=feed.items,
@@ -481,11 +562,199 @@ async def _intel_tone_extract(spec: Any) -> tuple[int, str]:
               f"落库 {stats.get('written', 0)} 条"
               f"（跳过：低可信 {stats.get('skipped_low_credibility', 0)} /"
               f"已抽过 {stats.get('skipped_already_done', 0)} /"
-              f"无指纹 {stats.get('skipped_no_hash', 0)}）；"
+              f"无指纹 {stats.get('skipped_no_hash', 0)} /"
+              # 短文本是"落库了但没调模型"的一条（用户口径：≤100 字不走模型）。
+              # 不单列的话，用户问"这条怎么没有模型摘要/这批怎么这么快"时
+              # 日志里什么都查不到。
+              f"短文本免抽取 {stats.get('skipped_short_text', 0)}）；"
               f"倾向分布 " + "/".join(f"{k}{v}" for k, v in tones.items()))
+    # 全文的写入/清理**必须报数**：它是"点开看全文"这条功能的唯一观测点，
+    # 而它静默失败的形态（存储被清空 / 每轮都写 0 条）在别处看不出来。
+    detail += (f"；全文新增 {bodies.get('written', 0)} 条"
+               f"（候选 {bodies.get('considered', 0)}）")
     if stats.get("pruned"):
         detail += f"；清理过期 {stats['pruned']} 条"
+    if bodies.get("pruned"):
+        detail += f"；清理过期全文 {bodies['pruned']} 条"
     return int(stats.get("extracted") or 0), detail
+
+
+async def _intel_hot_topics(spec: Any) -> tuple[int, str]:
+    """平台热议聚合（本地模型，排在倾向抽取之后）。
+
+    ## ⚠️ 这个 handler 是补上的
+
+    `hot_job.run_once()` 写好了却**没有任何调度分支** —— 每次触发都记
+    `未知作业类型` 失败，而页面上表现为"热门个股/热议事件是空的"，
+    看起来像上游没数据。与 `intel_zsxq_collect` / `intel_token_alert`
+    是同一类错误（同一个测试用例现在覆盖了这三条）。
+
+    ## 输入是**各平台公开快讯**，不是知识星球研报
+
+    用户口径："把几大平台（雪球/东方财富股吧/同花顺/财联社/百度人气榜/
+    韭研公社）的热点事件和个股，聚合汇总显示在情报流或事件告警里。"
+    快讯才是"市场在热议什么"，研报是"机构在看什么"。
+    """
+    from src.core.config import get_settings
+    from src.domain.intel import hot_job
+    from src.infrastructure.llm import LLMGateway
+
+    max_items = int(spec.params.get("max_items") or hot_job.MAX_NOTES_PER_RUN)
+    gateway = LLMGateway(settings=get_settings())
+
+    try:
+        stats = await hot_job.run_once(gateway=gateway, max_items=max_items)
+    except Exception as exc:  # noqa: BLE001 模型挂了不该让任务记 failed
+        from src.core.redaction import sanitize_error
+
+        logger.warning("平台热议聚合失败：%s", sanitize_error(exc))
+        return 0, f"失败：{sanitize_error(exc)}"
+
+    detail = (f"材料 {stats.get('notes', 0)} 条 / {stats.get('batches', 0)} 批；"
+              f"个股 {stats.get('stocks', 0)} 只、事件 {stats.get('topics', 0)} 个")
+    rejected = stats.get("rejected") or {}
+    if rejected:
+        # 被拦掉的数量**要报出来**：它明显偏高就说明模型在编，
+        # 该去调 prompt，而不是当成正常。
+        detail += "；拦截 " + "/".join(f"{k}{v}" for k, v in rejected.items())
+    return int(stats.get("stocks") or 0), detail
+
+
+async def _intel_hot_rank(spec: Any) -> tuple[int, str]:
+    """抓各平台人气/热搜榜并落盘（情报流的「平台热议 · 人气榜」读它）。
+
+    ## 为什么需要这个作业（它修的是**性能**，不是功能）
+
+    `hot_rank.fetch_hot_rank()` 原本由接口**每次请求实时调用**，实测
+    3.0~3.5 秒／次；而 `intel.py` 的注释一直写着"热榜走定时任务落库，
+    这里只读结果" —— 注释与代码相反，于是情报流每打开一次要等 5~6 秒。
+
+    现在改成：本作业落盘，接口读落盘结果（0 ms）。接口侧仍保留
+    "落盘结果超过 `HOT_RANK_MAX_AGE` 就自己现抓一次"的兜底 ——
+    因为**没有任何东西保证这个作业一定会跑**：落盘结果缺失或过期时
+    接口那条兜底就是人气榜唯一的来源，只读落盘会让客户那边的人气榜
+    **永远是空的**。
+
+    ⚠️ 这里原来写的是"因为对外试点实例 `MOSS_SCHEDULER_ENABLED=0`
+    （没有定时任务）"。**那句话是错的，已实测推翻**（2026-10-01）：
+    `MOSS_SCHEDULER_ENABLED` **全仓库没有任何一处读它**
+    （`manage.py` 写、`main.py` 的 lifespan 无条件
+    `CronScheduler(...).start()`），所以试点的调度器**一直在跑** ——
+    `data/pilot/scheduler/runs.jsonl` 有 497 条记录、24 个作业，
+    包含 `quant_data_sync`（每 30 分钟一班）。
+    兜底**照样要保留**，但理由要换成真的那一个：作业可能没跑成 / 还没到班次。
+    （把"开关不生效"当理由会让后来的人以为关掉开关就能让兜底失效。）
+
+
+    ## 取不到时要**保留上一次结果**，不要把页面清空
+
+    主源（东财千股千评）是 T-1 口径、备源两个东财接口偶发
+    `RemoteDisconnected`（见 `hot_rank` 模块文档的实测表）。所以这里
+    失败时**不覆盖**已有落盘：`hot_rank.refresh()` 只在真的拿到行时才写，
+    拿不到就原样留着旧文件，并如实报告失败原因。
+    """
+    from src.domain.intel import hot_rank
+
+    try:
+        data = await hot_rank.refresh()
+    except Exception as exc:  # noqa: BLE001 免费接口挂了不该让任务记 failed
+        from src.core.redaction import sanitize_error
+
+        logger.warning("热榜抓取失败：%s", sanitize_error(exc))
+        return 0, f"失败：{sanitize_error(exc)}"
+
+    rows = data.get("rows") or []
+    if not rows:
+        # 全源失败：`refresh` 会把空结果也落盘，这里明确说清楚"没覆盖到新数据"
+        reasons = "、".join(f"{k}:{v}" for k, v in (data.get("failures") or {}).items())
+        return 0, f"失败：全部热榜源未取到数据（{reasons or '无失败详情'}）"
+    return len(rows), (f"{len(rows)} 行 · 来源 {','.join(data.get('sources') or [])}"
+                       f" · 落盘 {data.get('at') or ''}")
+
+
+async def _intel_signal_alert(spec: Any, runtime: Any) -> tuple[int, str]:
+    """把情报流里**有明显利空/利多**的条目推成事件告警（可弹窗）。
+
+    > 用户口径（2026-09-25）："为什么不把情报流、舆情热度 有明显利空或
+    >  利多的信息，都通过事件告警弹出。"
+
+    ## 为什么不是"情报流直接弹"
+
+    实测 pilot 库里 541 条事件只产出 27 条告警 —— 差的 95% 全被去重
+    与冷却挡下。情报流一天几百条，直接灌进弹窗通道会变成"每条都弹"。
+    所以这条链只在闸门全过时才产出告警（见 `alert_bridge` 的说明）。
+    非交易时段还会被 `in_trading_window()` 静音（只入库不弹）。
+
+    ## ⚠️ 闸门**按来源分两套**（2026-10-01 用户改判据）
+
+        其它来源      方向明确 + 信度 ≥74 + 引擎判为 high + 跨源同文合并
+        知识星球      命中分析师名 **或** 模型给出方向 + 跨源同文合并
+                      （**不看信度**；分数抬到 high 档，理由见 `FORCED_SCORE`）
+
+    改判据的原因是一条实测数据：知识星球 15 条真实笔记**全部 58 分**
+    （闸门 74），也就是说这个来源在结构上永远不可能弹一次 ——
+    表现是"什么都不弹"，而排查时看不出任何异常（闸门本身工作正常）。
+
+    ## 与 `event_alert_scan` 的分工
+
+        event_alert_scan   从**新闻采集器**拉原始新闻 → 云端模型判方向 → 告警
+        本作业             复用**情报流已判定的方向** → 直接出告警
+
+    两者不重复：前者是"我们自己去发现事件"，后者是"情报流已经确认过的
+    方向，别让它只躺在列表里"。第二条同时也避免了同一件事有两套方向判断
+    （情报流说"偏多"、告警说"风险"）—— 那比没有告警更伤信任。
+    """
+    service = getattr(runtime, "event_service", None)
+    if service is None:
+        if runtime is None:
+            return 0, "失败：调度器未注入 runtime（无法取得 event_service）"
+        return 0, "失败：event_service未装配到Runtime"
+
+    from src.domain.intel import alert_bridge
+    from src.domain.intel.service import build_feed
+
+    try:
+        # 平铺池：收容组是展示层的东西，信号识别要的是真实条目
+        feed = await build_feed(limit=500, group_undetermined=False)
+    except Exception as exc:  # noqa: BLE001
+        from src.core.redaction import sanitize_error
+
+        logger.warning("信号取数失败：%s", sanitize_error(exc))
+        return 0, f"失败：{sanitize_error(exc)}"
+
+    hits = alert_bridge.select(
+        feed.items, limit=int(spec.params.get("max_items") or 40))
+    if not hits:
+        # ⚠️ 说明必须**写全两套判据**（2026-10-01 补）：只写"方向明确 + 信度≥74"
+        # 会让知识星球那条路看起来没生效 —— 而它恰恰是**不走信度**的那一条。
+        # 排障时看到这句的人要靠它判断"是没数据，还是闸门配错了"。
+        return 0, ("本轮没有满足条件的情报（知识星球需：命中分析师名或"
+                   "模型给出方向；其它来源需：方向明确 + 可信度"
+                   f"≥{alert_bridge.MIN_CREDIBILITY}）")
+
+    pairs = alert_bridge.build_pairs(hits)
+    try:
+        scan = await service.ingest_assessed(pairs, trigger="intel_signal")
+    except Exception as exc:  # noqa: BLE001
+        from src.core.redaction import sanitize_error
+
+        logger.warning("信号告警入库失败：%s", sanitize_error(exc))
+        return 0, f"失败：{sanitize_error(exc)}"
+
+    from src.domain.alerts.service import in_trading_window
+
+    quiet = "（非交易时段，只入库未弹窗）" if not in_trading_window() else ""
+    # 触发构成（谁让它弹的）：知识星球的告警**理由**与其它来源不同
+    # （内容规则 vs 模型方向），不报出来就只能靠翻原文猜
+    # —— 而"这条为什么弹"正是用户会问的第一个问题。
+    kinds: dict[str, int] = {}
+    for it in hits:
+        for t in alert_bridge.reason_of(it).triggers() or ["direction"]:
+            kinds[t] = kinds.get(t, 0) + 1
+    detail = (f"候选 {len(hits)} 条 → 新增事件 {scan.new_events}、"
+              f"告警 {scan.alerts_created}，级别 {scan.by_level}、"
+              f"方向 {scan.by_type}、触发 {kinds}{quiet}")
+    return int(scan.alerts_created or 0), detail
 
 
 async def _auction_tick_capture(spec: Any) -> tuple[int, str]:
@@ -1101,6 +1370,13 @@ async def _mainline_daily(spec: Any) -> tuple[int, dict[str, Any]]:
             except Exception as exc:  # noqa: BLE001 推送状态回写失败不影响主流程
                 logger.warning("主线告警推送状态回写失败：%s", exc)
 
+    # 顺手把这份快照落成「热快照」（`data/mainline/warm_snapshot.json`）。
+    #
+    # 这里**不重复计算**：快照刚算完，只是序列化一次（0.1 MB）。
+    # 落盘之后，第二天重启/第一个访问者都不用再等一次全市场重算
+    # （实测冷算 8.4~22.6 秒）。
+    warm_ok = await asyncio.to_thread(_persist_warm_snapshot, snapshot)
+
     detail = {
         "failed": bool(failed),
         "message": (
@@ -1109,11 +1385,59 @@ async def _mainline_daily(spec: Any) -> tuple[int, dict[str, Any]]:
             f"告警 {len(snapshot.alerts)}；"
             + ("；".join(notes)[:200] if notes else "无需同步")
             + ("；推送：" + "，".join(item.note for item in pushed) if pushed else "")
+            + ("；热快照已落盘" if warm_ok else "；⚠️ 热快照落盘失败")
             + (f"；同步失败 {len(failed)} 项" if failed else "")
             + (f"；可选数据集未同步 {'、'.join(skipped_optional)}（不影响打分）"
                if skipped_optional else "")),
     }
     return len(snapshot.alerts), detail
+
+
+def _persist_warm_snapshot(snapshot: Any) -> bool:
+    """把算好的快照落成热快照。**不抛异常** —— 缓存失败不该让日更作业判 failed。"""
+    try:
+        from src.api.routes.mainline import warm_persist
+
+        return bool(warm_persist(snapshot))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("主线热快照落盘失败：%s", type(exc).__name__)
+        return False
+
+
+async def _mainline_warm() -> tuple[int, dict[str, Any]]:
+    """主线挖掘·热快照预热：重算一次全市场评分并落盘（`mainline_daily` 的兜底）。
+
+    ## 为什么有了 `mainline_daily` 还要它
+
+    `mainline_daily`（17:30）算完会顺手落热快照，但那条链只在**它自己跑成功**
+    时才落。下面两种情况下热快照会缺失或过期，而面板照样是一打开就等 8~23 秒：
+
+      · 日更作业被自动暂停（连续失败 3 次会被暂停，见 `_mainline_daily` 的注释）；
+      · 数据由**另一个实例/脚本**同步的（本地仓被别的进程更新，本进程没参与）。
+
+    所以本作业只做一件事：**用当前本地数据重算并落盘**。它是只读的 ——
+    不联网、不写 `data/quant`、不落库、不推送，纯粹把算好的快照写进
+    `data/mainline/warm_snapshot.json`。这也是它能安全地与别的实例并存的原因。
+
+    ## 幂等
+
+    落盘按**数据水位线**（`ml_board_bar` 的最新交易日）记版本，同一个水位线
+    重复跑只会覆盖成同一份内容，不会产生副作用。
+    """
+    from src.api.routes.mainline import warm_refresh
+
+    try:
+        info = await asyncio.to_thread(warm_refresh)
+    except Exception as exc:  # noqa: BLE001 预热失败只记 failed，不影响任何业务链路
+        logger.warning("主线热快照预热失败：%s", type(exc).__name__)
+        return 0, {"failed": True,
+                   "message": f"失败：{type(exc).__name__}"}
+
+    return int(info.get("boards") or 0), {
+        "failed": False,
+        "message": (f"水位线 {info.get('watermark')}："
+                    f"板块 {info.get('boards')}，告警 {info.get('alerts')}"),
+    }
 
 
 async def _mainline_etf_flow() -> tuple[int, dict[str, Any]]:
@@ -1204,6 +1528,75 @@ async def _sw_valuation_snapshot(runtime: Any) -> tuple[int, list[str]]:
         except Exception as exc:  # noqa: BLE001 单指标失败不阻断其余
             errors.append(f"{indicator}: {exc}")
     return total_points, errors
+
+
+async def _generic_indicator_snapshot(
+    runtime: Any, indicators: tuple[str, ...], task_prefix: str,
+) -> tuple[int, list[str]]:
+    """通用多指标预采集：逐个经 A01 采集（走完整清洗校验入库链路）。
+
+    为什么需要它（2026-09-26）：`scripts/data_lifecycle.py --check` 列出 6 个
+    **有分析需求、却没有任何定期作业**的指标 —— 于是每次分析都要现打网络：
+
+      us_cpi_yoy / us_fed_rate / us_nonfarm / us_pce   （美国宏观，月频）
+      资产负债率:{code} / 流动比率:{code}                （财务比率，季频）
+
+    用户问题里明确提到"美国说年内还会再加息一次"，而 `us_fed_rate` 却没有
+    北京时间作业在采 —— 这正是"为什么每次都先从互联网采集"的一个直接原因。
+    """
+    from src.core.models import AgentInput
+
+    total_points, errors = 0, []
+    collector = runtime.agents.get("A01_data_collector")
+    if collector is None:
+        return 0, ["A01_data_collector未注册"]
+    for indicator in indicators:
+        try:
+            output = await collector.execute(AgentInput(
+                task_id=f"{task_prefix}_{int(time.time())}",
+                tenant_id="tenant_001",
+                payload={"indicator": indicator},
+            ))
+            total_points += len(output.result.get("data_points", []))
+        except Exception as exc:  # noqa: BLE001 单指标失败不阻断其余
+            errors.append(f"{indicator}: {exc}")
+    return total_points, errors
+
+
+#: 财务比率预采集的标的来源：**已在库的 PE/PB 标的**（已有的估值覆盖就是
+#: 最自然的"要分析哪些票"清单），取最近有数据的若干只控制作业时长。
+_FIN_RATIO_MAX_CODES = 60
+
+
+async def _resolve_financial_ratio_indicators(runtime: Any) -> tuple[str, ...]:
+    """解析"该为哪些标的预采财务比率"。
+
+    为什么不能写死清单：估值覆盖会随 quant_data_sync 变化，
+    写死的清单几天就过期。改成**从库里反查已经有 PE(TTM) 的标的** ——
+    那正是分析时会去看估值的那些票，天然保持同步。
+    """
+    repo = getattr(runtime, "repo", None)
+    if repo is None:
+        return ()
+    codes: list[str] = []
+    for indicator in ("PE(TTM)", "PB"):
+        try:
+            points = await repo.query_points(indicator)
+        except Exception as exc:  # noqa: BLE001 取不到清单就少采，不阻断作业
+            logger.debug("解析财务比率标的失败(%s): %s", indicator, exc)
+            continue
+        for p in points:
+            code = str(getattr(p, "indicator", "")).split(":", 1)[-1]
+            if len(code) == 6 and code.isdigit() and code not in codes:
+                codes.append(code)
+        if codes:
+            break
+    codes.sort()
+    return tuple(
+        f"{name}:{code}"
+        for code in codes[:_FIN_RATIO_MAX_CODES]
+        for name in ("资产负债率", "流动比率")
+    )
 
 
 async def _penetration_rate_update(runtime: Any) -> tuple[int, list[str]]:

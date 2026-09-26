@@ -60,6 +60,8 @@ select = ["E", "F", "I", "W", "UP", "B"]
 "src/infrastructure/security/rls.py" = ["E402"]
 # scripts/ 下临时脚本质量要求低
 "scripts/*" = ["F", "E402", "I001", "F541"]
+# 导入脚本的 docstring 是"数据来源 → 内容"对照表（中文按列对齐），行宽无意义
+"scripts/import_mainline_backtests.py" = ["E501"]
 # 这两处的文档字符串里有大量中文对照表与推导说明，行宽按"列"算没有意义
 "src/intraday/engine.py" = ["E501"]
 "src/intraday/level_fit.py" = ["E501"]

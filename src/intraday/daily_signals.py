@@ -108,7 +108,7 @@ def _consolidation_after_rally(ctx: DailyContext, window: int = 15) -> bool:
 
 
 # ==================================================================
-# 买入信号库 B1–B15
+# 多方条件 B1–B15
 # ==================================================================
 
 def signal_b1(ctx: DailyContext) -> DailySignalItem | None:
@@ -201,14 +201,14 @@ def signal_b3(ctx: DailyContext) -> DailySignalItem | None:
                   f"{recent_max_vol * 1.7:.0f}",
                   "<近5日最大量×1.7"),
         ],
-        reason="阴线反包：放量阴线洗盘，次日竞价/分时确认后低吸",
+        reason="阴线反包：放量阴线洗盘，次日竞价/分时确认后回踩",
         stop_loss=ctx.low(),
         gaps=["竞价模式（一气呵成/缓慢上攻）与分时三类买点需竞价+分时数据"],
         require_all=False)
 
 
 def signal_b4(ctx: DailyContext) -> DailySignalItem | None:
-    """B4 涨停回调低吸（注册制战法）。"""
+    """B4 涨停回调回踩（注册制战法）。"""
     params = ctx.params
     offset = _recent_limit_up(ctx, params.limit_up_tolerance)
     if offset is None or offset < params.pullback_days_min:
@@ -223,7 +223,7 @@ def signal_b4(ctx: DailyContext) -> DailySignalItem | None:
         1 - params.emotion_tolerance_pct / 100)
     in_window = params.pullback_days_min <= pullback <= params.pullback_days_max + 3
     return _finish(
-        "B4", "涨停回调低吸", "buy",
+        "B4", "涨停回调回踩", "buy",
         [
             _cond("近期首板涨停", True, f"{ctx.date(offset)}"),
             _cond(f"回调≥{params.pullback_days_min}天", in_window,
@@ -233,7 +233,7 @@ def signal_b4(ctx: DailyContext) -> DailySignalItem | None:
             _cond("未破支撑位(涨停日最低)", ctx.close() > support,
                   f"支撑 {support:.2f}"),
         ],
-        reason="情绪释放点下方低吸，破支撑无条件离场",
+        reason="情绪释放点下方回踩，破支撑无条件离场",
         entry=ctx.close(), stop_loss=support * 0.97,
         gaps=["换手率≥3%与市值≤300亿需快照/财务数据，若缺失则不做该项过滤"],
         require_all=False)
@@ -446,7 +446,7 @@ def signal_b10(ctx: DailyContext) -> DailySignalItem | None:
             _cond("量缩至区间最高量一半以下（地量K线）", ground,
                   f"当前量 {ctx.volume(0):.0f} vs 区间峰 {window_peak:.0f}"),
         ],
-        reason="地量当日尾盘或次日逢低低吸；跌破5日线止损",
+        reason="地量当日尾盘或次日逢低回踩；跌破5日线止损",
         entry=ctx.close(),
         stop_loss=(float(ma5.iloc[ctx.index])
                    if ma5.iloc[ctx.index] == ma5.iloc[ctx.index] else None),
@@ -523,7 +523,7 @@ def signal_b12(ctx: DailyContext) -> DailySignalItem | None:
             _cond("后续未跌破长下影最低价", hold_lower,
                   f"长下影低点 {float(frame['low'].iloc[rub_index]):.2f}"),
         ],
-        reason="长下影之后逢低低吸；跌破长下影K线最低价止损",
+        reason="长下影之后逢低回踩；跌破长下影K线最低价止损",
         entry=ctx.close(), stop_loss=float(frame["low"].iloc[rub_index]),
         require_all=False)
 
@@ -624,7 +624,7 @@ def signal_b15(ctx: DailyContext) -> DailySignalItem | None:
 
 
 # ==================================================================
-# 卖出 / 风控信号库 S1–S6
+# 风险与离场条件信号库 S1–S6
 # ==================================================================
 
 def signal_s2(ctx: DailyContext) -> DailySignalItem | None:
@@ -849,7 +849,7 @@ def build_verdict(buy: list[DailySignalItem], sell: list[DailySignalItem],
         parts.append(f"买点信号 {','.join(triggered_buy)} 与风控信号 "
                      f"{','.join(triggered_risk)} 矛盾 → 依需求「技术矛盾优先观望」")
     elif triggered_buy:
-        parts.append(f"买入信号触发：{','.join(triggered_buy)}")
+        parts.append(f"多方条件触发：{','.join(triggered_buy)}")
     elif triggered_risk:
         parts.append(f"风控信号触发：{','.join(triggered_risk)}，不新增仓位")
     else:

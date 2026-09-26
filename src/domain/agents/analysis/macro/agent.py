@@ -12,15 +12,11 @@ class MacroAnalysisAgent(AnalysisAgentBase):
     context_max_periods = 12
 
     system_prompt = (
-        "你是资深宏观分析师。基于给定的宏观经济数据点（中国CPI/PPI/M2/社融、"
-        "美国CPI/核心CPI/非农/失业率/美联储利率/PCE等）与信息层财经事件，"
-        "回答用户的宏观/海外市场提问并做经济周期与流动性判断。要求：\n"
-        "1. conclusion必须先正面回答用户提问，再引用数据佐证，禁止脱离给定数据编造数值；\n"
-        "2. 问加息/降息概率时：基于已采集的CPI/PCE/非农/利率数据做趋势判断，"
-        "如未接入CME FedWatch期货隐含概率，须明确声明数据缺口，"
-        "但必须基于已给数据给出方向性判断（如通胀回落→降息概率上升），禁止回答'无法判断'；\n"
-        "3. 周期判断遵循美林时钟框架（复苏/过热/滞胀/衰退）；\n"
-        "4. 输出仅为研究参考，不构成投资建议。"
+        "资深宏观分析师。依据给定中国(CPI/PPI/M2/社融)与美国(CPI/核心CPI/非农/失业率/"
+        "联邦利率/PCE)数据点及财经事件，判断经济周期与流动性。\n"
+        "- 问加息/降息而无FedWatch：声明数据缺口，按已有数据给方向"
+        "（如通胀回落→降息概率升），禁答「无法判断」；\n"
+        "- 周期用美林时钟：复苏/过热/滞胀/衰退。"
     )
 
     def __init__(self, gateway, agent_id: str = "A08_macro",
@@ -38,19 +34,13 @@ class MacroAnalysisAgent(AnalysisAgentBase):
         return True
 
     def _requirements(self, payload) -> str:
-        answer_rule = (
-            f"conclusion首句必须直接回答用户问题「{payload.user_query[:80]}」"
-            "（问概率/数值而系统未接入对应量化数据时，须明确说明数据缺口"
-            "（如未接入CME FedWatch）并给方向性判断，禁止杜撰百分比），再做综合研判；"
-            if payload.user_query else
-            "宏观综合研判（150字内，必须点名关键数据）；"
-        )
         return (
-            "请输出JSON对象，字段：\n"
-            f'- "conclusion": {answer_rule}（200字内）\n'
-            '- "confidence": "high"|"medium"|"low"（数据充分且方向一致为high）\n'
-            '- "cycle_position": "复苏"|"过热"|"滞胀"|"衰退"|"不明确"\n'
-            '- "liquidity": "宽松"|"中性"|"收紧"|"不明确"\n'
-            '- "key_points": 3-5条要点\n'
-            '- "risks": 主要宏观风险1-3条'
+            "输出JSON：\n"
+            '- "conclusion": 首句直接答问（缺对应量化数据时声明缺口并给方向，'
+            "禁杜撰百分比），200字内\n"
+            '- "confidence": high|medium|low\n'
+            '- "cycle_position": 复苏|过热|滞胀|衰退|不明确\n'
+            '- "liquidity": 宽松|中性|收紧|不明确\n'
+            '- "key_points": 3-5条\n'
+            '- "risks": 1-3条'
         )

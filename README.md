@@ -33,6 +33,8 @@
 | **量化因子与回测** | 因子库（IC/IR、5 分位分层回测、换手率）、VaR/CVaR、历史压力测试、Brinson 归因、参数敏感性 |
 | **量化选股 / 日 K 选股** | 三档模型定时选股；LightGBM 日 K 多因子选股写入自选股 |
 | **资金流 / 板块拥挤度** | 大资金动向、概念板块近 6 年拥挤度水位与告警 |
+| **主线挖掘** | 三层漏斗（六维基座→三维建仓痕迹→龙头共振门控）识别板块主线，启动前/初期告警；Walk-Forward 回测 + 监控胜率六章报告；期货先行信号 |
+| **ETF 份额监控** | 宽基 ETF 份额申赎的逆周期痕迹：份额环比/5-10-20 日累计 + 指数分位 + **市场环境门控**（机会信号仅熊市放行，回测 T+34 +9.18%/胜率 83.3%）；多产品共振、行业 ETF 反转警示 |
 | **告警** | 事件驱动告警，批量分类 + 批量打分两阶段（2 次 LLM 调用扫 30 条候选） |
 
 ---
@@ -214,6 +216,102 @@ uv run pytest
 
 **完整演示动线见 [`docs/DEMO_GUIDE.md`](docs/DEMO_GUIDE.md)。**
 
+### 多用户化：管理员与审批（**第一次跑必须先做这一步**）
+
+本系统的注册是**审批制**：新用户注册后状态为 `pending`、**不能登录**，
+必须由管理员在「用户管理」里放行。而管理台本身需要管理员身份 ——
+所以**第一个管理员不可能从界面产生**，必须由部署者用服务器访问权显式创建：
+
+```powershell
+# 创建首个管理员（会打印一次初始密码，请立刻保存）
+.\.venv\Scripts\python.exe scripts/bootstrap_admin.py `
+    --username admin --email you@example.com --db data/dev/moss_dev.db
+
+# 查看当前有哪些管理员
+.\.venv\Scripts\python.exe scripts/bootstrap_admin.py --list --db data/dev/moss_dev.db
+
+# 把已有用户提升为管理员（给同事开权限）
+.\.venv\Scripts\python.exe scripts/bootstrap_admin.py --promote someone --db data/dev/moss_dev.db
+```
+
+**注意 `--db`**：`manage.py start` 默认走 **dev 隔离实例**（`data/dev/moss_dev.db`），
+不写 `--db` 会建到 `data/moss_finagent.db` —— 两边都"成功"但互相看不见，
+表现为"我明明建了管理员，登录却说账号不存在"。脚本第一行会打印实际库路径与体积，
+**先核对它**。
+
+登录后顶栏最右出现账户区；管理员还会多一个 **「用户管理」** 页签：
+
+| 能力 | 说明 |
+|---|---|
+| 待审批列表 | 顶部显示"N 人待审批"，一条就能批完（选套餐 + 有效期 + 备注） |
+| 直接开号 | 跳过邮箱验证，管理员设定初始密码，可勾选"首登强制改密" |
+| 套餐等级 | 管理员 / VIP（单池 100、总数 100）/ 试用（单池 5、总数 25） |
+| 有效期 | 用「今天 + N 天」设置；过期后**能看不能写**，可随时续期 |
+| 禁用 / 启用 | 禁用后立即无法登录 |
+| 忘记密码兜底 | 管理员可重置某用户密码（该用户全部设备同时下线） |
+| 强制下线 | 一键踢掉某用户全部设备（怀疑盗号时用） |
+| 删除账号 | **软删**（审计链保留）；同时**释放邮箱**，该邮箱可重新注册 |
+
+两条刻意的限制（**服务端强制**，不是靠界面藏入口）：
+
+1. **管理员不能改自己的套餐等级、也不能停用/删除自己** ——
+   否则会失去唯一的进入管理台的入口，只能改库才能救回来；
+2. **每个管理动作都记流水**（谁、对谁、改了什么、从什么改成什么）——
+   匿名管理员在合规上等于没有管理员（四眼原则要求操作可归因到人）。
+
+### 多用户化：普通用户能用的三个页面
+
+登录后顶栏新增两组入口，都是**按用户隔离**的：
+
+| 页面 | 能力 | 隔离口径 |
+|---|---|---|
+| **我的自选池** | 建池/改名/删池、加票（单个或批量）、置顶、移除；顶部常驻显示额度「3/5 个池 · 12/100 只」 | 按 `(tenant_id, user_id)` 存取；**知道别人的 pool_id 也读不到**（404） |
+| **个股口径**（在自选池里点某只票的「口径」） | 调该票的因子权重/阈值/档位；显示权重合计是否为 100；一键「还原系统默认」 | 同一只票两人各有各的一份；`from_user` 标明是"已自定义"还是"跟随系统默认" |
+| **用户管理**（仅管理员） | 见上一节 | 服务端每个端点强制 `applied_tier == 'admin'` |
+
+**自选池从 YAML 迁移是分步的，不会打断现有使用**：
+
+```
+解析顺序：该用户建过池 → 用他自己的（dim_user_pool）
+          没建过     → 回退 configs/intraday.yaml（线上那 39 只仍在）
+```
+
+所以你现在登录进去看到的还是原来那份列表；**新建一个池，就自动切换成你自己的**。
+彻底切换只需要引导用户建池，不需要停机迁移。
+
+**额度由服务端按套餐强制**（`applied_tier` → 额度表只在
+`src/domain/quota/service.py` 定义一处）：
+
+| 套餐 | 池数 | 单池 | 自选总数（去重） | 自定义板块 |
+|---|---|---|---|---|
+| 管理员 | 5 | 100 | 100 | 20 个 / 单板块 200 |
+| VIP | 5 | 100 | 100 | 20 个 / 单板块 200 |
+| 试用 | 5 | 5 | 25 | 5 个 / 单板块 50 |
+
+板块成员**不占**自选总数（也不进实时取数宇宙）—— 否则"我加了个板块，自选就满了"。
+
+### 多用户化：数据迁移与实测
+
+```powershell
+# 旧口径表（dim_intraday_profile，主键只有 code）→ v2 多用户表
+# 默认 dry-run，只打印不写库；确认后加 --apply
+.\.venv\Scripts\python.exe scripts/migrate_intraday_profile_to_v2.py `
+    --tenant-id t_default --user-id admin@example.com
+.\.venv\Scripts\python.exe scripts/migrate_intraday_profile_to_v2.py `
+    --tenant-id t_default --user-id admin@example.com --apply
+
+# 自选池读写延迟实测（含批量 vs 逐条对比）
+.\.venv\Scripts\python.exe scripts/_probe_pool_latency.py
+.\.venv\Scripts\python.exe scripts/_probe_pool_hotpath.py
+```
+
+实测结论：单条写入中位 **10.1 ms**，其中 **7.6 ms 是 INSERT 的 fsync**（连接只占 0.1 ms）；
+`add_stocks_bulk` 把 50 只票收进一个事务后 **542 ms → 14 ms（38×）**。
+读路径 1.4 ms / 100 只 —— 本地库不是瓶颈，**取数才是**。
+
+详细数字与三条可引用的结论见
+[`docs/PLATFORM_MULTI_TENANCY_DESIGN.md`](docs/PLATFORM_MULTI_TENANCY_DESIGN.md) §13.4。
+
 ---
 
 ## 已知不足
@@ -249,9 +347,14 @@ uv run pytest
 | [`docs/SHORTTERM_BACKTEST.md`](docs/SHORTTERM_BACKTEST.md) | 短线回测 |
 | [`docs/SECTOR_CROWDING.md`](docs/SECTOR_CROWDING.md) | 板块拥挤度 |
 | [`docs/FUND_FLOW_MONITOR.md`](docs/FUND_FLOW_MONITOR.md) | 资金流监控 |
+| [`docs/MAINLINE_MINING.md`](docs/MAINLINE_MINING.md) | **主线挖掘（三层漏斗、数据口径、回测框架、期货先行信号）** |
+| [`docs/ETF_FLOW_MONITOR.md`](docs/ETF_FLOW_MONITOR.md) | **ETF 份额监控（环境门控、三类信号、份额口径）** |
+| [`docs/ETF_FLOW_BACKTEST.md`](docs/ETF_FLOW_BACKTEST.md) | ETF 份额信号回测报告（1252 个信号，含类型×环境交叉表） |
 | [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md) | HTTP 接口参考 |
 | [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) | 指标、审计链与可观测性 |
 | [`docs/SECURITY_COMPLIANCE.md`](docs/SECURITY_COMPLIANCE.md) | 安全合规 |
+| [`docs/PLATFORM_MULTI_TENANCY_DESIGN.md`](docs/PLATFORM_MULTI_TENANCY_DESIGN.md) | **平台多租户与权限设计（三级资源归属 / 模块级能力码 / RLS 双层隔离）+ 面试防御包** |
+| [`docs/MULTI_TENANCY_DESIGN.md`](docs/MULTI_TENANCY_DESIGN.md) | 多租户与合规设计（RBAC × ABAC × 信息隔离墙、四眼原则、审计链） |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | 常见问题排查 |
 | [`docs/DEVELOPMENT_ROADMAP.md`](docs/DEVELOPMENT_ROADMAP.md) | 路线图与 Backlog |
 

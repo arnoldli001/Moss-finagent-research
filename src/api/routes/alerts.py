@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+import time
 
 from fastapi import APIRouter, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 
@@ -131,47 +133,22 @@ async def _viewer_user_id(request: Request) -> str:
         return ""
 
 
-def alert_to_public(alert, *, is_admin: bool) -> dict:
-    """告警 → 可出接口的 dict。
-
-    ## 为什么必须有这一层
-
-    原来直接 `alert.model_dump()`，于是响应里带着：
-
-        "source_name": "东方财富-全球财经"
-        "source_url":  "https://finance.eastmoney.com/a/202609243883509677.html"
-
-    任何登录用户按一下 F12 就能看到**我们用了哪几个免费渠道**，
-    而"渠道组合 + 采集节奏"正是本项目的壁垒。前端**根本没用到**
-    这两个字段（`AlertsPanel` 只渲染了 `source_name` 做署名），
-    所以把它们从用户响应里去掉不损失任何功能。
-
-    ## 三层处理
-
-      · `source_name` → 用户侧换成**稳定假名** `source_alias`
-        （不是打码成 `***`：那样所有来源塌成同一个值，按源分组/去重全失效）
-      · `source_url`  → **一律不给用户**（管理员保留，他需要排查）
-      · 文本字段里的裸 URL → 抹成"（链接已隐藏）"
-    """
-    data = alert.model_dump()
-    for f in _TEXT_FIELDS:
-        if f in data:
-            data[f] = _strip_urls(data.get(f))
-    # `raw_data` 走白名单（实测里面有内部 `source_tag`）
-    if "raw_data" in data:
-        data["raw_data"] = _safe_raw_data(data.get("raw_data"))
-
-    if is_admin:
-        # 管理员要能溯源排障：保留真名与链接
-        return data
-
-    from src.core.redaction import source_pseudonym
-
-    raw_name = str(data.get("source_name") or "")
-    data.pop("source_url", None)
-    data.pop("source_name", None)
-    data["source_alias"] = source_pseudonym(raw_name)
-    return data
+#: 内部字段：**不进列表响应**。它们谁都不渲染，只是白占带宽。
+#:
+#: 实测（2026-09-26，pilot 库 95 条告警）：整个列表 **112,520 B ≈ 1,184 B/条**，
+#: 而公网隧道实测只有 **~51 KB/s**（834 KB 静态包要 16.3 秒）——
+#: 于是这 112 KB 要传 **2 秒以上**，正是用户报的"首次打开 2~3 秒"。
+#: 带宽这么贵的情况下，每一个没人读的字段都是直接从用户等待时间里扣的。
+#:
+#: 逐个说明为什么可以去掉：
+#:   · `alert_key` / `content_key` —— 服务端去重键，前端零引用
+#:   · `tenant_id`                —— 多租户内部标识，前端零引用
+#:   · `source_url`（非管理员已去掉）—— 管理员保留，用于溯源排障
+#:
+#: ⚠️ 独立的定义位置在下面（`alert_to_public` 之前），这里只是**常量**，
+#: 别再往这里插函数 —— 曾经因为一次编辑把 `alert_to_public` 复制成了两份，
+#: ruff 的 F811 才把它抓出来（静默的那一份会让"瘦身没生效"且毫无报错）。
+_ALERT_LIST_DROP = ("alert_key", "content_key", "tenant_id")
 
 
 def event_to_public(event, *, is_admin: bool) -> dict:
@@ -197,7 +174,120 @@ def event_to_public(event, *, is_admin: bool) -> dict:
     return data
 
 
+def alert_to_public(alert, *, is_admin: bool, for_list: bool = False) -> dict:
+    """告警 → 可出接口的 dict。
+
+    ## 为什么必须有这一层
+
+    原来直接 `alert.model_dump()`，于是响应里带着：
+
+        "source_name": "东方财富-全球财经"
+        "source_url":  "https://finance.eastmoney.com/a/202609243883509677.html"
+
+    任何登录用户按一下 F12 就能看到**我们用了哪几个免费渠道**，
+    而"渠道组合 + 采集节奏"正是本项目的壁垒。前端**根本没用到**
+    这两个字段（`AlertsPanel` 只渲染了 `source_name` 做署名），
+    所以把它们从用户响应里去掉不损失任何功能。
+
+    ## 三层处理
+
+      · `source_name` → 用户侧换成**稳定假名** `source_alias`
+        （不是打码成 `***`：那样所有来源塌成同一个值，按源分组/去重全失效）
+      · `source_url`  → **一律不给用户**（管理员保留，他需要排查）
+      · 文本字段里的裸 URL → 抹成"（链接已隐藏）"
+
+    ## `for_list=True`（列表专用瘦身，2026-09-26）
+
+    在以上基础上再砍三处**没人读**的东西。它们不影响任何功能，
+    在"隧道只有 ~51 KB/s"的前提下却是实打实的等待时间：
+
+      1. `disclaimer` —— 同一条 91 字节文案在 95 条里重复 95 遍
+         （实测 **8,645 B，占整个载荷 7.7%**）。文案是**响应级**的，
+         已经由列表顶层的 `disclaimer` 下发一次（前端渲染的是
+         `settings.disclaimer`，不是每条的）。
+      2. `alert_key` / `content_key` / `tenant_id` —— 见 `_ALERT_LIST_DROP`。
+      3. `affected_stocks` 里**三个字段全空**的占位项 —— 实测有
+         `[{"code": "688428", "name": "诺诚健华", "impact": "", "reason": ""}]`
+         这种：没有 impact、没有 reason，详情页对它是"只显示个代码"。
+         但同一个字段在别的告警上是有内容的（288 B 那种），所以只滤空项、
+         **不删字段**。
+
+    ⚠️ **不要**顺手把 `description` / `affected_stocks` 整个从列表里删掉。
+    `AlertsPanel.selectAlert` 是**直接拿列表对象**打开详情抽屉、不重新请求的
+    （见该文件 104 行）。删了它们确实能再省 ~35 KB，代价却是
+    "点一条要先转两秒" —— 在这个带宽下那是明显的退步，不是优化。
+    """
+    data = alert.model_dump()
+    for f in _TEXT_FIELDS:
+        if f in data:
+            data[f] = _strip_urls(data.get(f))
+    # `raw_data` 走白名单（实测里面有内部 `source_tag`）
+    if "raw_data" in data:
+        data["raw_data"] = _safe_raw_data(data.get("raw_data"))
+
+    if for_list:
+        for key in _ALERT_LIST_DROP:
+            data.pop(key, None)
+        data.pop("disclaimer", None)
+        stocks = data.get("affected_stocks")
+        if isinstance(stocks, list):
+            data["affected_stocks"] = [
+                s for s in stocks
+                if isinstance(s, dict)
+                and (str(s.get("impact") or "").strip()
+                     or str(s.get("reason") or "").strip())
+            ]
+
+    if is_admin:
+        # 管理员要能溯源排障：保留真名与链接
+        return data
+
+    from src.core.redaction import source_pseudonym
+
+    raw_name = str(data.get("source_name") or "")
+    data.pop("source_url", None)
+    data.pop("source_name", None)
+    data["source_alias"] = source_pseudonym(raw_name)
+    return data
+
+
 # ---------- 告警查询/操作 ----------
+
+# ⚠️ **这条必须注册在 `/alerts/{alert_id}` 之前**。
+# FastAPI 按注册顺序匹配：`/alerts/{alert_id}` 会把 "bootstrap" 当成一个
+# 告警 ID 吞掉，于是这条端点永远 404（而且看起来像"告警不存在"，
+# 与路由顺序完全联系不起来）。所以它放在这里，而不是跟其它 `/alerts/*` 挨着。
+@router.get("/alerts/bootstrap")
+async def alerts_bootstrap(
+    request: Request, type: str | None = None, level: str | None = None,
+    status: str | None = None, limit: int = 100,
+    include_expired: bool = False, tenant_id: str = DEFAULT_TENANT,
+) -> dict:
+    """**一次往返**取齐事件告警界面首屏要的全部东西。
+
+    ## 为什么值得单独开一条（用户口径 2026-09-26）
+
+    > "数据入库，首次取库，减少冷启动，用户登录成功就预加载进来。"
+
+    原来首屏要发**两条**（`/alerts` + `/alerts/settings`）。在本机这无所谓
+    （各自 30~70 ms），但在**隧道只有 51 KB/s、单次往返 0.4~2 秒**的现实下，
+    每多一条请求就多一次往返 + 一次的队头等待。
+
+    这里把两条并成一条（`settings` 复用同一个处理函数，不重写一份 ——
+    否则两处口径必然分叉）。列表本身仍然走 `list_alerts` 的缓存，
+    所以这条端点在被预加载过之后基本是纯内存组装。
+
+    ## 为什么不做成"登录就推"
+
+    用户说的"登录成功就预加载"落到实现上就是**前端在登录成功后立刻调这条**，
+    而不是让服务端往某个连接上推。理由：登录那一刻 WebSocket 往往还没建好，
+    推了也没人接；而前端主动拉一次是确定性的，且天然带 Cookie 与鉴权。
+    """
+    data = await list_alerts(
+        request, type=type, level=level, status=status, limit=limit,
+        include_expired=include_expired, tenant_id=tenant_id)
+    return {**data, "settings": await alert_settings(request)}
+
 
 @router.get("/alerts/settings")
 async def alert_settings(request: Request) -> dict:
@@ -284,6 +374,10 @@ async def trigger_scan(
                 started_at=scan["started_at"], finished_at=now_iso()).model_dump()
         finally:
             scan["running"] = False
+            # ★ 扫完必须失效列表缓存：新告警要立刻能被拉出来。
+            #   不失效的话，用户在扫描期间正好拉过一次列表，之后 45 秒内
+            #   无论怎么点都看不到新告警 —— 那是"扫描没生效"的假象。
+            _invalidate_alerts()
 
     asyncio.create_task(_job(), name="manual-event-scan")
     return {"status": "accepted", "started_at": scan["started_at"],
@@ -300,8 +394,12 @@ async def mark_all_read(request: Request, tenant_id: str = DEFAULT_TENANT) -> di
     runtime = _require_stack(request)
     # 只把**这个用户**的告警标成已读。原来是一条 UPDATE 把整个租户的
     # 告警全置 read —— 一个人点"全部已读"，13 个人的角标一起清零。
-    return {"updated": await runtime.event_repo.mark_all_read(
-        tenant_id, user_id=await _viewer_user_id(request))}
+    updated = await runtime.event_repo.mark_all_read(
+        tenant_id, user_id=await _viewer_user_id(request))
+    # ★ 已读状态变了，列表缓存必须失效 —— 否则用户点完"全部已读"再切回来，
+    #   会看到 45 秒内的旧未读状态，看起来像"点了没用"。
+    _invalidate_alerts()
+    return {"updated": updated}
 
 
 @router.get("/alerts/{alert_id}")
@@ -325,7 +423,104 @@ async def mark_read(
         alert_id, tenant_id, user_id=await _viewer_user_id(request))
     if not updated:
         raise HTTPException(status_code=404, detail="告警不存在或已读")
+    # ★ 同上：单条已读也要失效（前端点一条就标已读，是最常发生的那条路径）
+    _invalidate_alerts()
     return {"alert_id": alert_id, "status": "read"}
+
+
+# ======================================================================
+# 告警列表的**进程内响应缓存**（2026-09-26 用户报障"打开等 2~3 秒"）
+#
+# ## 为什么 DB 快、用户还是慢
+#
+# 实测（pilot 库 95 条告警）：
+#
+#     本机 8110  `/alerts?limit=100`    28~74 ms，112,520 B
+#     公网隧道   同一条                 **5,705 ms**（第二次直接读超时）
+#     隧道带宽   834 KB 静态包           16.3 s  ≈ **51 KB/s**
+#
+# 也就是说：**后端不是瓶颈，带宽才是**。`fact_alerts` 只有 95 行、
+# 索引齐全，2 秒全花在把 112 KB 挪过隧道上。
+#
+# 所以这里的优化分两层，缺一不可：
+#
+#   ① **少传**：`alert_to_public(for_list=True)` 砍掉每条重复的 disclaimer
+#      与内部字段 —— 实测能省 ~15% 字节（见该函数注释）。
+#   ② **少往返**：列表结果按 (租户, 用户, 筛选) 缓存 45 秒。用户切页签、
+#      来回点筛选时不再每次重查重序列化。
+#
+# ## 为什么 TTL 只有 45 秒（而不是像日历那样 6 小时）
+#
+# 告警是**时效性内容**：新的告警随时会来，已读状态是用户自己刚点的。
+# 缓存太久会让"我刚点的已读又变回未读"（用户会认为系统坏了）。
+# 45 秒足够覆盖"来回切界面"这个真实场景，又短到不会让人看出陈旧。
+#
+# ## 一致性：写操作**主动失效**，不靠 TTL 兜
+#
+# 已读/全部已读都会改列表内容。只靠 45 秒 TTL 的话，用户点完已读
+# 再切回来会看到旧状态 —— 那是明显的 bug。所以三个写端点
+# （`mark_read` / `mark_all_read` / `scan`）成功后一律 `_invalidate_alerts()`。
+# ======================================================================
+
+#: 列表缓存有效期（秒）。理由见上方注释块。
+ALERTS_CACHE_TTL = 45.0
+
+#: 缓存条目上限。键含用户与筛选组合，正常每人几条；
+#: 上限只为防"参数枚举"把内存撑满（与项目里其它小缓存同策略）。
+_ALERTS_CACHE_MAX = 24
+
+_alerts_cache: dict[str, tuple[float, dict]] = {}
+_alerts_lock = threading.Lock()
+
+
+def _alerts_cache_key(*, tenant_id: str, user_id: str, alert_type: str | None,
+                      alert_level: str | None, status: str | None,
+                      limit: int, include_expired: bool,
+                      is_admin: bool) -> str:
+    """缓存键**必须含全部影响结果的参数**。
+
+    漏掉任何一个的表现都很隐蔽：切到"仅未读"会拿到上一档的列表，
+    看起来完全正常、只是筛选没用。
+
+    `is_admin` 也在键里：管理员响应保留 `source_name`/`source_url`，
+    与普通用户**不是同一份内容** —— 不含它就会把管理员的响应
+    发给普通用户（那是数据源泄漏，不只是显示问题）。
+    """
+    return "|".join([
+        tenant_id, user_id, "A" if is_admin else "u",
+        alert_type or "-", alert_level or "-", status or "-",
+        str(limit), "1" if include_expired else "0",
+    ])
+
+
+def _alerts_cached(key: str) -> dict | None:
+    with _alerts_lock:
+        entry = _alerts_cache.get(key)
+    if entry is None:
+        return None
+    at, payload = entry
+    if (time.monotonic() - at) >= ALERTS_CACHE_TTL:
+        return None
+    # 浅拷贝：调用方会往里塞字段，别让它改到缓存里那份
+    return dict(payload)
+
+
+def _alerts_store(key: str, payload: dict) -> None:
+    with _alerts_lock:
+        if len(_alerts_cache) >= _ALERTS_CACHE_MAX:
+            _alerts_cache.clear()      # 与项目里其它小缓存同策略：整体清空
+        _alerts_cache[key] = (time.monotonic(), dict(payload))
+
+
+def _invalidate_alerts() -> None:
+    """清空列表缓存。**任何改变告警内容/已读状态的写操作都要调它**。
+
+    整体清空而不是按用户清：规模极小（≤24 条），而"按用户精确失效"
+    一旦漏掉某个键，表现就是"我点了已读，切回来又是未读" ——
+    为省一点内存换一个难查的 bug 不划算。
+    """
+    with _alerts_lock:
+        _alerts_cache.clear()
 
 
 @router.get("/alerts")
@@ -337,6 +532,15 @@ async def list_alerts(
     runtime = _require_stack(request)
     limit = max(1, min(limit, 200))
     uid = await _viewer_user_id(request)
+    is_admin = await _viewer_is_admin(request)
+    key = _alerts_cache_key(
+        tenant_id=tenant_id, user_id=uid, alert_type=type, alert_level=level,
+        status=status, limit=limit, include_expired=include_expired,
+        is_admin=is_admin)
+    cached = _alerts_cached(key)
+    if cached is not None:
+        return cached
+
     alerts = await runtime.event_repo.list_alerts(
         alert_type=type, alert_level=level, status=status,
         limit=limit, include_expired=include_expired, tenant_id=tenant_id,
@@ -344,9 +548,13 @@ async def list_alerts(
     # 未读数也要按用户 —— 否则列表是我的未读、角标是全体的未读，
     # 两个数对不上，用户会以为系统坏了
     unread = await runtime.event_repo.count_unread(tenant_id, user_id=uid)
-    is_admin = await _viewer_is_admin(request)
-    return {"alerts": [alert_to_public(a, is_admin=is_admin) for a in alerts],
-            "total": len(alerts), "unread": unread}
+    payload = {
+        "alerts": [alert_to_public(a, is_admin=is_admin, for_list=True)
+                   for a in alerts],
+        "total": len(alerts), "unread": unread,
+    }
+    _alerts_store(key, payload)
+    return payload
 
 
 # ---------- 事件 ----------

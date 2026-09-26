@@ -35,6 +35,8 @@ JobKind = Literal[
     "intel_token_alert",  # 数据源授权到期提醒（邮件通知管理员，只发管理员不发用户）
     "intel_zsxq_collect",  # 知识星球增量采集（水位线，2 小时一次，少量多次）
     "intel_tone_extract",   # 原文倾向抽取（本地模型，排在采集之后）
+    "intel_hot_rank",     # 各平台人气/热搜榜（接口只读落盘结果，不再实时抓）
+    "mainline_warm",      # 主线热快照预热（只读；消除 8~23 秒的冷启动）
 ]
 
 
@@ -198,6 +200,41 @@ JOB_REGISTRY: dict[str, JobSpec] = {
             "→LLM风险/机会评估→阈值告警→WebSocket推送与邮件"
         ),
         params={},
+    ),
+    # ── 补齐"有分析需求但没有定期作业"的指标（2026-09-26）──────────────
+    # 起因：用户问"美国说年内还会再加息一次，请分析…"，而 us_fed_rate
+    # **没有任何作业在采** —— 每次分析都要现打网络，这正是"为什么每次都
+    # 先从互联网采集"的一个直接原因。`scripts/data_lifecycle.py --check`
+    # 可列出全部这类指标。
+    #
+    # ⚠️ 关于数据新鲜度的实话：AkShare 的 `macro_bank_usa_interest_rate`
+    # 实测**最新有效值是 2025-07-31**，2025-09-18 / 2025-10-30 两行是
+    # NaN 占位（上游未回填）。也就是说"美联储当前利率"这个指标在本数据源上
+    # 是**陈旧**的，作业只能把已发布的部分入库，不能变出新数据。
+    # 分析层会按 DataFreshnessEvaluator 的衰减给出低置信标注，A08 的
+    # system_prompt 也要求"缺 FedWatch 时声明数据缺口并按已有数据给方向"。
+    "us_macro_daily": JobSpec(
+        name="us_macro_daily",
+        cron="40 8 * * *",
+        kind="generic_indicator_snapshot",
+        description=(
+            "每日08:40预采集美国宏观指标（CPI同比/核心CPI/非农/失业率/PCE/美联储利率），"
+            "入库供宏观分析直接命中。注：AkShare 的美联储利率源最新有效值停在 2025-07-31，"
+            "该指标会带陈旧标注，作业不掩盖这一点"
+        ),
+        params={"task_prefix": "us_macro",
+                "indicators": ["us_cpi_yoy", "us_core_cpi", "us_nonfarm",
+                               "us_unemployment", "us_pce", "us_fed_rate"]},
+    ),
+    "financial_ratio_weekly": JobSpec(
+        name="financial_ratio_weekly",
+        cron="50 16 * * 5",
+        kind="generic_indicator_snapshot",
+        description=(
+            "每周五16:50预采集已覆盖标的的财务比率（资产负债率/流动比率），"
+            "供 A10 估值与 A11 财务风险分析直接命中。财报为季频，周频足够及时"
+        ),
+        params={"task_prefix": "fin_ratio", "indicators": []},  # 标的由作业内解析
     ),
     "tech_industry_daily": JobSpec(
         name="tech_industry_daily",
@@ -392,6 +429,38 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         ),
         params={},
     ),
+    # 主线挖掘·热快照预热（18:10）。
+    #
+    # 排在 `mainline_daily`（17:30）与 `mainline_etf_flow`（17:50）**之后**：
+    # 等当天的数据同步与打分都落地了，再把那份快照预热好。
+    #
+    # ## 它解决什么（实测）
+    #
+    # 主线快照的全市场重算要 **8.4~22.6 秒**（随 IO 竞争浮动），而面板
+    # 一打开就要它。原来的缓存是进程内 300 秒 TTL：过期有一个人挨一次，
+    # 每次重启更是第一个访问者替所有人挨一次（一天重启 5 次就是 5 次）。
+    #
+    # 现在接口按**数据水位线**（`ml_board_bar` 最新交易日）缓存，并且这份
+    # 作业 + `mainline_daily` 都会把算好的快照落盘；服务启动时（lifespan）
+    # 直接装回内存。于是"重启"不再等于"冷启动"。
+    #
+    # ## 为什么有了 `mainline_daily` 还要单独一个
+    #
+    # 日更作业连续失败 3 次会被自动暂停；数据也可能由**别的实例**同步。
+    # 那两种情况下热快照会缺，而面板照样一打开就等 8~23 秒。
+    # 本作业是**只读**的：不联网、不写 `data/quant`、不落库、不推送 ——
+    # 所以它与别的实例并存是安全的，这也是它能作为兜底的原因。
+    "mainline_warm": JobSpec(
+        name="mainline_warm",
+        cron="10 18 * * 1-5",
+        kind="mainline_warm",
+        description=(
+            "主线挖掘·热快照预热：用当前本地数据重算一次全市场评分并落盘"
+            "（data/mainline/warm_snapshot.json），让面板与重启后首个请求免于"
+            "一次 8~23 秒的全市场重算。只读：不联网、不写 data/quant、不落库、不推送"
+        ),
+        params={},
+    ),
     # 期货映射表季度校准（需求 5.3 / 8.11）：每季度末月首个周六 09:00。
     # 放在非交易日是为了不与盘后链路抢 Tushare 频次。
     "mainline_futures_calibrate": JobSpec(        name="mainline_futures_calibrate",
@@ -407,13 +476,19 @@ JOB_REGISTRY: dict[str, JobSpec] = {
     # 数据保留（用户口径：最多保留最近 10 年）：每日 03:30 低峰清理。
     # 作业幂等：无超期数据时删除 0 行；启动钩子另跑一次，保证长期没开定时
     # 任务的环境重启时也会收敛。
+    #
+    # 2026-09-26 新增第三档：**事件告警按 `alert_expire_days`（默认 3 天）
+    # 真正删除**（用户口径："事件告警的信息最多保留三天，超过3天的信息
+    # 自动溢出删除"）。与读路径的懒过期（置 `expired`）是两层机制：
+    # 懒过期只让列表不显示，行还在库里 —— 只有这一档才真正释放数据。
     "data_retention_daily": JobSpec(
         name="data_retention_daily",
         cron="30 3 * * *",
         kind="data_retention",
         description=(
-            "数据保留：每日03:30删除早于保留年限（默认10年）的数据点，"
-            "并清理超过保留天数（默认30天）的新闻缓存"
+            "数据保留：每日03:30删除早于保留年限（默认10年）的数据点、"
+            "清理超过保留天数（默认30天）的新闻缓存，"
+            "并删除超过 alert_expire_days（默认3天）的事件告警及其孤儿事件"
         ),
         params={},
     ),
@@ -491,7 +566,78 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         # 池子约 260 条高可信条目，而**默认视图看的是最近 60 条** ——
         # 40 条/2 小时要 13 小时才铺一遍，期间用户看到的多是尚未抽取。
         # 120 条两三批就能把存量铺满，之后每批只处理新增的那几十条。
+        #
+        # ⚠️ 实测（2026-10-01）这批上限**跟不上快讯的周转**：
+        # 试点的 18:20 那一班跑完全程只用了 6.2 秒（说明大部分条目的
+        # `content_hash` 已经抽过、被短路跳过），而**默认视图那 60 条里
+        # 一条模型判定都没有**（`tone_store` 覆盖 0/60）。
+        # 成因是池子的构成：`FILTER_POOL=500` 里绝大多数是快讯（实测
+        # 一次真实聚合 321 条、其中 newswire 上百条），它们进得快、
+        # 3 天窗口一到就走，而一班只抽 120 条。
+        # 所以**方向与摘要不能只靠这个作业** —— `build_feed` 现在会在
+        # 请求路径上用规则层给方向兜底（`tone.rule_tone_verdict`），
+        # 摘要则在没有模型结果时**标明是原文摘录**（`service._summary_of`）。
+        # 要提高模型覆盖率，得调这个 `max_items` 或缩短班次间隔，
+        # 那是**成本决策**（本机 8B 实测 ~26.5 秒/次调用），不在本轮改动里。
         params={"max_items": 120},
+    ),
+    # ⚠️ 这个作业是**补上的**。`hot_job.run_once()` 早就写好了，但从来没有
+    # 任何调度任务调用它 —— 只有调试脚本 `scripts/_dbg_hot.py` 跑过。
+    # 结果是「热门个股 / 热议事件」在页面上永远是空的或极旧，而空的原因
+    # **看起来像"上游没数据"**，完全不像"这条链路没接上"（我因此白查了一轮）。
+    #
+    # 排在 `intel_tone_extract` 之后 7 分钟：先有逐条倾向与摘要，
+    # 再有整批聚合 —— 聚合的输入里用得上前者的产出。
+    "intel_hot_topics": JobSpec(
+        name="intel_hot_topics",
+        cron="27 */2 * * *",
+        kind="intel_hot_topics",
+        description=(
+            "平台热议聚合：把各平台**公开快讯**（财联社/富途/东财/同花顺/新浪）"
+            "整批喂本地模型，聚出「讨论最集中的个股与事件」，"
+            "落 data/intel/hot_topics.json。"
+            "⚠️ 股票名有两道闸：模型侧要求名字必须在原文出现；"
+            "另有确定性名录匹配（hot_scan，零模型）兜底，"
+            "宁可漏也不认错 —— 编一只票用户是看不出来的"
+        ),
+        # 160 条 ≈ 4 批 ≈ 80 秒。本地 1.5B 带 JSON Schema 约束后单批约 20 秒。
+        params={"max_items": 160},
+    ),
+    # ⚠️ 这个作业补的是**性能事故**，不是新功能。
+    #
+    # `hot_rank.fetch_hot_rank()` 原本是**接口每次请求实时调**的
+    # （`intel._build_heat`），实测 3.0~3.5 秒 —— 而 `intel.py` 的注释
+    # 一直声称"热榜走定时任务落库，这里只读结果"。注释与代码相反，
+    # 后果是情报流每打开一次等 5~6 秒（`/feed` 无任何缓存）。
+    #
+    # 现在改成：本作业每 10 分钟落盘一次，接口读落盘结果（0 ms）；
+    # 落盘结果超过 10 分钟才允许接口自己现抓一次 —— 因为对外试点实例
+    # `MOSS_SCHEDULER_ENABLED=0`，只读落盘会让客户那边的人气榜永远是空的。
+    "intel_hot_rank": JobSpec(
+        name="intel_hot_rank",
+        cron="*/10 8-22 * * *",
+        kind="intel_hot_rank",
+        description=(
+            "各平台人气/热搜榜（东财千股千评为主源，百度热搜/东财人气榜备源），"
+            "落 data/intel/hot_rank.json，情报流的「平台热议 · 人气榜」读它。"
+            "⚠️ 主源是 T-1 口径、备源偶发 RemoteDisconnected，"
+            "取不到时保留上一次结果并如实标注时间，不把页面清空"
+        ),
+        params={},
+    ),
+    # 排在热度聚合之后 3 分钟：先把倾向抽好、把方向判出来，
+    # 再决定哪些值得弹窗。
+    "intel_signal_alert": JobSpec(
+        name="intel_signal_alert",
+        cron="30 */2 * * *",
+        kind="intel_signal_alert",
+        description=(
+            "情报信号告警：把情报流里**明显利空/利多**的条目推成事件告警，"
+            "走既有告警系统的去重、冷却、等级、每人已读与 WebSocket 弹窗。"
+            "闸门（用户口径 2026-09-25）：方向明确 + 可信度≥74 + 引擎判为 high "
+            "+ 跨源同文合并成一条；**非交易时段只入库不弹窗**"
+        ),
+        params={"max_items": 40},
     ),
 }
 

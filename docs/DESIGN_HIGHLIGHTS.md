@@ -192,7 +192,7 @@ authorize(READ_STRATEGY, resource, wall_crossing=WallCrossing(
 **门禁上线当天就抓到三个真问题**（全在 `.env.example`）：
 
 1. `POSTGRES_PASSWORD=moss_finagent` —— **一个能用的默认密码**，会诱导部署时直接照抄
-2. `ALERT_EMAIL_TO=1027312283@qq.com` —— **真实个人邮箱进了版本库**
+2. `ALERT_EMAIL_TO=2693888583@qq.com` —— **真实个人邮箱进了版本库**
 3. `DEEPSEEK_API_KEY=sk-your-deepseek-key-here` —— 形似真 key
 
 **这次经历本身最值得讲**：我写完门禁先跑了一遍，以为会全绿，结果红了三条。

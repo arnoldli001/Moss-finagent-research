@@ -21,7 +21,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from src.core.errors import BRIEF_DEFAULT
+from src.core.errors import BRIEF_DEFAULT, brief
 
 LOG_DIR = Path("data/qmt")
 INDEX_CODES = [

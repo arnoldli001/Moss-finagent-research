@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
+from src.core.errors import brief
 from src.domain.skills.library import SkillLibrary
 
 router = APIRouter(prefix="/api/v1", tags=["skills"])
@@ -52,7 +53,7 @@ async def skill_detail(agent_id: str, skill_name: str) -> dict[str, object]:
     try:
         content = _lib().load_skill(agent_id, skill_name)
     except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=brief(exc)) from exc
     except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from exc
+        raise HTTPException(status_code=403, detail=brief(exc)) from exc
     return {"agent_id": agent_id, "skill_name": skill_name, "content": content}

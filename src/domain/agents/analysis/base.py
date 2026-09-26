@@ -153,31 +153,27 @@ class AnalysisAgentBase(BaseAgent):
                     if raw_conf is not None else fe.confidence
                 )
                 value = p.get("value", "缺失")
+                # 紧凑记号：图标+指标 期=值 c置信 来源；省去重复中文标签（模型按序解读）
                 parts = [
-                    f"- {indicator} {fe.status_icon}",
-                    f"期间 {p.get('period_date', '?')}",
-                    f"值 {value}",
-                    f"来源 {p.get('source_name', '?')}",
-                    f"置信度 {display_conf:.2f}",
+                    f"- {fe.status_icon}{indicator}",
+                    f"{p.get('period_date', '?')}={value}",
+                    f"c{display_conf:.2f}",
+                    str(p.get("source_name", "?")),
                 ]
                 if fe.weight_multiplier < 1.0:
-                    parts.append(f"权重×{fe.weight_multiplier}")
+                    parts.append(f"w×{fe.weight_multiplier}")
                 if fe.note and fe.status != "expired":
-                    parts.append(f"[{fe.note}]")
-                lines.append(" | ".join(parts))
+                    parts.append(fe.note)
+                lines.append(" ".join(parts))
 
-        # 时效概览
+        # 时效概览（紧凑：去掉模型无需知晓的衰减公式说明行）
         total = len(payload.data_points)
-        freshness_header = [
-            f"### 当前日期锚定：{today.isoformat()}",
-            f"### 输入数据：{len(lines)} 条展示（{total} 总 / {expired_count} 过期已过滤）",
-            "### 新鲜度机制：指数衰减 exp(-0.5×d/(周期×行业倍数))",
-        ]
+        header = (
+            f"[日期{today.isoformat()}；展示{len(lines)}/{total}，"
+            f"过期过滤{expired_count}]\n"
+        )
         if stale_indicators:
-            freshness_header.append(
-                f"### ⚠️ 以下指标新鲜度下降：{', '.join(stale_indicators)}"
-            )
-        header = "\n".join(freshness_header) + "\n"
+            header += f"⚠️新鲜度下降：{', '.join(stale_indicators)}\n"
 
         return header + "\n".join(lines) if lines else header + "（无可用数据点）"
 
@@ -235,41 +231,35 @@ class AnalysisAgentBase(BaseAgent):
             for e in payload.events[:15]
         ) or "无"
         verified_lines = "\n".join(f"- {t}" for t in payload.verified_texts[:5]) or "无"
-        query_block = (
-            f"### 用户提问（conclusion必须直接回答此问题，不得答非所问）\n{payload.user_query}\n"
-            if payload.user_query else
-            f"### 分析焦点\n{payload.focus or '综合分析'}\n"
-        )
-        rule1 = (
-            f"1. conclusion首句必须直接回答「{payload.user_query[:80]}」，"
-            "禁止绕开问题给模板点评；\n"
-            if payload.user_query else
-            "1. 结论必须直接回应用户提问；\n"
-        )
-        liq_rule = (
-            "5. 大盘/买卖/仓位类问题：按「总量阶段→三市分项占比→双创宽度"
-            "与PE分位→结论」顺序，缩量阶段(<2.5万亿)低吸不追高；"
-            "data_gaps缺口须如实声明；\n"
-            if has_liq else ""
-        )
+        if payload.user_query:
+            query_block = f"### 提问（conclusion首句须直接作答）\n{payload.user_query}"
+            if payload.focus:
+                query_block += f"\n焦点：{payload.focus}"
+        else:
+            query_block = f"### 分析焦点\n{payload.focus or '综合分析'}"
         skill_hits = self._match_skills(payload)
+        # 规则合并：原2/3/4条（不编造/缺口/方向性）语义重叠，压成一条；
+        # 流动性规则条件插入并动态编号。
+        rules = [
+            "1. conclusion首句直接答问，禁模板点评",
+            "2. 仅依据上方带period_date的数据与事件；无则声明数据缺口并降置信，"
+            "禁编造或引用训练记忆中的数值",
+        ]
+        if has_liq:
+            rules.append(
+                "3. 大盘/买卖/仓位：按「总量阶段→三市分项→双创宽度与PE分位→结论」，"
+                "缩量(<2.5万亿)回踩不追高；data_gaps如实声明")
+        rules.append(f"{'4' if has_liq else '3'}. 遵循技能Phase步骤与任务要求的输出格式")
+        rule_block = "### 规则\n" + "；\n".join(rules)
+        # 时效红线：与规则2同源，压成一句（保留今天锚定+period_date grounding）。
+        grounding = (
+            f"### 时效红线\n今天{today_str}。只用上方数据，引用须带period_date；"
+            "上方没有即「数据缺口」，不得使用任何训练记忆的年份/数值。")
         prompt = (
             f"{query_block}\n"
-            "### 回答规则\n"
-            f"{rule1}"
-            "2. 只用给定数据与事件，禁止编造数值；\n"
-            "3. 无关数据不作依据，说明数据缺口并降置信度；\n"
-            "4. 缺量化数据源时说明缺口，给方向性判断不杜撰数字；\n"
-            f"{liq_rule}"
-            "6. 若含技能指引须遵循其Phase步骤与输出格式。\n\n"
-            f"### 🔴 时效红线（最高优先级）\n"
-            f"当前日期是 {today_str}。你只能使用上方「输入数据」中展示的数据点。\n"
-            "严禁引用你训练数据中任何年份、任何时间点的外部信息或历史数值，"
-            "哪怕你记得准确也要当作不存在。所有数据引用必须能在上方「输入数据」"
-            "段落找到对应 period_date 和数值。如果上方没有某数据，就说「未获取到」"
-            "或「数据缺口」，然后只依据有的数据给结论。引用数据时必须带 period_date。\n\n"
-            f"### 分析焦点\n{payload.focus or '综合分析'}\n\n"
-            f"## 输入数据（含溯源）\n{self._build_context(payload)}\n\n"
+            f"{rule_block}\n"
+            f"{grounding}\n\n"
+            f"## 输入数据\n{self._build_context(payload)}\n\n"
             f"## 信息层事件\n{event_lines}\n\n"
             f"## 已核验原文\n{verified_lines}\n\n"
             f"## 本地计算参考\n{hint}\n\n"
@@ -294,6 +284,7 @@ class AnalysisAgentBase(BaseAgent):
                 self.task_tier, self.system_prompt, repair_prompt,
                 agent_id=self.agent_id, trace_id=input.task_id,
                 json_mode=True, use_cache=False,
+                reasoning_effort="low",  # 纯JSON重排，收敛思维链省token/延迟
             )
             data = self._parse_llm_json(response.content)
 

@@ -11,16 +11,28 @@
 数据源优先级（逐个尝试，首个成功即返回；全部失败则上抛 DataFetchError，
 由上层写入 health.gaps —— 绝不使用模拟数据）：
 
-  分钟K线 bars:  qmt → tencent → eastmoney → sina(逐笔聚合)
-  当日分时 trend: qmt → tencent → sina(逐笔)
-  实时快照 quote: tencent(qt) → qmt(get_full_tick)
+  分钟K线 bars:  tencent → sina(逐笔聚合) → eastmoney → qmt
+  当日分时 trend: tencent → sina(逐笔) → eastmoney(trends2) → qmt
+  实时快照 quote: tencent(qt) → qmt(get_full_tick，仅启用时)
+
+> **2026-09 变更：QMT 退到链尾且默认不参与（`data.qmt_enabled=false`）**。
+> 本机 QMT 终端已失去行情权限（`127.0.0.1:58610` 拒连）且**短期内无法恢复**，
+> 而它原来在链首 —— 每次取数都要先撞一次失败的 xtquant 连接（实测白等 4~5s
+> 超时）才轮得到腾讯。
+> QmtMinuteSource 的代码**全部保留**、位置写在 `intraday_sources` **最后**，
+> 将来权限恢复时改 `qmt_enabled` 一个布尔值即可在链尾兜底。
+> 上表就是**当前实际生效**的顺序。
 
 各源特性（2026-09 实测于本机）：
-  - qmt(迅投XtMiniQmt)：最权威、可回补长历史，但需终端运行登录；
-  - tencent(腾讯)：一次请求即回 320根5分钟K线 / 全天分时 / 实时快照，稳定且免Key；
-  - eastmoney(东财)：push2his 接口在本机网络被阻断（RemoteDisconnected），
-    保留在链上以便网络恢复或其他部署环境自动生效；
-  - sina(新浪)：逐笔成交（全天约4500笔），聚合为分钟bar，作为最深兜底。
+  - tencent(腾讯)：一次请求即回 320根分钟K线 / 全天分时 / 实时快照，稳定且免Key。
+    实测快照 87ms、分钟K 86ms、分时 78ms —— 三种用途全部可用，且**与东财/新浪
+    是不同机房**，本项目历史事故中"东财+新浪同时不可用"时它一直正常。
+  - sina(新浪)：逐笔成交（全天约 2000~4500 笔），聚合为分钟bar，作为最深兜底。
+  - eastmoney(东财)：**本机 push2/push2his 被按 TLS SNI 阻断**（TCP 443 可连、
+    域名请求握手后立刻断；且阻断会漂移 —— 有时连 IP 直连也断）。
+    见 `src/core/eastmoney_direct.py` 的实测证据表与规避开关 `MOSS_EM_DIRECT`。
+  - qmt(迅投XtMiniQmt)：最权威、可回补长历史，但需终端运行登录**且有行情权限**；
+    本机已失去权限且短期无法恢复，故排在链尾并默认关闭。
 """
 
 from __future__ import annotations
@@ -262,7 +274,11 @@ def series_date(frame: pd.DataFrame | None) -> str:
 
 
 def _probe_qmt_session_date() -> str:
-    """向上证指数问「市场现在走到哪个交易日」；取不到返回 ""。"""
+    """向上证指数问「市场现在走到哪个交易日」；取不到返回 ""。
+
+    这是 QMT 专用的探针，**只在 QMT 已启用时**才会走到（见 `live_session_date`
+    的多源编排）—— 保留原名与行为，避免破坏既有单测的 monkeypatch 目标。
+    """
     from src.core.qmt_guard import qmt_lock
 
     try:
@@ -290,19 +306,82 @@ def _probe_qmt_session_date() -> str:
     return "" if text is None else text[:10]
 
 
+# 市场时钟探针使用的指数：上证综指（腾讯符号）与东财 secid
+_SESSION_INDEX_TENCENT = "sh000001"
+_SESSION_INDEX_EM = "1.000001"
+_SESSION_PROBE_TIMEOUT = 6.0
+
+
+def _probe_tencent_session_date() -> str:
+    """腾讯快照问「市场现在走到哪个交易日」。
+
+    腾讯 `qt.gtimg.cn` 的返回行里第 31 位是 `YYYYMMDDHHMMSS` 格式的行情时间戳
+    （实测 `20260922150000`），取前 8 位即当日。这是 QMT 不可用时最可靠的市场
+    时钟：它来自行情源自身而不是本机日历，所以节假日/盘前会天然回落到上一个
+    交易日，正是 `live_session_date` 需要的语义。
+    """
+    try:
+        with httpx.Client(timeout=_SESSION_PROBE_TIMEOUT,
+                          headers=_TENCENT_MIN_HEADERS) as client:
+            resp = client.get(f"https://qt.gtimg.cn/q={_SESSION_INDEX_TENCENT}")
+            resp.raise_for_status()
+            resp.encoding = "gbk"
+            text = resp.text
+    except Exception as exc:  # noqa: BLE001 网络/编码异常都只意味着"这一路探针不可用"
+        logger.debug("交易日时钟探测失败(腾讯快照): %s", brief(exc, BRIEF_TIGHT))
+        return ""
+    if '"' not in text:
+        return ""
+    parts = text.split('"')[1].split("~")
+    if len(parts) < 33:
+        return ""
+    stamp = str(parts[30]).strip()
+    if len(stamp) >= 8 and stamp[:8].isdigit():
+        return f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}"
+    return ""
+
+
+def _probe_eastmoney_session_date() -> str:
+    """东财 trends2 问「市场现在走到哪个交易日」（本机常被封，保留作为第三路）。"""
+    url = ("https://push2his.eastmoney.com/api/qt/stock/trends2/get?"
+           f"secid={_SESSION_INDEX_EM}&fields1=f1,f2,f3&fields2=f51,f53"
+           "&iscr=0&ndays=1")
+    try:
+        with httpx.Client(timeout=_SESSION_PROBE_TIMEOUT,
+                          headers=_TENCENT_MIN_HEADERS) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("交易日时钟探测失败(东财trends2): %s", brief(exc, BRIEF_TIGHT))
+        return ""
+    rows = ((payload.get("data") or {}).get("trends")) or []
+    if not rows:
+        return ""
+    stamp = str(rows[0]).split(" ")[0] if " " in str(rows[0]) else str(rows[0])[:10]
+    return stamp[:10] if len(stamp) >= 10 else ""
+
+
 def live_session_date(*, refresh: bool = False) -> str:
     """当前「活的」交易日（`YYYY-MM-DD`）；时钟不可用时返回 ""（调用方放行）。
 
     ## 为什么不用「今天是不是工作日」判断
     春节/国庆等**工作日但休市**的日期里，上一交易日的完整分时就是正确数据；
     按日历判断会把它判成"陈旧"，从而把唯一可用的数据也拒掉。
-    所以改问行情源本身：上证指数 tick 的 `timetag` 就是市场推进到的时点 ——
-    盘中是今天，节假日/盘前是上一个交易日，天然正确。实测（2026-09-16 09:56）
-    `get_full_tick(["000001.SH"])` → `timetag='20260916 09:56:03'`，耗时 0.2ms。
+    所以改问行情源本身：上证指数的行情时间戳就是市场推进到的时点 ——
+    盘中是今天，节假日/盘前是上一个交易日，天然正确。
+
+    ## 多源编排（2026-09 从「QMT 单源」改为三路）
+    原实现**只**探 QMT。QMT 一失去行情权限，这个时钟就恒返回 ""，
+    于是 `_try_source` 的新鲜度闸门整段失效 —— 陈旧数据不再被判失败，
+    「昨天的完整分时」会顶着今天的名头画出来，而容灾链也不会往下走。
+    所以现在按「当前实际可用的源」依次探测：
+        腾讯（实测 87ms，最可靠）→ 东财 trends2 → QMT（仅启用时）
+    任一路成功即返回；全部失败仍返回 ""，语义与原来一致（放行，fail-safe）。
 
     ## 时钟取不到时为什么是**放行**而不是拦下
     闸门的目的是"有更新的数据时不要用旧的"，判断依据缺失时宁可不过滤：
-    真正会陈旧的是 QMT 本地库，而 QMT 不可用时它的读取本来就会失败，
+    真正会陈旧的是本地行情库，而它不可用时读取本来就会失败，
     腾讯/新浪返回的又恒是当日/最近交易日数据，放行不会放进陈旧数据。
     另外，探测失败不会清掉上一次的可用日期（日期**偏旧**只会让闸门更宽松，
     不会误杀新数据），因此这个缓存在最坏情况下也是 fail-safe 的。
@@ -310,11 +389,32 @@ def live_session_date(*, refresh: bool = False) -> str:
     now = time.monotonic()
     if not refresh and now - float(_session_clock["stamp"]) < _SESSION_CLOCK_TTL:
         return str(_session_clock["date"])
-    date = _probe_qmt_session_date()
+    date = _probe_tencent_session_date()
+    if not date:
+        date = _probe_eastmoney_session_date()
+    if not date and _qmt_source_enabled():
+        date = _probe_qmt_session_date()
     if date:
         _session_clock["date"] = date
     _session_clock["stamp"] = now
     return str(_session_clock["date"])
+
+
+def _qmt_source_enabled() -> bool:
+    """QMT 是否启用（`configs/intraday.yaml` 的 `data.qmt_enabled`，默认关闭）。
+
+    单独抽成一个函数：市场时钟探针在**模块级**被调用（`live_session_date` 是自由
+    函数，没有 provider 实例），拿不到 provider 上按需覆盖的配置，只能读热重载的
+    全局配置。配置读取本身有 mtime 缓存，不会成为热点。
+    读取失败按**关闭**处理：本机 QMT 无行情权限时它只会贡献一次连接超时。
+    """
+    try:
+        from src.intraday.config import load_intraday_config
+
+        return bool(load_intraday_config().data.qmt_enabled)
+    except Exception as exc:  # noqa: BLE001 配置损坏不该让时钟探针炸掉
+        logger.debug("读取 qmt_enabled 失败，按关闭处理: %s", brief(exc, BRIEF_TIGHT))
+        return False
 
 
 # ==================================================================
@@ -1067,18 +1167,46 @@ class IntradayDataProvider:
     def _ordered_sources(self, method: str = "bars") -> list[str]:
         """按**实测响应速度**排序（配置顺序只作先验）。
 
-        实测（2026-09-15，32 次直连）：QMT 快照中位 0ms、分时 17ms、5m 8ms（本机终端），
-        腾讯 54ms（公网），新浪逐笔更慢；东财在本机被阻断。所以顺序不该写死 ——
-        QMT 掉线/变慢时自动让位给腾讯，恢复后再自动回到第一。
+        实测（2026-09，逐源直测）：
+            腾讯    快照 87ms / 分钟K 86ms / 分时 78ms（公网，三种用途全通）
+            新浪    逐笔聚合（最慢，最深兜底）
+            东财    本机 push2/push2his 被 TLS SNI 阻断（且阻断会漂移）
+            迅投QMT  本机终端内存读取（原为 0ms，但已失去行情权限、短期无法恢复）
+
+        ## 关于"谁在链首"
+        `health.rank` **只对已有 ≥3 次样本的源重排**（样本不足时照抄传入的
+        `prior` 顺序），所以**配置顺序就是默认顺序**。要改顺序只能改配置
+        （`data.intraday_sources`），代码里的 `pool` 只是配置缺项时的兜底。
+
+        实测踩过的坑：把 qmt 写在配置最前、只靠 `qmt_enabled=false` 关掉，
+        结果所有取值都正确、但"意图"被藏进了另一个开关 —— 谁只改
+        `qmt_enabled=true` 就会让它顶到链首。现在**顺序与开关表达同一个意图**：
+        QMT 在链尾，且默认不参与。
         """
-        candidates = [s for s in self._config.data.intraday_sources
-                      if s in ("qmt", "tencent", "eastmoney", "sina")]
-        prior = candidates or ["qmt", "tencent", "eastmoney", "sina"]
+        # 内置候选池的顺序与 `DataParams.intraday_sources` 的默认值保持一致：
+        # **qmt 在最后**（终端短期内无法取得行情权限），下一行按开关决定摘掉/保留。
+        pool = ["tencent", "sina", "eastmoney", "qmt"]
+        if not self._qmt_enabled():
+            pool.remove("qmt")
+        candidates = [s for s in self._config.data.intraday_sources if s in pool]
+        # 配置里没写的源不该被静默丢弃：配置缺项时用内置池兜底补齐
+        for source in pool:
+            if source not in candidates:
+                candidates.append(source)
+        prior = candidates or pool
         ranked = self.health.rank(prior, method, prior=prior)
         # 探索式刷新：链路上首选源一旦成功就返回，后面的源拿不到调用 →
         # 证据会一直停在很久以前，因一次异常被降级的源就再也回不来。
         # 这里允许"证据过期最久"的源插到最前刷新一次（默认 60 秒一次）。
         return self.health.explore_refresh(ranked, method)
+
+    def _qmt_enabled(self) -> bool:
+        """QMT 是否参与本轮取数（以 provider 自己的配置为准）。
+
+        市场时钟探针走**模块级** `_qmt_source_enabled()`（`live_session_date` 是
+        自由函数，拿不到 provider 实例）；两处读的是同一份 `data.qmt_enabled`。
+        """
+        return bool(self._config.data.qmt_enabled)
 
     def _session_date(self) -> str:
         """当前活着的交易日，供新鲜度闸门比对；时钟不可用返回 ""（不闸门）。
@@ -1277,11 +1405,12 @@ class IntradayDataProvider:
         """**批量**实时快照（自选池「报价快车道」专用）：一次调用取全部标的。
 
         与 `fetch_quote()`（单只、带容灾链与尝试日志）的区别是**调用次数**：
-        报价快车道每几秒跑一轮，若按标的逐个调，9 只票就是 9 次 QMT 锁 +
-        9 次公网 RTT；这里两级都是"一次调用取全部"：
+        报价快车道每几秒跑一轮，若按标的逐个调，9 只票就是 9 次锁 + 9 次公网 RTT；
+        这里两级都是"一次调用取全部"：
 
-            ① QMT `get_full_tick([9只])`  实测中位 **0.54ms**（本机终端内存读取）
-            ② 腾讯 qt 批量（一次请求 9 个代码）约 **54ms**（公网）
+            ① QMT `get_full_tick([9只])` 实测中位 **0.54ms**（本机终端内存读取）
+               —— 仅在 `data.qmt_enabled=true` 时参与，见下方 `_qmt_enabled()` 分支
+            ② 腾讯 qt 批量（一次请求 9 个代码）约 **54ms**（公网，实测 4 只 52ms）
 
         QMT 没给到的代码（未订阅/停牌/终端未登录）再走腾讯批量补缺，仍然缺的
         才逐只走完整容灾链。返回 `{6位代码: Quote}`；取不到的代码**不出现**在结果里
@@ -1293,6 +1422,11 @@ class IntradayDataProvider:
         result: dict[str, Quote] = {}
 
         allowed, reason = self.health.should_attempt("qmt", "quote")
+        # `qmt_enabled=false` 时必须在这里就断掉：批量快照原来**硬编码**先打 QMT，
+        # 不看配置也不看 `_ordered_sources` —— 于是关掉 QMT 后每轮报价快车道
+        # 仍会先撞一次失败的 xtquant 连接（实测 4~5s），还在健康表里留一条红色记录。
+        if not self._qmt_enabled():
+            allowed, reason = False, "QMT 已禁用（data.qmt_enabled=false）"
         if allowed:
             started = time.perf_counter()
             try:
@@ -1330,23 +1464,26 @@ class IntradayDataProvider:
         return result
 
     async def fetch_quote(self, code: str) -> tuple[Quote, str, list[SourceAttempt]]:
-        """实时快照：**按实测速度排序**的多源容灾链（QMT ↔ 腾讯互为备用）。
+        """实时快照：**按实测速度排序**的多源容灾链（腾讯 / QMT 互为备用）。
 
-        原实现写死"腾讯优先"，理由是腾讯一次请求就带 PE/PB。但实测（32 次直连）：
+        ## 2026-09 变更：候选池改成配置驱动，QMT 排在腾讯**之后**
+        原实现写死 `["qmt", "tencent"]` 并让 QMT 排第一，理由是它读本机终端内存
+        （实测中位 0ms）而腾讯要付公网 RTT（中位 54ms）。这个结论在 QMT
+        **有行情权限**时成立；本机失去权限后，QMT 每一次都失败并白等 4~5s 超时，
+        排序反而把最慢的放在最前。现在候选池为
+        `["tencent"] + (["qmt"] 仅当 data.qmt_enabled)` —— 腾讯在前、QMT 在末，
+        与 `_ordered_sources` 同一口径。将来权限恢复时打开开关即可多一层兜底。
 
-            QMT `get_full_tick` 中位 **0 ms**（本机终端内存读取）
-            腾讯 HTTP            中位 **54 ms**、p90 62 ms（公网）
-
-        做T要的是**盘中实时 + 快**，所以改成测量驱动排序：默认 QMT 先（快且带五档盘口），
-        QMT 掉线/未启动时自动切腾讯，恢复后再自动切回。PE/PB 仍由估值面板
-        （`ValuationProvider`，走百度/腾讯批量/巨潮）单独取，不依赖这条快照链。
+        PE/PB 仍由估值面板（`ValuationProvider`，走百度/腾讯批量/巨潮）单独取，
+        不依赖这条快照链。
         """
         key = f"quote:{code}"
         cached = self._cache_get(key, 15)
         if cached is not None:
             return cached[0], cached[1], []
         attempts: list[SourceAttempt] = []
-        ranked = self.health.rank(["qmt", "tencent"], "quote", prior=["qmt", "tencent"])
+        pool = ["tencent"] + (["qmt"] if self._qmt_enabled() else [])
+        ranked = self.health.rank(pool, "quote", prior=pool)
         order = self.health.explore_refresh(ranked, "quote")
         for source in order:
             allowed, reason = self.health.should_attempt(source, "quote")

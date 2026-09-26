@@ -166,8 +166,10 @@ async def test_stock_rank_uses_net_to_market_cap_ratio(repo, monkeypatch) -> Non
                          "circ_mv": [1e11, 2e9]})   # 1000亿 vs 20亿
     provider = FakeProvider(
         frame=frame, caps=caps,
-        # 昨日涨停给一只（600000，市值 1000 亿 ≥30 亿门槛）：它会排在最前
-        # —— 这正是"昨日涨停股优先"的新口径，排序断言里要体现。
+        # 昨日涨停给一只（600000）：**它不再因此被保送入榜**
+        # —— 2026-09-22 取消了「昨日涨停股」这一类，榜单只按 净额/市值 排序。
+        # 600000 的 1e8/1e11 = 1e-3 低于 300001 的 2e7/2e9 = 1e-2，
+        # 所以它只能凭数据排到第 2（这正是本次改动要钉住的口径）。
         limit_up={"600000": "20260916"},
         stock_series={
             "600000": {"points": [{"date": "20260916", "net": 1e8},
@@ -178,18 +180,22 @@ async def test_stock_rank_uses_net_to_market_cap_ratio(repo, monkeypatch) -> Non
                        "circ_mv": 2e9},
         })
     service = FundFlowService(provider=provider, repo=repo)
-    rank, series, gaps = await service._rank_stocks(  # noqa: SLF001
+    rank, watch, series, gaps = await service._rank_stocks(  # noqa: SLF001
         window_days=10, top=20, extra_codes=[])
     by_code = {item.code: item for item in rank}
-    # 「昨日涨停」优先：600000 排第一，即使它的"净额/市值"比值更低
-    assert [item.code for item in rank] == ["600000", "300001"]
-    assert by_code["600000"].rank_group == "昨日涨停"
+    # 纯排序口径：比值高的在前，涨停身份不再改变名次
+    assert [item.code for item in rank] == ["300001", "600000"]
     assert by_code["300001"].rank_group == "净流入前10"
+    assert by_code["600000"].rank_group == "净流入前10"
+    assert "昨日涨停" not in {item.rank_group for item in rank}
+    assert watch == [], "extra_codes 为空时自选段必须是空的"
     assert by_code["300001"].change_pct == pytest.approx(3.5)
     assert by_code["300001"].change_source.startswith("腾讯")
     assert by_code["300001"].limitup_reason == ""      # 非涨停股没有原因
-    assert rank[0].net_to_mv == pytest.approx(1e8 / 1e11)
-    assert rank[1].net_to_mv == pytest.approx(2e7 / 2e9)
+    # 涨停股仍在榜上、且**涨停原因列照旧补上**（那一列与"是否保送"无关）
+    assert by_code["600000"].limitup_reason.startswith("银行")
+    assert rank[0].net_to_mv == pytest.approx(2e7 / 2e9)
+    assert rank[1].net_to_mv == pytest.approx(1e8 / 1e11)
     assert not gaps
     assert set(series) == {"600000", "300001"}
 
@@ -213,13 +219,13 @@ async def test_stock_rank_reports_missing_market_cap(repo) -> None:
             "999999": {"points": [{"date": "20260917", "net": 5e7}], "circ_mv": None},
         })
     service = FundFlowService(provider=provider, repo=repo)
-    rank, _series, gaps = await service._rank_stocks(  # noqa: SLF001
+    rank, _watch, _series, gaps = await service._rank_stocks(  # noqa: SLF001
         window_days=10, top=20, extra_codes=[])
     codes = [item.code for item in rank]
-    assert codes[0] == "600000"          # 昨日涨停 + 有市值（比值口径）
+    assert codes[0] == "600000"          # 有市值 → 进比值榜（与涨停无关）
     assert "999999" in codes             # 没市值的仍然出现，但排在后面
     assert rank[-1].net_to_mv is None
-    assert not gaps                      # 涨停与市值都取到了，不该报缺口
+    assert not gaps                      # 市值取到了，不该报缺口
 
 
 @pytest.mark.asyncio
@@ -235,7 +241,7 @@ async def test_stock_rank_without_caps_degrades_and_says_so(repo) -> None:
         stock_series={"600000": {"points": [{"date": "20260917", "net": 1e8}],
                                  "circ_mv": None}})
     service = FundFlowService(provider=provider, repo=repo)
-    rank, _series, gaps = await service._rank_stocks(  # noqa: SLF001
+    rank, _watch, _series, gaps = await service._rank_stocks(  # noqa: SLF001
         window_days=10, top=20, extra_codes=[])
     assert [item.code for item in rank] == ["600000"]
     assert any("流通市值" in gap for gap in gaps)
@@ -247,15 +253,20 @@ async def test_stock_rank_without_warehouse_reports_command(repo) -> None:
 
     provider = FakeProvider(frame=pd.DataFrame(), caps=pd.DataFrame())
     service = FundFlowService(provider=provider, repo=repo)
-    rank, series, gaps = await service._rank_stocks(  # noqa: SLF001
+    rank, watch, series, gaps = await service._rank_stocks(  # noqa: SLF001
         window_days=10, top=20, extra_codes=[])
-    assert rank == [] and series == {}
+    assert rank == [] and watch == [] and series == {}
     assert gaps and "quant_warehouse.py" in gaps[0], "缺口必须给出可执行的补数命令"
 
 
 @pytest.mark.asyncio
-async def test_extra_watch_codes_always_in_rank(repo) -> None:
-    """用户手动加的票必须在榜单里（即使没进前 N）。"""
+async def test_watch_codes_are_a_separate_section(repo) -> None:
+    """自选票单列一段，**不占**排行榜名额（2026-09-22 口径）。
+
+    实测背景：原来自选混在 `stock_rank` 里，个股榜 12 行有 10 行是自选，
+    `top=10` 的净流入榜实际只显示得出 2 只 —— 自选把名额吃光了。
+    改后两段互斥：榜单纯粹是排序结果，自选在 `watch` 里。
+    """
     import pandas as pd
 
     frame = pd.DataFrame({
@@ -271,10 +282,19 @@ async def test_extra_watch_codes_always_in_rank(repo) -> None:
         "circ_mv": 1e9 * index} for index in range(1, 6)}
     provider = FakeProvider(frame=frame, caps=caps, stock_series=series)
     service = FundFlowService(provider=provider, repo=repo)
-    rank, _series, _gaps = await service._rank_stocks(  # noqa: SLF001
+    rank, watch, _series, _gaps = await service._rank_stocks(  # noqa: SLF001
         window_days=10, top=2, extra_codes=["600005"])
-    codes = [item.code for item in rank]
-    assert "600005" in codes, "用户手动加入的票不能因为不在前 N 就消失"
+
+    assert [item.code for item in watch] == ["600005"], "自选必须在自选段"
+    # 名额没被吃掉：净流入前 2 完整给出（而不是被自选挤掉一只）
+    inflow = [item.code for item in rank if item.rank_group == "净流入前10"]
+    assert inflow == ["600001", "600002"]
+    # ⚠️ 断言"榜单里没有自选"，而不是断言总行数：`top=2` 时净流入取前 2、
+    # 净流出取后 2，两者在只有 5 只票时会**重叠**（600004 同时落在两段里，
+    # 去重后只算一次），所以榜单行数本来就不等于 2×top。
+    assert "600005" not in {item.code for item in rank}, "自选不能占排行榜名额"
+    assert all(item.rank_group for item in rank), "榜单票必须带类别徽标"
+    assert watch[0].rank_group == "", "自选段不带类别（身份由所在段落表达）"
 
 
 # ==================== 板块榜 ====================

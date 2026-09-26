@@ -1,0 +1,466 @@
+# ================================================================
+# 主线挖掘 · 第一层「宏观驱动」子维度
+# 宏观因子 × 申万一级行业敏感度映射表
+# ================================================================
+# 用途：宏观模块先把每个因子算成 z-score（历史 36 个月滚动），再按
+#       direction 归一到"越大越利好"的方向，最后用本表把宏观状态映射成
+#       每个申万一级行业的 0-100 分：
+#
+#           raw   = Σ_f  weight_f × sens[industry][f] × z_dir[f]
+#           score = clip(50 + 50 × tanh(raw / 2), 0, 100)      # 举例，以代码为准
+#
+#       weight_f 由 mainline.yaml 的 macro 段控制；sens 为正表示该因子
+#       "走强"时行业受益，为负表示受损。
+#
+# ⚠️ 口径提醒（改这张表前必读）：
+#   1. shibor_3m 的 direction 是 lower —— 本表里该列填的是"利率上行"的
+#      暴露方向。所以 房地产 -0.8 表示**利率上行时房地产受损（-0.8）**，
+#      代码在乘 z-score 前会先按 direction 把符号翻正，本表不需要再翻一次。
+#      银行 +0.3 表示利率上行时银行（息差）受益。
+#   2. 敏感度取值区间 [-1.0, +1.0]，实测分布集中在 -0.5 ~ +0.7；
+#      |值| ≥ 0.5 视为强传导，0.2 以下视为弱传导，0 表示基本无传导。
+#   3. 宏观因子对全市场是**共同项**，全表若填得过于一致，31 个行业分数会
+#      趋同。因此本表刻意让同一列在不同行业间拉开分布（见文件末的分布
+#      自检），并保留一批"对周期脱敏"的防御行业（医药/食品饮料/公用事业/
+#      环保）以承接宏观弱势期的相对收益。
+#   4. 敏感度是**结构性先验**，不是回测拟合结果：季度复核一次，或在
+#      sw_daily 行业名录变更时同步复核。
+#
+# 数据源：Tushare Pro（cn_pmi / cn_m / sf_month / shibor / cn_cpi / cn_ppi）
+# 行业清单：申万一级 31 个（代码末位 0），与 sw_daily 名录一致。
+# ================================================================
+
+version: 1
+updated_at: "2026-09-20"
+
+# ----------------------------------------------------------------
+# 一、宏观因子定义（key 即代码里的因子名，固定不可改）
+# ----------------------------------------------------------------
+factors:
+  - key: pmi
+    label: 制造业PMI
+    source: tushare:cn_pmi.PMI010000
+    unit: 指数
+    direction: higher
+    note: 荣枯线 50 上方为扩张；新订单分项领先于行业营收，月度发布滞后约 1 个月
+
+  - key: m1_yoy
+    label: M1同比
+    source: tushare:cn_m.m1_yoy
+    unit: "%"
+    direction: higher
+    note: 代表企业与居民活期存款（资金活化度），是股市流动性与风险偏好的核心领先指标
+
+  - key: m2_yoy
+    label: M2同比
+    source: tushare:cn_m.m2_yoy
+    unit: "%"
+    direction: higher
+    note: 代表广义货币总量与信用扩张速度，对银行扩表、地产销售与成长股估值均构成支撑
+
+  - key: sf_yoy
+    label: 社融存量同比
+    source: tushare:sf_month.stk_endval
+    unit: "%"
+    direction: higher
+    note: 取 stk_endval（社融存量，单位万亿元）的 12 个月同比；接口仅 2 位小数，精度约 0.01pp 可接受。取不到时回退 inc_cumval 同比（累计值同比受季节性影响，仅作近似）
+
+  - key: shibor_3m
+    label: 3个月Shibor
+    source: tushare:shibor.3m
+    unit: "%"
+    direction: lower
+    note: 银行间 3 个月资金价格，近似无风险短端利率；direction=lower 表示利率**下行**为利好（本表敏感度列填的是利率上行的暴露方向）
+
+  - key: cpi_yoy
+    label: CPI同比
+    source: tushare:cn_cpi.nt_yoy
+    unit: "%"
+    direction: higher
+    note: 全国居民消费价格指数同比；上行利好食品链与必需消费提价，但压制成长期贴现率与中游成本
+
+  - key: ppi_yoy
+    label: PPI同比
+    source: tushare:cn_ppi.ppi_yoy
+    unit: "%"
+    direction: higher
+    note: 工业生产者出厂价格指数同比；上行直接改善上游资源品盈利，中下游制造因成本无法完全转嫁而受损
+
+# ----------------------------------------------------------------
+# 二、行业敏感度（31 个申万一级行业）
+#     正数 = 该因子按 direction 归一后走强时该行业受益
+#     负数 = 受损（如 利率上行 → 房地产/券商 受损）
+#     0    = 基本无传导
+# ----------------------------------------------------------------
+industries:
+  - code: "801010"
+    name: 农林牧渔
+    sensitivity:
+      pmi: 0.10
+      m1_yoy: 0.05
+      m2_yoy: 0.05
+      sf_yoy: 0.10
+      shibor_3m: -0.15
+      cpi_yoy: 0.70
+      ppi_yoy: -0.20
+    note: 猪价与粮价直接决定 CPI 食品项，是 CPI 的天然多头；与 PMI/利率传导很弱，主要看自身产能周期
+
+  - code: "801030"
+    name: 基础化工
+    sensitivity:
+      pmi: 0.50
+      m1_yoy: 0.20
+      m2_yoy: 0.15
+      sf_yoy: 0.20
+      shibor_3m: -0.30
+      cpi_yoy: -0.10
+      ppi_yoy: 0.50
+    note: 产品价格顺 PPI 与制造业开工，油价煤价为成本项；重资产高负债，利率上行同时压制估值与财务费用
+
+  - code: "801040"
+    name: 钢铁
+    sensitivity:
+      pmi: 0.60
+      m1_yoy: 0.15
+      m2_yoy: 0.10
+      sf_yoy: 0.30
+      shibor_3m: -0.35
+      cpi_yoy: -0.15
+      ppi_yoy: 0.60
+    note: 需求端看地产基建开工（PMI 新订单、社融），价格端顺 PPI 黑色系；利润弹性大于收入弹性
+
+  - code: "801050"
+    name: 有色金属
+    sensitivity:
+      pmi: 0.70
+      m1_yoy: 0.25
+      m2_yoy: 0.20
+      sf_yoy: 0.30
+      shibor_3m: -0.30
+      cpi_yoy: -0.10
+      ppi_yoy: 0.70
+    note: 全球定价的顺周期品种，PMI 与 PPI 双高时盈利弹性最大；国内利率上行多伴随美元走强，压制金属价格
+
+  - code: "801080"
+    name: 电子
+    sensitivity:
+      pmi: 0.40
+      m1_yoy: 0.40
+      m2_yoy: 0.30
+      sf_yoy: 0.30
+      shibor_3m: -0.40
+      cpi_yoy: -0.15
+      ppi_yoy: -0.20
+    note: 兼具成长久期（利率敏感）与制造业景气（PMI、出口）双重属性，M1 回升带来的风险偏好改善对其估值弹性最大
+
+  - code: "801110"
+    name: 家用电器
+    sensitivity:
+      pmi: 0.30
+      m1_yoy: 0.25
+      m2_yoy: 0.20
+      sf_yoy: 0.30
+      shibor_3m: -0.35
+      cpi_yoy: -0.30
+      ppi_yoy: -0.25
+    note: 地产后周期加消费属性，社融与地产销售是核心驱动；铜铝钢等原材料涨价直接挤压毛利，CPI 上行对家电多为成本推动而非提价
+
+  - code: "801120"
+    name: 食品饮料
+    sensitivity:
+      pmi: 0.00
+      m1_yoy: 0.15
+      m2_yoy: 0.20
+      sf_yoy: 0.10
+      shibor_3m: -0.20
+      cpi_yoy: 0.50
+      ppi_yoy: -0.15
+    note: 典型防御板块，CPI 上行（尤其食品项）打开提价空间；对 PMI/PPI 几乎脱敏，利率下行时稳定现金流与高股息更受青睐
+
+  - code: "801130"
+    name: 纺织服饰
+    sensitivity:
+      pmi: 0.20
+      m1_yoy: 0.10
+      m2_yoy: 0.05
+      sf_yoy: 0.10
+      shibor_3m: -0.15
+      cpi_yoy: 0.10
+      ppi_yoy: -0.30
+    note: 内外需均属弱周期，主要看棉花与化纤成本（PPI 负向）及品牌提价能力，整体宏观弹性偏低
+
+  - code: "801140"
+    name: 轻工制造
+    sensitivity:
+      pmi: 0.30
+      m1_yoy: 0.10
+      m2_yoy: 0.05
+      sf_yoy: 0.20
+      shibor_3m: -0.30
+      cpi_yoy: -0.20
+      ppi_yoy: -0.30
+    note: 家具与包装受地产竣工和出口双重影响，纸浆木材成本顺 PPI 上行构成压力，是地产链中弹性偏弱的一环
+
+  - code: "801150"
+    name: 医药生物
+    sensitivity:
+      pmi: 0.00
+      m1_yoy: 0.15
+      m2_yoy: 0.20
+      sf_yoy: 0.05
+      shibor_3m: -0.25
+      cpi_yoy: 0.15
+      ppi_yoy: -0.10
+    note: 需求刚性、与宏观周期基本脱敏；作为久期较长的成长资产，利率下行时估值受益，CPI 仅通过中药材与消费医疗价格小幅传导
+
+  - code: "801160"
+    name: 公用事业
+    sensitivity:
+      pmi: 0.00
+      m1_yoy: -0.10
+      m2_yoy: 0.00
+      sf_yoy: 0.05
+      shibor_3m: -0.30
+      cpi_yoy: 0.05
+      ppi_yoy: -0.50
+    note: 电价受管制、需求刚性，PPI 上行（燃料成本）无法向终端传导，是 PPI 最明确的受损方；高股息属性使其在利率下行时相对占优
+
+  - code: "801170"
+    name: 交通运输
+    sensitivity:
+      pmi: 0.40
+      m1_yoy: 0.10
+      m2_yoy: 0.05
+      sf_yoy: 0.20
+      shibor_3m: -0.30
+      cpi_yoy: -0.05
+      ppi_yoy: -0.40
+    note: 客货运量同步 PMI 属顺周期，但燃油成本随 PPI 上行而运价传导滞后，PPI 明显为负；重资产高负债，对利率敏感
+
+  - code: "801180"
+    name: 房地产
+    sensitivity:
+      pmi: 0.30
+      m1_yoy: 0.50
+      m2_yoy: 0.40
+      sf_yoy: 0.60
+      shibor_3m: -0.80
+      cpi_yoy: -0.20
+      ppi_yoy: -0.20
+    note: 全市场对利率与社融最敏感的行业：按揭利率、开发贷成本与销售回款共同决定估值，M1 回升代表购房与投资意愿修复
+
+  - code: "801200"
+    name: 商贸零售
+    sensitivity:
+      pmi: 0.20
+      m1_yoy: 0.30
+      m2_yoy: 0.15
+      sf_yoy: 0.20
+      shibor_3m: -0.25
+      cpi_yoy: 0.30
+      ppi_yoy: -0.10
+    note: 核心驱动是居民消费意愿与消费信贷可得性（M1、社融），CPI 上行时渠道存货增值与同店增长受益
+
+  - code: "801210"
+    name: 社会服务
+    sensitivity:
+      pmi: 0.15
+      m1_yoy: 0.30
+      m2_yoy: 0.10
+      sf_yoy: 0.15
+      shibor_3m: -0.25
+      cpi_yoy: 0.15
+      ppi_yoy: -0.15
+    note: 出行与线下消费的活跃度代理，M1 回升与消费信心修复是主要驱动；人力与租金成本需看 PPI/CPI 剪刀差
+
+  - code: "801230"
+    name: 综合
+    sensitivity:
+      pmi: 0.15
+      m1_yoy: 0.15
+      m2_yoy: 0.10
+      sf_yoy: 0.15
+      shibor_3m: -0.30
+      cpi_yoy: 0.05
+      ppi_yoy: 0.10
+    note: 成分以多元化控股与贸易类为主，缺乏统一产业逻辑，宏观只提供弱 β；高杠杆特征使其对利率上行为负
+
+  - code: "801710"
+    name: 建筑材料
+    sensitivity:
+      pmi: 0.50
+      m1_yoy: 0.20
+      m2_yoy: 0.10
+      sf_yoy: 0.50
+      shibor_3m: -0.45
+      cpi_yoy: -0.15
+      ppi_yoy: 0.20
+    note: 需求由地产开工与基建投资（社融、PMI）决定，水泥玻璃价格本身即 PPI 分项故对 PPI 为正；同时是地产链中负债率最高的环节之一
+
+  - code: "801720"
+    name: 建筑装饰
+    sensitivity:
+      pmi: 0.50
+      m1_yoy: 0.20
+      m2_yoy: 0.10
+      sf_yoy: 0.60
+      shibor_3m: -0.50
+      cpi_yoy: -0.10
+      ppi_yoy: -0.20
+    note: 基建与地产投资的直接执行方，社融（专项债、信贷）领先于订单；钢材水泥涨价无法完全转嫁、垫资模式对利率极敏感
+
+  - code: "801730"
+    name: 电力设备
+    sensitivity:
+      pmi: 0.35
+      m1_yoy: 0.30
+      m2_yoy: 0.25
+      sf_yoy: 0.30
+      shibor_3m: -0.45
+      cpi_yoy: -0.20
+      ppi_yoy: -0.40
+    note: 资本开支依赖社融与信贷，同时是典型长久期成长资产、对利率高度敏感；中游制造属性使 PPI 上行（铜、锂、钢）直接压缩毛利
+
+  - code: "801740"
+    name: 国防军工
+    sensitivity:
+      pmi: 0.10
+      m1_yoy: 0.30
+      m2_yoy: 0.20
+      sf_yoy: 0.15
+      shibor_3m: -0.35
+      cpi_yoy: 0.00
+      ppi_yoy: -0.15
+    note: 需求由财政与订单计划决定、与 PMI 几乎无关；作为成长板块其估值受流动性与利率主导，M1 回升时风险偏好弹性明显
+
+  - code: "801750"
+    name: 计算机
+    sensitivity:
+      pmi: 0.20
+      m1_yoy: 0.50
+      m2_yoy: 0.40
+      sf_yoy: 0.30
+      shibor_3m: -0.60
+      cpi_yoy: -0.05
+      ppi_yoy: -0.20
+    note: 流动性与风险偏好的高 β 品种，M1 回升与利率下行时估值弹性最大；政府与企业 IT 支出依赖信用扩张（社融）
+
+  - code: "801760"
+    name: 传媒
+    sensitivity:
+      pmi: 0.15
+      m1_yoy: 0.50
+      m2_yoy: 0.40
+      sf_yoy: 0.25
+      shibor_3m: -0.55
+      cpi_yoy: 0.00
+      ppi_yoy: -0.10
+    note: 同属流动性驱动的成长板块，对 M1 与利率的敏感度仅次于计算机；内容成本与宏观价格指数关联很弱
+
+  - code: "801770"
+    name: 通信
+    sensitivity:
+      pmi: 0.30
+      m1_yoy: 0.35
+      m2_yoy: 0.30
+      sf_yoy: 0.30
+      shibor_3m: -0.45
+      cpi_yoy: -0.10
+      ppi_yoy: -0.15
+    note: 运营商与算力资本开支顺社融和制造业景气，同时具备成长属性、利率下行时估值受益；PPI 上行对设备与光模块成本有小幅压力
+
+  - code: "801780"
+    name: 银行
+    sensitivity:
+      pmi: 0.30
+      m1_yoy: -0.10
+      m2_yoy: 0.30
+      sf_yoy: 0.70
+      shibor_3m: 0.30
+      cpi_yoy: -0.05
+      ppi_yoy: 0.10
+    note: 顺周期的资产质量与规模扩张（社融、M2）是核心多头逻辑；利率上行修复净息差，但 M1 大幅回升意味着存款活化与资金脱媒、对负债端偏负
+
+  - code: "801790"
+    name: 非银金融
+    sensitivity:
+      pmi: 0.40
+      m1_yoy: 0.70
+      m2_yoy: 0.50
+      sf_yoy: 0.50
+      shibor_3m: -0.60
+      cpi_yoy: 0.05
+      ppi_yoy: 0.10
+    note: 券商是 M1 与流动性的最强映射（成交额、两融余额），社融扩张带来增量资金；利率上行压制自营债券估值与估值中枢
+
+  - code: "801880"
+    name: 汽车
+    sensitivity:
+      pmi: 0.40
+      m1_yoy: 0.30
+      m2_yoy: 0.15
+      sf_yoy: 0.35
+      shibor_3m: -0.40
+      cpi_yoy: -0.10
+      ppi_yoy: -0.30
+    note: 销量顺 PMI 与消费信贷（社融），新能源资本开支依赖信用扩张；钢、铝、锂等原材料涨价压制盈利，PPI 明确为负
+
+  - code: "801890"
+    name: 机械设备
+    sensitivity:
+      pmi: 0.50
+      m1_yoy: 0.25
+      m2_yoy: 0.15
+      sf_yoy: 0.35
+      shibor_3m: -0.40
+      cpi_yoy: -0.10
+      ppi_yoy: -0.30
+    note: 制造业资本开支的代理变量，PMI 与社融（设备更新贷款、技改投资）是最直接的驱动；钢材等中游成本上行挤压毛利
+
+  - code: "801950"
+    name: 煤炭
+    sensitivity:
+      pmi: 0.60
+      m1_yoy: 0.15
+      m2_yoy: 0.05
+      sf_yoy: 0.15
+      shibor_3m: -0.20
+      cpi_yoy: 0.10
+      ppi_yoy: 0.70
+    note: 动力煤焦煤价格即 PPI 上游分项，价格弹性全市场最高；高分红属性使其在利率下行时具备类债券吸引力
+
+  - code: "801960"
+    name: 石油石化
+    sensitivity:
+      pmi: 0.40
+      m1_yoy: 0.10
+      m2_yoy: 0.05
+      sf_yoy: 0.10
+      shibor_3m: -0.25
+      cpi_yoy: 0.30
+      ppi_yoy: 0.60
+    note: 油价同时驱动盈利与 CPI 能源项，是 PPI 与 CPI 的双正暴露；需求端顺 PMI，分红属性带来利率负敏感
+
+  - code: "801970"
+    name: 环保
+    sensitivity:
+      pmi: 0.05
+      m1_yoy: 0.10
+      m2_yoy: 0.10
+      sf_yoy: 0.30
+      shibor_3m: -0.30
+      cpi_yoy: 0.00
+      ppi_yoy: -0.10
+    note: 需求与政府支付能力挂钩（专项债、社融），与 PMI/PPI 基本脱敏；重资产且应收账款周期长，利率上行对现金流与估值双重压制
+
+  - code: "801980"
+    name: 美容护理
+    sensitivity:
+      pmi: 0.10
+      m1_yoy: 0.25
+      m2_yoy: 0.15
+      sf_yoy: 0.10
+      shibor_3m: -0.30
+      cpi_yoy: 0.20
+      ppi_yoy: -0.20
+    note: 可选消费属性，看消费信心与 M1 回升带来的边际改善；CPI 上行时具备提价逻辑，包材成本随 PPI 上行构成小幅压力

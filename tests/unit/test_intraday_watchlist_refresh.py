@@ -19,7 +19,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -56,6 +59,23 @@ def _market_clock_matches_test_date(monkeypatch):
 
     monkeypatch.setattr(sources_module, "live_session_date",
                         lambda **_: "2026-09-16")
+
+
+@pytest.fixture(autouse=True)
+def _trading_day_true(monkeypatch):
+    """把「是不是交易日」也钉成真 —— 与上面钉市场时钟是**同一个理由**。
+
+    `_watchlist_refresh_loop` 里有第二道闸门：非交易日跳过整表重算
+    （2026-09-25 中秋事故的修复，见 `test_intraday_push_guard.py`）。
+    它用的是 `auto_select.is_trading_day()`，会读**真实当天**的市场时钟 ——
+    于是本文件里那两个"循环应当重算"的用例只要跑在节假日就必然变红
+    （实测 2026-09-25 中秋当天：59 passed → 2 failed）。
+
+    需要验"节假日不重算"的用例，请到 `test_intraday_push_guard.py`，
+    那里对这道闸门有正反两个用例。
+    """
+    monkeypatch.setattr("src.intraday.auto_select.is_trading_day",
+                        lambda moment=None: True)
 
 
 # ==================== 窗口判定 ====================
@@ -149,6 +169,19 @@ def test_next_tick_supports_multi_minute_interval() -> None:
 # ==================== 缓存与单飞 ====================
 
 
+def _isolated_cache_dir() -> str:
+    """测试用的缓存目录：**绝不写进仓库的 `data/cache/`**。
+
+    回归（2026-09-24 实测踩到）：`watchlist(force=True)` 会把自选概览落盘
+    （`_persist_watch_snapshot`），而热加载是按**代码交集**校验的 ——
+    测试替身返回的 600000/600001/600002 一旦写进真实的
+    `data/cache/intraday/watchlist_snapshot.json`，下次启动就因"与当前自选池
+    无交集"把整份缓存丢弃。表现是：跑完单测后重启服务，前端自选分数一直空着，
+    直到 200 秒的整表重算跑完 —— 排查半天才发现是测试污染。
+    """
+    return os.path.join(tempfile.gettempdir(), "moss_finagent_test_cache")
+
+
 class _FakeService(IntradayService):
     """把重算替换成计数器，专测缓存/单飞/循环，不碰任何网络。"""
 
@@ -162,6 +195,8 @@ class _FakeService(IntradayService):
         # 生产默认把第一次整表重算延后 `_WATCHLIST_STARTUP_GRACE`（20 秒）以免
         # 和首屏抢 CPU；宽限期内无缓存时返回的是占位列表，会盖住这些用例的被测行为。
         self._startup_grace_seconds = 0.0
+        # 落盘快照写临时目录，别污染仓库里的真实热缓存（见 `_isolated_cache_dir`）
+        self._snapshot_dir = _isolated_cache_dir()
         self.computes = 0
         self.delay = 0.05
 
@@ -414,6 +449,8 @@ class _CountingService(IntradayService):
         self._config = self._config.model_copy(deep=True)
         self._config.watchlist = [
             WatchConfig(code=code, name=f"票{code}") for code in codes]
+        # 落盘快照写临时目录，别污染仓库里的真实热缓存（见 `_isolated_cache_dir`）
+        self._snapshot_dir = _isolated_cache_dir()
         # 单只桩快照的耗时（用例可调大，用来模拟"整表要很久"）
         self.delay = 0.02
         self.live = 0
@@ -858,11 +895,21 @@ def test_qmt_batch_quote_parses_ticks(monkeypatch) -> None:
 
 
 def test_batch_quotes_falls_back_to_tencent_then_single(monkeypatch) -> None:
-    """QMT 只给到一部分时，缺失的走腾讯批量补；仍缺的才逐只兜底。"""
+    """QMT 只给到一部分时，缺失的走腾讯批量补；仍缺的才逐只兜底。
+
+    这里显式 `qmt_enabled=True`：本用例校验的是**三级补缺**语义
+    （QMT 批量 → 腾讯批量 → 逐只），只有在 QMT 参与时才存在。
+    2026-09 起 `IntradayConfig` 默认 `qmt_enabled=False`（终端失去行情权限），
+    默认关闭时跳过 QMT 直接走腾讯的行为见
+    `test_intraday_trend_freshness.test_quote_chain_skips_qmt_when_disabled`。
+    """
+    from src.intraday.config import IntradayConfig
     from src.intraday.models import Quote
     from src.intraday.sources import IntradayDataProvider
 
-    provider = IntradayDataProvider(IntradayConfig())
+    config = IntradayConfig()
+    config.data.qmt_enabled = True
+    provider = IntradayDataProvider(config)
     single_calls: list[str] = []
 
     class _Xt:
@@ -897,3 +944,26 @@ def test_batch_quotes_returns_empty_for_empty_input() -> None:
 
     provider = IntradayDataProvider(IntradayConfig())
     assert asyncio_run(provider.fetch_quotes([])) == {}
+
+
+def test_fakes_never_write_the_repo_hot_cache() -> None:
+    """测试替身绝不写仓库里的 `data/cache/intraday/watchlist_snapshot.json`。
+
+    回归（2026-09-24 实测踩到）：`watchlist(force=True)` 会把自选概览落盘，
+    而热加载是按**代码交集**校验的 —— 测试替身返回的 600000/600001/600002
+    一写进真实缓存文件，下次启动就会"与当前自选池无交集"整份丢弃。
+    现象是：跑完单测后重启服务，前端自选分数一直空着（要等 200 秒整表重算）。
+    """
+    # 显式写仓库里的那个真实路径（不用 `snapshot_path()` 的默认参数 ——
+    # 它是在定义时绑定的，根 conftest 的缓存隔离夹具改不到它）
+    real = Path("data/cache/intraday/watchlist_snapshot.json")
+    before = real.read_bytes() if real.exists() else None
+
+    service = _no_startup_grace(_FakeService())
+
+    async def _run():
+        await service.watchlist(force=True)
+
+    asyncio_run(_run())
+    after = real.read_bytes() if real.exists() else None
+    assert after == before, "测试把自选概览快照写进了仓库的真实缓存文件"

@@ -148,6 +148,44 @@ def test_formula_stays_in_design_range(src: int, cont: int, lo: int,
 # 内容分
 # ======================================================================
 
+def test_broker_signature_in_title_raises_source_level() -> None:
+    """标题里的**持牌机构署名**要能把来源档提上去（只提不降）。
+
+    ## 实测踩到的低估
+
+    券商研报经常**走快讯通道**转载，来源名是"东方财富-全球财经快讯"这类 ——
+    名字里既没有"研报"也没有"研究所"，于是被判成"财经自媒体"只给 54 分。
+    实测一条标题写着 `【中信证券：展望2026年下半年…】` 的内容只拿 51~57 分，
+    与它的权威性明显不符（那是持牌机构的研究结论，不是自媒体小作文）。
+
+    而 `kind` 也帮不上忙（采集通道是 `newswire`），所以只能从标题认。
+    """
+    wire = "东方财富-全球财经快讯"
+    # 没有署名的普通快讯：留在自媒体档
+    plain = score_item(source_name=wire, kind="newswire",
+                       title="【通航满一周 平陆运河全线运行平稳有序】",
+                       summary="记者了解到…")
+    assert plain.source_base == 54, plain.source_base
+
+    # 有持牌机构署名：提到研报档
+    signed = score_item(
+        source_name=wire, kind="newswire",
+        title="【中信证券：展望2026年下半年，产业链各环节料将推进】",
+        summary="中信证券研报指出…")
+    assert signed.source_base == 84, signed.source_base
+    assert signed.score > plain.score, (
+        f"署名识别没起作用：{plain.score} → {signed.score}")
+    assert "署名" in signed.source_reason or "研报" in signed.source_reason
+
+
+def test_broker_signature_does_not_downgrade() -> None:
+    """只**提**档，不降档 —— 官方档不会被标题里的"证券"两字拉下来。"""
+    c = score_item(source_name="交易所公告", kind="policy",
+                   title="关于某证券股份有限公司重大资产重组的公告",
+                   summary="公告编号2026-088")
+    assert c.source_base == 94, c.source_base
+
+
 def test_content_score_orders_by_verifiability() -> None:
     """内容分按**可核实程度**降序，不是按"写得好不好"。"""
     official = content_score("关于签订重大合同的公告", "公告编号2026-001")

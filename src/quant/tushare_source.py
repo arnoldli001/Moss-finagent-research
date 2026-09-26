@@ -358,6 +358,17 @@ LIMIT_MAP: dict[str, str] = {
     "pre_close": "limit_pre_close",
 }
 
+# namechange：**历史名称**（ST/*ST 判定的唯一数据源）。
+# 每行是一段名称生效区间 `[start_date, end_date]`（闭区间，end_date 空 = 仍在生效）。
+# ⚠️ 不要拿 `stock_basic.name` 判 ST：那是"今天"的名录，会把
+# "当年 ST、后来摘帽"的票当成正常股，回测就不是当时的现实了。
+# 详见 `src/quant/st_status.py`。
+NAME_CHANGE_MAP: dict[str, str] = {
+    "ts_code": "ts_code", "name": "name", "start_date": "start_date",
+    "end_date": "end_date", "ann_date": "ann_date",
+    "change_reason": "change_reason",
+}
+
 # fina_indicator：只取因子需要的字段（其余字段按需再加）
 FINA_MAP: dict[str, str] = {
     "ts_code": "ts_code", "ann_date": "ann_date", "end_date": "end_date",
@@ -388,9 +399,32 @@ _UNIT_SCALE: dict[str, float] = {
 }
 
 
+#: **文本列**：`normalize` 不能对它们做数字强转。
+#: 事故记录（2026-09-25）：这套转换原先只放行 4 个日期/代码列，其余一律
+#: `pd.to_numeric(errors="coerce")` —— 于是 `namechange.name` 变成全 NaN，
+#: 表现为"历史上曾被 ST 的票数 = 0"；`suspend_d.suspend_type`（S=停牌/R=复牌）
+#: 与 `suspend_timing`、`bak_daily.industry` 同样被清空。
+#: 加新数据集时，**文本字段一定要登记到这里**（`normalize` 现在也会
+#: 在"有值→全 NaN"时打 warning 兜住这类错误）。
+_TEXT_COLUMNS: tuple[str, ...] = (
+    # 代码与日期
+    "ts_code", "code", "trade_date", "ann_date", "end_date", "start_date",
+    "list_date", "suspend_timing",
+    # 名称/分类/原因
+    "name", "change_reason", "industry", "area", "suspend_type",
+)
+
+
 def normalize(frame: pd.DataFrame, mapping: dict[str, str], *,
               extra: dict[str, pd.Series] | None = None) -> pd.DataFrame:
-    """按映射重塑列名并统一单位（纯函数，便于单测）。"""
+    """按映射重塑列名并统一单位（纯函数，便于单测）。
+
+    ⚠️ **文本列必须显式登记在 `_TEXT_COLUMNS`**，否则会被下面的
+    "逐列数字强转"吃掉。这不是理论风险：实测 `namechange.name`、
+    `suspend_d.suspend_type`/`suspend_timing`、`bak_daily.industry`
+    全被转成了 NaN —— 而且**不报错**。其中 `namechange.name` 直接导致
+    "历史上曾被 ST 的票数 = 0"（一个安静的错误答案）。
+    """
     if frame is None or len(frame) == 0:
         return pd.DataFrame(columns=list(mapping.values()))
     out = pd.DataFrame()
@@ -404,9 +438,16 @@ def normalize(frame: pd.DataFrame, mapping: dict[str, str], *,
         if column in out.columns:
             out[column] = pd.to_numeric(out[column], errors="coerce") * scale
     for column in out.columns:
-        if column in ("ts_code", "trade_date", "ann_date", "end_date"):
+        if column in _TEXT_COLUMNS:
             continue
+        source_values = int(out[column].notna().sum())
         out[column] = pd.to_numeric(out[column], errors="coerce")
+        if source_values and not out[column].notna().any():
+            # 有值 → 全 NaN = 把文本列当数字强转了。宁可吵一句也不静默。
+            logger.warning(
+                "normalize：列 %r 的 %d 个非空值被数字强转全部丢弃 ——"
+                "如果它是文本列，请加进 tushare_source._TEXT_COLUMNS",
+                column, source_values)
     return out.reset_index(drop=True)
 
 

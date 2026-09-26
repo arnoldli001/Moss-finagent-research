@@ -36,7 +36,7 @@ from src.core.exceptions import ConfigError
 if TYPE_CHECKING:  # pragma: no cover - 仅类型检查期使用，避免 domain → intraday 的硬依赖
     from src.intraday.config import CodeOverride
 
-# 来源标记：面板会据此显示"这条档案是手工调的还是股性自动推荐的"
+# 来源标记：面板会据此显示"这条档案是手工调的还是股性自动预填的"
 SOURCE_MANUAL = "manual"
 SOURCE_AUTO_CHARACTER = "auto_character"
 SOURCE_IMPORT = "import"
@@ -57,7 +57,7 @@ class IntradayProfile(BaseModel):
         default_factory=dict, description="分时动手线/提示线覆盖 {action, hint}")
     daily_thresholds: dict[str, float] = Field(
         default_factory=dict, description="日线动手线/提示线覆盖")
-    # ---- 低吸/高抛数值计算 ----
+    # ---- 回踩/冲高数值计算 ----
     levels: dict[str, float] = Field(
         default_factory=dict,
         description="档位覆盖：min_band_pct/max_band_pct/stop_loss_pct/"

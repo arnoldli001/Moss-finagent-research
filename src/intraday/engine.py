@@ -9,8 +9,8 @@
     提示线 ±hint （默认20）：hint≤|总分|<action 且价格触及档位 → 空心三角（小仓位试仓）
 
 三、止损硬约束（安全关键，任何情况下不可绕过）
-    价格 ≤ 止损位 → 强制卖出警告（forced_exit），且**禁止一切低吸信号**：
-    在止损判定中低吸分支根本不会被求值，杜绝「越跌越买」的越套越深路径。
+    价格 ≤ 止损位 → 止损提示（forced_exit），且**禁止一切回踩信号**：
+    在止损判定中回踩分支根本不会被求值，杜绝「越跌越买」的越套越深路径。
 
 四、数据覆盖度护栏
     因子数据缺口使有效权重不足时（coverage<0.7），实心信号自动降级为空心并说明原因，
@@ -65,30 +65,30 @@ def compute_levels(
     day_low: float | None = None,
     config: IntradayConfig,
 ) -> LevelSet:
-    """计算做T关键价位（低吸线/高抛线/止损位）。
+    """计算做T关键价位（回踩线/冲高线/止损位）。
 
     档位口径：
-      - 低吸线 = 箱体下沿；开启 blend_boll_bands 且布林下轨**确实在现价下方**时取高者；
-      - 高抛线 = 箱体上沿 + take_profit_buffer_pct；融合时取布林上轨中较低者；
-      - 止损位 = 低吸线 - max(低吸线×stop_loss_pct%, atr_stop_mult×ATR)，
+      - 回踩线 = 箱体下沿；开启 blend_boll_bands 且布林下轨**确实在现价下方**时取高者；
+      - 冲高线 = 箱体上沿 + take_profit_buffer_pct；融合时取布林上轨中较低者；
+      - 止损位 = 回踩线 - max(回踩线×stop_loss_pct%, atr_stop_mult×ATR)，
         且**必须低于当日已成交低点**（见下）。
 
     ## 为什么要有这三道护栏（2026-09-16 实盘事故）
 
     **现象**：几乎每只自选股的早盘低位都冒出一整排红色实心倒三角（强制止损），
-    而那些位置恰恰是全天最好的低吸区。
+    而那些位置恰恰是全天最好的回踩区。
 
     **实测根因**（300308，2026-09-16）：
 
         箱体 804.02~949.73(20日)   布林 下902.06 中905.55 上909.04（带宽仅 0.77%）
         当日开盘 869.02   当日最低 867.44
-        → 低吸线 = max(箱体下沿804, 布林下轨902) = 902   ← 布林是**当日分钟bar**算的
-        → 档位差护栏再围绕中轨扩张 → 低吸 898.75
+        → 回踩线 = max(箱体下沿804, 布林下轨902) = 902   ← 布林是**当日分钟bar**算的
+        → 档位差护栏再围绕中轨扩张 → 回踩 898.75
         → 止损 = 898.75 × 0.99 = **889.76**（高于当日最低 867.44）
         → 开盘那一刻就"已跌破止损" → 27% 的分时点被判 forced_exit
 
     1. **布林轨是当日分钟口径**：强势股刚突破时 20 根bar带宽会窄到 1% 以内，
-       下轨跑到当日开盘价**上方**。那不是支撑，取 max 只会把低吸线抬到现价上方。
+       下轨跑到当日开盘价**上方**。那不是支撑，取 max 只会把回踩线抬到现价上方。
     2. **止损是风控线不是预测线**：它必须低于当日**已经成交过**的区间，否则
        "开盘即跌破"，信号失去意义。低于当日低点是"破位才走"的口径。
     3. **固定百分比止损距离对高波动股形同噪声**：300308 的日线 ATR = 52.8（占价 5.8%），
@@ -112,7 +112,7 @@ def compute_levels(
             and math.isfinite(float(boll_upper))
             and float(boll_upper) > price):
         high_sell = min(high_sell, float(boll_upper))
-    # 档位不可交叉：若融合后低吸线≥高抛线，退回纯箱体口径
+    # 档位不可交叉：若融合后回踩线≥冲高线，退回纯箱体口径
     if low_buy >= high_sell:
         low_buy, high_sell = float(box_low), float(box_high) * (
             1.0 + params.take_profit_buffer_pct / 100.0)
@@ -121,15 +121,15 @@ def compute_levels(
     #   上限——箱体过宽时档位离现价太远会永不触发，失去做T意义。
     low_buy, high_sell = _enforce_band_width(
         low_buy, high_sell, price, params)
-    # 护栏 2：低吸线的语义是"跌到这里的支撑"，必须在现价下方。跳空高开 / 强势股
+    # 护栏 2：回踩线的语义是"跌到这里的支撑"，必须在现价下方。跳空高开 / 强势股
     # 盘中上冲时，连箱体下沿与布林下轨都会落到现价上方 —— 这时**不能**把线钉在
     # 现价附近当作替身：贴线判定是 `price ≤ low_buy × (1+touch_band)`，
-    # 若低吸线取 `price × (1-touch_band)`，两者相乘恰好等于现价（0.997×1.003≈1），
-    # 结果是"**永远差一线、低吸信号实际被做死**"。实测（2026-09-16）：
-    # 300308/603083 当日触及低吸线 0 次，而这正是用户报"该低吸的位置没信号"的机制。
+    # 若回踩线取 `price × (1-touch_band)`，两者相乘恰好等于现价（0.997×1.003≈1），
+    # 结果是"**永远差一线、回踩信号实际被做死**"。实测（2026-09-16）：
+    # 300308/603083 当日触及回踩线 0 次，而这正是用户报"该回踩的位置没信号"的机制。
     #
     # 正确做法是给它一个**按波动率定的真实位置**：现价下方 dip_fallback_atr×ATR
-    # （603083 的 0.3×ATR≈4.4 → 低吸线 215.5，恰好是当日最低 215.44 —— 价格真的会碰到它）。
+    # （603083 的 0.3×ATR≈4.4 → 回踩线 215.5，恰好是当日最低 215.44 —— 价格真的会碰到它）。
     if low_buy >= price * (1.0 - _MIN_LEVEL_GAP):
         fallback = None
         if (atr is not None and math.isfinite(float(atr)) and float(atr) > 0
@@ -141,11 +141,11 @@ def compute_levels(
         low_buy = min(price - fallback, high_sell * (1.0 - _MIN_LEVEL_GAP))
     # 止损距离 = max(百分比口径, ATR 口径)：高波动股的固定 1% 会被噪声打穿
     stop_distance = low_buy * params.stop_loss_pct / 100.0
-    basis = f"低吸线下方 {params.stop_loss_pct:g}%"
+    basis = f"回踩线下方 {params.stop_loss_pct:g}%"
     if (atr is not None and math.isfinite(float(atr)) and params.atr_stop_mult > 0
             and float(atr) * params.atr_stop_mult > stop_distance):
         stop_distance = float(atr) * params.atr_stop_mult
-        basis = (f"低吸线下方 {params.atr_stop_mult:g}×ATR"
+        basis = (f"回踩线下方 {params.atr_stop_mult:g}×ATR"
                  f"（ATR={float(atr):.2f}，大于 {params.stop_loss_pct:g}% 的"
                  f"{low_buy * params.stop_loss_pct / 100.0:.2f}）")
     stop_loss = low_buy - stop_distance
@@ -184,7 +184,7 @@ def apply_level_fit(
 
     | 阶段 | 输入 | 产物 |
     |---|---|---|
-    | 拟合（主） | 7 个客观维度（筹码/箱体/缠论/VWAP/布林/MACD/KDJ·RSI） | 低吸/高抛/止损三条线的**尺度**（相对当日均价%） |
+    | 拟合（主） | 7 个客观维度（筹码/箱体/缠论/VWAP/布林/MACD/KDJ·RSI） | 回踩/冲高/止损三条线的**尺度**（相对当日均价%） |
     | 调整（后置） | 其余 7 个维度（指数量能/消息面/市场情绪/情绪周期/海外映射/板块排行/股性） | 对上述尺度的**±50% 以内**微调 |
 
     实现要点：
@@ -194,7 +194,7 @@ def apply_level_fit(
        "相对当日成本中枢"这个参照系里学的，换参照物会让训练与推理口径不一致。
     2. `adjustment_scale` 由 `level_fit.adjustment_factors` 给出（结构侧 + 环境侧 +
        微观侧三个乘数）。它只**缩放线的远近**，不会把线翻到另一侧。
-    3. 拟合与调整后仍要过**三条硬约束**（低吸<高抛、止损在低吸下方、与现价留出
+    3. 拟合与调整后仍要过**三条硬约束**（回踩<冲高、止损在回踩下方、与现价留出
        最小间距）—— 拟合是统计结论，约束是风控底线，后者优先。
     4. `blend` 是"拟合占比"：<1 时与规则口径的档位按比例混合，便于灰度对比。
     """
@@ -213,13 +213,13 @@ def apply_level_fit(
     structure = max(0.5, min(1.5, float(scale.get("structure", 1.0))))
     environment = max(0.5, min(1.5, float(scale.get("environment", 1.0))))
     micro = max(0.5, min(1.5, float(scale.get("micro", 1.0))))
-    # 低吸距离：负向环境 → 跌得更深才接（更谨慎）；正向环境 → 适度提前接
+    # 回踩距离：负向环境 → 跌得更深才接（更谨慎）；正向环境 → 适度提前接
     width_scale = structure * (1.0 + 0.25 * (environment - 1.0))
     low_pct = low_pct * width_scale * micro
     high_pct = high_pct * structure * micro
     stop_pct = stop_pct * max(1.0, structure)
 
-    # 三条线的次序与间距：低吸<高抛、止损<低吸，且价差不为负
+    # 三条线的次序与间距：回踩<冲高、止损<回踩，且价差不为负
     if high_pct <= low_pct:
         high_pct = low_pct * 1.05 + 0.05
     if stop_pct <= low_pct:
@@ -254,12 +254,12 @@ def apply_level_fit(
         "low_buy": round(low_buy, 4),
         "high_sell": round(high_sell, 4),
         "stop_loss": round(stop_loss, 4),
-        "low_source": (f"神经网络拟合：低吸 −{low_pct:.2f}%（相对当日均价）"
+        "low_source": (f"神经网络拟合：回踩 −{low_pct:.2f}%（相对当日均价）"
                        f"；底座 {base.low_source or '规则档位'}"),
-        "high_source": (f"神经网络拟合：高抛 +{high_pct:.2f}%（相对当日均价）"
+        "high_source": (f"神经网络拟合：冲高 +{high_pct:.2f}%（相对当日均价）"
                         f"；底座 {base.high_source or '规则档位'}"),
         "stop_basis": (f"神经网络拟合：止损 −{stop_pct:.2f}%"
-                       f"；低吸线下方 {stop_pct - low_pct:.2f}%（原口径 "
+                       f"；回踩线下方 {stop_pct - low_pct:.2f}%（原口径 "
                        f"{base.stop_basis or '百分比/ATR'}）"),
         "level_fit_note": note,
     })
@@ -296,12 +296,12 @@ def _pct_text(value: float | None) -> str:
 
 def _enforce_band_width(    low_buy: float, high_sell: float, price: float, params: Any,
 ) -> tuple[float, float]:
-    """把低吸~高抛档位差夹到 [min_band_pct, max_band_pct]×现价 区间内。
+    """把回踩~冲高档位差夹到 [min_band_pct, max_band_pct]×现价 区间内。
 
     围绕档位中点或现价对称调整：
       - 过窄 → 围绕**原档位中点**向外扩张（保留「箱体与布林中更早触及」的原始意图）；
       - 过宽 → 围绕**现价**向内收缩（箱体过宽时原中点可能远离现价，
-        若围绕中点收缩会出现「低吸线高于现价」这种永不触发的档位）。
+        若围绕中点收缩会出现「回踩线高于现价」这种永不触发的档位）。
     仅当配置的上下限有效时才调整。
     """
     if price <= 0:
@@ -383,14 +383,14 @@ def _verdict(total: float, zone: ScoreZone, available_weight: float,
     coverage_note = (
         f"；有效权重 {available_weight:g}/100" if available_weight < 100 else "")
     if zone == "strong_buy_zone":
-        return (f"总分 {total:+.1f} 突破动手线 +{action:g} → 偏多低吸区，"
-                f"价格触及低吸档位可正式动手{coverage_note}")
+        return (f"总分 {total:+.1f} 突破动手线 +{action:g} → 偏多回踩区，"
+                f"价格触及回踩档位可正式动手{coverage_note}")
     if zone == "buy_zone":
         return (f"总分 {total:+.1f} 位于提示线与动手线之间 → 偏多，"
                 f"仅小仓位试仓{coverage_note}")
     if zone == "strong_sell_zone":
-        return (f"总分 {total:+.1f} 跌破动手线 -{action:g} → 偏空高抛区，"
-                f"价格触及高抛档位可正式减仓{coverage_note}")
+        return (f"总分 {total:+.1f} 跌破动手线 -{action:g} → 偏空冲高区，"
+                f"价格触及冲高档位可正式减仓{coverage_note}")
     if zone == "sell_zone":
         return (f"总分 {total:+.1f} 位于 -{hint:g}～-{action:g} 之间 → 偏空，"
                 f"仅小仓位试减{coverage_note}")
@@ -407,12 +407,12 @@ def decide_signal(
     ts: str,
     dev_z: float | None = None,
 ) -> TradeSignal:
-    """按阈值与关键档位决定做T信号（止损优先级最高，且禁止低吸）。
+    """按阈值与关键档位决定做T信号（止损优先级最高，且禁止回踩）。
 
     判定顺序（顺序即优先级）：
-      1) 价格 ≤ 止损位 → forced_exit 强制卖出警告（并标记禁止低吸）
-      2) 触及低吸档位（价格≤低吸线+触及带宽，或VWAP偏离达极值）且总分≥提示线/动手线
-      3) 触及高抛档位（价格≥高抛线-触及带宽，或VWAP偏离达极值）且总分≤-提示线/-动手线
+      1) 价格 ≤ 止损位 → forced_exit 止损提示（并标记禁止回踩）
+      2) 触及回踩档位（价格≤回踩线+触及带宽，或VWAP偏离达极值）且总分≥提示线/动手线
+      3) 触及冲高档位（价格≥冲高线-触及带宽，或VWAP偏离达极值）且总分≤-提示线/-动手线
       4) 否则无信号
     """
     band = config.levels.touch_band_pct / 100.0
@@ -421,15 +421,15 @@ def decide_signal(
     coverage = scorecard.available_weight / 100.0
     gated = coverage < MIN_COVERAGE_FOR_SOLID
 
-    # ---- 1) 止损硬约束：优先级最高，低吸分支不再求值 ----
+    # ---- 1) 止损硬约束：优先级最高，回踩分支不再求值 ----
     if price <= levels.stop_loss + 1e-9:
         return TradeSignal(
             kind="stop_loss", strength="forced_exit", triggered=True,
             price=round(price, 4), ts=ts, total_score=total,
             reason=(
                 f"⚠️ 现价 {price:.2f} 已跌破止损位 {levels.stop_loss:.2f}"
-                f"（低吸线 {levels.low_buy:.2f} 下方 {levels.stop_loss_pct:g}%）"
-                f"→ 强制卖出警告，本模块禁止任何低吸信号"),
+                f"（回踩线 {levels.low_buy:.2f} 下方 {levels.stop_loss_pct:g}%）"
+                f"→ 止损提示，本模块禁止任何回踩信号"),
             blocked_by_stop_loss=True, target_level=levels.stop_loss,
         )
 
@@ -440,10 +440,10 @@ def decide_signal(
     touch_high_level = price >= levels.high_sell * (1.0 - band)
     touch_high_vwap = z is not None and z >= extreme
 
-    # ---- 2) 低吸 ----
+    # ---- 2) 回踩 ----
     if (touch_low_level or touch_low_vwap) and total >= hint:
         solid = total >= action and not gated
-        how = "价格触及低吸线" if touch_low_level else f"VWAP偏离达极值(z={z:.2f})"
+        how = "价格触及回踩线" if touch_low_level else f"VWAP偏离达极值(z={z:.2f})"
         why = f"总分 {total:+.1f} ≥ 动手线 {action:g}" if total >= action else (
             f"总分 {total:+.1f} 位于提示线 {hint:g}～动手线 {action:g}")
         gate_note = (
@@ -454,16 +454,16 @@ def decide_signal(
             kind="low_buy", strength="solid" if solid else "hollow",
             triggered=True, price=round(price, 4), ts=ts, total_score=total,
             reason=(f"{how}（{levels.low_buy:.2f}），{why} → "
-                    f"{'实心三角：正式低吸做T' if solid else '空心三角：小仓位试仓'}"
+                    f"{'实心三角：正式回踩区间提示' if solid else '空心三角：小仓位试仓'}"
                     f"{gate_note}"),
             blocked_by_stop_loss=False,
             target_level=levels.low_buy,
         )
 
-    # ---- 3) 高抛 ----
+    # ---- 3) 冲高 ----
     if (touch_high_level or touch_high_vwap) and total <= -hint:
         solid = total <= -action and not gated
-        how = "价格触及高抛线" if touch_high_level else f"VWAP偏离达极值(z={z:.2f})"
+        how = "价格触及冲高线" if touch_high_level else f"VWAP偏离达极值(z={z:.2f})"
         why = (f"总分 {total:+.1f} ≤ 动手线 -{action:g}" if total <= -action
                else f"总分 {total:+.1f} 位于 -{hint:g}～-{action:g}")
         gate_note = (
@@ -474,7 +474,7 @@ def decide_signal(
             kind="high_sell", strength="solid" if solid else "hollow",
             triggered=True, price=round(price, 4), ts=ts, total_score=total,
             reason=(f"{how}（{levels.high_sell:.2f}），{why} → "
-                    f"{'实心三角：正式高抛做T' if solid else '空心三角：小仓位试减'}"
+                    f"{'实心三角：正式冲高区间提示' if solid else '空心三角：小仓位试减'}"
                     f"{gate_note}"),
             blocked_by_stop_loss=False,
             target_level=levels.high_sell,
@@ -484,14 +484,14 @@ def decide_signal(
     if abs(total) < hint:
         reason = (
             f"总分 {total:+.1f} 未达提示线 ±{hint:g} → 震荡区间不动手"
-            f"（低吸线 {levels.low_buy:.2f} / 高抛线 {levels.high_sell:.2f}）")
+            f"（回踩线 {levels.low_buy:.2f} / 冲高线 {levels.high_sell:.2f}）")
     elif total >= hint:
         reason = (
-            f"总分 {total:+.1f} 偏多但价格未触及低吸线 {levels.low_buy:.2f}"
+            f"总分 {total:+.1f} 偏多但价格未触及回踩线 {levels.low_buy:.2f}"
             f"（现价 {price:.2f}）→ 继续观察")
     else:
         reason = (
-            f"总分 {total:+.1f} 偏空但价格未触及高抛线 {levels.high_sell:.2f}"
+            f"总分 {total:+.1f} 偏空但价格未触及冲高线 {levels.high_sell:.2f}"
             f"（现价 {price:.2f}）→ 继续观察")
     return TradeSignal(
         kind="none", strength="none", triggered=False, price=round(price, 4),
@@ -516,8 +516,8 @@ def build_markers(
 
     ## 为什么要逐bar档位（`levels_series`，2026-09-16 实测）
 
-    档位是**时刻量**：低吸线/止损位随 VWAP、布林、现价每分钟重算（实测 300308
-    当日低吸线从 862 一路抬到 898）。而图上那条横线画的是**当前值**，
+    档位是**时刻量**：回踩线/止损位随 VWAP、布林、现价每分钟重算（实测 300308
+    当日回踩线从 862 一路抬到 898）。而图上那条横线画的是**当前值**，
     拿它去判早盘的 bar 会得出完全错误的结论：
 
         300308 09:45 那根被标成"止损"（因为收盘 867 < 当前止损 872），
@@ -561,21 +561,21 @@ def build_markers(
                 strength="forced_exit", label="止损"))
             continue
         # 「价格触及档位」用**盘中极值**判定，而不是收盘价：
-        # 低吸是"跌到支撑位就动手"，盘中砸到线下（哪怕收盘又收回去）就已经触及了。
-        # 实测踩过：600176 早盘 W 底的最低价正好落在低吸线上，但每根 5 分钟bar的**收盘**
+        # 回踩是"跌到支撑位就动手"，盘中砸到线下（哪怕收盘又收回去）就已经触及了。
+        # 实测踩过：600176 早盘 W 底的最低价正好落在回踩线上，但每根 5 分钟bar的**收盘**
         # 都在线上方 → 判定"从未触及" → 用户看到的图上明明摸到了却没有任何信号。
         if bar_low <= bar_levels.low_buy * (1.0 + band) and total >= hint:
             solid = total >= action
             markers.append(SignalMarker(
                 ts=ts, price=round(close, 3), kind="low_buy",
                 strength="solid" if solid else "hollow",
-                label=f"{'低吸' if solid else '低吸提示'} {total:+.0f}"))
+                label=f"{'回踩' if solid else '回踩提示'} {total:+.0f}"))
         elif bar_high >= bar_levels.high_sell * (1.0 - band) and total <= -hint:
             solid = total <= -action
             markers.append(SignalMarker(
                 ts=ts, price=round(close, 3), kind="high_sell",
                 strength="solid" if solid else "hollow",
-                label=f"{'高抛' if solid else '高抛提示'} {total:+.0f}"))
+                label=f"{'冲高' if solid else '冲高提示'} {total:+.0f}"))
     return markers[-limit:]
 
 
@@ -588,15 +588,15 @@ def replay_levels(
     atr: float | None,
     config: IntradayConfig,
 ) -> list[LevelSet]:
-    """逐bar重算档位（低吸/高抛/止损），用于**按当时那一刻**回放与画图。
+    """逐bar重算档位（回踩/冲高/止损），用于**按当时那一刻**回放与画图。
 
     档位是时刻量：随 VWAP / 布林 / 现价每分钟变化。实测 300308 2026-09-16
-    低吸线从 862.09 一路抬到 898.63、止损从 853.47 抬到 889.64；603083 低吸线
+    回踩线从 862.09 一路抬到 898.63、止损从 853.47 抬到 889.64；603083 回踩线
     从 215.42 抬到 221.91。所以：
 
     - **回放**必须用当刻档位，否则早盘的正常回踩会被后来的高位止损追认成"破位"
       （图1 里 09:45 那个红色 ▼ 就是这么来的）；
-    - **画图**要能看出档位随时间漂移，否则用户会以为"开盘就在低吸线以下"
+    - **画图**要能看出档位随时间漂移，否则用户会以为"开盘就在回踩线以下"
       （那只是当前值横贯全天的错觉）。
 
     每个 bar 只用**当日截至该bar**的数据（含 running low），不引入未来信息。

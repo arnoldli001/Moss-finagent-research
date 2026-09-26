@@ -27,6 +27,7 @@ from src.core.errors import (
     BRIEF_TIGHT,
     brief,
 )
+from src.fundflow import sector_filter
 from src.fundflow.service import FundFlowService
 
 logger = logging.getLogger(__name__)
@@ -153,13 +154,17 @@ async def search(
         # 用户加入的名字必须能被取到数，拿别的名单（同花顺概念名）会出现
         # "加进去了但走势永远空白"。
         snapshot = await service.provider.sector_snapshot()
-        names = list(snapshot.keys())
+        # 剔除清单里的板块**不提供搜索**。否则用户可以把它手工加回来，
+        # 而加回来之后榜单/走势依然不显示它（`_build` 会再滤一次），
+        # 表现为"加入了却什么都没有" —— 比直接搜不到更让人困惑。
+        names, excluded = sector_filter.filter_names(list(snapshot.keys()))
         if keyword:
             hits = [name for name in names if keyword in name]
         else:
             hits = sorted(names, key=lambda name: -abs(
                 float((snapshot.get(name) or {}).get("net") or 0.0)))
         return {"kind": "sector", "query": keyword, "total": len(names),
+                "excluded": excluded,
                 "items": [{"code": name, "name": name,
                            "net_yi": ((snapshot.get(name) or {}).get("net") or 0) / 1e8,
                            "change_pct": (snapshot.get(name) or {}).get("pct_change"),

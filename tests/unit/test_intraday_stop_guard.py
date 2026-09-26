@@ -2,19 +2,19 @@
 
 ## 事故记录（2026-09-16 实盘，用户报"几乎每只股早盘低位都是红色实心止损三角"）
 
-那排三角的位置恰恰是全天最好的低吸区。逐字段拉真实快照后定位到：
+那排三角的位置恰恰是全天最好的回踩区。逐字段拉真实快照后定位到：
 
     300308（中际旭创）2026-09-16 14:44
       箱体 804.02~949.73(20日)   布林 下902.06 中905.55 上909.04（带宽仅 0.77%）
       当日开盘 869.02   当日最低 867.44
-      → 低吸线 = max(箱体下沿804, 布林下轨902) = 902   ← 布林是**当日分钟bar**算的
-      → 档位差护栏再围绕中轨扩张 → 低吸 898.75
+      → 回踩线 = max(箱体下沿804, 布林下轨902) = 902   ← 布林是**当日分钟bar**算的
+      → 档位差护栏再围绕中轨扩张 → 回踩 898.75
       → 止损 = 898.75 × 0.99 = **889.76**，高于当日最低 867.44
       → 开盘那一刻就已"跌破止损" → 226 个分时点里 60 个（27%）被判 forced_exit
 
 三道护栏（见 `engine.compute_levels`）：
   1. 布林下轨只有在**现价下方**才算支撑候选（强势股突破时它会跑到开盘价上方）；
-  2. 低吸线必须在现价下方（跳空高开时连箱体下沿都会在现价上方）；
+  2. 回踩线必须在现价下方（跳空高开时连箱体下沿都会在现价上方）；
   3. 止损距离 = max(固定百分比, k×ATR) —— 高波动股的固定 1% 会被噪声打穿；
      且止损必须**低于当日已成交低点**（"破位才走"，而不是"开盘即跌破"）。
 """
@@ -42,10 +42,10 @@ def _zx_levels(**overrides) -> object:
 
 
 def test_real_case_stop_is_below_price() -> None:
-    """事故复现：低吸线必须在现价下方，止损又必须在低吸线下方。
+    """事故复现：回踩线必须在现价下方，止损又必须在回踩线下方。
 
     事故当刻的真实快照：布林下轨 902.06 **高于**当日开盘 869.02 —— 那是"支撑"
-    这个词的反面；取 max 会把低吸线抬到现价上方，止损随之失效。
+    这个词的反面；取 max 会把回踩线抬到现价上方，止损随之失效。
     """
     levels = _zx_levels()
     assert levels.low_buy < levels.price
@@ -110,7 +110,7 @@ def test_atr_stop_can_be_disabled() -> None:
 
 
 def test_boll_lower_above_price_is_not_a_support() -> None:
-    """布林下轨跑到现价上方时不算支撑（否则低吸线会被抬到现价之上）。"""
+    """布林下轨跑到现价上方时不算支撑（否则回踩线会被抬到现价之上）。"""
     config = IntradayConfig()
     price = 869.02          # 当日开盘
     levels = compute_levels(
@@ -118,12 +118,12 @@ def test_boll_lower_above_price_is_not_a_support() -> None:
         box_span_days=20, boll_lower=902.06, boll_upper=909.04, atr=52.82,
         day_low=867.44)
     assert levels.low_buy < price, (
-        f"低吸线 {levels.low_buy} 高于现价 {price} —— 布林下轨 902 被当成了支撑")
+        f"回踩线 {levels.low_buy} 高于现价 {price} —— 布林下轨 902 被当成了支撑")
     assert levels.stop_loss < price
 
 
 def test_low_buy_reanchors_when_box_low_is_above_price() -> None:
-    """跳空高开（连箱体下沿都在现价上方）时，低吸线退化为现价下方的防守位。"""
+    """跳空高开（连箱体下沿都在现价上方）时，回踩线退化为现价下方的防守位。"""
     config = IntradayConfig()
     levels = compute_levels(
         config=config, price=100.0, box_high=140.0, box_low=105.0,
@@ -141,7 +141,7 @@ def test_stop_basis_is_human_readable() -> None:
 
 
 def test_normal_stock_behavior_unchanged() -> None:
-    """低波动股（ATR 远小于固定百分比）不受影响：止损仍在低吸线下方 1%。"""
+    """低波动股（ATR 远小于固定百分比）不受影响：止损仍在回踩线下方 1%。"""
     config = IntradayConfig()
     levels = compute_levels(
         config=config, price=40.97, box_high=42.0, box_low=40.5,
@@ -152,7 +152,7 @@ def test_normal_stock_behavior_unchanged() -> None:
 
 
 def test_levels_survive_missing_day_low() -> None:
-    """没有当日低点（盘前/数据缺口）时不得报错，且仍满足"止损低于低吸线"。"""
+    """没有当日低点（盘前/数据缺口）时不得报错，且仍满足"止损低于回踩线"。"""
     config = IntradayConfig()
     levels = compute_levels(
         config=config, price=100.0, box_high=110.0, box_low=95.0,

@@ -89,6 +89,10 @@ class SingleBacktestConfig:
     t_plus_1: bool = True
     respect_price_limits: bool = True
     respect_suspension: bool = True
+    #: ST 期间不买入（历史名称口径，见 `st_status.StStatus`）。
+    #: 默认 True：实盘里很多账户本来就不允许买 ST，默认不买是更安全的近似；
+    #: 关掉它就能看到"连 ST 一起买"的历史（用于对照）。
+    respect_st: bool = True
     train_ratio: float = 0.7
     index_code: str = "000300.SH"    # 指数基准（默认沪深300）
     recent_days: int = 240           # "近一年"分段长度（交易日）
@@ -409,6 +413,7 @@ def run_single_backtest(
     config: SingleBacktestConfig | None = None,
     factors: dict[str, pd.DataFrame] | None = None,
     name: str = "",
+    st_status: Any = None,
 ) -> SingleBacktestResult:
     """在单只股票上回测一条 DSL 条件策略（端到端，按需计算因子）。
 
@@ -418,6 +423,8 @@ def run_single_backtest(
 
     `factors`：已经算好的因子宽表（可复用，避免重复计算）。给了就直接用，
     不再按需计算 —— 批量试多只票时先算一次更划算。
+    `st_status`：`st_status.StStatus`；配合 `cfg.respect_st` 实现
+    "ST 期间不买入"。不传且 cfg 要求剔除时会如实记一条 note。
     """
     cfg = config or SingleBacktestConfig(code=code)
     cfg.code = code or cfg.code
@@ -476,8 +483,13 @@ def run_single_backtest(
             "窗口太长导致前段全是缺失、阈值过严、或因子在早期根本没有数据")
 
     prices = _price_panel(single, cfg.code, frame.index)
+    if cfg.respect_st and st_status is None:
+        notes.append("要求「ST 期间不买」，但本地没有 namechange 数据 → "
+                     "**本次未生效**；补数据：python scripts/quant_sync.py "
+                     "download --namechange-only --start 2006-01-01 --end <今天>")
     trades, equity, positions = _simulate(
-        cfg, frame, entry_mask, exit_mask, prices, notes, warnings)
+        cfg, frame, entry_mask, exit_mask, prices, notes, warnings,
+        st_status=st_status)
 
     result.dates = list(frame.index)
     result.equity = [round(float(value), 2) for value in equity]
@@ -809,7 +821,7 @@ class _Position:
 def _simulate(
     cfg: SingleBacktestConfig, frame: pd.DataFrame, entry_mask: pd.Series,
     exit_mask: pd.Series, prices: pd.DataFrame, notes: list[str],
-    warnings: list[str],
+    warnings: list[str], st_status: Any = None,
 ) -> tuple[list[Trade], pd.Series, pd.Series]:
     """逐日推进的撮合循环。
 
@@ -819,6 +831,9 @@ def _simulate(
         2. **再处理空仓**：用 t-1 日的入场信号在 t 日**开盘**买入。
 
     信号一律来自 t-1、成交一律发生在 t —— 这条纪律是整套回测可信度的地基。
+
+    `st_status`：给了它且 `cfg.respect_st` 为真时，**ST 期间不买入**
+    （已持仓的照常按出场规则处理 —— 不假装"能精准在戴帽当天跑掉"）。
     """
     dates = list(frame.index)
     close, open_ = prices["close"], prices["open"]
@@ -880,6 +895,11 @@ def _simulate(
                 blocked = "无有效开盘价"
             elif cfg.respect_suspension and (day, cfg.code) in suspended:
                 blocked = "停牌"
+            elif (cfg.respect_st and st_status is not None
+                  and st_status.is_st(cfg.code, day)):
+                # ST 期间不买入：历史名称口径（`*ST`/`ST`），不是"今天的名字"。
+                # 判定用**成交日**（t 日）而不是信号日（t-1）：能不能下单看的是当天状态。
+                blocked = "ST 期间不买"
             elif cfg.respect_price_limits and up_limit is not None:
                 cap = float(up_limit.iloc[index])
                 if np.isfinite(cap) and open_price >= cap - 1e-9:
@@ -1218,6 +1238,7 @@ def _append_honesty_notes(cfg: SingleBacktestConfig,
         f"{'，T+1 不可当日卖出' if cfg.t_plus_1 else ''}"
         f"{'，涨停不买/跌停不卖' if cfg.respect_price_limits else ''}"
         f"{'，停牌不交易' if cfg.respect_suspension else ''}"
+        f"{'，ST 期间不买（历史名称口径）' if cfg.respect_st else ''}"
         f"，整手（100 股），佣金万三（最低 5 元）+ 卖出印花税 0.05%"
         f" + 过户费 0.001% + 滑点 {cfg.costs.slippage_bps:.0f}bp")
     result.notes.append("价格为后复权（close × adj_factor），跨除权日的收益率正确")
@@ -1234,6 +1255,7 @@ def _config_dict(cfg: SingleBacktestConfig) -> dict[str, Any]:
         "t_plus_1": cfg.t_plus_1,
         "respect_price_limits": cfg.respect_price_limits,
         "respect_suspension": cfg.respect_suspension,
+        "respect_st": cfg.respect_st,
         "train_ratio": cfg.train_ratio,
         "costs": {
             "commission_rate": cfg.costs.commission_rate,

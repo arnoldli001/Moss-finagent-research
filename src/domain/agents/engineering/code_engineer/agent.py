@@ -176,6 +176,46 @@ class CodeEngineerAgent(BaseAgent):
                 "A19需要gap_description或indicator参数描述数据缺口")
 
         steps: list[TraceStep] = []
+
+        # --- Step 0: 幂等守卫（2026-09-21）---
+        # 该指标**已经有能用的动态连接器**时直接返回，不再花钱让 LLM 生成一遍。
+        #
+        # 为什么必须有：`POST /code-engineer/fix-gap` 是**每个 HTTP 请求**直接
+        # 触发 `execute`，没有任何守卫；`data_gap_resolver` 还会对"长期取不到的
+        # 指标"在每轮研究任务里重试。实测 A19 五十次调用**零缓存命中**、
+        # 输出 16.2 万 token（均值 3,252），其中相当一部分是同一个缺口反复生成
+        # —— 同一份 prompt 本可以复用，纯浪费。
+        #
+        # 注意：生成出来的连接器**本来就落盘**（`data/dynamic_connectors/`）
+        # 并在冷启动时由 `runtime.py` 自动加载 —— 也就是说"产物早就复用了，
+        # 只有 LLM 调用没复用"。这里补上的就是这个缺口。
+        # 真要重生成（例如已有连接器的数据源挂了），payload 传 `force=True`。
+        if not bool(payload.get("force")):
+            existing = get_dynamic_loader().covering(indicator_hint)
+            if existing:
+                logger.info("A19跳过生成：%s 已有连接器 %s",
+                            indicator_hint or gap_description, existing)
+                steps.append(TraceStep(
+                    step=0, step_type="data_retrieval",
+                    description=f"「{indicator_hint}」已有可用连接器"
+                                f"{existing}，跳过生成（幂等守卫）"))
+                return AgentOutput(
+                    task_id=input.task_id, agent_id=self.agent_id,
+                    conclusion=(
+                        f"「{gap_description or indicator_hint}」已有动态连接器"
+                        f"{'、'.join(existing)}覆盖该指标，**未重复生成**"
+                        "（要强制重生成请在请求里传 force=true）。"),
+                    confidence=Confidence.HIGH,
+                    data_refs=[f"dynamic_connector:{name}" for name in existing],
+                    trace_id=input.task_id,
+                    reasoning_steps=steps,
+                    result={
+                        "skipped": True,
+                        "reason": "该指标已有可用连接器",
+                        "existing_connectors": existing,
+                    },
+                )
+
         # --- Step 1: 分析缺口，推荐数据源 ---
         source_hint = self._recommend_source(gap_description, indicator_hint)
         steps.append(TraceStep(step=1, step_type="data_retrieval",

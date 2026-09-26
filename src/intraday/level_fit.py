@@ -1,4 +1,4 @@
-"""关键价位（低吸/高抛/止损）的**按股神经网络拟合**。
+"""关键价位（回踩/冲高/止损）的**按股神经网络拟合**。
 
 用户要的是：用 7 个客观维度（筹码量能结构 / 箱体压力位 / 缠论结构 / VWAP偏离 /
 布林带 / MACD / KDJ·RSI）把这三条线"拟合出来"，目标是过去 10 个交易日做T成功率达
@@ -8,12 +8,12 @@
 ## 一句话说清"神经网络在这里干什么"
 
 三条线本身**不是**神经网络从零"猜"出来的 —— 它们在数学上是**分位数**：
-"跌到过去 10 天里最深的 10% 那种位置"就是低吸线。真正需要学的、也确实是
+"跌到过去 10 天里最深的 10% 那种位置"就是回踩线。真正需要学的、也确实是
 **逐票不同、无法预先写死**的那部分，是「**怎么把这些客观维度组合成对该股
 合适的尺度**」：
 
-    低吸线 = Σ_k  w_k(该票自己学出来的混合权重) × 分位数锚点_k(P05…P30)
-    高抛线 = Σ_k  v_k × 分位数锚点_k(P70…P95)
+    回踩线 = Σ_k  w_k(该票自己学出来的混合权重) × 分位数锚点_k(P05…P30)
+    冲高线 = Σ_k  v_k × 分位数锚点_k(P70…P95)
     止损位 = Σ_k  u_k × 分位数锚点_k(P97…P99.5)
 
   - **分位数锚点**由该股自己的经验分布给出（P10 就是"这只票 10 天里最深的那 10%
@@ -422,15 +422,15 @@ def evaluate_levels(
     *, dataset: FitDataset, low_pct: float, high_pct: float, stop_pct: float,
     horizon: int, cost_pct: float, min_touches: int = 1,
 ) -> dict[str, Any]:
-    """按"先触低吸 → 先到高抛 vs 先破止损"统计成功率（见模块 docstring）。
+    """按"先触回踩 → 先到冲高 vs 先破止损"统计成功率（见模块 docstring）。
 
     `*_pct` 是相对**当日均价**的偏离百分比（正数表示离中枢多远）。
     返回 `touches / success / rate / avg_ret_pct`。
 
-    单轮盈亏口径（做T一轮：低吸买入 → 高抛卖出）：
+    单轮盈亏口径（做T一轮：回踩买入 → 冲高卖出）：
       - 成功：`+(high-low) − cost`（cost 是双边摩擦成本）
       - 先破止损：`−(stop-low) − cost`
-      - 时间到没到高抛：`−cost`（按现价附近平掉，只亏手续费）
+      - 时间到没到冲高：`−cost`（按现价附近平掉，只亏手续费）
     """
     empty = {"touches": 0, "success": 0, "rate": None, "avg_ret_pct": None}
     if not dataset.available or dataset.closes is None or dataset.day_mean is None:
@@ -587,8 +587,8 @@ def fit_levels(
 
     # ---- 可达性上限：同一窗口内"放宽搜索"能到多少 ----
     # 为什么要这一步：拟合只在自己那 5×5×3 个锚点里选最优，用户看到 30% 会问
-    # "是没搜到，还是这只票本来就不行"。于是再扫一遍更宽的组合（低吸 0.1~2.0%、
-    # 高抛 0.2~4.0%、止损到 8%），把**该窗口内真正能达到的上限**报出来：
+    # "是没搜到，还是这只票本来就不行"。于是再扫一遍更宽的组合（回踩 0.1~2.0%、
+    # 冲高 0.2~4.0%、止损到 8%），把**该窗口内真正能达到的上限**报出来：
     #   · 上限 ≥ 目标 → 说明是搜索/泛化没做好，值得继续调；
     #   · 上限 < 目标 → 说明这段行情里不存在"成功率 80%"的做T结构（不是调参能解决的）。
     metrics.best_achievable_rate, metrics.best_achievable_lines = _best_achievable(
@@ -656,7 +656,7 @@ def fit_levels(
             result.notes.append(
                 f"📉 该窗口内**放宽搜索的上限**也只有 "
                 f"{metrics.best_achievable_rate * 100:.0f}%"
-                f"（低吸 {metrics.best_achievable_lines[0]:.2f}% / 高抛 "
+                f"（回踩 {metrics.best_achievable_lines[0]:.2f}% / 冲高 "
                 f"{metrics.best_achievable_lines[1]:.2f}% / 止损 "
                 f"{metrics.best_achievable_lines[2]:.1f}%，"
                 f"{metrics.best_achievable_lines[3]:.0f} 次触及）—— "
@@ -668,7 +668,7 @@ def fit_levels(
                 f"（≥目标 {config.target_hit_rate * 100:.0f}%）：说明机会存在，"
                 "但当前拟合没能泛化到它 —— 值得在权重/档位参数上继续调。")
     result.notes.append(
-        f"拟合线（相对当日均价的偏离）：低吸 −{low_pct:.2f}% / 高抛 +{high_pct:.2f}% "
+        f"拟合线（相对当日均价的偏离）：回踩 −{low_pct:.2f}% / 冲高 +{high_pct:.2f}% "
         f"/ 止损 −{stop_pct:.2f}%（价差 {high_pct - low_pct:.2f}% vs 双边成本 "
         f"{config.round_trip_cost_pct:.2f}%）")
     return result
@@ -679,7 +679,7 @@ def _best_achievable(
 ) -> tuple[float | None, list[float]]:
     """放宽搜索能到的成功率上限（区分"没搜到"与"到不了"）。
 
-    网格刻意比正式搜索宽：低吸 0.10~2.00%、高抛 0.30~4.00%、止损 1.5~8.0%
+    网格刻意比正式搜索宽：回踩 0.10~2.00%、冲高 0.30~4.00%、止损 1.5~8.0%
     （步长 0.10%/1.0%）。代价是几百次 `evaluate_levels`，实测 ~0.2 秒，
     换来的是"目标是否可达"这个**结论性**信息 —— 值得。
     """
@@ -721,7 +721,7 @@ def _fit_micro_net(
 ) -> tuple[TinyNet, np.ndarray, np.ndarray]:
     """逐 bar 微调网络：输入 7 个客观维度，输出"是否适合放宽"的 0/1 标签。
 
-    标签口径：该 bar **是否有低吸触及且最终成功**（成功=先到高抛、不破止损，
+    标签口径：该 bar **是否有回踩触及且最终成功**（成功=先到冲高、不破止损，
     阈值用主搜索得到的线）。这是一个可解释的二分类：
     "此刻的因子状态，是不是一个能做成 T 的状态"。
     网络输出用于**按当前状态微调**三条线的比例（见 `apply_net_adjustment`）。
@@ -814,7 +814,7 @@ def adjustment_factors(
     | 分组 | 维度 | 乘数含义 |
     |---|---|---|
     | `structure` 结构 | 指数量能、股性适配 | >1 = 该股/该环境适合更宽的波段（线放远，减少假触发） |
-    | `environment` 环境 | 市场情绪、情绪周期、海外映射、板块排行 | >1 = 环境偏暖（低吸可以适度提前） |
+    | `environment` 环境 | 市场情绪、情绪周期、海外映射、板块排行 | >1 = 环境偏暖（回踩可以适度提前） |
     | `micro` 微观 | 消息面 | >1 = 消息面偏多（整体往有利方向微调） |
 
     打分来源有两个口径，优先用**打分卡**（那样与面板那张表逐行同源）；

@@ -39,9 +39,10 @@ import asyncio
 import hashlib
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Final
+from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +57,47 @@ SOURCE_KINDS: Final[dict[str, str]] = {
     "broker_report": "券商研报",
     "newswire": "财经快讯",
     "policy": "政策信号",
-    "research_note": "研究笔记",
+    #: 用户口径（2026-10-01）：`research_note` 的**展示名**改成「券商作文」。
+    #: ⚠️ 内部 `kind` 值**一个字都不改**（仍是 `research_note`）：
+    #: 它是 `tone_store` / `tone_job` / 前端筛选 / 告警闸门共用的**键**，
+    #: 改名等于让所有已落库的行、所有按 kind 分支的判据集体失配 ——
+    #: 而那种失配不会报错，只会表现为"某一类内容凭空消失"。
+    "research_note": "券商作文",
     "other": "其他",
 }
+
+#: **可公开**的平台名：内部源名 → 平台名。
+#:
+#: ## 为什么这里可以放明文，而 `source_alias` 不行
+#:
+#: 用户口径（2026-09-25）：
+#
+#:    "公开数据的地方（AkShare/腾讯/新浪/东财/QMT）可以暴露；
+#:     必须隐藏平台/群身份（WD调研、知识星球、群 id）。"
+#:
+#: 这两件事看起来矛盾，其实不是：**"我从哪个公开网站抓的"不是壁垒**
+#: （谁都能去抓），**"我有一份付费/私域的信息源"才是壁垒**。
+#: 财联社的电报、同花顺的快讯，公开网页上就有；而知识星球的调研纪要
+#: 需要付费入群 —— 后者泄漏等于把核心资产送人。
+#:
+#: 所以这里是**白名单**：只有明确公开的财经平台才给标签，
+#: 研报机构（`broker-*`）与知识星球（`research-note-zsxq`）一律**不在表里**，
+#: 于是 `to_public()` 给它们空串 —— 前端只显示"公开财经信息"。
+#:
+#: 让平台名可公开还有实际用处：用户在"热议个股"里能看到
+#: "财联社 / 东方财富 都提到了它"，这本身就是跨源印证（corroboration），
+#: 比一个匿名的来源数量有意义得多。
+PUBLIC_PLATFORMS: Final[dict[str, str]] = {
+    "newswire-em": "东方财富",
+    "newswire-ths": "同花顺",
+    "newswire-sina": "新浪财经",
+    "newswire-cls": "财联社",
+    "newswire-futu": "富途",
+    "policy-cctv": "新闻联播",
+}
+
+#: 未在 `PUBLIC_PLATFORMS` 里的来源对外统一的标签（**不含来源标识**）。
+PUBLIC_PLATFORM_FALLBACK: Final = "公开财经信息"
 
 #: 每个源最近一次调用结果（探活用，进程内）。
 #: 只存成功与否与耗时，**不存任何来源标识**。
@@ -174,14 +213,16 @@ class IntelItem:
             # 标题也过一遍富文本剥离：知识星球有整条主题以 `<e>` 开头的
             # （分享链接类），标题里同样会带平台地址。
             "title": _strip_rich_tags(self.title),
-            # 摘要截断：源文本最长 800+ 字（政策全文），直接下发会把移动端
-            # 撑爆 —— 820 字在手机上约 45 行，一条就占满一屏。截断放在
-            # **契约层**，这样任何调用方拿到的都是安全长度。
             "summary": _clip(self.summary,
                              SUMMARY_MAX_BY_KIND.get(self.kind,
                                                      SUMMARY_MAX_CHARS)),
             "published_at": self.published_at,
             "source_alias": source_pseudonym(self.source_alias),
+            # 公开平台名（**可空**）。用户口径：公开数据平台可以暴露
+            # （"公开数据的地方（AkShare/腾讯/新浪/东财/QMT）可以暴露"），
+            # 只有平台/群身份要藏。所以这里只映射**公开财经平台**，
+            # 研报机构与知识星球一律给空串 —— 白名单式，加源时默认不暴露。
+            "platform": PUBLIC_PLATFORMS.get(self.source_alias, ""),
             "codes": list(self.codes),
             "industry": self.industry,
             "rating_origin": self.rating_origin,
@@ -193,7 +234,85 @@ class IntelItem:
             # 可信度：**可复算、可展开看构成**（`explain`）。
             # 它只描述"多可核实"，不含任何方向判断。
             "credibility": cred.to_public(),
+            # 内容里出现的**机构名**（"中泰证券"/"天风证券"…）。
+            #
+            # ## 用户口径（2026-10-01）
+            #
+            # > "券商名不一定要告警，但是一定要前端输出信息。"
+            #
+            # 所以它**不是**告警触发条件（见 `domain/intel/alert_rules`），
+            # 但必须出现在前端 —— 用户要能看见"这条笔记是哪家机构出的 /
+            # 提到了哪家机构"，界面上会渲染成"机构：中泰证券"。
+            #
+            # ## ⚠️ 它与"来源平台"毫无关系，别混淆
+            #
+            #   · 本字段       **内容里写的机构**（研报本来就公开署名）→ 可以出
+            #   · `source_alias` / `platform`  这条**来自哪个渠道**（知识星球…）
+            #     → 一律不出，走 `source_pseudonym()` 白名单
+            # 加这个字段**不削弱**来源隐私纪律：它一个字都不透露渠道身份。
+            #
+            # 空列表是正常值（绝大多数快讯里没有机构名）。
+            "institutions": self._institutions(),
+            # 内容里命中的**分析师名**（用户点名的六人名单，见
+            # `alert_rules.ANALYST_WATCHLIST`）。
+            #
+            # ## 用户口径（2026-10-01）
+            #
+            # > "股票名 板块名 券商 孙潇雅、赵宇阳、武超则、陈果、刘晨明、洪灏
+            # >  ……推送到前端展示。"
+            #
+            # 这六个人原先**只用于告警触发**（`alert_bridge`），界面上一个字都
+            # 看不到 —— 用户现在要求他们**上屏**。所以这里与 `institutions`
+            # 完全平行：同一个扫描实现、同样是展示字段、同样在收容组的
+            # `_group_row()` 里显式透传（漏一处的表现就是"抽到了但永远看不到"，
+            # 不会有任何报错）。
+            #
+            # ⚠️ 与渠道身份**毫无关系**：名单命中的是**原文里写的分析师姓名**
+            # （公开署名内容），不是"这条来自知识星球"。渠道身份照旧走
+            # `source_pseudonym()`，一个字都不出。
+            "analysts": self._analysts(),
         }
+
+    def _institutions(self) -> list[str]:
+        """内容里命中的机构名（**展示用**，见 `to_public` 里那一段说明）。
+
+        ⚠️ 与告警侧（`alert_rules.institutions`）**共用同一个实现** ——
+        判据只能有一份：两处各写一遍必然漂移，而漂移的表现是
+        "前端显示了机构名、告警侧却没命中"（或反过来），两边都对不上账。
+
+        ⚠️ 契约层（本层）只有**未清洗的原文**，而告警侧扫的是清洗后文本。
+        这里扫原文是**有意的**：清洗（`content_filter.strip_noise`）会剥掉
+        星球署名，而那是**渠道**信息不是机构名，不影响本字段；
+        真正影响的是"剥了之后还剩什么"，那由 `build_feed` 在清洗之后
+        用同一份实现**再补一次**（见那里对 `institutions` 的处理）。
+        两层都扫，取并集，宁可多给一个名字。
+        """
+        from src.domain.intel import alert_rules
+
+        try:
+            return alert_rules.institutions({
+                "title": self.title, "summary": self.summary})
+        except Exception:  # noqa: BLE001 展示字段失败不该让整条出不了接口
+            return []
+
+    def _analysts(self) -> list[str]:
+        """内容里命中的**分析师名**（用户点名的六人名单）—— 展示用。
+
+        ⚠️ 与告警侧（`alert_rules.analysts`）**共用同一个实现**，理由与
+        `_institutions` 完全相同：判据只能有一份。两处各写一遍必然漂移，
+        而漂移的表现是"前端显示了名字、告警侧却没命中"（或反过来）。
+
+        ⚠️ 契约层（本层）只有**未清洗的原文**，所以这里扫原文；清洗之后
+        `build_feed` 会用同一份实现**再补一次**（清洗会剥掉星球署名，
+        而署名附近常带分析师名 —— 两层都扫、取并集，宁可多给一个名字）。
+        """
+        from src.domain.intel import alert_rules
+
+        try:
+            return alert_rules.analysts({
+                "title": self.title, "summary": self.summary})
+        except Exception:  # noqa: BLE001 展示字段失败不该让整条出不了接口
+            return []
 
 
 def _now_iso() -> str:
@@ -251,6 +370,29 @@ def _strip_rich_tags(text: object) -> str:
     s = re.sub(r"<e\b.*$", "", s, flags=re.S | re.I)
     # 收尾：多出来的空白与空行
     return re.sub(r"[ \t]{2,}", " ", s).strip()
+
+
+def strip_rich_tags(text: object) -> str:
+    """公开入口：剥掉上游正文里的内联富文本标签（**与脱敏链路同一份实现**）。
+
+    ## 为什么要有这个公开名字
+
+    抽取链路（`service.extraction_input`）必须先清洗**再压缩**：
+    实测有一条笔记的"尾部 300 字"整段是
+
+        …%E7%89%87%E4%BF%A1%E6%81%AF%23" />
+
+    也就是 URL 编码后的标签残留 —— 因为那时压缩（取两头各 300 字）
+    是直接作用在**原始文本**上的，`<e …>` 标签本身就在被取的那 300 字里，
+    切完才想起来要清洗，标签的头部已经被切掉了，谁也救不回来。
+
+    那个缺陷的修法是把顺序倒过来（见 `_strip_rich_tags` 的三条规则）。
+    但**修法不能是"再写一份剥离逻辑"**：这份逻辑里每一条都对应一次实测
+    泄漏（百分号编码、协议相对地址、被截断的标签），抄一份出去必然漂移，
+    而漂移的表现是"脱敏那条路干净了，抽取这条路还在把平台域名喂给模型"。
+    所以这里只暴露一个名字，实现仍然只有一份。
+    """
+    return _strip_rich_tags(text)
 
 
 def _clip(text: object, limit: int) -> str:
@@ -451,6 +593,78 @@ def _fetch_sina_newswire(*, limit: int = 30) -> list[IntelItem]:
     return items
 
 
+def _fetch_cls_newswire(*, limit: int = 30) -> list[IntelItem]:
+    """财联社电报（实测 20 条/次）。
+
+    ## 为什么加它（用户点名的平台）
+
+    > "把几大平台（雪球/东方财富股吧/同花顺/财联社/百度人气榜/韭研公社）的
+    >  热点事件和个股，聚合汇总显示在情报流或事件告警里。"
+
+    财联社是这批平台里**唯一能免费拿到、且带"红字"级别的重要电报**的源。
+    它的内容形态是"财联社X月X日电，……"，标题与内容高度重合，
+    所以 `title` 取标题、`summary` 取内容，由 `content_filter` 去重。
+
+    ⚠️ 它的 `发布日期`/`发布时间` 是**两列**，必须拼起来 ——
+    只取 `发布时间`（`15:36:44`）会丢掉日期，跨日排序会把昨天的电报
+    排到今天前面（本项目在 `sort_key` 上已经踩过一次跨格式排序的坑）。
+    """
+    import akshare as ak
+
+    df = ak.stock_info_global_cls(symbol="全部")
+    items: list[IntelItem] = []
+    for _, row in df.head(limit).iterrows():
+        title = str(row.get("标题", "") or "")
+        body = str(row.get("内容", "") or "")
+        day = str(row.get("发布日期", "") or "").strip()
+        clock = str(row.get("发布时间", "") or "").strip()
+        ts = f"{day} {clock}".strip()
+        items.append(IntelItem(
+            kind="newswire",
+            title=title or body[:60].replace("\n", " "),
+            summary=body,
+            published_at=ts,
+            source_alias="newswire-cls",
+            source_name="财联社-电报",
+            content_hash=_hash("cls", title, body[:120], ts),
+        ))
+    return items
+
+
+def _fetch_futu_newswire(*, limit: int = 50) -> list[IntelItem]:
+    """富途快讯（实测 50 条/次，带原文链接）。
+
+    ⚠️ 标题里有**占位式长标题**（实测偶发整篇正文被塞进标题列、
+    内容列为空）。所以标题为空时用内容首句兜底，反之亦然 ——
+    否则会产出"有标题没正文"的条目，被 `content_filter` 判成
+    `too_short` 丢掉，表现为"这个源采到了但一条都不显示"。
+    """
+    import akshare as ak
+
+    df = ak.stock_info_global_futu()
+    items: list[IntelItem] = []
+    for _, row in df.head(limit).iterrows():
+        title = str(row.get("标题", "") or "").strip()
+        body = str(row.get("内容", "") or "").strip()
+        ts = str(row.get("发布时间", "") or "").strip()
+        link = str(row.get("链接", "") or "").strip()
+        if not body:
+            body = title
+        if not title:
+            title = body[:60].replace("\n", " ")
+        items.append(IntelItem(
+            kind="newswire",
+            title=title,
+            summary=body,
+            published_at=ts,
+            source_alias="newswire-futu",
+            source_name="富途-快讯",
+            content_hash=_hash("futu", title, ts),
+            extra={"url": link},
+        ))
+    return items
+
+
 def _fetch_policy_cctv(date: str, *, limit: int = 30) -> list[IntelItem]:
     """新闻联播文字稿 —— 国内政策信号最权威的公开源（按日全量）。
 
@@ -481,10 +695,17 @@ def _fetch_policy_cctv(date: str, *, limit: int = 30) -> list[IntelItem]:
 # ======================================================================
 
 #: (源名, 调用工厂)。工厂接收 `ctx`（含 watch_codes 与 policy_date）。
+#:
+#: ⚠️ 这里是**并行合并**（`asyncio.gather`），不是 `source_chain` 文档里写的
+#: 降级链 —— 那个模块只有 `SOURCE_LABELS` 与注释在用，链路语义从未落地。
+#: 合并是有意的：快讯类源各自覆盖不同的时间段与口径，合并后才有"跨源同文"
+#: 可言（`related.py` 的 corroboration 正是靠这个），降级反而会丢掉这一点。
 _FETCHERS: Final[tuple[tuple[str, Callable[[dict[str, Any]], list[IntelItem]]], ...]] = (
     ("newswire_em", lambda c: _fetch_em_newswire(limit=c.get("newswire_limit", 100))),
     ("newswire_ths", lambda c: _fetch_ths_newswire(limit=c.get("newswire_limit", 30))),
     ("newswire_sina", lambda c: _fetch_sina_newswire(limit=c.get("newswire_limit", 30))),
+    ("newswire_cls", lambda c: _fetch_cls_newswire(limit=c.get("newswire_limit", 30))),
+    ("newswire_futu", lambda c: _fetch_futu_newswire(limit=c.get("newswire_limit", 60))),
     ("policy_cctv", lambda c: _fetch_policy_cctv(c["policy_date"], limit=30)),
 )
 
@@ -568,4 +789,5 @@ __all__ = [
     "IntelItem",
     "fetch_all",
     "health",
+    "strip_rich_tags",
 ]

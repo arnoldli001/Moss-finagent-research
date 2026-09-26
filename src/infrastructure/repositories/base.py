@@ -45,6 +45,26 @@ class DataPointRepository(ABC):
         调用方必须通过统一数据层，禁止直接操作数据库。
         """
 
+    @abstractmethod
+    async def delete_points_by_source(self, source_name: str) -> int:
+        """按**来源**删除数据点，返回删除行数。
+
+        用于「某个源整条链路作废」的清理（占位/模拟源退役、源口径错误污染本地
+        缓存）。这类清理的判据是来源而不是指标 —— `delete_points` 的指标口径做
+        不到：同一个 indicator id 下往往既有旧源的坏点、也有新源的好点，
+        按指标删会把新源的好数据一起删掉。
+        调用方必须通过统一数据层，禁止直接操作数据库。
+        """
+
+    @abstractmethod
+    async def prune_before(self, cutoff_date: str) -> int:
+        """保留策略：删除所有 period_date 早于截止线的数据点，返回删除行数。
+
+        用于「最多保留最近 N 年」。仅删除可定期间（period_date 非空）且早于
+        cutoff_date（`YYYY-MM-DD`）的行；period_date 为空/无法定期间的行不在
+        日期型保留范围内，避免误删无期间快照。
+        """
+
     async def close(self) -> None:
         """释放连接资源（默认无操作，连接池后端覆盖）。"""
         return None

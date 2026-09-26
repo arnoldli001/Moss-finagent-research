@@ -1,0 +1,1161 @@
+version: 1
+updated_at: "2026-09-20"
+
+# ==================================================================
+# 主线挖掘 · 期货品种 ↔ A 股板块 传导映射表
+# ------------------------------------------------------------------
+# 消费者：src/mainline/futures_mapping.py（结构契约 src.mainline.models.FutureMapping）
+# 表规模：93 行 / 89 个品种 = 内盘 55（50 商品 + 5 中金所金融期货）+ 外盘 25 + 非期货 9
+#         （4 行是一品种对两板块：SC 原油→航空反向、LC 碳酸锂→能源金属、M 豆粕→养殖反向、
+#           LH 生猪→屠宰反向，所以行数 93 大于品种数 89）
+#
+# 【代码口径 —— 三种约定混在同一列，靠 kind 区分取数路径】
+#   kind: domestic     Tushare fut_daily 主力连续，形如 `品种代码.交易所后缀`
+#   kind: foreign      AKShare/新浪外盘字母代码（商品）或 Tushare index_global 代码（海外指数）
+#   kind: non_futures  汇率 fx_daily(FXCM) / 场内基金 / 国际通行的非 Tushare 代码
+#
+# 【交易所后缀：实测口径，与交易所英文名不同】
+#   fut_basic(fut_type=2) 与 fut_daily 实际返回的后缀是
+#     SHF(上期所) / DCE(大商所) / ZCE(郑商所) / CFX(中金所) / INE(能源中心) / GFE(广期所)
+#   不是 SHFE / CZCE / GFEX。2026-09-01~09-17 区间实测：
+#     fut_daily(ts_code="RB.SHF") → 13 行；"RB.SHFE" → 0 行
+#     fut_daily(ts_code="TA.ZCE") → 13 行；"TA.CZCE" → 0 行
+#     fut_daily(ts_code="SI.GFE") → 13 行；"SI.GFEX" → 0 行
+#   表内 55 个内盘代码已逐个用 fut_daily 验证区间行数 > 0。
+#
+# 【board_code 命名空间】字段是**信息性**的，匹配仍以 board_name 为准（见 FutureMapping：
+#   board_code 允许为空、按名字匹配）。两种命名空间并存，前缀即来源：
+#     `883xxx.TI` / `86xxxx.TI` / `88xxxx.TI` = 同花顺指数（ths_index）
+#     `80xxxx.SI` / `85xxxx.SI`                 = 申万行业指数（sw_daily）
+#   同花顺概念优先（板块名即选股口径），同花顺没有合适的才回落申万一级/二级。
+#   全部 54 个 board_name 已逐个校对：在 ths_index(2517 条) 或 sw_daily(439 条) 中真实存在。
+#
+# 【已知取数风险（不影响本表作为映射字典使用）】
+#   1. `USDX.FXCM` 是 Spec 指定的美元指数代码，但 Tushare fx_daily 对该代码返回 0 行；
+#      fx_obasic 里 美元指数 的真实代码是 `USDOLLAR.FXCM`，其 fx_daily 行情止于 2023-06。
+#      即 Tushare 侧目前**没有**可用的美元指数日线，美元指数需另接 AKShare/新浪外盘。
+#   2. `ZN.CBOT` 是十年美债主连（国际通行代码 ZN 属 CBOT），Tushare 无此合约；后缀写
+#      CBOT 而不是 CFX，是因为 CFX 实测就是中金所，写成 ZN.CFX 会与上期所沪锌 ZN 混淆。
+#   3. 外盘商品字母代码在不同数据源间存在别名（如 布伦特原油 `OIL`），已在各行 logic 内写明
+#      交易所与品种全称，换源时以 logic 描述为准而不是以字母为准。
+#   4. `IXIC/SPX/DJI/HSI/N225/GDAXI` 走 Tushare index_global（已实测 2026-09 有行情），
+#      不走新浪外盘期货接口。
+#
+# 【direction 语义】positive=期货涨→板块利好；negative=期货涨→板块利空（成本端）；
+#   auxiliary=只作宏观流动性/情绪背景，不参与板块评分（非期货 9 行全部是 auxiliary）。
+# 【strength】人工设定的传导强度 ★1-5；季度滚动相关学校准值写 calibrated_strength，
+#   **不覆盖**本列（口径见 futures_mapping.py 模块 docstring）。
+# ==================================================================
+
+# ------------------------------------------------------------------
+# 产业链分组：chain 字段的取值域，用于"产业链级异动"判定
+#（同一 chain 下 N 个品种同时异动 → 判为链条级异动，而不是单品种噪音）
+# ------------------------------------------------------------------
+chains:
+  - key: precious_metals
+    label: 贵金属
+    note: 金/银/铂同受实际利率与避险驱动，金银比是同链内部的结构读数
+  - key: base_metals
+    label: 基本金属
+    note: 铜铝锌镍锡 + 氧化铝，同受美元、全球制造业 PMI 与中国地产竣工端驱动
+  - key: coal_steel
+    label: 煤焦钢矿
+    note: 焦煤→焦炭→铁矿石→螺纹/热卷成本与需求同源，双焦同涨即链条级异动
+  - key: energy
+    label: 能源油气
+    note: 原油为定价锚，燃料油/沥青/液化气是其裂解下游；LOF 是场内映射工具
+  - key: new_energy
+    label: 新能源材料
+    note: 工业硅→多晶硅→光伏，锂盐→正极→电池，两条链共同受终端装机与排产驱动
+  - key: building_materials
+    label: 建材
+    note: 纯碱是玻璃第一大原料（成本端），两者同涨要区分是需求共振还是成本推动
+  - key: chemicals
+    label: 化工
+    note: 芳烃链(PX→PTA)、聚酯链、煤化工(甲醇/尿素)、氯碱链，加工费比绝对价格更重要
+  - key: rubber
+    label: 橡胶轮胎
+    note: 天胶/合成胶是轮胎主要成本项，胶价涨对轮胎股是利润压制被需求对冲
+  - key: agri
+    label: 农产品
+    note: 大豆/玉米定种植与压榨利润，粕类定饲料成本，油脂定粮油加工利润
+  - key: soft_commodity
+    label: 软商品
+    note: 白糖/棉花/咖啡，供给受天气与产区政策主导，波动大但传导链短
+  - key: breeding
+    label: 养殖
+    note: 猪价是养殖利润本身、同时是屠宰与肉制品的成本，同一品种上下游反向
+  - key: pulp_paper
+    label: 浆纸
+    note: 浆价占纸企成本六成以上，纸价-浆价价差才是纸企利润
+  - key: shipping
+    label: 航运
+    note: 运价即集运公司收入，绕行/地缘事件是弹性放大器
+  - key: financial
+    label: 金融期货
+    note: 股指期货基差与持仓是机构对冲与风险偏好的读数；国债期货对应无风险利率
+  - key: global_equity
+    label: 全球股指
+    note: 隔夜外盘定 A 股开盘情绪，只作背景不参与板块评分
+  - key: macro_fx
+    label: 宏观汇率流动性
+    note: 美元/人民币/美债是外资流向与国内货币政策空间的先行变量，纯背景项
+
+# ------------------------------------------------------------------
+# 映射表：每行一条「期货品种 → A 股板块」传导
+# 字段齐全（即使为空也保留键）；future_code + board_name 是联合唯一键
+# ------------------------------------------------------------------
+mappings:
+
+  # ============ 一、内盘商品期货（50 个品种） ============
+
+  # ---- 贵金属 ----
+  - future_code: "AU.SHF"
+    future_name: "沪金"
+    kind: domestic
+    chain: precious_metals
+    board_name: "黄金"
+    board_code: "865030.TI"
+    direction: positive
+    strength: 5
+    lead_days: 1
+    logic: "金价直接决定矿企吨毛利与资源重估空间，沪金与黄金股当日同向且几乎无滞后，是表内传导最硬的一条"
+
+  - future_code: "AG.SHF"
+    future_name: "沪银"
+    kind: domestic
+    chain: precious_metals
+    board_name: "白银"
+    board_code: "865164.TI"
+    direction: positive
+    strength: 5
+    lead_days: 1
+    logic: "白银兼具贵金属与工业金属双重属性，价格弹性大于黄金，白银股的业绩贝塔因此更高"
+
+  - future_code: "PT.GFE"
+    future_name: "铂"
+    kind: domestic
+    chain: precious_metals
+    board_name: "小金属"
+    board_code: "875127.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "铂钯主用于尾气催化与氢能质子交换膜，广期所铂期货涨跌通过贵研铂业等标的传导至小金属板块"
+
+  # ---- 基本金属 ----
+  - future_code: "CU.SHF"
+    future_name: "沪铜"
+    kind: domestic
+    chain: base_metals
+    board_name: "金属铜"
+    board_code: "865146.TI"
+    direction: positive
+    strength: 4
+    lead_days: 2
+    logic: "铜价同时决定矿企吨矿利润与冶炼加工费，是铜产业股盈利预期与库存重估的共同锚"
+
+  - future_code: "AL.SHF"
+    future_name: "沪铝"
+    kind: domestic
+    chain: base_metals
+    board_name: "铝"
+    board_code: "875204.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "电解铝利润≈铝价-氧化铝-电价，铝价上行直接扩电解铝企业单吨盈利，是铝板块最强的单一变量"
+
+  - future_code: "ZN.SHF"
+    future_name: "沪锌"
+    kind: domestic
+    chain: base_metals
+    board_name: "金属锌"
+    board_code: "875225.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "锌价与冶炼加工费共同决定锌企利润，锌价上行利好矿冶一体化标的，对纯冶炼企业则被加工费抵消"
+
+  - future_code: "NI.SHF"
+    future_name: "沪镍"
+    kind: domestic
+    chain: base_metals
+    board_name: "金属镍"
+    board_code: "875223.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "镍价牵动不锈钢成本与三元前驱体成本，镍板块标的少但印尼供给政策事件驱动下弹性极大"
+
+  - future_code: "SN.SHF"
+    future_name: "沪锡"
+    kind: domestic
+    chain: base_metals
+    board_name: "小金属"
+    board_code: "875127.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "锡是半导体焊料刚需且供给高度集中，锡价上行与电子景气共振，通过锡业股份传导至小金属板块"
+
+  - future_code: "AO.SHF"
+    future_name: "氧化铝"
+    kind: domestic
+    chain: base_metals
+    board_name: "铝"
+    board_code: "875204.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "氧化铝是电解铝第一大成本，自身涨价利好氧化铝自给率高的铝企，对纯电解铝产能则是成本挤压"
+
+  # ---- 煤焦钢矿 ----
+  - future_code: "RB.SHF"
+    future_name: "螺纹钢"
+    kind: domestic
+    chain: coal_steel
+    board_name: "钢铁"
+    board_code: "881112.TI"
+    direction: positive
+    strength: 4
+    lead_days: 5
+    logic: "螺纹钢价格决定钢厂吨钢利润，价格上行→钢铁板块盈利预期改善；同时螺纹是地产与基建需求的直接读数"
+
+  - future_code: "HC.SHF"
+    future_name: "热轧卷板"
+    kind: domestic
+    chain: coal_steel
+    board_name: "钢铁"
+    board_code: "881112.TI"
+    direction: positive
+    strength: 4
+    lead_days: 5
+    logic: "热卷对应制造业与出口用钢需求，与螺纹共振时才是钢铁板块的全面行情，单热卷强则更利好板材类钢企"
+
+  - future_code: "I.DCE"
+    future_name: "铁矿石"
+    kind: domestic
+    chain: coal_steel
+    board_name: "钢铁"
+    board_code: "881112.TI"
+    direction: positive
+    strength: 3
+    lead_days: 5
+    logic: "铁矿是钢厂最大成本项，矿价上行挤压吨钢利润、却抬升铁矿自给率高的钢企，故对钢铁板块强度弱于成材"
+
+  - future_code: "J.DCE"
+    future_name: "焦炭"
+    kind: domestic
+    chain: coal_steel
+    board_name: "焦炭Ⅱ"
+    board_code: "801952.SI"
+    direction: positive
+    strength: 4
+    lead_days: 4
+    logic: "焦炭是焦化利润的载体，焦炭涨价直接扩焦化企业盈利，是煤焦钢链条中利润弹性最大的环节"
+
+  - future_code: "JM.DCE"
+    future_name: "焦煤"
+    kind: domestic
+    chain: coal_steel
+    board_name: "焦煤"
+    board_code: "859512.SI"
+    direction: positive
+    strength: 4
+    lead_days: 4
+    logic: "焦煤是焦炭的原料，焦煤价格上涨直接增厚炼焦煤企业利润，双焦同涨即为链条级供给收缩信号"
+
+  - future_code: "SS.SHF"
+    future_name: "不锈钢"
+    kind: domestic
+    chain: coal_steel
+    board_name: "特钢概念"
+    board_code: "885428.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "不锈钢价格与镍铬成本共振，通过太钢不锈等标的传导至特钢板块，但加工费模式下弹性弱于原料端"
+
+  - future_code: "SF.ZCE"
+    future_name: "硅铁"
+    kind: domestic
+    chain: coal_steel
+    board_name: "冶钢原料"
+    board_code: "884214.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "硅铁是炼钢脱氧剂，价格反映钢厂开工强度与能耗双控成本，是钢厂复产的先行读数"
+
+  - future_code: "SM.ZCE"
+    future_name: "锰硅"
+    kind: domestic
+    chain: coal_steel
+    board_name: "冶钢原料"
+    board_code: "884214.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "锰硅成本随锰矿与电价，价格上涨利多铁合金企业、同时抬升钢厂成本，链条内方向需按环节区分"
+
+  # ---- 能源油气 ----
+  - future_code: "SC.INE"
+    future_name: "原油"
+    kind: domestic
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: positive
+    strength: 4
+    lead_days: 2
+    logic: "油价定上游油气利润与炼化价差，是A股石油石化板块盈利预期的内盘定价锚"
+
+  - future_code: "SC.INE"
+    future_name: "原油"
+    kind: domestic
+    chain: energy
+    board_name: "航空机场"
+    board_code: "801991.SI"
+    direction: negative
+    strength: 2
+    lead_days: 2
+    logic: "航油是航空公司最大成本项，油价上行直接压缩航空毛利，与石油股方向相反，是最容易做反的一类传导"
+
+  - future_code: "FU.SHF"
+    future_name: "燃料油"
+    kind: domestic
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "高硫燃料油是炼厂余料与船燃，跟原油但受船运需求扰动，通过炼化企业利润传导至石油石化板块"
+
+  - future_code: "LU.INE"
+    future_name: "低硫燃料油"
+    kind: domestic
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "低硫燃料油受限硫令与航运需求驱动，与集运运价共振，是炼化企业船燃产品线的利润读数"
+
+  - future_code: "BU.SHF"
+    future_name: "沥青"
+    kind: domestic
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "沥青是炼厂重油流向，旺季对应道路基建开工，价格上涨反映炼厂重油产品线利润改善"
+
+  - future_code: "PG.DCE"
+    future_name: "液化石油气"
+    kind: domestic
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "液化石油气绑定丙烷进口价与民用燃气需求，价格上行改善炼化与LPG贸易企业的价差"
+
+  # ---- 新能源材料 ----
+  - future_code: "PS.GFE"
+    future_name: "多晶硅"
+    kind: domestic
+    chain: new_energy
+    board_name: "光伏概念"
+    board_code: "865090.TI"
+    direction: positive
+    strength: 4
+    lead_days: 5
+    logic: "硅料价格决定光伏链条内的利润分配，硅料涨价→上游硅料企业盈利改善，是光伏板块盈利拐点的领先读数"
+
+  - future_code: "SI.GFE"
+    future_name: "工业硅"
+    kind: domestic
+    chain: new_energy
+    board_name: "光伏概念"
+    board_code: "865090.TI"
+    direction: positive
+    strength: 3
+    lead_days: 5
+    logic: "工业硅是多晶硅与有机硅的共同原料，价格上涨通过成本传导影响光伏与有机硅两条链的盈利预期"
+
+  - future_code: "LC.GFE"
+    future_name: "碳酸锂"
+    kind: domestic
+    chain: new_energy
+    board_name: "锂电池"
+    board_code: "865007.TI"
+    direction: positive
+    strength: 4
+    lead_days: 3
+    logic: "锂价决定锂矿端利润与电池厂成本，锂价企稳回升是锂电板块盈利与库存重估的双重催化"
+
+  - future_code: "LC.GFE"
+    future_name: "碳酸锂"
+    kind: domestic
+    chain: new_energy
+    board_name: "能源金属"
+    board_code: "881267.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "矿端口径下锂矿企业收入直接由锂价决定，与电池厂的成本挤压方向相反，故单独映射能源金属板块"
+
+  # ---- 建材 ----
+  - future_code: "FG.ZCE"
+    future_name: "玻璃"
+    kind: domestic
+    chain: building_materials
+    board_name: "建筑材料"
+    board_code: "881115.TI"
+    direction: positive
+    strength: 3
+    lead_days: 5
+    logic: "玻璃价格定浮法玻璃利润，且是地产竣工端的直接读数，价格上行利好玻璃与建材龙头"
+
+  - future_code: "SA.ZCE"
+    future_name: "纯碱"
+    kind: domestic
+    chain: building_materials
+    board_name: "建筑材料"
+    board_code: "881115.TI"
+    direction: positive
+    strength: 3
+    lead_days: 5
+    logic: "纯碱是玻璃第一大原料，光伏玻璃扩产拉动重碱需求；但纯碱涨价对纯玻璃企业是成本挤压，需与玻璃同看"
+
+  # ---- 化工 ----
+  - future_code: "TA.ZCE"
+    future_name: "PTA"
+    kind: domestic
+    chain: chemicals
+    board_name: "基础化工"
+    board_code: "801030.SI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "PX-PTA-聚酯价差是聚酯链利润的度量，PTA加工费扩张直接改善聚酯与PTA企业的盈利"
+
+  - future_code: "PX.ZCE"
+    future_name: "对二甲苯"
+    kind: domestic
+    chain: chemicals
+    board_name: "基础化工"
+    board_code: "801030.SI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "PX是PTA的直接原料，PX价格与价差决定PTA环节利润分配，通过炼化一体化企业传导至化工板块"
+
+  - future_code: "EG.DCE"
+    future_name: "乙二醇"
+    kind: domestic
+    chain: chemicals
+    board_name: "基础化工"
+    board_code: "801030.SI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "乙二醇是聚酯第二大原料且进口依存度高，其价格决定聚酯成本端，与PTA共同框定涤纶利润"
+
+  - future_code: "MA.ZCE"
+    future_name: "甲醇"
+    kind: domestic
+    chain: chemicals
+    board_name: "煤化工概念"
+    board_code: "885398.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "甲醇是煤化工与MTO的核心中间品，价格随煤价与烯烃需求，是煤化工企业盈利的直接变量"
+
+  - future_code: "PP.DCE"
+    future_name: "聚丙烯"
+    kind: domestic
+    chain: chemicals
+    board_name: "基础化工"
+    board_code: "801030.SI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "聚丙烯油头与煤头工艺价差决定烯烃企业利润，价格上行反映包装与家电需求改善"
+
+  - future_code: "EB.DCE"
+    future_name: "苯乙烯"
+    kind: domestic
+    chain: chemicals
+    board_name: "基础化工"
+    board_code: "801030.SI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "纯苯-苯乙烯价差即EPS/ABS企业利润，苯乙烯价格上行通过改性塑料与家电外壳链传导"
+
+  - future_code: "BZ.DCE"
+    future_name: "纯苯"
+    kind: domestic
+    chain: chemicals
+    board_name: "基础化工"
+    board_code: "801030.SI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "纯苯是芳烃链起点，与原油、苯乙烯高度联动，是化工板块成本端最早的涨价信号"
+
+  - future_code: "SH.ZCE"
+    future_name: "烧碱"
+    kind: domestic
+    chain: chemicals
+    board_name: "氯碱"
+    board_code: "884023.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "烧碱是氯碱平衡的另一端，氧化铝与粘胶需求主导其价格，涨价直接改善氯碱企业综合利润"
+
+  - future_code: "UR.ZCE"
+    future_name: "尿素"
+    kind: domestic
+    chain: chemicals
+    board_name: "化肥"
+    board_code: "885967.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "尿素是化肥主品种，气头成本与农业需求共振，价格上行直接增厚氮肥与复合肥企业利润"
+
+  # ---- 橡胶 ----
+  - future_code: "RU.SHF"
+    future_name: "天然橡胶"
+    kind: domestic
+    chain: rubber
+    board_name: "轮胎轮毂"
+    board_code: "884291.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "天胶占轮胎成本大头，胶价上行对轮胎股本是成本压制，但通常伴随重卡与替换需求回暖，净效应偏正"
+
+  - future_code: "BR.SHF"
+    future_name: "丁二烯橡胶"
+    kind: domestic
+    chain: rubber
+    board_name: "轮胎轮毂"
+    board_code: "884291.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "丁二烯橡胶跟随丁二烯与油价，是轮胎企业替代天胶的成本对冲工具，与RU价差反映配方切换"
+
+  # ---- 农产品 ----
+  - future_code: "A.DCE"
+    future_name: "豆一"
+    kind: domestic
+    chain: agri
+    board_name: "大豆"
+    board_code: "885810.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "国产大豆价格直接决定豆农与大豆深加工企业的利润，收储政策是主要驱动变量"
+
+  - future_code: "C.DCE"
+    future_name: "玉米"
+    kind: domestic
+    chain: agri
+    board_name: "玉米"
+    board_code: "885811.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "玉米是能量饲料主体，价格上行利好种植与贸易环节，对深加工与饲料企业则是成本上升"
+
+  - future_code: "M.DCE"
+    future_name: "豆粕"
+    kind: domestic
+    chain: agri
+    board_name: "饲料"
+    board_code: "801014.SI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "豆粕是饲料最大成本项，价格上涨直接抬升饲料企业售价与压榨利润，饲料板块盈利同步改善"
+
+  - future_code: "M.DCE"
+    future_name: "豆粕"
+    kind: domestic
+    chain: agri
+    board_name: "养殖业"
+    board_code: "881102.TI"
+    direction: negative
+    strength: 2
+    lead_days: 2
+    logic: "饲料涨价压缩养殖利润，与饲料板块方向相反：豆粕是养殖成本、却是饲料企业的收入，同一品种上下游对立"
+
+  - future_code: "RM.ZCE"
+    future_name: "菜粕"
+    kind: domestic
+    chain: agri
+    board_name: "饲料"
+    board_code: "801014.SI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "菜粕与豆粕互为替代，价差决定饲料配方切换，价格上涨同样改善饲料企业盈利"
+
+  - future_code: "Y.DCE"
+    future_name: "豆油"
+    kind: domestic
+    chain: agri
+    board_name: "粮油加工"
+    board_code: "884010.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "豆油是压榨的主要利润来源，价格上涨直接改善榨利，是粮油加工板块盈利的核心变量"
+
+  - future_code: "OI.ZCE"
+    future_name: "菜油"
+    kind: domestic
+    chain: agri
+    board_name: "粮油加工"
+    board_code: "884010.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "菜油受进口菜籽与收储政策影响，与豆油、棕油互相替代，共同决定粮油加工企业的产品端定价"
+
+  - future_code: "P.DCE"
+    future_name: "棕榈油"
+    kind: domestic
+    chain: agri
+    board_name: "粮油加工"
+    board_code: "884010.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "棕榈油是油脂定价锚，产地出口政策与生柴掺混需求驱动，其价格领涨通常带动整个油脂链利润改善"
+
+  # ---- 软商品 ----
+  - future_code: "SR.ZCE"
+    future_name: "白糖"
+    kind: domestic
+    chain: soft_commodity
+    board_name: "农林牧渔"
+    board_code: "801010.SI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "糖价决定糖料种植收益与制糖企业利润，价格上行利好中粮糖业等制糖标的，对食品饮料则是成本上升"
+
+  - future_code: "CF.ZCE"
+    future_name: "棉花"
+    kind: domestic
+    chain: soft_commodity
+    board_name: "农林牧渔"
+    board_code: "801010.SI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "棉价决定棉农与轧花厂利润，是纺织产业链利润在上游与下游之间分配的核心变量"
+
+  # ---- 养殖 ----
+  - future_code: "LH.DCE"
+    future_name: "生猪"
+    kind: domestic
+    chain: breeding
+    board_name: "养殖业"
+    board_code: "881102.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "猪价决定养殖利润，产能周期决定幅度，是养殖板块盈利与股价最直接的驱动变量"
+
+  - future_code: "LH.DCE"
+    future_name: "生猪"
+    kind: domestic
+    chain: breeding
+    board_name: "农产品加工"
+    board_code: "881103.TI"
+    direction: negative
+    strength: 2
+    lead_days: 3
+    logic: "猪价是屠宰与肉制品企业的原料成本，猪价上涨压缩屠宰毛利，与养殖板块方向完全相反"
+
+  # ---- 浆纸 ----
+  - future_code: "SP.SHF"
+    future_name: "纸浆"
+    kind: domestic
+    chain: pulp_paper
+    board_name: "造纸"
+    board_code: "881137.TI"
+    direction: positive
+    strength: 3
+    lead_days: 3
+    logic: "浆价占纸企成本六成以上，浆价上行通常伴随纸价提价函，价格能否落地决定纸企毛利方向"
+
+  # ---- 航运 ----
+  - future_code: "EC.INE"
+    future_name: "欧线集运"
+    kind: domestic
+    chain: shipping
+    board_name: "航运"
+    board_code: "884191.TI"
+    direction: positive
+    strength: 4
+    lead_days: 2
+    logic: "运价即集运公司的单位收入，欧线运价上行直接增厚集运企业利润，绕行与地缘事件是弹性放大器"
+
+  # ============ 二、中金所金融期货（5 个品种） ============
+
+  - future_code: "IF.CFX"
+    future_name: "沪深300股指期货"
+    kind: domestic
+    chain: financial
+    board_name: "证券Ⅱ"
+    board_code: "801193.SI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "IF基差与持仓放大反映机构对冲与交易活跃度，直接增厚券商经纪与衍生品业务收入"
+
+  - future_code: "IH.CFX"
+    future_name: "上证50股指期货"
+    kind: domestic
+    chain: financial
+    board_name: "银行"
+    board_code: "881155.TI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "上证50中银行权重超三成，IH升贴水变化是权重蓝筹资金面与机构情绪的先行读数"
+
+  - future_code: "IC.CFX"
+    future_name: "中证500股指期货"
+    kind: domestic
+    chain: financial
+    board_name: "中证500成份股"
+    board_code: "883304.TI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "IC的现货标的就是中证500，基差走强反映中盘股资金面改善与对冲盘减压"
+
+  - future_code: "IM.CFX"
+    future_name: "中证1000股指期货"
+    kind: domestic
+    chain: financial
+    board_name: "小盘指数"
+    board_code: "801813.SI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "IM是中小盘对冲的主要工具，深度贴水收敛通常对应小盘股风险偏好回升与量化中性策略扩容"
+
+  - future_code: "T.CFX"
+    future_name: "十年国债期货"
+    kind: domestic
+    chain: financial
+    board_name: "高股息精选"
+    board_code: "886072.TI"
+    direction: positive
+    strength: 2
+    lead_days: 3
+    logic: "国债期货走强对应无风险利率下行，高股息资产的相对吸引力提升，是红利板块估值最确定的驱动"
+
+  # ============ 三、外盘期货 / 海外指数（25 个品种） ============
+
+  # ---- 外盘能源：NYMEX / ICE ----
+  - future_code: "CL"
+    future_name: "NYMEX原油"
+    kind: foreign
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: positive
+    strength: 4
+    lead_days: 1
+    logic: "WTI是隔夜油价的定价基准，其涨跌决定A股石油石化板块次日开盘的盈利预期修正方向"
+
+  - future_code: "OIL"
+    future_name: "布伦特原油"
+    kind: foreign
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: positive
+    strength: 4
+    lead_days: 1
+    logic: "Brent是全球原油现货贸易基准，定成品油与化工品成本，对石化板块的传导比WTI更贴近实际结算价"
+
+  - future_code: "NG"
+    future_name: "NYMEX天然气"
+    kind: foreign
+    chain: energy
+    board_name: "天然气"
+    board_code: "865032.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "气价影响城燃采购成本与LNG贸易商价差，海外气价异动通过进口成本预期传导至天然气板块"
+
+  # ---- 外盘贵金属：COMEX ----
+  - future_code: "GC"
+    future_name: "COMEX黄金"
+    kind: foreign
+    chain: precious_metals
+    board_name: "黄金"
+    board_code: "865030.TI"
+    direction: positive
+    strength: 5
+    lead_days: 1
+    logic: "美盘是黄金定价中心，COMEX金价隔夜变动直接决定次日A股黄金股开盘的定价与情绪"
+
+  - future_code: "SI"
+    future_name: "COMEX白银"
+    kind: foreign
+    chain: precious_metals
+    board_name: "白银"
+    board_code: "865164.TI"
+    direction: positive
+    strength: 5
+    lead_days: 1
+    logic: "与沪银同源，隔夜银价由内盘补涨，且受工业需求驱动波动大于黄金，白银股弹性更高"
+
+  # ---- 外盘基本金属：COMEX / LME ----
+  - future_code: "HG"
+    future_name: "COMEX铜"
+    kind: foreign
+    chain: base_metals
+    board_name: "金属铜"
+    board_code: "865146.TI"
+    direction: positive
+    strength: 4
+    lead_days: 1
+    logic: "美盘铜价领先内盘，是铜产业股隔夜定价的锚，与COMEX库存、美铜溢价共同反映区域供需"
+
+  - future_code: "CAD"
+    future_name: "LME铜"
+    kind: foreign
+    chain: base_metals
+    board_name: "金属铜"
+    board_code: "865146.TI"
+    direction: positive
+    strength: 4
+    lead_days: 1
+    logic: "LME是全球铜定价中心，其库存与升贴水结构决定铜价曲线，对铜产业股的中期盈利预期影响最大"
+
+  - future_code: "AHD"
+    future_name: "LME铝"
+    kind: foreign
+    chain: base_metals
+    board_name: "铝"
+    board_code: "875204.TI"
+    direction: positive
+    strength: 3
+    lead_days: 1
+    logic: "海外铝价影响出口报价与内外价差，LME铝与沪铝价差决定铝材出口窗口是否打开"
+
+  - future_code: "ZSD"
+    future_name: "LME锌"
+    kind: foreign
+    chain: base_metals
+    board_name: "金属锌"
+    board_code: "875225.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "外盘锌价影响锌企出口报价与进口矿加工费谈判，是锌板块盈利预期的领先变量"
+
+  - future_code: "NID"
+    future_name: "LME镍"
+    kind: foreign
+    chain: base_metals
+    board_name: "金属镍"
+    board_code: "875223.TI"
+    direction: positive
+    strength: 3
+    lead_days: 2
+    logic: "伦镍波动放大且隔夜传导快，印尼镍矿政策与俄镍供应事件均先在LME定价，再传导镍板块"
+
+  # ---- 外盘农产品：CBOT ----
+  - future_code: "S"
+    future_name: "CBOT大豆"
+    kind: foreign
+    chain: agri
+    board_name: "大豆"
+    board_code: "885810.TI"
+    direction: positive
+    strength: 3
+    lead_days: 1
+    logic: "CBOT大豆是全球定价中心，隔夜变动直接决定国内豆粕、豆油次日开盘与压榨利润预期"
+
+  - future_code: "C"
+    future_name: "CBOT玉米"
+    kind: foreign
+    chain: agri
+    board_name: "玉米"
+    board_code: "885811.TI"
+    direction: positive
+    strength: 3
+    lead_days: 1
+    logic: "美玉米与国内价差决定进口利润与饲用替代需求，进口窗口打开会压制国内玉米价格与种植利润"
+
+  - future_code: "W"
+    future_name: "CBOT小麦"
+    kind: foreign
+    chain: agri
+    board_name: "粮食概念"
+    board_code: "885995.TI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "小麦是口粮定价基准且与玉米存在饲用替代，海外麦价异动传导至粮食安全与种植板块情绪"
+
+  - future_code: "BO"
+    future_name: "CBOT豆油"
+    kind: foreign
+    chain: agri
+    board_name: "粮油加工"
+    board_code: "884010.TI"
+    direction: positive
+    strength: 2
+    lead_days: 1
+    logic: "CBOT豆油叠加美国生柴政策，是全球油脂定价锚，其上涨带动国内油脂压榨利润改善"
+
+  - future_code: "SM"
+    future_name: "CBOT豆粕"
+    kind: foreign
+    chain: agri
+    board_name: "饲料"
+    board_code: "801014.SI"
+    direction: positive
+    strength: 3
+    lead_days: 1
+    logic: "CBOT豆粕直接映射国内豆粕的成本端，隔夜美盘粕价决定次日饲料企业采购成本与提价预期"
+
+  # ---- 外盘软商品：ICE ----
+  - future_code: "CT"
+    future_name: "ICE棉花"
+    kind: foreign
+    chain: soft_commodity
+    board_name: "纺织服饰"
+    board_code: "801130.SI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "外棉价是进口成本与内外价差的另一端，外棉上涨打开国内棉价上行空间并传导至纺织服饰板块"
+
+  - future_code: "SB"
+    future_name: "ICE白糖"
+    kind: foreign
+    chain: soft_commodity
+    board_name: "农林牧渔"
+    board_code: "801010.SI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "原糖定配额外进口成本，外糖上涨抬高国内糖价底部，直接改善制糖企业盈利预期"
+
+  - future_code: "KC"
+    future_name: "ICE咖啡"
+    kind: foreign
+    chain: soft_commodity
+    board_name: "咖啡"
+    board_code: "865212.TI"
+    direction: positive
+    strength: 2
+    lead_days: 2
+    logic: "ICE咖啡受巴西产区天气主导，其价格波动传导至国内咖啡连锁与饮品企业的原料成本预期"
+
+  # ---- 海外指数：Tushare index_global ----
+  - future_code: "IXIC"
+    future_name: "纳斯达克指数"
+    kind: foreign
+    chain: global_equity
+    board_name: "半导体"
+    board_code: "865053.TI"
+    direction: auxiliary
+    strength: 3
+    lead_days: 1
+    logic: "隔夜纳指（尤以费城半导体权重）决定A股科技成长板块的开盘风险偏好，只作背景不单独作为看多理由"
+
+  - future_code: "SPX"
+    future_name: "标普500指数"
+    kind: foreign
+    chain: global_equity
+    board_name: "消费电子"
+    board_code: "865153.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "标普500是全球风险资产的定价基准，其苹果等消费电子龙头走势与A股果链情绪高度共振"
+
+  - future_code: "DJI"
+    future_name: "道琼斯指数"
+    kind: foreign
+    chain: global_equity
+    board_name: "家用电器"
+    board_code: "875183.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "道指成分以工业与消费龙头为主，其走势反映美国终端需求，与A股家电出口链的订单预期同向"
+
+  - future_code: "HSI"
+    future_name: "恒生指数"
+    kind: foreign
+    chain: global_equity
+    board_name: "银行"
+    board_code: "881155.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "港股是外资定价中国资产的窗口，恒指与A股权重银行股的外资持仓变化高度同步，作流动性背景项"
+
+  - future_code: "N225"
+    future_name: "日经225"
+    kind: foreign
+    chain: global_equity
+    board_name: "电子"
+    board_code: "801080.SI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "日经半导体设备与材料权重高且早于A股开盘，是亚太时段全球电子周期情绪的先行读数"
+
+  - future_code: "GDAXI"
+    future_name: "德国DAX"
+    kind: foreign
+    chain: global_equity
+    board_name: "汽车零部件"
+    board_code: "881126.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "德国汽车工业景气是A股汽车零部件出口链的先行读数，DAX走弱通常领先零部件订单预期下修"
+
+  # ---- 外盘汇率：ICE 美元指数期货 ----
+  - future_code: "DX"
+    future_name: "美元指数期货"
+    kind: foreign
+    chain: macro_fx
+    board_name: "有色金属"
+    board_code: "801050.SI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "ICE美元指数期货（新浪外盘代码DX）是全球美元流动性的定价基准，走强系统性压制以美元计价的有色金属"
+
+  # ============ 四、非期货品种（9 个，全部 auxiliary） ============
+  # 定位：宏观流动性与风险偏好的背景变量，只用于解释"为什么今天整体该谨慎/积极"，
+  # 不单独产生板块看多信号；strength 统一 1-2，direction 统一 auxiliary。
+
+  - future_code: "USDCNH.FXCM"
+    future_name: "离岸人民币"
+    kind: non_futures
+    chain: macro_fx
+    board_name: "人民币贬值受益"
+    board_code: "885840.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "Tushare fx_daily(FXCM) 口径；离岸人民币贬值利好出口链汇兑收益，同时是外资流向的先行读数，仅作背景"
+
+  - future_code: "USDX.FXCM"
+    future_name: "美元指数"
+    kind: non_futures
+    chain: macro_fx
+    board_name: "黄金"
+    board_code: "865030.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "Spec 指定的美元指数代码；注意 fx_daily 对该代码返回 0 行（fx_obasic 内真实代码为 USDOLLAR.FXCM，行情止于2023-06），需另接 AKShare/新浪。美元与金价长期负相关"
+
+  - future_code: "ZN.CBOT"
+    future_name: "十年美债主连"
+    kind: non_futures
+    chain: macro_fx
+    board_name: "银行"
+    board_code: "881155.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 2
+    logic: "CBOT十年期美债期货（国际通行代码ZN，Tushare无此合约故后缀写CBOT而非CFX，以免与上期所沪锌ZN混淆）。美债收益率是全球无风险利率锚"
+
+  - future_code: "USDJPY.FXCM"
+    future_name: "美元日元"
+    kind: non_futures
+    chain: macro_fx
+    board_name: "半导体"
+    board_code: "865053.TI"
+    direction: auxiliary
+    strength: 1
+    lead_days: 1
+    logic: "Tushare fx_daily(FXCM) 口径；日元套息交易的松紧决定全球风险资产杠杆水平，日元急升常对应半导体等高贝塔板块回调"
+
+  - future_code: "EURUSD.FXCM"
+    future_name: "欧元美元"
+    kind: non_futures
+    chain: macro_fx
+    board_name: "有色金属"
+    board_code: "801050.SI"
+    direction: auxiliary
+    strength: 1
+    lead_days: 1
+    logic: "Tushare fx_daily(FXCM) 口径；欧元走强通常对应美元走弱，利多以美元计价的有色金属，是汇率侧的镜像确认变量"
+
+  - future_code: "501018.SH"
+    future_name: "南方原油LOF"
+    kind: non_futures
+    chain: energy
+    board_name: "石油股"
+    board_code: "875034.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "场内原油QDII基金，是A股投资者参与油价的直接工具；其溢价率与涨幅反映油气板块的场内情绪与拥挤度"
+
+  - future_code: "162411.SZ"
+    future_name: "华宝油气LOF"
+    kind: non_futures
+    chain: energy
+    board_name: "油气开采"
+    board_code: "865011.TI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "跟踪美股油气上游指数，其溢价与涨幅是A股油气开采板块的隔夜先行读数，溢价过高需警惕情绪透支"
+
+  - future_code: "513100.SH"
+    future_name: "纳指100ETF"
+    kind: non_futures
+    chain: global_equity
+    board_name: "计算机"
+    board_code: "801750.SI"
+    direction: auxiliary
+    strength: 2
+    lead_days: 1
+    logic: "场内纳指100ETF的溢价与份额变化反映国内资金对成长风格的风险偏好，计算机板块对其弹性最敏感"
+
+  - future_code: "159920.SZ"
+    future_name: "恒生ETF"
+    kind: non_futures
+    chain: global_equity
+    board_name: "非银金融"
+    board_code: "801790.SI"
+    direction: auxiliary
+    strength: 1
+    lead_days: 1
+    logic: "场内恒生ETF是配置港股的核心工具，其溢价与份额变化是南下资金情绪的日内读数，非银板块弹性最高"

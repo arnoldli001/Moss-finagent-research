@@ -24,6 +24,7 @@ from src.api.routes.intraday_weights import router
 from src.infrastructure.repositories.intraday_profile_sqlite_repo import (
     IntradayProfileSqliteRepository,
 )
+from src.intraday.level_fit import LevelFitResult
 from src.intraday.service import IntradayService
 
 CODE = "300308"
@@ -274,3 +275,95 @@ def test_preview_declares_current_levels_field() -> None:
         "current_levels": {"low_buy": 9.5},
     })
     assert body.current_levels == {"low_buy": 9.5}
+
+
+# ======================================================================
+# /intraday/level-fit（档位拟合）：**quote 是 3 元组，必须解包**
+# ======================================================================
+
+class _Quote:
+    """够用的行情对象：路由链路只读 `.price`。"""
+
+    price = 89.36
+
+
+class _StubProvider:
+    """只喂 level-fit 路由要的两样：多日 bars 与实时快照。
+
+    ⚠️ `fetch_quote` **必须返回 3 元组** —— 真实 `IntradayDataProvider` 的签名是
+    `-> tuple[Quote, str, list[SourceAttempt]]`（多源容灾链）。
+    这里刻意照抄那个形状，否则测试就钉不住这次的 bug。
+    """
+
+    def __init__(self, quote_result: tuple) -> None:
+        self._quote_result = quote_result
+
+    async def fetch_bars(self, code: str, *, days: int):
+        return [object()], "腾讯行情", []          # 非空即可（路由只判空）
+
+    async def fetch_quote(self, code: str):
+        return self._quote_result
+
+
+class _StubService:
+    """只实现 level-fit 路由用到的那几个成员。"""
+
+    def __init__(self, provider: _StubProvider, config) -> None:
+        self.data_provider = provider
+        self.config = config
+        self._intraday_days = 10
+        self.seen: dict = {}
+
+    async def _fetch_daily_bars(self, code: str):
+        return None, "router"                       # 本测试不关心日线
+
+    async def level_fit(self, code, *, refresh, features, daily_bars, quote):
+        # ★ 这里记录路由**实际传进来**的 quote —— 旧代码传的是元组，会在此暴露。
+        self.seen = {"code": code, "refresh": refresh, "quote": quote}
+        return LevelFitResult(code=code, trade_date="2026-09-23")
+
+
+def test_level_fit_route_unpacks_quote_tuple(monkeypatch) -> None:
+    """**回归（2026-09-23）**：点「重新拟合」不再 503。
+
+    实测故障：`/intraday/level-fit` 把 `IntradayDataProvider.fetch_quote()` 的
+    返回值**直接当成 Quote** 往下传。但那个方法返回的是 **3 元组**
+    `(Quote, 源名, 尝试记录)`（多源容灾链），于是 `service._fit_levels_sync` 里
+    的 `quote.price` 抛
+
+        AttributeError: 'tuple' object has no attribute 'price'
+
+    而 `level_fit` 把这个异常吞成 `None`，路由便报
+    **503「档位拟合结果不可用」**——用户只看到一个语焉不详的失败。
+
+    ⚠️ **指纹：只有 `refresh=true`（重新拟合按钮）必现**。
+    `refresh=false` 时 `level_fit` 先命中当日缓存直接返回，根本走不到那个
+    同步拟合函数；而那份缓存是**快照路径**用正确解包过的 Quote 写进去的。
+    所以"不点重新拟合就正常、一点就炸"正是这个漏解包的指纹。
+
+    同文件里 `fetch_bars` 那一行**是解了包的**（`bars, bars_source, _attempts =`），
+    漏的只有 `fetch_quote` —— 这条测试把两者都钉住。
+    """
+    from src.api.routes import intraday_weights
+    from src.intraday.config import load_intraday_config
+
+    config = load_intraday_config()
+    sentinel = _Quote()
+    service = _StubService(_StubProvider((sentinel, "腾讯行情", [])), config)
+    # 造真 bars 太重：特征工程不是本测试的对象，只要求它别炸。
+    monkeypatch.setattr(intraday_weights, "build_intraday_features",
+                        lambda bars, config=None: [{"fake": 1}])
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.runtime = SimpleNamespace(intraday=service)
+    with TestClient(app) as client:
+        resp = client.get("/api/v1/intraday/level-fit",
+                          params={"code": CODE, "refresh": "true"})
+
+    assert resp.status_code == 200, resp.text
+    quote = service.seen["quote"]
+    assert not isinstance(quote, tuple), \
+        "路由把 fetch_quote 的 3 元组当 Quote 传下去了（refresh 路径会 503）"
+    assert quote is sentinel, "解包后应当拿到元组里的那个 Quote 对象"
+    assert service.seen["refresh"] is True, "refresh 没有透传到 level_fit"

@@ -32,21 +32,14 @@ class IndustryAgentBase(AnalysisAgentBase):
 
     def _requirements(self, payload: AnalysisPayload) -> str:
         focus = payload.focus or f"{self.industry_name}行业"
-        answer_rule = (
-            f'conclusion必须先直接回答用户提问「{payload.user_query[:80]}」，'
-            "再给行业景气研判；"
-            if payload.user_query else ""
-        )
         return (
-            f"你正在按「{self.framework}」框架分析{focus}所在的{self.industry_name}行业。\n"
-            "请输出JSON对象，字段：\n"
-            f'- "conclusion": {answer_rule}（200字内，必须点名"{focus}"，'
-            "引用本地信号或信息层事件中的具体事实，禁止复述与本行业无关的数据。\n"
-            "若上下文包含申万行业估值截面，须引用具体行业PE/PB数值判断估值高低；"
-            "若包含渗透率数据，须判断生命周期阶段（预研/导入/成长/成熟/饱和）。\n"
-            "可输出'估值洼地'判断：PE分位低于20%的行业值得关注，高于80%属高估。）\n"
-            '- "confidence": "high"|"medium"|"low"\n'
-            '- "outlook": "向好"|"平稳"|"走弱"|"不明确"\n'
+            f"按「{self.framework}」框架分析{focus}。\n输出JSON：\n"
+            f'- "conclusion": 首句直接答问并点名"{focus}"，200字内，引用本地信号/事件的'
+            "具体事实，不复述无关数据。有申万估值截面须引具体PE/PB判高低"
+            "（PE分位<20%关注、>80%高估，可判「估值洼地」）；有渗透率须判生命周期"
+            "（预研/导入/成长/成熟/饱和）\n"
+            '- "confidence": high|medium|low\n'
+            '- "outlook": 向好|平稳|走弱|不明确\n'
             '- "cycle_position": 当前行业周期位置（30字内，须用上述框架术语，'
             "并解释本地信号对应哪个阶段）\n"
             '- "drivers": 核心驱动因素2-4条（须落到本行业，如库存/价格/政策/需求）\n'
@@ -92,17 +85,16 @@ class IndustryAgentBase(AnalysisAgentBase):
                 if raw_conf is not None else fe.confidence
             )
             parts = [
-                f"- {indicator} {fe.status_icon}",
-                f"期间 {p.get('period_date', '?')}",
-                f"值 {p.get('value', '缺失')}",
-                f"来源 {p.get('source_name', '?')}",
-                f"置信度 {display_conf:.2f}",
+                f"- {fe.status_icon}{indicator}",
+                f"{p.get('period_date', '?')}={p.get('value', '缺失')}",
+                f"c{display_conf:.2f}",
+                str(p.get('source_name', '?')),
             ]
             if fe.weight_multiplier < 1.0:
-                parts.append(f"权重×{fe.weight_multiplier}")
+                parts.append(f"w×{fe.weight_multiplier}")
             if fe.note and fe.status != "expired":
-                parts.append(f"[{fe.note}]")
-            return " | ".join(parts)
+                parts.append(fe.note)
+            return " ".join(parts)
 
         # 常规行业指标（关注指标+PE时序点）
         for points in (watched, pe_points):
@@ -174,13 +166,12 @@ class IndustryAgentBase(AnalysisAgentBase):
                     line += f" | 备注：{note}"
                 lines.append(line)
 
-        # 头部时效概览
+        # 头部时效概览（紧凑）
         header = (
-            f"### 当前日期锚定：{today.isoformat()}\n"
-            f"### 行业：{self.industry_name}\n"
+            f"[日期{today.isoformat()}；{self.industry_name}行业"
+            + (f"；{expired_count}点过期过滤" if expired_count else "")
+            + "]\n"
         )
-        if expired_count:
-            header += f"### ℹ️ {expired_count} 个数据点因过期已过滤\n"
 
         return header + "\n".join(lines) if lines else header + "（无行业关注指标数据点）"
 

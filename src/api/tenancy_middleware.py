@@ -31,6 +31,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from src.core.errors import brief
 from src.core.tenancy import (
     DataClass,
     Principal,
@@ -43,9 +44,20 @@ from src.core.tenancy import (
 logger = logging.getLogger(__name__)
 
 #: 免鉴权路径（健康检查与前端静态资源）。**只放确实不需要身份的。**
+#:
+#: `/api/v1/health/live` 必须在这里，两个理由：
+#:   ① **登录页就要能用** —— 前端连接状态条在还没有会话时就要判断
+#:      "后端在不在"，否则用户会在登录页看到一条假的"服务不可达"；
+#:   ② 存活探针（k8s liveness / 负载均衡）本来就不该带凭证。
+#: 它的返回体只有 `{"ok": true, "ts": ...}`（无 pid、无环境名、无版本号），
+#: 匿名可读不泄露任何部署信息。
+#:
+#: ⚠️ 但**聚合健康度 `/api/v1/health` 故意不放进来**：它会返回 Ollama/
+#: DeepSeek 配置状态、数据源健康度、库表行数 —— 那是内部拓扑，
+#: 匿名可读等于给攻击者一份踩点清单。所以"存活免鉴权、就绪要鉴权"。
 _PUBLIC_PATHS: frozenset[str] = frozenset({
     "/api/v1/metrics/health", "/healthz", "/favicon.ico",
-    "/api/v1/metrics/ready",
+    "/api/v1/metrics/ready", "/api/v1/health/live",
 })
 
 #: 仅开发环境可用：允许用请求头声明身份（`MOSS_ALLOW_HEADER_IDENTITY=1` 时才生效）
@@ -240,8 +252,10 @@ class TenancyMiddleware(BaseHTTPMiddleware):
         except TenantError as exc:
             self._audit.record(principal=principal, method=request.method,
                                path=path, status=403, latency_ms=0,
-                               extra={"reason": str(exc)})
-            return JSONResponse({"detail": str(exc)}, status_code=403)
+                               extra={"reason": brief(exc)})
+            # 对外只发报错码 + 通用文案（异常原文可能含内部隔离规则，只进审计）
+            return JSONResponse(
+                {"detail": "权限不足", "code": "AUTH_4030"}, status_code=403)
         elapsed = int((time.perf_counter() - began) * 1000)
         self._audit.record(principal=principal, method=request.method, path=path,
                            status=response.status_code, latency_ms=elapsed)

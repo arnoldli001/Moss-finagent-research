@@ -22,7 +22,7 @@ def test_settings_alert_defaults():
     assert s.alert_confidence_min == 0.70
     assert s.alert_risk_high == 75
     assert s.alert_opp_high == 80
-    assert s.alert_email_to == "1027312283@qq.com"
+    assert s.alert_email_to == "2693888583@qq.com"
     assert s.alert_cooldown_hours == 24
     assert s.alert_smtp_host == "smtp.qq.com"
 

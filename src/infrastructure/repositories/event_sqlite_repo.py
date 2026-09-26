@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from src.domain.alerts.dedup import event_recency_key
 from src.domain.alerts.models import DEFAULT_TENANT, Event
 from src.domain.alerts.repository import EventRepository
 from src.infrastructure.repositories.alert_sqlite_repo import AlertSqliteMixin
@@ -92,15 +93,26 @@ class EventSqliteRepository(AlertSqliteMixin, EventSqliteStore, EventRepository)
         self, limit: int, tenant_id: str,
     ) -> list[Event]:
         self._sync_once()
+        # 取一窗 + 在 Python 里按 `event_recency_key` 排序后再截到 limit。
+        #
+        # 为什么不在 SQL 里排：`publish_time` 有两种写法（裸本地时间
+        # 'YYYY-MM-DD HH:MM:SS' 与 ISO 'YYYY-MM-DDTHH:MM:SS+08:00'），
+        # 字符串直接比大小在同一天里会把 ISO 写法恒判为更大；而"未来日程"
+        # 又不能只靠 publish_time 倒序 —— 财报披露日程的 publish_time 是未来
+        # 披露日（09-28/09-30），会永远压在当天快讯前面把候选窗口饿死
+        # （2026-09-24 实测：已分析 87 条 100% 是日程，184 条快讯一条没轮到，
+        # `fact_alerts` 恒 0）。规则只留一份实现：`dedup.event_recency_key`。
+        window = max(int(limit) * 10, 200)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM fact_events WHERE tenant_id = ? "
                 "AND COALESCE(analyzed, 0) = 0 "
-                "ORDER BY COALESCE(NULLIF(publish_time, ''), fetch_time) DESC, "
-                "created_at DESC LIMIT ?",
-                (tenant_id, int(limit)),
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (tenant_id, window),
             ).fetchall()
-        return [row_to_event(r) for r in rows]
+        events = [row_to_event(r) for r in rows]
+        events.sort(key=event_recency_key, reverse=True)
+        return events[:int(limit)]
 
     async def list_unanalyzed_events(
         self, limit: int = 100, tenant_id: str = DEFAULT_TENANT,

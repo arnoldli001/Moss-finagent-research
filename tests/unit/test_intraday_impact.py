@@ -4,7 +4,7 @@
   1. 档位线的来源说出来必须与 `compute_levels` 的实际取值**对得上**
      （标记布林下轨，值就不能是箱体下沿 —— 用户拿这两个数一比就会怀疑面板乱算）；
   2. 触发价必须与 `decide_signal` 的贴线判定同口径
-     （低吸触发价 = 低吸线×(1+贴线带宽)，价格跌到它就"触及"）；
+     （回踩触发价 = 回踩线×(1+贴线带宽)，价格跌到它就"触及"）；
   3. 「还差多少分/多少价」必须能直接读出结论，且止损/情绪周期否决要如实标出；
   4. 因子影响度就是得分（权重每 +1 分对总分的推动），关掉一项 = 减去它的贡献分。
 """
@@ -57,7 +57,7 @@ def _factor(key: str, score: float, weight: float, *, available: bool = True,
 
 
 def test_level_source_matches_box_when_boll_missing() -> None:
-    """没有布林数据时，低吸/高抛的来源就是箱体上下沿。"""
+    """没有布林数据时，回踩/冲高的来源就是箱体上下沿。"""
     config = IntradayConfig()
     annotated = annotate_level_basis(_levels(config=config), config)
     assert "箱体下沿 9.70" in annotated.low_source
@@ -111,7 +111,7 @@ def test_level_source_flags_band_clamp_so_value_and_label_agree() -> None:
 
 
 def test_trigger_prices_match_touch_band() -> None:
-    """触发价 = 低吸线×(1+贴线带宽) / 高抛线×(1−贴线带宽)（与 decide_signal 同口径）。"""
+    """触发价 = 回踩线×(1+贴线带宽) / 冲高线×(1−贴线带宽)（与 decide_signal 同口径）。"""
     config = IntradayConfig()
     config.levels.touch_band_pct = 0.5
     annotated = annotate_level_basis(_levels(config=config), config)
@@ -136,7 +136,7 @@ def test_gate_rows_tell_how_much_is_missing() -> None:
     assert "还差 8.0 分" in low.note
     assert high.score_need == pytest.approx(32.0)   # 12 + 20
     assert "还差 32.0 分" in high.note
-    # 低吸触发价在现价下方 → 价格需**下跌**才能触及
+    # 回踩触发价在现价下方 → 价格需**下跌**才能触及
     assert low.price_need_pct is not None and low.price_need_pct < 0
     assert high.price_need_pct is not None and high.price_need_pct > 0
 
@@ -167,7 +167,7 @@ def test_gate_reports_coverage_downgrade_and_cycle_veto() -> None:
     ])
     impact = build_trigger_impact(scorecard=card, levels=_levels(), config=config)
     low = next(row for row in impact.gates if row.key == "low_buy")
-    # 总分 40 已越过动手线，但覆盖度<70 → 只能出空心；周期否决 → 低吸不可动手
+    # 总分 40 已越过动手线，但覆盖度<70 → 只能出空心；周期否决 → 回踩不可动手
     assert impact.coverage_blocked is True
     assert impact.cycle_blocked is True
     assert impact.cycle_stage == "退潮期"
@@ -175,7 +175,7 @@ def test_gate_reports_coverage_downgrade_and_cycle_veto() -> None:
     assert "有效权重<70" in low.blocked_by
     assert "退潮期" in low.blocked_by
     assert any("一票否决" in note for note in impact.notes) or any(
-        "禁止正式低吸" in note for note in impact.notes)
+        "禁止正式回踩" in note for note in impact.notes)
 
 
 def test_cycle_facts_are_read_back_from_scorecard() -> None:
@@ -203,10 +203,10 @@ def test_impact_unavailable_without_scorecard_or_levels() -> None:
 
 
 def test_stop_loss_gate_flags_breakdown() -> None:
-    """跌破止损位 → ready=True 且明确写「禁止任何低吸信号」。
+    """跌破止损位 → ready=True 且明确写「禁止任何回踩信号」。
 
-    直接构造「现价在止损位下方」的档位：`compute_levels` 只保证止损低于低吸线，
-    而低吸线本身可以落在现价下方（早盘杀跌到低吸线以下的真实情形）。
+    直接构造「现价在止损位下方」的档位：`compute_levels` 只保证止损低于回踩线，
+    而回踩线本身可以落在现价下方（早盘杀跌到回踩线以下的真实情形）。
     """
     config = IntradayConfig()
     levels = LevelSet(
@@ -217,7 +217,7 @@ def test_stop_loss_gate_flags_breakdown() -> None:
     stop = next(row for row in impact.gates if row.key == "stop_loss")
     assert stop.ready is True
     assert "现价已跌破" in stop.note
-    assert "禁止任何低吸信号" in stop.note
+    assert "禁止任何回踩信号" in stop.note
 
 
 # ==================== 因子影响度 ====================
@@ -292,7 +292,7 @@ def test_level_deltas_compare_baseline_and_preview_params() -> None:
     """
     baseline = IntradayConfig()
     before = annotate_level_basis(_levels(config=baseline), baseline)
-    # 模拟"止损参数放宽 + 高抛线上移"之后的两条线
+    # 模拟"止损参数放宽 + 冲高线上移"之后的两条线
     after = before.model_copy(update={
         "low_buy": round(before.low_buy - 1.0, 4),
         "high_sell": round(before.high_sell + 2.0, 4),

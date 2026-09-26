@@ -84,6 +84,28 @@ performance:
 api:
   prefix: "/api/sector_crowding"
 
+# ---------------------------- [周频] ----------------------------------------
+# 告警面板最右侧 4 列「周频异动指标」：近5日/近1月/近2月拥挤度水位变化 +
+# 近1月资金净流入占板块流通市值比。由调度作业 crowding_metrics_weekly
+# （每周三 08:30）计算并落库 sector_crowding_metric，避免每天重算。
+metrics:
+  # 短窗口：近 N 个**交易日**的水位变化
+  short_days: 5
+  # "近 1 个月"折算多少个交易日（2 个月 = 这个值 × long_month_multiplier）
+  month_trading_days: 20
+  long_month_multiplier: 2
+  # 算变化率要求基准日水位 ≥ 该值，否则该列写 NULL（前端"—"）。
+  # 冷门板块水位可以低到 0.04%，"从 0.0004 涨到 0.02"会算出 +5000%，
+  # 数学没错但不是资金异动，且按列降序会把真异动板块全挤下去。
+  min_base_water: 0.005
+  # 板块成分股（ths_member）并发抓取线程数 / 失败重试次数
+  member_workers: 6
+  member_retry_times: 2
+  # 成分股本地缓存有效天数（900+ 板块全量抓一次约 4 分钟，别每次算都重抓）
+  member_cache_days: 30
+  # 每周几自动算（仅文档用途；实际 cron 在 src/scheduler/registry.py）
+  flow_weekday: 2
+
 # ---------------------------- [日志] ----------------------------------------
 logging:
   level: "INFO"

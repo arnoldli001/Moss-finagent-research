@@ -16,11 +16,9 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
     """合规风险、爆雷风险预警（PRD A12，P2）。"""
 
     system_prompt = (
-        "你是严谨的合规风控专员，职责是上市公司合规排雷与爆雷预警。基于给定的"
-        "财务比率数据点、本地规则旗标以及信息层提取的诉讼/监管事件进行研判。要求：\n"
-        "1. 只基于给定材料判断，未提及的违规/诉讼不得断言存在；\n"
-        "2. 爆雷等级必须与本地规则旗标数量和严重程度自洽，不得弱化严重旗标；\n"
-        "3. 输出仅为研究参考，不构成投资建议。"
+        "严谨合规风控专员，负责上市公司合规排雷与爆雷预警。依据财务比率、本地规则旗标"
+        "与诉讼/监管事件研判；未提及的违规/诉讼不断言。爆雷等级须与旗标数量、"
+        "严重程度自洽，不得弱化严重旗标。"
     )
 
     def __init__(self, gateway, agent_id: str = "A12_compliance",
@@ -53,13 +51,12 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
     def _requirements(self, payload: AnalysisPayload) -> str:
         calc_level = payload.hint.get("compliance_calc", {}).get("compliance_level_calc", "无")
         return (
-            f"本地规则给出的爆雷等级为「{calc_level}」，LLM结论必须与此自洽。\n"
-            "请输出JSON对象，字段：\n"
-            '- "conclusion": 合规风险与爆雷可能性评估（120字内，必须引用具体旗标/事件）\n'
-            '- "confidence": "high"|"medium"|"low"（有明确监管事件或严重旗标为high）\n'
-            '- "compliance_level": "高"|"中"|"无"（必须与本地规则等级一致）\n'
-            '- "burst_risk": 爆雷路径简述（如质押平仓/商誉减值/立案处罚，'
-            '无风险则填"未见明确爆雷路径"）\n'
+            f"本地规则爆雷等级为「{calc_level}」，LLM结论须与此自洽。\n"
+            "输出JSON：\n"
+            '- "conclusion": 合规与爆雷可能性评估，120字内，须引用具体旗标/事件\n'
+            '- "confidence": high|medium|low\n'
+            '- "compliance_level": 高|中|无（须与本地规则一致）\n'
+            '- "burst_risk": 爆雷路径简述（质押平仓/商誉减值/立案处罚；无则填"未见明确爆雷路径"）\n'
             '- "red_flags": 风险明细数组（与本地旗标呼应）\n'
-            '- "key_points": 2-4条要点'
+            '- "key_points": 2-4条'
         )

@@ -32,7 +32,7 @@
 
     # 指定密码
     .venv/Scripts/python.exe scripts/reset_admin_password.py --username admin \\
-        --password 'li12345671'
+        --password 'YOUR_NEW_PASSWORD'
 
     # ⚠️ 必须指定到**你正在用的那个库**（见下方"目标库"）
 

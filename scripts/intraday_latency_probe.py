@@ -33,7 +33,7 @@ import httpx  # noqa: E402
 
 from src.intraday.config import load_intraday_config  # noqa: E402
 from src.intraday.sources import IntradayDataProvider  # noqa: E402
-from src.core.errors import BRIEF_DEFAULT
+from src.core.errors import BRIEF_DEFAULT, brief
 
 SAMPLES = 20
 CODES = ["600519", "000001", "300750"]

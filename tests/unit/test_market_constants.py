@@ -89,10 +89,14 @@ def test_limit_pct_by_board() -> None:
 
 
 def test_auction_cap_threshold_not_merged_with_stats_threshold() -> None:
-    """统计口径（25 亿）与选股门槛（15/110 亿）必须保持不同。
+    """统计口径（25 亿）与选股门槛（2026-09-21 起是 20/150 亿）必须保持不同。
 
     历史上这两者被混用过一次，`market_constants` 里专门写了「不要合并」。
     这里用一个显式断言把"它们本来就不同"变成可执行事实。
+
+    ⚠️ 选股门槛的**具体数值**不在这里写死（它随用户口径变：25→15→20 亿、
+    150→110→150 亿）。这条测试守的是"两者没被合并"，所以只断言
+    "统计口径不等于任一选股边界" + "区间本身自洽"。
     """
     # `src/auction_select/` 是 .gitignore 里的私有核心资产，公开 checkout 里不存在；
     # 缺它就 skip 而不是失败（与 `test_auction_golden.py` 同一处置）。
@@ -108,9 +112,6 @@ def test_auction_cap_threshold_not_merged_with_stats_threshold() -> None:
         universe.max_market_cap,
     )
     assert universe.min_market_cap < universe.max_market_cap
-    # 15 亿 / 110 亿的元表示
-    assert universe.min_market_cap == 1.5e9
-    assert universe.max_market_cap == 11e9
 
 
 def test_magnitude_helpers() -> None:

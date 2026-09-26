@@ -665,3 +665,365 @@ def test_reclassify_updates_is_concept_without_touching_watermark(
         assert meta["885800.TI"]["last_update_date"] == "20260915"
     finally:
         conn.close()
+
+
+# ======================================================================
+# 成分股来源：优先用主线挖掘的提纯名单
+# ======================================================================
+
+
+def _pure_db(tmp_path: Path, rows: list[tuple[str, str, int]]) -> Path:
+    """造一个最小 `ml_member_pure` 库（`(board_code, code, relevant)`）。"""
+    path = tmp_path / "mainline_cache.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE ml_member_pure("
+                 "board_code TEXT, code TEXT, relevant INTEGER)")
+    conn.executemany("INSERT INTO ml_member_pure VALUES(?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_pure_members_take_priority_over_raw(tmp_path: Path) -> None:
+    """提纯名单可用时，**不能**再去用 `sector_member` 的原始名单。
+
+    这是本轮的真实缺陷：拥挤度的资金流列一直在用原始 `ths_member` 名单，
+    而主线挖掘早已换成提纯名单 —— 同一时刻两个子系统在讲不同的故事。
+    """
+    from src.sector_crowding import metrics
+
+    pure = _pure_db(tmp_path, [("885937.TI", f"00{i:04d}", 1) for i in range(11)])
+    conn = db.get_db_connection(path=tmp_path / "crowding.db")
+    db.init_tables(conn)
+    try:
+        db.upsert_members(conn, "885937.TI", [
+            {"code": f"99{i:04d}", "name": "原始沾边股"} for i in range(20)])
+        config = load_config()
+        config.metrics.min_purified_members = 3
+        pure_conn = metrics.open_pure_db(pure)
+        members, source = metrics._sector_members_cached(  # noqa: SLF001
+            conn, "885937.TI", config=config, pure_conn=pure_conn)
+        assert source == "purified"
+        assert len(members) == 11
+        assert all(code.startswith("00") for code in members)
+    finally:
+        conn.close()
+
+
+def test_pure_members_fall_back_when_degenerate(tmp_path: Path) -> None:
+    """提纯退化（只留下 1 只）时必须回退原始名单。
+
+    实测 885699 原始 256 只被压到 1 只 —— 那是提纯没跑完，不是"这个板块
+    只有一只相关股"。拿单只股票算资金流，噪声远大于信号。
+    """
+    from src.sector_crowding import metrics
+
+    pure = _pure_db(tmp_path, [("885699.TI", "000001", 1)])
+    conn = db.get_db_connection(path=tmp_path / "crowding.db")
+    db.init_tables(conn)
+    try:
+        db.upsert_members(conn, "885699.TI", [
+            {"code": f"99{i:04d}", "name": "原始"} for i in range(4)])
+        config = load_config()
+        config.metrics.min_purified_members = 3
+        members, source = metrics._sector_members_cached(  # noqa: SLF001
+            conn, "885699.TI", config=config,
+            pure_conn=metrics.open_pure_db(pure))
+        assert source == "raw"
+        assert len(members) == 4
+    finally:
+        conn.close()
+
+
+def test_pure_members_disabled_uses_raw(tmp_path: Path) -> None:
+    """`use_purified_members=False` 是给"提纯前后对照"用的开关。"""
+    from src.sector_crowding import metrics
+
+    pure = _pure_db(tmp_path, [("885937.TI", f"00{i:04d}", 1) for i in range(11)])
+    conn = db.get_db_connection(path=tmp_path / "crowding.db")
+    db.init_tables(conn)
+    try:
+        db.upsert_members(conn, "885937.TI", [
+            {"code": f"99{i:04d}", "name": "原始"} for i in range(20)])
+        config = load_config()
+        config.metrics.use_purified_members = False
+        members, source = metrics._sector_members_cached(  # noqa: SLF001
+            conn, "885937.TI", config=config,
+            pure_conn=metrics.open_pure_db(pure))
+        assert source == "raw"
+        assert len(members) == 20
+    finally:
+        conn.close()
+
+
+def test_open_pure_db_missing_file_is_not_an_error(tmp_path: Path) -> None:
+    """主线库不存在时安静回退，不该让整轮周频任务炸掉。"""
+    from src.sector_crowding import metrics
+
+    assert metrics.open_pure_db(tmp_path / "nope.db") is None
+    assert metrics.open_pure_db(tmp_path) is None       # 传目录也不行
+
+
+def test_metric_row_records_member_source(conn: sqlite3.Connection) -> None:
+    """`member_source` 必须落库 —— 否则无法回答"提纯名单到底生效没有"。"""
+    written = db.upsert_metrics(conn, [{
+        "sector_code": "885937.TI", "sector_name": "培育钻石",
+        "compute_week": "2026-W38", "computed_at": "2026-09-21T10:00:00",
+        "flow_base_date": "20260818", "flow_last_date": "20260915",
+        "net_inflow": 1.0e8, "circ_mv_base": 5.0e10, "flow_ratio": 0.2,
+        "member_source": "purified",
+    }])
+    assert written == 1
+    row = conn.execute(
+        f"SELECT member_source FROM {db.METRIC_TABLE}"
+        " WHERE sector_code='885937.TI'").fetchone()
+    assert row["member_source"] == "purified"
+
+
+def test_member_source_column_is_added_to_legacy_table(tmp_path: Path) -> None:
+    """老库（没有 `member_source` 列）要能靠 `_ADDABLE` 补列，不用重建表。"""
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute(f"CREATE TABLE {db.METRIC_TABLE} ("
+                   "id INTEGER PRIMARY KEY AUTOINCREMENT, sector_code TEXT,"
+                   " sector_name TEXT, compute_week TEXT, computed_at TEXT,"
+                   " base_date_5d TEXT, chg_5d REAL, base_date_1m TEXT,"
+                   " chg_1m REAL, base_date_2m TEXT, chg_2m REAL,"
+                   " flow_base_date TEXT, flow_last_date TEXT,"
+                   " net_inflow REAL, circ_mv_base REAL, flow_ratio REAL,"
+                   " UNIQUE(sector_code, compute_week))")
+    legacy.commit()
+    legacy.close()
+    conn = db.get_db_connection(path=path)
+    try:
+        db.init_tables(conn)
+        columns = {row["name"] for row in conn.execute(
+            f"PRAGMA table_info({db.METRIC_TABLE})")}
+        assert "member_source" in columns
+    finally:
+        conn.close()
+
+
+# ==================================================================
+# 板块黑名单：三个范围共用一个开关（2026-09-22 用户第四批）
+# ==================================================================
+
+
+def _seed_daily(conn: sqlite3.Connection, code: str, days: int = 8) -> None:
+    """给某板块写 `days` 天的水位（每天一个交易日，够算 5 日变化）。"""
+    for index in range(days):
+        conn.execute(
+            f"INSERT INTO {db.DAILY_TABLE}(trade_date, sector_code,"
+            " sector_name, water_level, created_at, updated_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (f"202609{index + 1:02d}", code, code, 0.5 + index * 0.01,
+             "2026-09-22", "2026-09-22"))
+    conn.commit()
+
+
+def test_water_changes_skip_blacklisted_sectors(monkeypatch,
+                                                conn: sqlite3.Connection) -> None:
+    """黑名单里的板块**不算拥挤度指标**。
+
+    用户口径是「不计入板块拥挤度**检测**范围」。`refresh._drop_blacklisted()`
+    只挡日更（不再写新行），而 `compute_water_changes` 是**全表扫描** ——
+    不在这里过滤的话，黑名单板块会带着停更前的老数据继续参与指标计算。
+    这条测试钉住"三个范围（主线池 / 日更 / 拥挤度指标）共用一个开关"。
+    """
+    from src.sector_crowding import metrics
+
+    _seed_daily(conn, "KEEP.TI")
+    _seed_daily(conn, "DROP.TI")
+    monkeypatch.setattr(metrics, "_sector_blacklist",
+                        lambda: frozenset({"DROP.TI"}))
+    changes, latest = metrics.compute_water_changes(conn)
+    assert "KEEP.TI" in changes
+    assert "DROP.TI" not in changes, "黑名单板块不得参与拥挤度指标计算"
+    assert latest == "20260908"
+
+
+def test_water_changes_keep_all_when_blacklist_unavailable(
+        monkeypatch, conn: sqlite3.Connection) -> None:
+    """黑名单**读不到**时不能当成"排除全部" —— 那会一个板块都不算。
+
+    与 `refresh._drop_blacklisted` 同一口径：不可用 = 不过滤。
+    """
+    from src.sector_crowding import metrics
+
+    _seed_daily(conn, "A.TI")
+    _seed_daily(conn, "B.TI")
+    monkeypatch.setattr(metrics, "_sector_blacklist", lambda: frozenset())
+    changes, _latest = metrics.compute_water_changes(conn)
+    assert {"A.TI", "B.TI"} <= set(changes)
+
+
+def test_sector_blacklist_helper_returns_empty_on_failure(monkeypatch) -> None:
+    """两份清单加载器**都**抛异常时，`_sector_blacklist()` 返回空集而不是把任务打挂。
+
+    ⚠️ 必须把**两份**都打坏：剔除来源有两个（主线批次点名 + 拥挤度剔除清单），
+    只坏一份时另一份仍会贡献代码 —— 第一版只坏了主线那份，断言就失败了。
+    """
+    import src.mainline.config as mainline_config
+    from src.sector_crowding import db, metrics
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("清单坏了")
+
+    monkeypatch.setattr(mainline_config, "load_removed_concepts", boom)
+    monkeypatch.setattr(metrics, "load_crowding_exclusions", boom)
+    monkeypatch.setattr(db, "load_crowding_exclusions", boom)
+    assert metrics._sector_blacklist() == frozenset()
+    assert db._sector_blacklist() == frozenset()
+
+
+def test_query_metrics_hides_removed_boards(monkeypatch,
+                                           conn: sqlite3.Connection) -> None:
+    """**"删了还在"的回归测试**：批次剔除的板块不得出现在拥挤度读取结果里。
+
+    用户剔除一个板块后，**当周已经算好的指标行还留在
+    `sector_crowding_metric` 里**（黑名单过滤只对之后算的周生效），
+    前端读这张表 → 板块"删了还在"。用户为此把同一批板块报了两遍。
+    所以读取侧必须兜住，而不是去删行（历史行按 `refresh` 的口径要保留）。
+    """
+    from src.sector_crowding import db
+
+    db.upsert_metrics(conn, [
+        {"sector_code": "KEEP.TI", "sector_name": "保留", "compute_week": "2026-W39"},
+        {"sector_code": "GONE.TI", "sector_name": "已剔", "compute_week": "2026-W39"},
+    ])
+    monkeypatch.setattr(db, "_sector_blacklist", lambda: frozenset({"GONE.TI"}))
+    got = db.query_metrics(conn, week="2026-W39")
+    assert "KEEP.TI" in got
+    assert "GONE.TI" not in got, "批次剔除的板块不得出现在拥挤度指标读取结果里"
+
+
+def test_seed_list_does_not_resurrect_blacklisted_boards(
+        monkeypatch, conn: sqlite3.Connection) -> None:
+    """**"删了又自己长回来"的回归测试**：`seed_list` 不得种回被剔除的板块。
+
+    实测复现的回路（2026-09-23，参股银行 885835.TI）：
+
+        用户删板块 → prune 置 visible=0 → 用户要求"彻底去掉"→ 删掉清单行
+        → 前端下一次调 `/config_list` → `seed_list()` 看到
+          "该板块在 `sector_meta` 里 bars=1456>0、且不在清单表里"
+        → **重新插入 visible=1** → 板块回到前端可见列表（无任何日志）
+
+    根因是判据混用：`bars>0` 是"**有没有数据**"的事实陈述，黑名单才是
+    "**用户还要不要它**"的意图陈述。`sector_meta` 的历史**刻意保留**
+    （不删历史是可逆性的前提），所以判据必须在读取侧。
+
+    与 `test_query_metrics_hides_removed_boards` 同型：
+    读取侧的每个入口都要兜住，只修一个入口就会有别的入口把删除抹掉。
+    """
+    from src.sector_crowding import db
+
+    db.update_sector_meta(conn, sector_code="KEEP.TI", sector_name="保留", bars=100)
+    db.update_sector_meta(conn, sector_code="GONE.TI", sector_name="已剔", bars=1456)
+    monkeypatch.setattr(db, "_sector_blacklist", lambda: frozenset({"GONE.TI"}))
+    added = db.seed_list(conn, concepts_only=False)
+    codes = {str(row[0]) for row in conn.execute(
+        f"SELECT sector_code FROM {db.LIST_TABLE}")}
+    assert "KEEP.TI" in codes
+    assert "GONE.TI" not in codes, "被剔除的板块不得被 seed_list 种回清单"
+    assert added == len(codes), "新增行数应与实际落库的清单行一致"
+
+
+def test_seed_list_still_seeds_when_blacklist_unavailable(
+        monkeypatch, conn: sqlite3.Connection) -> None:
+    """清单不可用时**照常种子化** —— 否则前端会一片空白（与其它读取侧同口径）。"""
+    from src.sector_crowding import db
+
+    db.update_sector_meta(conn, sector_code="A.TI", sector_name="A", bars=10)
+    monkeypatch.setattr(db, "_sector_blacklist", lambda: frozenset())
+    db.seed_list(conn, concepts_only=False)
+    codes = {str(row[0]) for row in conn.execute(
+        f"SELECT sector_code FROM {db.LIST_TABLE}")}
+    assert "A.TI" in codes
+
+
+def test_query_metrics_keeps_history_when_blacklist_unavailable(
+        monkeypatch, conn: sqlite3.Connection) -> None:
+    """清单不可用时**不过滤** —— 把"读不到"当成"排除全部"会让前端一片空白。"""
+    from src.sector_crowding import db
+
+    db.upsert_metrics(conn, [
+        {"sector_code": "A.TI", "sector_name": "A", "compute_week": "2026-W39"},
+        {"sector_code": "B.TI", "sector_name": "B", "compute_week": "2026-W39"},
+    ])
+    monkeypatch.setattr(db, "_sector_blacklist", lambda: frozenset())
+    got = db.query_metrics(conn, week="2026-W39")
+    assert {"A.TI", "B.TI"} <= set(got)
+
+
+def test_removed_concepts_is_the_scoped_list_not_the_whole_blacklist() -> None:
+    """`load_removed_concepts()` 只收**批次点名**那批，不是整份黑名单。
+
+    整份黑名单 600+ 条里大头是历史遗留（865xxx 概念体系 / GICS 行业 /
+    地域板块），而拥挤度模块**刻意保留**它们。按整份过滤会把最新一周的
+    板块数从 1878 砍到 1541 —— 多砍的绝大多数是行业指数，那是过度过滤。
+    """
+    from src.mainline.config import load_removed_concepts, load_sector_blacklist
+
+    removed = load_removed_concepts()
+    whole = load_sector_blacklist()
+    assert removed is not None and whole is not None
+    assert set(removed) < set(whole), "批次点名必须是整份黑名单的真子集"
+    assert len(removed) < 300, "批次点名不该把历史遗留那 400+ 条吃进来"
+    # 用户点名的三个必须在里面（血氧仪 / 信创 / 光伏概念）
+    assert {"886028.TI", "886013.TI", "885531.TI"} <= set(removed)
+    # 没被点名的板块不该被误伤
+    assert "885573.TI" not in removed          # 猪肉（用户特意保下来的）
+
+
+def test_crowding_exclusions_shipped_config_loads() -> None:
+    """线上那份拥挤度剔除清单必须真的被解析出来（否则等于没生效）。
+
+    ⚠️ 代码是 `scripts/prune_crowding.py --emit-config` **从库里查出来的**，
+    不是手写的 —— 第一版手写 6 个代码里有 4 个是错的（会把三胎概念 /
+    食品安全 / 元宇宙删掉）。这条测试顺带钉住"清单里的代码必须真存在于
+    `sector_crowding_list`"，防止有人再手写。
+    """
+    from src.sector_crowding.config import load_crowding_exclusions
+
+    ex = load_crowding_exclusions()
+    assert ex is not None, "线上清单必须可读"
+    assert len(ex) > 50, f"清单不该这么少（实际 {len(ex)}）"
+    # 用户点名的几个
+    assert {"885521.TI", "886026.TI", "886021.TI", "886019.TI"} <= ex
+
+
+def test_metrics_and_db_blacklist_include_crowding_exclusions() -> None:
+    """三处机制（算指标 / 显示 / 停日更）必须共用同一份拥挤度清单。"""
+    from src.sector_crowding import db, metrics, refresh
+    from src.sector_crowding.config import load_crowding_exclusions
+
+    ex = load_crowding_exclusions() or frozenset()
+    sample = sorted(ex)[:5]
+    for helper in (metrics._sector_blacklist, db._sector_blacklist):
+        got = helper()
+        assert set(sample) <= set(got), f"{helper.__module__} 没并入拥挤度清单"
+    boards = [{"sector_code": c} for c in list(sample) + ["885700.TI"]]
+    kept, blocked = refresh._drop_blacklisted(boards)
+    assert blocked == len(sample), "停日更没有挡掉拥挤度剔除清单里的板块"
+    assert [b["sector_code"] for b in kept] == ["885700.TI"]
+
+
+def test_blacklist_helpers_survive_missing_files(monkeypatch) -> None:
+    """两份清单都读不到时：返回空集 = **不过滤**，而不是"排除全部"。
+
+    把"读不到"当成"排除全部"会让拥挤度一个板块都不算、前端一片空白 ——
+    比"多算几个"严重得多。
+
+    ⚠️ 要从**模块自己的绑定**上打补丁：`metrics` / `db` 用的是
+    `from … import load_crowding_exclusions`，改源模块的属性不会影响
+    它们已经绑定的名字（第一版就是这么写错的）。
+    """
+    import src.mainline.config as mc
+    from src.sector_crowding import db, metrics
+
+    monkeypatch.setattr(mc, "load_removed_concepts", lambda *a, **k: None)
+    monkeypatch.setattr(metrics, "load_crowding_exclusions",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(db, "load_crowding_exclusions", lambda *a, **k: None)
+    assert metrics._sector_blacklist() == frozenset()
+    assert db._sector_blacklist() == frozenset()

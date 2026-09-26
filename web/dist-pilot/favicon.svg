@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"
+     role="img" aria-label="Moss-FinAgent-Research 量化投研工作台">
+  <title>Moss-FinAgent-Research 量化投研工作台</title>
+
+  <defs>
+    <linearGradient id="bar1" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#a9721c"/>
+      <stop offset="1" stop-color="#d9a13b"/>
+    </linearGradient>
+    <linearGradient id="bar2" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#c98f24"/>
+      <stop offset="1" stop-color="#e8bf4f"/>
+    </linearGradient>
+    <linearGradient id="bar3" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#e0b020"/>
+      <stop offset="1" stop-color="#ffd977"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="32" height="32" rx="7" fill="#0f1419"/>
+  <rect x="5.5"   y="18"  width="6.5" height="8.5"  rx="1.6" fill="url(#bar1)"/>
+  <rect x="12.75" y="12"  width="6.5" height="14.5" rx="1.6" fill="url(#bar2)"/>
+  <rect x="20"    y="5.5" width="6.5" height="21"   rx="1.6" fill="url(#bar3)"/>
+</svg>

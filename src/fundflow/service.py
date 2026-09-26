@@ -32,6 +32,7 @@ from src.core.errors import (
 )
 from src.core.trading_session import SESSION_LABELS
 from src.core.trading_session import session_state as _session_state
+from src.fundflow import sector_filter
 from src.fundflow.models import FlowBoard, FlowEntity, FlowPoint
 from src.fundflow.provider import FundFlowProvider, _finite
 from src.infrastructure.repositories.fund_flow_sqlite_repo import (
@@ -46,8 +47,9 @@ DEFAULT_TOP = 20
 CHART_LIMIT = 12
 # 盘中快照缓存：与做T自选池同一节奏（服务端 60 秒重算一次，前端取缓存）
 SNAPSHOT_TTL = 60.0
-# 个股榜里"昨日涨停股"的流通市值下限（元）：30 亿以下多为小资金推动，会淹没真实信号
-LIMIT_UP_MIN_CIRC_MV = 30e8
+#: ⚠️ 原「昨日涨停股保送入榜」的流通市值门槛（30 亿）。该口径已于 2026-09-22
+#: 取消（见 `_rank_stocks` 的说明），这里刻意**不保留**这个常量：留着它会让
+#: 后来者以为"还有个按市值筛涨停股的口径"，而实际上榜单已经是纯排序。
 # 涨停池 / 盘中快照的缓存（秒）：两者都盘中变化，60 秒与快照节奏一致
 QUOTE_TTL = 60.0
 
@@ -160,8 +162,28 @@ class FundFlowService:
             if state == "trading" else
             f"当前 {label}：板块即时口径不再变化，日频序列为最近一个交易日收盘值")
 
-        realtime = await self.provider.sector_snapshot()
-        if not realtime:
+        raw_realtime = await self.provider.sector_snapshot()
+        # 剔除"没有明确行业/概念"的板块（地域/指数成分/持仓属性/风格规模/
+        # 市场统计）。**必须在 `ensure_defaults` 之前**：默认热门是按当日净额
+        # 绝对值取的，而融资融券/富时罗素/MSCI中国这类板块金额极大，
+        # 不先滤掉就会被播种进用户的持久化选择列表 —— 之后再滤，
+        # 界面上就只剩"它在监控列表里，却永远不进榜单"的尴尬状态。
+        realtime, dropped = sector_filter.filter_payload(raw_realtime)
+        config = sector_filter.current()
+        note = sector_filter.disclosure(dropped, loaded=config.loaded,
+                                       gap=config.gap)
+        if note:
+            board.source_notes.append(note)
+        # 校验清单里的 (code, name) 配对是否与数据源一致。写错代码会**静默删掉
+        # 另一个真实板块**（名称匹配不上、代码却命中，两条路看起来都正常），
+        # 所以每次组装都对一遍，并把不一致摊在界面上而不是只记日志。
+        problems = sector_filter.verify_codes(raw_realtime)
+        if problems:
+            board.source_notes.append(
+                f"⚠️ 板块剔除清单有 {len(problems)} 条 code/名称不一致，"
+                f"可能误删了别的板块：{'；'.join(problems[:3])}"
+                + ("…" if len(problems) > 3 else ""))
+        if not raw_realtime:
             board.gaps.append(
                 "板块资金流截面不可用（Tushare `moneyflow_ind_dc` 失败或权限不足）——"
                 "板块榜与走势都拿不到数据")
@@ -182,7 +204,16 @@ class FundFlowService:
 
         # ---- 板块榜：近 N 日净额均值排序 ----
         selected_sectors = [entry.code for entry in await self.watchlist("sector")]
-        history_names = list(dict.fromkeys(selected_sectors))[:CHART_LIMIT]
+        # 已选列表也要过滤：默认热门是**早先**播种的（那时还没有剔除清单），
+        # 实测用户库里就躺着 MSCI中国 / 基金重仓 / 大盘成长 三个。
+        # 这里不删库里的记录（那是用户的选择，删了不可逆），只是本次不参与，
+        # 并如实说明有多少个被跳过 —— 否则"选定 12 个只画出 9 条线"会像 bug。
+        allowed_sectors, skipped = sector_filter.filter_names(selected_sectors)
+        if skipped:
+            board.source_notes.append(
+                f"已选板块里有 {skipped} 个属于剔除类别，本次不参与榜单与走势"
+                "（可在左侧监控列表里手动移除）")
+        history_names = list(dict.fromkeys(allowed_sectors))[:CHART_LIMIT]
         histories = await self._sector_histories(
             history_names, realtime=realtime, window_days=window_days)
         board.sector_rank = self._rank_sectors(histories, realtime, window_days)
@@ -192,20 +223,22 @@ class FundFlowService:
                 "已选板块的走势都没取到：可能是板块名与数据源口径不一致，"
                 "换一个（搜索加入）再试")
 
-        # ---- 个股榜：净额均值 / 流通市值 ----
+        # ---- 个股榜：净额均值 / 流通市值（自选单列，不占名额） ----
         stock_entries = await self.watchlist("stock")
         custom_codes = [entry.code for entry in stock_entries]
-        stock_rank, stock_series, stock_gaps = await self._rank_stocks(
+        stock_rank, stock_watch, stock_series, stock_gaps = await self._rank_stocks(
             window_days=window_days, top=top, extra_codes=custom_codes)
         board.stock_rank = stock_rank
+        board.stock_watch = stock_watch
         board.gaps.extend(stock_gaps)
         if stock_series:
             board.source_notes.append(
                 "个股日频资金流来自 Tushare moneyflow（本地仓库，单位元），"
                 "流通市值来自 daily_basic.circ_mv")
 
-        # 走势池 = 榜单前 N + 用户自定义（自定义优先，用户明确要看的必须在）
-        chart_codes = list(dict.fromkeys(custom_codes + [item.code for item in stock_rank]))
+        # 走势池 = 自选 + 榜单前 N（自选优先，用户明确要看的必须在，且总数受图上限约束）
+        chart_codes = list(dict.fromkeys(
+            [item.code for item in stock_watch] + [item.code for item in stock_rank]))
         chart_codes = chart_codes[:CHART_LIMIT]
         board.stocks = [stock_series[code] for code in chart_codes
                         if code in stock_series]
@@ -267,18 +300,31 @@ class FundFlowService:
 
     async def _rank_stocks(
         self, *, window_days: int, top: int, extra_codes: list[str],
-    ) -> tuple[list[FlowEntity], dict[str, FlowEntity], list[str]]:
-        """个股榜：**三类合成**（用户 2026-09-17 口径）。
+    ) -> tuple[list[FlowEntity], list[FlowEntity], dict[str, FlowEntity], list[str]]:
+        """个股榜 + 自选，**分两段返回**（2026-09-22 口径）。
 
-        构成（按顺序拼接，同一只票只出现一次，保留它最先命中的那一类）：
+        返回 `(榜单, 自选, 走势, 缺口)`。两段是**互斥**的：榜单里不含自选，
+        自选里不含榜单票（同一只票只会出现在一段里）。
 
-        1. **昨日涨停股**（且流通市值 ≥ `LIMIT_UP_MIN_CIRC_MV`，默认 30 亿）
-           —— 打板资金去向，是短线最直接的"钱在哪"；
-        2. **净流入前 10**（按「净额均值 ÷ 流通市值」排序）；
-        3. **净流出前 10**（同口径，取最负的）。
+        ## 榜单构成（纯排序，两个名额池）
 
-        为什么第 1 类要卡市值：30 亿以下的小票涨停常常是几百万资金推动的，
-        放进"机构大资金动向"里会完全淹没真实信号。
+        1. **净流入前 `top`**（按「净额均值 ÷ 流通市值」排序）；
+        2. **净流出前 `top`**（同口径，取最负的）。
+
+        ## 为什么自选要单独一段（用户 2026-09-22 要求）
+
+        原来自选票被塞进同一个 `stock_rank` 当作"入榜类别=自选"。后果实测：
+        个股榜 12 行里 10 行是自选 —— 用户手动加了几只票，`top=10` 的净流入榜
+        实际只显示得出 2 只，**自选把排行榜的名额吃光了**，榜就不成其为榜。
+
+        现在自选单列：它不占 `top` 名额，排行榜稳定给出完整的净流入/净流出
+        前 N；自选照样在，只是换个位置（前端单开一节）。
+        「自选」这个 rank_group 也随之取消 —— 两段本身已经说明了身份，
+        再挂一个类别徽标是重复信息。
+
+        ⚠️ 保留的东西（别一起删）：
+        * `_limit_up_pool()` 仍在调 —— 它是给**所有**入榜与自选个股补
+          「涨停原因」列（`limitup_reason`）的数据源，与"是否入榜"无关。
 
         排序在 DataFrame 上做（4 个标量列），只把**入选的**几十只票转成 FlowEntity
         并带出逐日序列 —— 给 5000 只票各建一个对象纯属浪费。
@@ -290,7 +336,7 @@ class FundFlowService:
                 "个股日频资金流不可用：本地 Tushare 仓库没有 moneyflow / daily_basic 数据。"
                 "补数：`python scripts/quant_warehouse.py sync --dataset moneyflow` "
                 "再 `ingest`（流通市值同理需要 daily_basic）")
-            return [], {}, gaps
+            return [], [], {}, gaps
         summary = (frame.groupby("code", as_index=False)["net"]
                    .agg(net_avg="mean", latest_net="last"))
         if caps is not None and len(caps):
@@ -304,27 +350,9 @@ class FundFlowService:
             if (row.get("circ_mv") and row["circ_mv"] > 0
                 and row.get("net_avg") is not None) else None, axis=1)
 
-        # ---- 三类候选 ----
-        # ① 昨日涨停（含涨停原因）：**历史判定必须用仓库自算** —— 东财 push2ex
-        #    的 `date` 参数实测无效（永远只给当天），用它会"把今天的涨停当成昨天"。
-        #    仓库 `daily.high >= stk_limit.up_limit` 是确定性判定，且不依赖盘中数据。
+        # 涨停池：**只用于**给个股补「涨停原因」列（见下方 pool_info），
+        # 不参与选票 —— 选票完全由净额/市值排序决定。
         limit_pool = await self._limit_up_pool()          # 今日涨停池（带原因）
-        yesterday_map = await asyncio.to_thread(
-            self.provider.limit_up_codes_from_warehouse)
-        yesterday_limit: list[str] = []
-        if yesterday_map:
-            cap_table = dict(zip(summary["code"].astype(str), summary["circ_mv"],
-                                 strict=False))
-            for code in yesterday_map:
-                circ = cap_table.get(code)
-                if circ and circ >= LIMIT_UP_MIN_CIRC_MV:
-                    yesterday_limit.append(code)
-            # 连板数高的排前面（用今日池里的 streak 作参考；没有就按代码序）
-            yesterday_limit.sort(
-                key=lambda item: -((limit_pool.get(item) or {}).get("streak") or 0))
-        else:
-            gaps.append("仓库缺 daily/stk_limit → 本次榜单缺「昨日涨停股」一类"
-                        "（补数：python scripts/quant_warehouse.py sync --dataset stk_limit）")
 
         numeric = summary.dropna(subset=["net_to_mv"]).sort_values(
             "net_to_mv", ascending=False)
@@ -332,29 +360,31 @@ class FundFlowService:
         outflow = [str(code) for code in numeric["code"].tail(top)][::-1]
         fallback = summary[summary["net_to_mv"].isna()].sort_values(
             "net_avg", ascending=False)
+        known = set(summary["code"].astype(str))
+        # 自选先登记成集合：它们**不进榜单**，但仍要取数据与走势
+        watch_codes = [str(code) for code in dict.fromkeys(extra_codes)]
+        watch_set = {code for code in watch_codes if code in known}
+
         picked: list[str] = []
         group_of: dict[str, str] = {}
         for code, group in (
-            *((code, "昨日涨停") for code in yesterday_limit),
             *((code, "净流入前10") for code in inflow),
             *((code, "净流出前10") for code in outflow),
             *((str(code), "其他") for code in fallback["code"]),
         ):
-            if code not in group_of:
+            if code not in group_of and code not in watch_set:
                 group_of[code] = group
                 picked.append(code)
-        # 用户手动加的票必须在（即使没进任何一类）
-        for code in extra_codes:
-            code = str(code)
-            if code not in group_of and code in set(summary["code"].astype(str)):
-                group_of[code] = "自选"
-                picked.append(code)
+        # 自选里不在榜单的一并取数（顺序按用户加入的先后，保持稳定）
+        picked.extend(code for code in watch_codes
+                      if code in watch_set and code not in group_of)
 
         series = await self.provider.stock_series(picked, window_days=window_days)
         names = await self._stock_names(picked)
         realtime = await self._realtime_snapshot(picked)
         entities: dict[str, FlowEntity] = {}
         order: list[FlowEntity] = []
+        watch: list[FlowEntity] = []
         by_code = {str(row["code"]): row for _, row in summary.iterrows()}
         for code in picked:
             payload = series.get(code)
@@ -367,7 +397,9 @@ class FundFlowService:
                                 data_source="Tushare moneyflow（本地仓库）")
             entity.series = [FlowPoint(**point) for point in payload["points"]]
             entity.circ_mv = payload.get("circ_mv")
-            entity.rank_group = group_of.get(code, "其他")
+            # 自选段的票不带 rank_group：身份由"在哪一段"表达，徽标是重复信息
+            is_watch = code in watch_set and code not in group_of
+            entity.rank_group = "" if is_watch else group_of.get(code, "其他")
             if row is not None:
                 # 用 `_finite` 而不是 `value != value`：
                 # pandas 的 object 列里缺值是 `None`，而 `None != None` 是 **False** ——
@@ -392,8 +424,9 @@ class FundFlowService:
                 entity.latest_date = entity.series[-1].date
             entity.available = bool(entity.series)
             entities[code] = entity
-            order.append(entity)
-        return order, entities, gaps
+            # 分两段：自选不占排行榜名额（见 `_rank_stocks` 的说明）
+            (watch if is_watch else order).append(entity)
+        return order, watch, entities, gaps
 
     async def _limit_up_pool(self) -> dict[str, dict[str, Any]]:
         """**上一交易日**涨停池（60 秒缓存）：`{code: {theme, streak, ...}}`。

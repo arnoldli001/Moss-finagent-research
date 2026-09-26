@@ -52,6 +52,14 @@ _HEADROOM_LABELS = {
     "unknown": "数据不足",
 }
 
+#: 档位 → **列表行用**的短标签（公开别名，供 `service.py` 的自选列表复用）。
+#:
+#: 与 `_HEADROOM_LABELS` 只差 "moderate" 一项：面板里说「估值中性偏多」，
+#: 而自选列表一行里要的是「估值合理」——用户口径 2026-09-23 列的三档就是
+#: 「估值透支 / 估值合理偏贵 / 估值合理」。放在这里而不是 service 里另抄一份，
+#: 是为了让"档位只有五个"这件事只有一处定义（少一处会漂移的重复）。
+HEADROOM_LABELS = {**_HEADROOM_LABELS, "moderate": "估值合理"}
+
 
 def valuation_from_series(
     pe_points: list[Any], pb_points: list[Any],

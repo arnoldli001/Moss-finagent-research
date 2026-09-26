@@ -1,5 +1,5 @@
 # 股票做T辅助模块配置（多因子合成打分 + 做T信号）
-#
+
 # 全部参数热可调：改本文件后重新请求 /api/v1/intraday/snapshot 即生效（按文件mtime自动重载）。
 # 权重约束：weights 各项之和必须恰好等于 100（加载时硬校验，防止总分刻度漂移）。
 
@@ -64,7 +64,7 @@ thresholds:
 #     levels:
 #       stop_loss_pct: 2.0                # 止损距离下限 2%
 #       atr_stop_mult: 0.8                # 且不小于 0.8×ATR（高波动股的关键）
-#       min_band_pct: 2.0                 # 低吸~高抛最小档位差，否则被摩擦成本吃光
+#       min_band_pct: 2.0                 # 回踩~冲高最小档位差，否则被摩擦成本吃光
 #   "600036":
 #     levels: {stop_loss_pct: 0.8, atr_stop_mult: 0.5}   # 低波动银行股：止损收紧
 
@@ -121,6 +121,15 @@ factors:
     # 中位 53.7 秒/次 —— 全是白烧算力。开启后 TTL 到期照常抓一次新闻（本来也要抓），
     # 内容指纹没变就直接复用、不调 LLM。关掉可回到"每个 TTL 周期都重跑"。
     reuse_when_unchanged: true
+    # 网关**磁盘**缓存的存活小时数（跨进程复用；与上面 data.news_cache_ttl
+    # 那个进程内 TTL 是两回事）。
+    # 为什么可以比进程内 TTL 长得多：prompt 里已经含了**新闻正文**，
+    # 所以"新闻没变 → 结论照样成立"；真正让结论失效的是新闻变化，
+    # 而那会改变 prompt 文本、自然换 key。
+    # 默认 6 小时：覆盖盘中反复刷新与当天重启，又不会拿昨天的情绪判今天。
+    # 设 0 = 不落盘，只走进程内缓存。
+    # 注意：前端「强制刷新」（?refresh=true）会绕过它，不受这个值影响。
+    gateway_cache_ttl_hours: 6.0
 
   # ---- 新增：指数量能（个股所属指数的量价配合） ----
   index_volume:
@@ -155,7 +164,7 @@ factors:
       usORCL: 0.5   # 甲骨文
       kr000660: 1.0 # 韩国SK海力士（存储，盘中同步）
 
-  # ---- 交易技能库四因子（2026-09-16 接入）----
+  # ---- 交易技能库四因子----
   # 缠论结构：分时/日线「包含处理→分型→笔→中枢→MACD背驰」
   chan:
     min_bars: 30          # 构建结构所需最少K线
@@ -212,8 +221,14 @@ data:
   valuation_cache_ttl: 3600 # 估值/同业缓存秒数（日频）
   news_cache_ttl: 600       # 消息面缓存秒数
   request_timeout: 12       # 单次外部请求超时（秒）
-  # 数据源优先级（逐个尝试，全部失败则报数据缺口，绝不使用模拟数据）
-  intraday_sources: [qmt, tencent, eastmoney, sina]
+  # 数据源优先级（逐个尝试，全部失败则报数据缺口）
+  #   tencent  快照 87ms / 分钟K(1m~60m) 86ms / 分时 78ms（三种用途全通）
+  #   sina     逐笔成交（聚合为分钟bar，最深兜底）
+  #   eastmoney 本机 push2*/push2his 被 TLS SNI 阻断，且阻断会漂移；见 core/eastmoney_direct.py
+  intraday_sources: [tencent, sina, eastmoney, qmt]
+  # QMT 数据源开关：默认关闭。终端无行情权限，打开只会贡献一次连接超时；
+  # 将来权限恢复时置 true 即可在链尾兜底（位置由上面的 intraday_sources 决定）。
+  qmt_enabled: false
 
 # ============ 交易时段（北京时间） ============
 session:
@@ -225,21 +240,21 @@ session:
 
 # ============ 关键价位 ============
 levels:
-  # 止损位 = 低吸线 × (1 - stop_loss_pct/100)；跌破即强制卖出警告并禁止一切低吸信号
+  # 止损位 = 回踩线 × (1 - stop_loss_pct/100)；跌破即强制卖出警告并禁止一切回踩信号
   stop_loss_pct: 1.0
-  # 高抛线 = 箱体上沿（可由 buffer 微调，正数上移）
+  # 冲高线 = 箱体上沿（可由 buffer 微调，正数上移）
   take_profit_buffer_pct: 0.0
   # 价格触及关键档位的判定带宽（%）：|price - level|/level ≤ band 视为触及
   touch_band_pct: 0.3
-  # 高抛线不高于布林上轨、低吸线不低于布林下轨时的融合开关
-  # （开启后低吸/高抛各取「箱体与布林带中更早被触及」的那条档位）
+  # 冲高线不高于布林上轨、回踩线不低于布林下轨时的融合开关
+  # （开启后回踩/冲高各取「箱体与布林带中更早被触及」的那条档位）
   blend_boll_bands: true
   # VWAP偏离极值 |z|：达标即视为「价格触及关键档位」（对应需求中的「VWAP极值」触发条件）
   vwap_extreme_z: 1.5
-  # 低吸线~高抛线的最小档位差（占现价%）：做T一轮双边成本约0.2%
+  # 回踩线~冲高线的最小档位差（占现价%）：做T一轮双边成本约0.2%
   # （佣金0.05% + 印花税0.05% + 滑点0.1%），档位差过小会让信号被摩擦成本吃光
   min_band_pct: 1.5
-  # 档位差上限：防止箱体过宽时低吸/高抛线离现价太远而永不触发
+  # 档位差上限：防止箱体过宽时回踩/冲高线离现价太远而永不触发
   max_band_pct: 8.0
 
 # ============ 关联板块（同花顺概念板块名，real-time 快照含板块涨幅/涨跌家数/资金流） ============
@@ -259,9 +274,27 @@ boards:
 # peers：自选同业股票池（用于逐只 PE/PB 对比，经腾讯批量快照一次取回）
 # industry：巨潮行业分类名（用于自动取"行业中位数PE"作权威对标）
 watchlist:
-  - code: "600150"
-    name: "中国船舶"
-    boards: ["PCB概念"]
+  - code: "688825"
+    name: "长鑫科技"
+    boards: ["存储芯片"]
+    peers: []
+    overseas: ["usmu"]
+  - code: "002409"
+    name: "雅克科技"
+    boards: ["存储芯片"]
+    peers: []
+  - code: "300308"
+    name: "中际旭创"
+    boards: ["通信设备", "共封装光学(CPO)"]
+    peers: []
+    overseas: ["usNVDA"]
+  - code: "002636"
+    name: "金安国纪"
+    boards: ["覆铜板", "PCB概念"]
+    peers: []
+  - code: "002436"
+    name: "兴森科技"
+    boards: ["通信网络设备及器件", "F5G概念", "通信设备"]
     peers: []
   - code: "603083"
     name: "剑桥科技"
@@ -280,26 +313,6 @@ watchlist:
     boards: []
     peers: []
     overseas: ["usNVDA"]
-  - code: "603618"
-    name: "杭电股份"
-    boards: []
-    peers: []
-  - code: "600721"
-    name: "百花医药"
-    boards: []
-    peers: []
-  - code: "002297"
-    name: "博云新材"
-    boards: []
-    peers: []
-  - code: "688432"
-    name: "有研硅"
-    boards: []
-    peers: []
-  - code: "600737"
-    name: "中粮糖业"
-    boards: []
-    peers: []
   - code: "300319"
     name: "麦捷科技"
     boards: []
@@ -316,49 +329,13 @@ watchlist:
     name: "德福科技"
     boards: []
     peers: []
-  - code: "300913"
-    name: "兆龙互连"
-    boards: ["光纤概念"]
-    peers: []
   - code: "002855"
     name: "捷荣技术"
-    boards: []
-    peers: []
-  - code: "000402"
-    name: "金融街"
     boards: []
     peers: []
   - code: "688017"
     name: "绿的谐波"
     boards: ["F5G概念"]
-    peers: []
-  - code: "603402"
-    name: "陕西旅游"
-    boards: ["旅游综合"]
-    peers: []
-  - code: "688372"
-    name: "伟测科技"
-    boards: []
-    peers: []
-  - code: "301018"
-    name: "申菱环境"
-    boards: []
-    peers: []
-  - code: "300189"
-    name: "神农种业"
-    boards: []
-    peers: []
-  - code: "600869"
-    name: "远东股份"
-    boards: []
-    peers: []
-  - code: "002437"
-    name: "誉衡药业"
-    boards: []
-    peers: []
-  - code: "000779"
-    name: "甘咨询"
-    boards: []
     peers: []
   - code: "600127"
     name: "金健米业"
@@ -372,10 +349,6 @@ watchlist:
     name: "欧莱新材"
     boards: []
     peers: []
-  - code: "601118"
-    name: "海南橡胶"
-    boards: []
-    peers: []
   - code: "002655"
     name: "共达电声"
     boards: []
@@ -386,18 +359,6 @@ watchlist:
     peers: []
   - code: "688028"
     name: "沃尔德"
-    boards: []
-    peers: []
-  - code: "600313"
-    name: "农发种业"
-    boards: []
-    peers: []
-  - code: "003040"
-    name: "楚天龙"
-    boards: []
-    peers: []
-  - code: "002365"
-    name: "永安药业"
     boards: []
     peers: []
   - code: "600186"
@@ -476,10 +437,6 @@ watchlist:
     name: "胜蓝股份"
     boards: []
     peers: []
-  - code: "601360"
-    name: "三六零"
-    boards: []
-    peers: []
   - code: "300433"
     name: "蓝思科技"
     boards: []
@@ -496,14 +453,45 @@ watchlist:
     name: "盛科通信"
     boards: ["F5G概念", "通信网络设备及器件", "通信设备"]
     peers: []
+  - code: "603626"
+    name: "科森科技"
+    boards: ["通信网络设备及器件", "F5G概念", "通信设备"]
+    peers: []
+  - code: "300913"
+    name: "兆龙互连"
+    boards: ["光纤概念"]
+    peers: []
+    pinned: true
+  - code: "300502"
+    name: "新易盛"
+    boards: ["能源金属", "动力电池回收", "小金属概念"]
+    peers: []
+  - code: "688300"
+    name: "联瑞新材"
+    boards: ["通信网络设备及器件", "通信设备", "同花顺金仓30"]
+    peers: []
 # <<< intraday-watchlist:end
 # ============ 信号推送（实心三角才推送；空心三角仅站内） ============
 notify:
   enabled: true
   # 仅推送正式信号（实心三角）与止损警告，避免提示线噪音
   push_solid_only: true
-  # 同标的同方向信号的推送冷却（分钟）
+  # 通知后静默多久（分钟）—— 窗口内无论重算多少次都不再发。
+  #
+  # 用户口径（2026-09-25）："可以设置成发出一次通知就静默半小时，
+  # 半小时后再检测，一天最多单个票发4次。"
   cooldown_minutes: 30
+  # ★ 每只票每日通知上限（所有方向合计）。
+  #
+  # 按**票**计而不是按（票, 方向）计 —— 否则"回踩 4 次 + 冲高 4 次"
+  # 就是 8 封，与"一天最多单个票发4次"不符。`0` = 不限制。
+  #
+  # ⚠️ 它与 cooldown_minutes 谁先到就按谁拦：上限设 100 + 冷却设 5
+  # 等于放开刷屏（一天几十封）。
+  daily_max_per_code: 4
+  # 当日节流总开关。**不要**为了"想多收点"关掉它 ——
+  # 关掉就退回"价格停在触发带内就每分钟重算重发"那个刷屏 bug。
+  daily_cap_enabled: true
   # 飞书/钉钉/企业微信 群机器人 Webhook（经环境变量注入，禁止硬编码）
   feishu_webhook_env: "FEISHU_WEBHOOK_URL"
   dingtalk_webhook_env: "DINGTALK_WEBHOOK_URL"

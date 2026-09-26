@@ -1,0 +1,637 @@
+{
+  "iteration": 1,
+  "label": "pure055",
+  "note": "",
+  "at": "2026-09-21T20:03:14+08:00",
+  "config": {
+    "six_dim.weights": {
+      "trading": 20.0,
+      "prosperity": 30.0,
+      "moneyflow": 20.0,
+      "chips": 10.0,
+      "macro": 5.0,
+      "technical": 15.0
+    },
+    "six_dim.reverse_dims": [
+      "trading",
+      "technical"
+    ],
+    "accumulation.weights": {
+      "leverage": 25.0,
+      "northbound": 50.0,
+      "volume_price": 25.0,
+      "etf": 0.0
+    },
+    "synthesis.layer_weights": {
+      "six_dim": 50.0,
+      "accumulation": 50.0
+    },
+    "etf.breakout_amount_ratio": 1.5,
+    "etf.breakout_percentile": 0.9,
+    "etf.bonus": [
+      6.0,
+      12.0,
+      3.0,
+      20.0
+    ],
+    "alert.nominate_limit": 8,
+    "alert.nominate_etf_limit": 3,
+    "alert.medium_score": 55.0,
+    "alert.strong_score": 70.0
+  },
+  "ic": {
+    "旧区间": {
+      "days": 204,
+      "boards": 317,
+      "factors": {
+        "total@20": {
+          "ic": 0.05172,
+          "icir": 0.3449,
+          "win": 0.6149,
+          "t_ne": 0.836,
+          "days": 174
+        },
+        "total@60": {
+          "ic": -0.00447,
+          "icir": -0.0463,
+          "win": 0.5224,
+          "t_ne": -1.131,
+          "days": 134
+        },
+        "six_dim@20": {
+          "ic": 0.09835,
+          "icir": 0.4731,
+          "win": 0.6494,
+          "t_ne": 1.349,
+          "days": 174
+        },
+        "six_dim@60": {
+          "ic": 0.13261,
+          "icir": 1.0301,
+          "win": 0.8284,
+          "t_ne": -4.287,
+          "days": 134
+        },
+        "accumulation@20": {
+          "ic": 0.08165,
+          "icir": 0.478,
+          "win": 0.6049,
+          "t_ne": 0.725,
+          "days": 162
+        },
+        "accumulation@60": {
+          "ic": 0.07432,
+          "icir": 0.5618,
+          "win": 0.6311,
+          "t_ne": 1.348,
+          "days": 122
+        },
+        "leader@20": {
+          "ic": -0.0097,
+          "icir": -0.0845,
+          "win": 0.4425,
+          "t_ne": -1.224,
+          "days": 174
+        },
+        "leader@60": {
+          "ic": -0.00192,
+          "icir": -0.019,
+          "win": 0.5299,
+          "t_ne": -6.732,
+          "days": 134
+        },
+        "six_dim.trading@20": {
+          "ic": -0.10979,
+          "icir": -0.3575,
+          "win": 0.408,
+          "t_ne": -1.423,
+          "days": 174
+        },
+        "six_dim.trading@60": {
+          "ic": -0.22116,
+          "icir": -0.8892,
+          "win": 0.194,
+          "t_ne": -0.05,
+          "days": 134
+        },
+        "six_dim.technical@20": {
+          "ic": -0.08159,
+          "icir": -0.3052,
+          "win": 0.45,
+          "t_ne": -1.407,
+          "days": 160
+        },
+        "six_dim.technical@60": {
+          "ic": -0.07532,
+          "icir": -0.2954,
+          "win": 0.4667,
+          "t_ne": -3.458,
+          "days": 120
+        },
+        "six_dim.prosperity@20": {
+          "ic": 0.07896,
+          "icir": 0.477,
+          "win": 0.6264,
+          "t_ne": 0.988,
+          "days": 174
+        },
+        "six_dim.prosperity@60": {
+          "ic": 0.06462,
+          "icir": 0.4186,
+          "win": 0.6791,
+          "t_ne": -1.749,
+          "days": 134
+        },
+        "six_dim.moneyflow@20": {
+          "ic": 0.01855,
+          "icir": 0.1212,
+          "win": 0.5862,
+          "t_ne": -0.288,
+          "days": 174
+        },
+        "six_dim.moneyflow@60": {
+          "ic": 0.02571,
+          "icir": 0.166,
+          "win": 0.6194,
+          "t_ne": 2.259,
+          "days": 134
+        },
+        "six_dim.chips@20": {
+          "ic": -0.07767,
+          "icir": -0.3162,
+          "win": 0.3935,
+          "t_ne": -2.049,
+          "days": 155
+        },
+        "six_dim.chips@60": {
+          "ic": -0.04512,
+          "icir": -0.2246,
+          "win": 0.4261,
+          "t_ne": 0.154,
+          "days": 115
+        },
+        "six_dim.macro@20": {
+          "ic": -0.01026,
+          "icir": -0.2235,
+          "win": 0.4195,
+          "t_ne": -0.547,
+          "days": 174
+        },
+        "six_dim.macro@60": {
+          "ic": -0.04093,
+          "icir": -1.2092,
+          "win": 0.1493,
+          "t_ne": 0.119,
+          "days": 134
+        },
+        "accumulation.northbound@20": {
+          "ic": 0.0379,
+          "icir": 0.185,
+          "win": 0.5752,
+          "t_ne": 1.779,
+          "days": 113
+        },
+        "accumulation.northbound@60": {
+          "ic": 0.04759,
+          "icir": 0.217,
+          "win": 0.5316,
+          "t_ne": 1.46,
+          "days": 79
+        },
+        "accumulation.leverage@20": {
+          "ic": 0.02317,
+          "icir": 0.0868,
+          "win": 0.6147,
+          "t_ne": 1.423,
+          "days": 109
+        },
+        "accumulation.leverage@60": {
+          "ic": -0.02703,
+          "icir": -0.1236,
+          "win": 0.4267,
+          "t_ne": 0.132,
+          "days": 75
+        },
+        "accumulation.volume_price@20": {
+          "ic": 0.06007,
+          "icir": 0.2466,
+          "win": 0.6545,
+          "t_ne": 0.379,
+          "days": 110
+        },
+        "accumulation.volume_price@60": {
+          "ic": 0.01063,
+          "icir": 0.0506,
+          "win": 0.4737,
+          "t_ne": 0.783,
+          "days": 76
+        }
+      },
+      "combos": {
+        "现行（自然分空间：反向维度为负权重）@20": {
+          "ic": 0.1026,
+          "win": 0.6609,
+          "baseline": true
+        },
+        "现行（自然分空间：反向维度为负权重）@60": {
+          "ic": 0.14471,
+          "win": 0.8358,
+          "baseline": true
+        },
+        "不反向对照组（诊断用）@20": {
+          "ic": -0.00695,
+          "win": 0.592,
+          "baseline": false
+        },
+        "不反向对照组（诊断用）@60": {
+          "ic": -0.04747,
+          "win": 0.3731,
+          "baseline": false
+        },
+        "六维等权（含反向）@20": {
+          "ic": 0.07863,
+          "win": 0.5747,
+          "baseline": false
+        },
+        "六维等权（含反向）@60": {
+          "ic": 0.13975,
+          "win": 0.8806,
+          "baseline": false
+        },
+        "只留正 IC 两项@20": {
+          "ic": 0.06756,
+          "win": 0.6034,
+          "baseline": false
+        },
+        "只留正 IC 两项@60": {
+          "ic": 0.06575,
+          "win": 0.7015,
+          "baseline": false
+        },
+        "砍动量（去掉反向维度）@20": {
+          "ic": 0.04931,
+          "win": 0.569,
+          "baseline": false
+        },
+        "砍动量（去掉反向维度）@60": {
+          "ic": 0.05539,
+          "win": 0.7015,
+          "baseline": false
+        },
+        "现行第二层@20": {
+          "ic": 0.0681,
+          "win": 0.6549,
+          "baseline": true
+        },
+        "现行第二层@60": {
+          "ic": 0.03467,
+          "win": 0.5316,
+          "baseline": true
+        },
+        "第二层等权@20": {
+          "ic": 0.07531,
+          "win": 0.6637,
+          "baseline": false
+        },
+        "第二层等权@60": {
+          "ic": 0.02466,
+          "win": 0.4684,
+          "baseline": false
+        },
+        "第二层只用 northbound@20": {
+          "ic": 0.0379,
+          "win": 0.5752,
+          "baseline": false
+        },
+        "第二层只用 northbound@60": {
+          "ic": 0.04759,
+          "win": 0.5316,
+          "baseline": false
+        }
+      }
+    },
+    "新区间": {
+      "days": 211,
+      "boards": 322,
+      "factors": {
+        "total@20": {
+          "ic": 0.04001,
+          "icir": 0.1463,
+          "win": 0.5604,
+          "t_ne": -0.044,
+          "days": 182
+        },
+        "total@60": {
+          "ic": 0.06476,
+          "icir": 0.2698,
+          "win": 0.7,
+          "t_ne": -0.074,
+          "days": 140
+        },
+        "six_dim@20": {
+          "ic": 0.13871,
+          "icir": 0.4284,
+          "win": 0.6319,
+          "t_ne": 0.758,
+          "days": 182
+        },
+        "six_dim@60": {
+          "ic": 0.22854,
+          "icir": 0.8449,
+          "win": 0.7571,
+          "t_ne": 0.786,
+          "days": 140
+        },
+        "accumulation@20": {
+          "ic": 0.11513,
+          "icir": 0.4556,
+          "win": 0.6484,
+          "t_ne": 1.117,
+          "days": 182
+        },
+        "accumulation@60": {
+          "ic": 0.19802,
+          "icir": 1.0227,
+          "win": 0.8143,
+          "t_ne": 1.094,
+          "days": 140
+        },
+        "leader@20": {
+          "ic": 0.00122,
+          "icir": 0.0048,
+          "win": 0.5,
+          "t_ne": 0.104,
+          "days": 182
+        },
+        "leader@60": {
+          "ic": -0.02459,
+          "icir": -0.0923,
+          "win": 0.5929,
+          "t_ne": -0.2,
+          "days": 140
+        },
+        "six_dim.trading@20": {
+          "ic": -0.02882,
+          "icir": -0.0895,
+          "win": 0.4725,
+          "t_ne": 0.278,
+          "days": 182
+        },
+        "six_dim.trading@60": {
+          "ic": -0.03579,
+          "icir": -0.1082,
+          "win": 0.5071,
+          "t_ne": 0.641,
+          "days": 140
+        },
+        "six_dim.technical@20": {
+          "ic": -0.04904,
+          "icir": -0.1353,
+          "win": 0.4176,
+          "t_ne": -0.561,
+          "days": 182
+        },
+        "six_dim.technical@60": {
+          "ic": -0.0776,
+          "icir": -0.2143,
+          "win": 0.4714,
+          "t_ne": -0.206,
+          "days": 140
+        },
+        "six_dim.prosperity@20": {
+          "ic": 0.10836,
+          "icir": 0.338,
+          "win": 0.6099,
+          "t_ne": 0.566,
+          "days": 182
+        },
+        "six_dim.prosperity@60": {
+          "ic": 0.2361,
+          "icir": 0.8206,
+          "win": 0.7857,
+          "t_ne": 0.943,
+          "days": 140
+        },
+        "six_dim.moneyflow@20": {
+          "ic": 0.01819,
+          "icir": 0.0819,
+          "win": 0.544,
+          "t_ne": 0.328,
+          "days": 182
+        },
+        "six_dim.moneyflow@60": {
+          "ic": 0.01335,
+          "icir": 0.0578,
+          "win": 0.6071,
+          "t_ne": -0.038,
+          "days": 140
+        },
+        "six_dim.chips@20": {
+          "ic": 0.04128,
+          "icir": 0.0913,
+          "win": 0.5824,
+          "t_ne": 0.262,
+          "days": 182
+        },
+        "six_dim.chips@60": {
+          "ic": 0.01735,
+          "icir": 0.0391,
+          "win": 0.6,
+          "t_ne": 0.012,
+          "days": 140
+        },
+        "six_dim.macro@20": {
+          "ic": -0.00412,
+          "icir": -0.1408,
+          "win": 0.4121,
+          "t_ne": -0.866,
+          "days": 182
+        },
+        "six_dim.macro@60": {
+          "ic": 0.00392,
+          "icir": 0.1362,
+          "win": 0.6143,
+          "t_ne": -0.313,
+          "days": 140
+        },
+        "accumulation.northbound@20": {
+          "ic": -0.08401,
+          "icir": -0.4308,
+          "win": 0.3396,
+          "t_ne": -1.226,
+          "days": 159
+        },
+        "accumulation.northbound@60": {
+          "ic": 0.02559,
+          "icir": 0.1732,
+          "win": 0.5517,
+          "t_ne": -1.147,
+          "days": 116
+        },
+        "accumulation.leverage@20": {
+          "ic": -0.01784,
+          "icir": -0.0521,
+          "win": 0.4615,
+          "t_ne": -0.696,
+          "days": 182
+        },
+        "accumulation.leverage@60": {
+          "ic": 0.03121,
+          "icir": 0.1125,
+          "win": 0.5357,
+          "t_ne": 0.099,
+          "days": 140
+        },
+        "accumulation.volume_price@20": {
+          "ic": 0.01837,
+          "icir": 0.0751,
+          "win": 0.5275,
+          "t_ne": -0.546,
+          "days": 182
+        },
+        "accumulation.volume_price@60": {
+          "ic": 0.01437,
+          "icir": 0.0586,
+          "win": 0.5,
+          "t_ne": -0.357,
+          "days": 140
+        }
+      },
+      "combos": {
+        "现行（自然分空间：反向维度为负权重）@20": {
+          "ic": 0.1385,
+          "win": 0.6319,
+          "baseline": true
+        },
+        "现行（自然分空间：反向维度为负权重）@60": {
+          "ic": 0.22725,
+          "win": 0.7571,
+          "baseline": true
+        },
+        "不反向对照组（诊断用）@20": {
+          "ic": 0.04001,
+          "win": 0.511,
+          "baseline": false
+        },
+        "不反向对照组（诊断用）@60": {
+          "ic": 0.12935,
+          "win": 0.6643,
+          "baseline": false
+        },
+        "六维等权（含反向）@20": {
+          "ic": 0.13831,
+          "win": 0.6703,
+          "baseline": false
+        },
+        "六维等权（含反向）@60": {
+          "ic": 0.193,
+          "win": 0.7214,
+          "baseline": false
+        },
+        "只留正 IC 两项@20": {
+          "ic": 0.08475,
+          "win": 0.5659,
+          "baseline": false
+        },
+        "只留正 IC 两项@60": {
+          "ic": 0.17162,
+          "win": 0.7,
+          "baseline": false
+        },
+        "砍动量（去掉反向维度）@20": {
+          "ic": 0.09474,
+          "win": 0.5659,
+          "baseline": false
+        },
+        "砍动量（去掉反向维度）@60": {
+          "ic": 0.18591,
+          "win": 0.7357,
+          "baseline": false
+        },
+        "现行第二层@20": {
+          "ic": -0.05679,
+          "win": 0.3626,
+          "baseline": true
+        },
+        "现行第二层@60": {
+          "ic": 0.04549,
+          "win": 0.6357,
+          "baseline": true
+        },
+        "第二层等权@20": {
+          "ic": -0.04386,
+          "win": 0.4176,
+          "baseline": false
+        },
+        "第二层等权@60": {
+          "ic": 0.0464,
+          "win": 0.6214,
+          "baseline": false
+        },
+        "第二层只用 northbound@20": {
+          "ic": -0.08401,
+          "win": 0.3396,
+          "baseline": false
+        },
+        "第二层只用 northbound@60": {
+          "ic": 0.02559,
+          "win": 0.5517,
+          "baseline": false
+        }
+      }
+    }
+  },
+  "layers": {
+    "告警持有收益": {
+      "h10": {
+        "样本": 8846,
+        "胜率": 35.36,
+        "盈亏比": 1.9,
+        "期望收益": 0.08,
+        "基准胜率": 34.72
+      },
+      "h20": {
+        "样本": 8738,
+        "胜率": 40.55,
+        "盈亏比": 1.73,
+        "期望收益": 0.56,
+        "基准胜率": 42.42
+      },
+      "h30": {
+        "样本": 8465,
+        "胜率": 40.56,
+        "盈亏比": 2.0,
+        "期望收益": 1.26,
+        "基准胜率": 41.56
+      },
+      "h40": {
+        "样本": 8429,
+        "胜率": 40.25,
+        "盈亏比": 2.01,
+        "期望收益": 1.4,
+        "基准胜率": 42.36
+      },
+      "h60": {
+        "样本": 7715,
+        "胜率": 44.25,
+        "盈亏比": 2.01,
+        "期望收益": 2.69,
+        "基准胜率": 43.48
+      },
+      "h90": {
+        "样本": 7371,
+        "胜率": 53.44,
+        "盈亏比": 2.02,
+        "期望收益": 5.98,
+        "基准胜率": 57.71
+      }
+    },
+    "策略(3笔×1成/60日/止损7%/止盈10%)": {
+      "笔数": 6801,
+      "资金收益率均值": -0.034,
+      "中位数": -2.155,
+      "胜率": 39.89,
+      "止损比例": 61.62
+    }
+  }
+}
