@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import SectorCrowdingAlertPanel from "./SectorCrowdingAlertPanel";
 import SectorCrowdingDetailModal from "./SectorCrowdingDetailModal";
 import SectorCrowdingOverview from "./SectorCrowdingOverview";
@@ -33,6 +33,25 @@ import { useMaxMa5 } from "./useMaxMa5";
 
 const POLL_MS = 60000;
 
+/**
+ * 这个页签此刻是否真的显示在屏幕上。
+ *
+ * ⚠️ `document.hidden` **不够**：它只知道"浏览器标签页有没有被切走"，
+ * 而本页签进了 KeepAlive —— 用户切到「行业轮动日报」时，本页签是被
+ * **祖先的 `display:none`** 藏起来的，`document.hidden` 仍是 `false`。
+ * 于是轮询照样每 60 秒打一次隧道（实测后端 `config_list` 被打了 614 次，
+ * 用户那两个 IP 每分钟各一条，**包括没在看这个页签的时候**）。
+ *
+ * 判据用**渲染盒**而不是 `getComputedStyle().display`：祖先 `display:none`
+ * 时子元素自身**仍然是 block**（frontend-change-guardrails 第六节记过这个坑）。
+ * 隐藏的子树里 `offsetParent === null`，这正是我们要的。
+ */
+function isTabVisible(root: HTMLElement | null): boolean {
+  if (typeof document !== "undefined" && document.hidden) return false;
+  if (!root) return true;             // 还没挂载出根节点：按"可能可见"放过首轮
+  return root.offsetParent !== null;
+}
+
 export default function SectorCrowdingTab() {
   /** 只看概念板块（默认开：告警只对概念板块，与需求一致）。 */
   const [conceptsOnly, setConceptsOnly] = useState(true);
@@ -40,6 +59,8 @@ export default function SectorCrowdingTab() {
   const [picked, setPicked] = useState<{ code: string; name: string }>(
     { code: "", name: "" });
   const [notice, setNotice] = useState<string | null>(null);
+  /** 本页签根节点 —— 供 `isTabVisible` 判"KeepAlive 有没有把我藏起来"。 */
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const toast = useCallback((text: string) => setNotice(text), []);
   const list = useCrowdingList(conceptsOnly);
   const { maxMa5, refresh: refreshMax } = useMaxMa5();
@@ -54,11 +75,12 @@ export default function SectorCrowdingTab() {
 
   // 低频兜底轮询：服务端只有"一键刷新"会改数据，但刷新可能发生在另一个标签页；
   // 60 秒一次足够，且服务端是本地读库（毫秒级）。
-  // ★ 2026-09-27：本页签进了 KeepAlive（互切不卸载），轮询在隐藏期间仍会
-  // 跑 —— 加 document.hidden 守卫，页面不可见时跳过本轮（可见后自然补上）。
+  // ★ 2026-09-27：本页签进了 KeepAlive（互切不卸载），**必须**按"自己这一栏
+  // 是否可见"决定要不要轮询 —— `document.hidden` 挡不住 KeepAlive 的
+  // display:none（详见 `isTabVisible`）。隐藏时跳过，可见后自然由下一轮补上。
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (document.hidden) return;
+      if (!isTabVisible(rootRef.current)) return;
       void list.reload();
     }, POLL_MS);
     return () => window.clearInterval(timer);
@@ -77,7 +99,7 @@ export default function SectorCrowdingTab() {
   const error = list.error;
 
   return (
-    <div className="crowding-root">
+    <div className="crowding-root" ref={rootRef}>
       {error && <div className="error-box">读取拥挤度数据失败：{error}</div>}
 
       {/* ① 一键刷新栏 */}
@@ -105,10 +127,10 @@ export default function SectorCrowdingTab() {
             ? `异动指标计算中… ${(metrics.status?.progress ?? 0) * 100 | 0}%`
             : "↻ 重算异动指标"}
         </button>
-        <button className="btn-ghost" disabled={list.loading}
+        <button className="btn-ghost" disabled={list.refreshing}
                 onClick={() => { void list.reload();
                                  void metrics.reloadSummary(); }}>
-          {list.loading ? "读取中…" : "↻ 重新读取"}
+          {list.refreshing ? "核对中…" : "↻ 重新读取"}
         </button>
       </div>
 
