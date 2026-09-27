@@ -1,13 +1,69 @@
-﻿# 模型路由配置
+# 模型路由配置
+
+# ======================================================================
+# 本地模型与显存（2026-09-26 实测，RTX 4060 8GB + 32GB 内存）
+# ======================================================================
+#
+# ## 一、Ollama 只有**一个**计算槽位 —— 并发请求是严格串行的
+#
+#     server.log:  slot launch_slot_: id 0 | task 47744 | processing task
+#                  srv update_slots: all slots are idle        ← 全程只出现 id 0
+#                  slot print_timing: tg = 44.2 t/s            ← 单请求就打满 GPU
+#
+# 实测生成速度 **44.1 t/s**（最近 30 次采样：min 43.75 / max 44.81，几乎不动）。
+# 结论：**调大并发不会提高吞吐**，只会让多个请求分时切片、每个都变慢，
+# 并各自多吃一份 KV cache。所以应用侧加了并发闸
+# （`src/infrastructure/llm/local_gate.py`，默认 1，可用
+# `MOSS_LOCAL_LLM_CONCURRENCY` 调整），把排队挪到应用里，超时只计生成时间。
+#
+# ## 二、8GB 显存**只能常驻一个 7~8B 模型** —— 换模型，不要叠模型
+#
+#     server.log:  available="1.7 GiB"
+#                  llama-server model predicted to exceed available memory, evicting
+#                  predicted="4.6 GiB" → 换出常驻模型 → 重新 load_tensors
+#
+# 实测踩过：qwen3:8b（常驻 5.20 GB）+ qwen2.5:1.5b（1.09 GB）已经占掉 6.3 GB，
+# 这时再请求一个 4~5 GB 的模型 → **每次都要换出+重载**（几秒到几十秒，
+# 且 KV 缓存清零、prompt 重算）。所以下列组合是硬约束：
+#
+#     组合                                  显存      结论
+#     qwen3:8b + qwen2.5:1.5b               6.3 GB   ✅ 可同时常驻（现状）
+#     qwen3:8b + deepseek-r1:7b             9.6 GB   ❌ 必互相换出
+#     qwen3:8b + qwen3.5:4b                 8.4 GB   ❌ 超了
+#     gemma4:e4b（8.95 GB）                          ❌ 溢到 CPU，慢一个数量级
+#
+# ## 三、什么场景用什么本地模型（按"显存放得下 + 任务难度"选）
+#
+# | 场景 | 建议模型 | 依据 |
+# |---|---|---|
+# | 高频/轻量：分类、情感、要点抽取、热门股名提取 | `local_light`（qwen2.5:1.5b，0.92 GB） | 与 8b 可共存；小模型够用（配 `json_schema` 受约束解码） |
+# | 语义判断：事件分类/多空打分、原文倾向抽取、做T消息面 | `local_medium`（qwen3:8b，5.20 GB） | 实测 44 t/s；事件打分 10/10 有效、0 付费（见 `alerts/analyzer.py`） |
+# | 需要长链条推理（多步推演、跨源综合）且**能接受更慢** | `local_reasoning`（deepseek-r1:7b，4.36 GB） | 已拉取但**默认不接线**：它要**替换** `local_medium` 而不是并存（见上面组合表）；质量对比待空闲时实测 |
+# | 单条长文/多字段抽取（情报语气抽取一次出九个字段） | `local_medium` | 输出预算要够（见 `tone_job._MAX_TOKENS`） |
+#
+# ⚠️ 选型第一原则是**显存放得下**，第二才是能力：一个跑在 CPU 上的大模型
+# 比一个跑在 GPU 上的小模型慢得多（数量级差别），"更聪明但每次几十秒"
+# 在批量作业里会直接撞上 120 秒超时。
+#
+# ======================================================================
 
 # 任务层级 → 主备模型（主模型失败自动降级到fallback）
+#
+# `local_only: true` = 该层**不允许降级到付费云端**（缺口由调用方按"本地不可用"
+# 处理）。为什么给 light/medium 钉上它（2026-09-26 结构修补）：这两层的 primary
+# 是本地模型、fallback 却是**付费的** deepseek-flash —— 本地一抖动就悄悄花钱，
+# 靠"每个调用点记得传 local_only=True"是靠不住的（实测：事件告警阶段一
+# 0.0196 元就是这么来的）。钉在配置里，**新调用方默认就是安全的**；
+# 真要花云端的少数场景，显式传 `local_only=False`。
 routing:
   light:              # 数据清洗、格式化等基础任务
     primary: local_light
     fallback: deepseek-flash
+    local_only: true
   medium:             # 信息层处理（A05去伪/A06提取）：本地模型为主，云端兜底
     primary: local_medium
     fallback: deepseek-flash
+    local_only: true
   reasoning:          # 宏观/中观/微观/财务风险等核心分析
     primary: deepseek-flash
     fallback: local_medium
@@ -36,6 +92,17 @@ models:
     max_tokens: 4096
     temperature: 0.1
 
+  # 本地推理候选（**默认不接线**）：deepseek-r1:7b 已拉取（4.36 GB）。
+  # 要用它请把 `reasoning` 或某个调用方的层级指到这里，并且**同时**把
+  # `local_medium` 从常驻里去掉 —— 8GB 显存放不下两个 7~8B 模型，
+  # 并存会导致每次调用都换出+重载（见文件顶部「本地模型与显存」）。
+  local_reasoning:
+    provider: "ollama"
+    model_name: "deepseek-r1:7b"
+    base_url: "http://localhost:11434"
+    max_tokens: 4096
+    temperature: 0.1
+
   deepseek-flash:
     provider: "deepseek"
     model_name: "deepseek-flash"
@@ -44,6 +111,22 @@ models:
     temperature: 0.1
     cost:
       input_cache_hit: 0.02  # 元/百万token
+      input_cache_miss: 1.0
+      output: 4.0
+
+  # ★ 2026-09-27 第八轮：补"线上实际用的模型名"配置
+  # 审计实证：`deepseek-v4-flash` 在线上跑了 309 次但未在 models.yaml 登记
+  # → `call_cost_cny()` 走兜底价 + `model_is_priced()` 返回 False → 旧实现
+  # 静默算成 0 元；现在登记一份，价格对齐 deepseek-flash（同 provider 同档位）。
+  # 后续若模型名真正改了，应该**同时**改这里和 routing，避免再次出现这种漂移。
+  deepseek-v4-flash:
+    provider: "deepseek"
+    model_name: "deepseek-v4-flash"
+    base_url: "https://api.deepseek.com"
+    max_tokens: 4096
+    temperature: 0.1
+    cost:
+      input_cache_hit: 0.02
       input_cache_miss: 1.0
       output: 4.0
 

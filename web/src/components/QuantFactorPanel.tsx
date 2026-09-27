@@ -131,16 +131,27 @@ export default function QuantFactorPanel({
   const pollRef = useRef<number | null>(null);
 
   const load = useCallback(async () => {
-    try {
-      const [factors, dataStatus] = await Promise.all([
-        api.quantFactors(),
-        api.quantDataStatus(),
-      ]);
-      setLibrary(factors);
-      setStatus(dataStatus);
-    } catch (exc) {
-      setError(`因子库加载失败：${String(exc)}`);
-    }
+    // ⚠️ **不要 `Promise.all`**（2026-09-27 用户报障：「因子库是固定数据面板，
+    // 为什么切过来要 20 秒，还先显示 0 个」）。
+    //
+    // 这两个请求的耗时差三个数量级：
+    //   · `quantFactors()`  —— 静态 spec 拼 dict，**毫秒级**，不碰库不碰盘；
+    //   · `quantDataStatus()` —— 「因子数据缓存体检」：逐个数据集 `iterdir()`
+    //     扫分区 + 读 manifest 算 coverage + 对仓库每张表做 MIN/MAX
+    //     （无索引 = 全表扫描）。**冷缓存实测十几到二十秒**（见
+    //     `src/api/routes/quant.py` 的 `data_status` docstring，那里记了
+    //     一次把事件循环按住 12.75 秒的线上事故）。
+    //
+    // 绑在一起等 = 因子库被数据条拖住，用户盯着「多因子库（0 个）」二十秒。
+    // 两件事**互不依赖**，各自落地即可：因子库先出，数据条后到。
+    void api.quantFactors()
+      .then(setLibrary)
+      .catch((exc) => setError(`因子库加载失败：${String(exc)}`));
+    void api.quantDataStatus()
+      .then(setStatus)
+      .catch(() => {
+        // 数据条失败不该影响因子库；它本来就是个"看一眼"的体检结论
+      });
   }, []);
 
   useEffect(() => {

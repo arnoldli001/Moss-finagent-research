@@ -1,0 +1,47 @@
+# frp **客户端**配置（在你本机跑，把本机 8110 反向暴露到香港 VPS）
+#
+# ## 它在整条链路里的位置
+#
+#     浏览器 → VPS nginx(443, 终止 TLS) → frps(VPS) → frpc(本机) → 127.0.0.1:8110
+#
+# 项目、Ollama、SQLite **全部不动**，仍在你自己这台机器上；
+# VPS 上只有 frps 与 nginx，看不到你的代码与数据。
+#
+# ## 用法
+#
+#   1) 把本文件复制到项目根：D:\code\Moss-finagent-research\frpc.toml
+#   2) 改下面两处：serverAddr（VPS 公网 IP）、auth.token
+#   3) 跑 scripts\frpc_start.ps1
+#
+# ⚠️ token 不要提交进 git。建议：把本文件的 .example 版本入库，
+#    真实文件加进 .gitignore（见文件末尾说明）。
+
+# VPS 的公网 IP（腾讯云香港控制台里那个）
+serverAddr = "REPLACE_ME_VPS_IP"
+serverPort = 7000
+
+# 必须与 VPS 上 /etc/frp/frps.toml 的 auth.token **完全一致**
+auth.method = "token"
+auth.token = "REPLACE_ME_SAME_TOKEN_AS_VPS"
+
+# 传输层加密（frps 那边设了 transport.tls.force，这里必须配合）
+transport.tls.enable = true
+
+# 断线自动重连（网络抖动时不要退出进程）
+transport.heartbeatInterval = 15
+transport.heartbeatTimeout = 45
+
+log.to = "data/run/frpc.log"
+log.level = "info"
+log.maxDays = 7
+
+[[proxies]]
+name = "moss-web"
+type = "tcp"
+# 本机要暴露的服务（后端只监听 127.0.0.1，这正是我们要的：
+# 它**不**对局域网/公网开放，唯一入口是这条隧道）
+localIP = "127.0.0.1"
+localPort = 8110
+# VPS 上落地的端口。必须落在 frps.toml 的 allowPorts 区间内（18100-18199）。
+# nginx 的 proxy_pass 指向这个端口（见 scripts/setup_frps.sh）。
+remotePort = 18110

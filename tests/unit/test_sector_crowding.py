@@ -608,12 +608,33 @@ def test_recompute_clears_water_level_when_below_min_bars(
             {**item, "sector_code": "A.TI", "sector_name": "小样本"} for item in computed])
         assert db.query_sector_crowding(conn, "A.TI")[-1]["water_level"] is not None
 
-        # 把闸门提到 750（> 100 行）后本地重算
+        # ① 关掉偏差校正 → 回到旧的二值门槛：把闸门提到 750（> 100 行）后重算，
+        #    水位必须被**清成 NULL**（这条是原测试的本意，行为没变）
+        config.window.bias_correction_enabled = False
         config.window.min_bars_for_water_level = 750
         stats = refresh.recompute_stored_water_levels(config=config, conn=conn)
         assert stats["skipped"] == 1 and stats["sectors"] == 0
         assert db.query_sector_crowding(conn, "A.TI")[-1]["water_level"] is None
+
+        # ② 打开偏差校正 → 发布下限降到 min_bars_publish(60)，100 行应当**重新出数**
+        #    （这正是 2026-09-27 这次改动的目的：把 750 根以下的新题材救回来）
+        config.window.bias_correction_enabled = True
+        config.window.min_bars_publish = 60
+        stats = refresh.recompute_stored_water_levels(config=config, conn=conn)
+        assert stats["sectors"] == 1 and stats["skipped"] == 0
+        assert db.query_sector_crowding(conn, "A.TI")[-1]["water_level"] is not None
+
+        # ③ 低于发布下限 → 仍然清成 NULL（100 < 200）
+        config.window.min_bars_publish = 200
+        stats = refresh.recompute_stored_water_levels(config=config, conn=conn)
+        assert stats["skipped"] == 1 and stats["sectors"] == 0
+        assert db.query_sector_crowding(conn, "A.TI")[-1]["water_level"] is None
     finally:
+        # ⚠️ `load_config()` 是 `lru_cache(maxsize=1)` 的**单例**：
+        # 上面改的 `bias_correction_enabled` / `min_bars_publish` 会**泄漏到后面的测试**
+        # （实测：本测试把 min_bars_publish 改成 200，下一个测试就被判成"样本不足"）。
+        # 所以必须清缓存 —— 只靠"测试里自己再赋一遍值"迟早会漏。
+        load_config.cache_clear()
         conn.close()
 
 
@@ -629,10 +650,14 @@ def test_recompute_keeps_water_level_when_enough_bars(
         db.upsert_sector_crowding(conn, [
             {**item, "sector_code": "B.TI", "sector_name": "足样本"} for item in computed])
         config.window.min_bars_for_water_level = 60
+        # 显式钉住发布下限：`load_config()` 是单例，别依赖"别的测试没改过它"
+        config.window.bias_correction_enabled = True
+        config.window.min_bars_publish = 60
         stats = refresh.recompute_stored_water_levels(config=config, conn=conn)
         assert stats["sectors"] == 1
         assert db.query_sector_crowding(conn, "B.TI")[-1]["water_level"] is not None
     finally:
+        load_config.cache_clear()
         conn.close()
 
 
@@ -876,6 +901,91 @@ def test_sector_blacklist_helper_returns_empty_on_failure(monkeypatch) -> None:
     assert db._sector_blacklist() == frozenset()
 
 
+# ==================================================================
+# 周频 4 列收口到看板**默认视图**（2026-09-27）
+# ==================================================================
+
+
+def test_pool_scope_defaults_match_dashboard_view() -> None:
+    """两个收口开关默认都要**开**，且 `concepts_only` 必须跟看板默认勾选一致。
+
+    改之前 `compute_all_metrics()` 对全量算。两个默认值写成 `False` 都不会报错、
+    也不会让任何断言失败，只会把白算的结果悄悄算回来 —— 所以钉住默认值。
+
+    ⚠️ 第一版收口用了 `concepts_only=False`，取到"可见 554"，
+    而看板的「只看概念板块」**默认是勾上的**（`SectorCrowdingTab.tsx`
+    `useState(true)`），用户实际看到的是 262。差的那 292 个是非概念板块
+    （行业指数 / 地区 / 指数样本 / 同花顺自建组合）。
+    """
+    from src.sector_crowding.config import MetricConfig
+
+    cfg = MetricConfig()
+    assert cfg.pool_only is True
+    assert cfg.pool_concepts_only is True, "收口判据必须等于看板默认渲染集合"
+
+
+def test_scope_to_pool_keeps_only_visible(conn: sqlite3.Connection) -> None:
+    """只有清单里 `visible=1` 的板块留在待算集合里。
+
+    `HIDDEN.TI` 是被移出看板的（`visible=0`），`NEVER.TI` 从没进过清单 ——
+    两者都该被挡掉，因为 4 列只在看板表格里渲染。
+    """
+    from src.sector_crowding import metrics
+
+    db.upsert_list_item(conn, "KEEP.TI", sector_name="保留", visible=1)
+    db.upsert_list_item(conn, "HIDDEN.TI", sector_name="移出看板", visible=0)
+    kept = metrics._scope_to_pool(conn, ["KEEP.TI", "HIDDEN.TI", "NEVER.TI"],
+                                  pool_only=True, concepts_only=False)
+    assert kept == ["KEEP.TI"]
+
+
+def test_scope_to_pool_drops_non_concept_by_default(
+        conn: sqlite3.Connection) -> None:
+    """**默认**还要再挡掉非概念板块 —— 这是第一版漏掉的那 292 个。
+
+    看板默认勾着「只看概念板块」，所以行业指数 / 地区 / 指数样本虽然
+    `visible=1`，默认根本不会出现在表格里。收口的唯一理由是"别算渲染不出来
+    的东西"，所以它们必须一起被挡掉。
+    """
+    from src.sector_crowding import metrics
+
+    db.update_sector_meta(conn, sector_code="CONCEPT.TI",
+                          sector_name="半导体", is_concept=True)
+    db.update_sector_meta(conn, sector_code="INDUSTRY.TI",
+                          sector_name="银行", is_concept=False)
+    for code in ("CONCEPT.TI", "INDUSTRY.TI"):
+        db.upsert_list_item(conn, code, sector_name=code, visible=1)
+
+    codes = ["CONCEPT.TI", "INDUSTRY.TI"]
+    # 默认（概念 only）→ 只剩概念
+    assert metrics._scope_to_pool(conn, codes) == ["CONCEPT.TI"]
+    # 放宽到"可能被渲染的集合" → 两个都留
+    assert metrics._scope_to_pool(conn, codes, concepts_only=False) == codes
+
+
+def test_scope_to_pool_off_returns_all(conn: sqlite3.Connection) -> None:
+    """`pool_only=False` 原样返回 —— 回填历史周 / 对照实验要靠它。"""
+    from src.sector_crowding import metrics
+
+    db.upsert_list_item(conn, "KEEP.TI", sector_name="保留", visible=1)
+    codes = ["KEEP.TI", "HIDDEN.TI"]
+    assert metrics._scope_to_pool(conn, codes, pool_only=False) == codes
+
+
+def test_scope_to_pool_falls_back_when_pool_empty(
+        conn: sqlite3.Connection) -> None:
+    """清单为空时**退回全量**，绝不能算成"本周 0 个板块"。
+
+    首装还没种子化、或用户把清单清空时交集就是空集。若照收不误，
+    这一周会落成 0 行却报 `done` —— 像一个成功的空周，把库里的周次
+    序列弄断，而且**不会**抛任何异常。所以这里断言"退回全量"。
+    """
+    from src.sector_crowding import metrics
+
+    codes = ["A.TI", "B.TI"]
+    assert metrics._scope_to_pool(conn, codes, pool_only=True) == codes
+
+
 def test_query_metrics_hides_removed_boards(monkeypatch,
                                            conn: sqlite3.Connection) -> None:
     """**"删了还在"的回归测试**：批次剔除的板块不得出现在拥挤度读取结果里。
@@ -1027,3 +1137,303 @@ def test_blacklist_helpers_survive_missing_files(monkeypatch) -> None:
     monkeypatch.setattr(db, "load_crowding_exclusions", lambda *a, **k: None)
     assert metrics._sector_blacklist() == frozenset()
     assert db._sector_blacklist() == frozenset()
+
+
+# ==================================================================
+# 全量刷新台账：同一周不重复全量（2026-09-27）
+# ==================================================================
+
+
+def test_full_refresh_ledger_roundtrip(conn: sqlite3.Connection) -> None:
+    """台账写入 / 读回；空台账返回 ("", []) 而不是抛错。
+
+    用户口径：「如果上次全量刷新时间和这次手动触发是**同一周**，
+    就不要全量刷新了，只刷新上次失败的板块即可。」
+    """
+    from src.sector_crowding import refresh
+
+    assert refresh._last_full_refresh(conn) == ("", [])
+
+    refresh._record_full_refresh(conn, "2026-W39", ["AAA.TI", "BBB.TI"])
+    week, failed = refresh._last_full_refresh(conn)
+    assert week == "2026-W39"
+    assert failed == ["AAA.TI", "BBB.TI"]
+
+
+def test_full_refresh_ledger_dedups_and_clears(conn: sqlite3.Connection) -> None:
+    """失败名单去重排序；传入空名单表示"上次全量全部成功"。
+
+    ⚠️ 空名单时**必须**写空——否则下一周还会去补一批已经补过的板块。
+    """
+    from src.sector_crowding import refresh
+
+    refresh._record_full_refresh(conn, "2026-W39", ["B.TI", "A.TI", "B.TI"])
+    assert refresh._last_full_refresh(conn)[1] == ["A.TI", "B.TI"]
+
+    refresh._record_full_refresh(conn, "2026-W40", [])
+    week, failed = refresh._last_full_refresh(conn)
+    assert week == "2026-W40"
+    assert failed == [], "全量成功后必须清空失败名单，否则下周会白跑一趟"
+
+
+def test_week_key_is_iso_week() -> None:
+    """周键格式 `YYYY-Www`，与 `metrics.week_key` 同口径。"""
+    import re
+
+    from src.sector_crowding import refresh
+
+    assert re.fullmatch(r"\d{4}-W\d{2}", refresh._week_key())
+
+
+def test_refresh_message_hides_failure_count() -> None:
+    """完成文案**不得**包含失败数（用户口径：前端不显示失败信息）。
+
+    失败对用户没有可操作性（看不到名单、也不能单独重刷），
+    而且多为数据源限流/抖动、下一轮会自愈。
+    """
+    from src.sector_crowding.refresh import RefreshTask
+
+    task = RefreshTask(task_id="t")
+    task.status = "done"
+    task.inserted = 1470
+    task.last_update_date = "20260924"
+    task.failed_sectors = ["861231.TI:频次超限", "861232.TI:频次超限"]
+    message = task.to_dict()["message"]
+    assert "1470" in message and "20260924" in message
+    assert "失败" not in message, f"完成文案不该提失败：{message!r}"
+
+
+# ==================================================================
+# 静态兜底：未定义名（2026-09-27 真实事故）
+# ==================================================================
+
+
+def test_no_undefined_names_in_crowding_modules() -> None:
+    """用 ruff 的 F821 兜住「改代码时误删变量定义」。
+
+    ## 真实事故
+
+    2026-09-27 改 `refresh_all_incremental()` 时，我把这段
+
+        workers = max(1, min(int(config.performance.worker_threads), 16))
+        peer_max = peer_max_median(conn, config)      # 后来废弃
+        inserted_total = 0
+
+    整段替换掉了，**把 `workers = ...` 一起删了**。运行时才在
+    `ThreadPoolExecutor(max_workers=workers)` 抛
+    `NameError: name 'workers' is not defined` ——
+    **「一键刷新」整条路直接挂掉**，用户点一次报一次。
+
+    而当时 **93 条单测全绿**：测试跑的是 `compute_series` /
+    `recompute_stored_water_levels` / `_scope_to_pool`，
+    **没有一条会走到那一行**。
+
+    ## 为什么用 ruff 而不是再写一条功能测试
+
+    这类错误是静态可判定的，写功能测试要造 warehouse + 网络桩才能覆盖，
+    成本高且仍然只覆盖这一处。ruff 的 F821 毫秒级扫全模块，**一次兜住所有同类**。
+    """
+    import shutil
+    import subprocess
+    import sys
+
+    from src.sector_crowding import __file__ as pkg_file
+
+    if shutil.which("ruff") is None:
+        try:
+            import ruff  # noqa: F401
+        except Exception:  # noqa: BLE001 环境没装 ruff → 跳过，不让测试变红
+            pytest.skip("未安装 ruff，跳过静态检查")
+
+    root = Path(pkg_file).resolve().parents[2]          # 仓库根
+    proc = subprocess.run(
+        [sys.executable, "-m", "ruff", "check",
+         str(Path(pkg_file).resolve().parent),          # src/sector_crowding
+         str(root / "src" / "api" / "routes" / "sector_crowding.py"),
+         "--select", "F821,F811", "--no-cache"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=str(root))
+    assert proc.returncode == 0, (
+        "存在未定义名（F821）—— 运行时才会 NameError：\n"
+        + (proc.stdout or "") + (proc.stderr or ""))
+
+
+# ==================================================================
+# 用户新增板块时的「临时算」（2026-09-27 产品规则）
+# ==================================================================
+
+
+def test_water_changes_codes_filter_limits_scan(conn: sqlite3.Connection) -> None:
+    """`codes=` 只算指定板块 —— 这是「用户新增板块时临时算」的核心。
+
+    用户 2026-09-27 规则：
+      * 前端**已配置**（`visible=1`）→ 提前算，打开页面直接有数据
+      * **非配置**的 → 用户新增到前端时**临时算**
+
+    全表 217 万行扫一遍要 2~3 秒；单板块只查它自己的行是毫秒级。
+    所以"临时算"必须走这个过滤，否则每次新增都要等一次全表扫描。
+    """
+    from src.sector_crowding import metrics
+
+    _seed_daily(conn, "AAA.TI")
+    _seed_daily(conn, "BBB.TI")
+
+    only, _ = metrics.compute_water_changes(conn, codes={"AAA.TI"})
+    assert set(only) == {"AAA.TI"}, "codes 过滤没生效，会退化成全表扫描"
+
+    both, _ = metrics.compute_water_changes(conn)
+    assert {"AAA.TI", "BBB.TI"} <= set(both)
+
+
+def test_precompute_scope_covers_user_configured_boards() -> None:
+    """预计算范围必须覆盖**用户手动配置**的板块，不能只覆盖系统种子的概念板块。
+
+    ⚠️ 这条钉住一个**方向反了**的错误：`pool_concepts_only=True` 时，
+    实测 `visible=1` 的 554 个里 ——
+        257 个是 `source='default'` 的概念板块（**系统种子**）
+        292 个是 `source='manual'` 的非概念板块（**用户手动加的**）
+    于是"只看概念板块"这个收口会**算系统塞的、不算用户自己配的**。
+
+    用户定的规则是按「**是否已配置**」切，不是按「是否概念」切。
+    """
+    from src.sector_crowding.config import load_config
+
+    assert load_config().metrics.pool_concepts_only is False, (
+        "预计算范围 = 已配置且可见，不做概念过滤；"
+        "设 True 会把用户手动配置的非概念板块排除在外")
+
+
+# ==================================================================
+# 水位分母的样本量偏差校正（2026-09-27）
+# ==================================================================
+
+
+def test_bias_factor_interpolates_and_clamps() -> None:
+    """`r(n)` 必须插值、且两端夹住。
+
+    ⚠️ 曾经的错：`load_config` 里写成 `{...} or None`，YAML 没配时把
+    **默认曲线覆盖成 None** → `r(n)` 恒为 1.0 → 校正静默失效、
+    60 根以下直接不出数。所以这里同时钉住"曲线非空"。
+    """
+    from src.sector_crowding.config import load_config
+    from src.sector_crowding.refresh import bias_factor
+
+    curve = {"60": 2.6, "250": 1.7, "750": 1.0}
+    assert bias_factor(60, curve) == 2.6
+    assert bias_factor(10, curve) == 2.6, "低于下界要夹住，不能外推"
+    assert bias_factor(5000, curve) == 1.0, "高于上界取 1.0（= 不校正）"
+    mid = bias_factor(155, curve)          # 60~250 的中点
+    assert 1.7 < mid < 2.6, f"中间要插值，实际 {mid}"
+    assert bias_factor(750, curve) == 1.0
+
+    # 生产配置里曲线必须存在（否则校正等于没开）
+    assert load_config().window.bias_curve, "bias_curve 不能为空"
+
+
+def test_compute_series_publishes_short_history_with_correction() -> None:
+    """有曲线时：短历史也出水位，且分母被**放大**（水位被压低）。
+
+    这是本次改动的核心 —— 把 750 根以下的新题材从"数据不足"救回来，
+    同时按标定好的倍数校正样本最大值偏差。
+    """
+    from src.sector_crowding.refresh import compute_series
+
+    rows = [{"trade_date": f"2026{(i // 28) + 1:02d}{(i % 28) + 1:02d}",
+             "sector_amount": 100.0 + i, "market_amount": 10000.0}
+            for i in range(80)]
+    curve = {"60": 2.0, "750": 1.0}
+
+    corrected = compute_series(rows, bias_curve=curve, min_bars_publish=60)
+    naive = compute_series(rows, bias_curve=None, min_bars=60)
+
+    got_c = [r["water_level"] for r in corrected if r["water_level"] is not None]
+    got_n = [r["water_level"] for r in naive if r["water_level"] is not None]
+    assert got_c and got_n, "两条路径都该出水（n=80 >= 60）"
+    assert max(got_c) < max(got_n), "校正后水位必须更低（分母被放大）"
+    # 80 根落在 60~750 之间 → r ∈ (1, 2]
+    assert max(got_n) / max(got_c) > 1.0
+
+
+def test_compute_series_without_curve_keeps_old_gate() -> None:
+    """不给曲线 → 退回原来的二值门槛（< min_bars 一律不出水位）。
+
+    这是"可回退"的保证：关掉 `bias_correction_enabled` 就等于回到改动前。
+    """
+    from src.sector_crowding.refresh import compute_series
+
+    rows = [{"trade_date": f"2026{(i // 28) + 1:02d}{(i % 28) + 1:02d}",
+             "sector_amount": 100.0 + i, "market_amount": 10000.0}
+            for i in range(80)]
+    out = compute_series(rows, bias_curve=None, min_bars=750)
+    assert all(r["water_level"] is None for r in out), "80 < 750，不该出水位"
+
+
+def test_peer_max_median_is_retired_loudly() -> None:
+    """废弃的"向同类中位数收缩"必须**吵**，不能静默返回 None。
+
+    静默 None 会让水位悄悄退回旧口径 —— 这类故障没有报错、没有断言失败，
+    只会让界面上的数看起来"正常但其实是错的"。
+    """
+    from src.sector_crowding import refresh
+
+    with pytest.raises(RuntimeError, match="已废弃"):
+        refresh.peer_max_median(None, None)
+
+
+# ==================================================================
+# 剔除清单：显式恢复/新增要能摘出去（2026-09-27）
+# ==================================================================
+
+
+def _write_exclusions(tmp_path: Path) -> Path:
+    (tmp_path / "configs").mkdir(exist_ok=True)
+    path = tmp_path / "configs" / "crowding_exclusions.yaml"
+    path.write_text(
+        "# 板块拥挤度功能的剔除清单\n"
+        "version: 1\n"
+        "count: 3\n"
+        "entries:\n"
+        '  - { code: "AAA.TI", name: "甲", reason: "点名" }\n'
+        '  - { code: "BBB.TI", name: "乙", reason: "看板移除" }\n'
+        '  - { code: "CCC.TI", name: "丙", reason: "看板移除" }\n',
+        encoding="utf-8")
+    return path
+
+
+def test_remove_crowding_exclusions_unblocks_restore(
+        tmp_path: Path, monkeypatch) -> None:
+    """显式恢复一个板块 → 必须把它从剔除清单里摘掉。
+
+    ⚠️ 这是 2026-09-27 发现的**静默陷阱**：清单一旦收入某个板块，
+    `db.query_list_view()` 就会把它过滤掉。而 `/config_list/restore`
+    只写 `visible = 1`、不碰清单 —— 结果接口回 `{"restored": 1}`，
+    板块却**不出现**，用户只会以为"恢复坏了"。
+    """
+    from src.sector_crowding import config as cfg
+
+    path = _write_exclusions(tmp_path)
+    monkeypatch.setattr(cfg, "PROJECT_ROOT", tmp_path)
+    cfg._cached_exclusions.cache_clear()
+
+    assert cfg.remove_crowding_exclusions(["BBB.TI"]) == 1
+    assert cfg.load_crowding_exclusions() == frozenset({"AAA.TI", "CCC.TI"})
+
+    text = path.read_text(encoding="utf-8")
+    assert "count: 2" in text, "count 必须同步，否则文件自述与内容不一致"
+    assert "version: 1" in text, "文件头不能被这次改写抹掉"
+    assert "BBB.TI" not in text
+
+
+def test_remove_crowding_exclusions_is_noop_when_absent(
+        tmp_path: Path, monkeypatch) -> None:
+    """清单里没有的代码 → 返回 0，且**不改动文件**（幂等、可重复调用）。"""
+    from src.sector_crowding import config as cfg
+
+    path = _write_exclusions(tmp_path)
+    monkeypatch.setattr(cfg, "PROJECT_ROOT", tmp_path)
+    cfg._cached_exclusions.cache_clear()
+    before = path.read_text(encoding="utf-8")
+
+    assert cfg.remove_crowding_exclusions(["ZZZ.TI"]) == 0
+    assert cfg.remove_crowding_exclusions([]) == 0
+    assert path.read_text(encoding="utf-8") == before

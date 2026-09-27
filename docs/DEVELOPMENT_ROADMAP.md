@@ -92,7 +92,7 @@
 
 | 编号 | 事项 | 现状 | 接入/完成条件 |
 |------|------|------|---------------|
-| B01 | 付费产业数据接口接入（Wind / 同花顺iFinD / Choice / Tushare Pro产业库等，覆盖半导体出货量、社零、煤价库存、IND申报、集采均价等行业指标） | 由 `MockIndustryConnector`（ind:前缀，24个月确定性合成序列，三重模拟标记）占位，A13-A16行业层链路已端到端打通 | 申请到付费API Key后，新建同 `BaseConnector` 契约的真实连接器，**保持 indicator id 不变**（见 supervisor.INDUSTRY_INDICATORS），在 `build_runtime()` 的 ConnectorRouter 中把 ind: 路由从模拟连接器换为真实连接器（可加 settings 开关与真实缺失时回退模拟）；替换后用 `scripts/_smoke_e2e.py` 科技/周期段回归 |
+| B01 | ~~付费产业数据接口接入~~（**已用免费公开源全部替换，2026-09-26 完成**） | 原 `MockIndustryConnector`（ind:前缀，24个月确定性合成序列）**已整体删除**。行业层指标现全部来自真实互联网源：科技三指标=WSTS/国家统计局/中证官网；消费·周期·医药行业PE=中证指数官网（备申万一级）；白酒价格=酒排名「酒价内参」（**终端零售均价，非批价**，已在 source_name 披露）；电厂煤炭库存=中电联CECI周报（发电企业样本口径）；创新药IND件数=CDE药审中心受理接口 | `ind:医保集采药品均价同比` **已退役**（集采是离散事件制，不存在连续月度均价同比的真实序列；官方自第10批起不再公布整体降幅）—— 宁缺口不造假。后续若需付费源（Wind/iFinD/Choice），按 `BaseConnector` 契约新建即可，indicator id 保持不变（见 supervisor.INDUSTRY_INDICATORS）；回归用 `scripts/_smoke_e2e.py` |
 | B02 | GitHub 远程仓库与 CI 启用 | `.github/workflows/ci.yml` 已就绪，本地仓库未配置 remote（用户决定暂缓创建） | 用户在 GitHub 建库后：`git remote add origin <url> && git push -u origin master`，观察首次 Actions（后端3.11/3.13 ruff+pytest，前端构建） |
-| B03 | 行业报告中的模拟数据披露 | 模拟点 source_name/extra 已标记，LLM上下文可见；**前端"运行指标→数据源与依赖健康"已常驻"模拟数据"橙色徽标** | 接入真实数据（B01）后自然消除；演示时仍建议口播补充说明行业段为模拟数据 |
+| B03 | ~~行业报告中的模拟数据披露~~（**已随 B01 消除**） | 行业层已无模拟数据，前端"数据源与依赖健康"不再出现模拟源 | 已消除；仅需注意两处**代理口径**披露：白酒=终端零售均价（非批价）、电厂库存=中电联样本口径 |
 | B04 | ~~回测真实行情实跑~~（已完成） | 东财主源断连，已给AkshareConnector加新浪前复权源故障回退；真实数据回测已跑通（601088，2007-10~2025-08共213月，朴素PPI动量规则跑输买入持有66%——框架验证结论：规则本身无超额收益，不构成投资建议） | 后续可扩展多规则/多标的对比；新增行情源时保持stock_close契约 |

@@ -258,6 +258,33 @@ async def execute_job(
                     record, status="success",
                     records_processed=scan.alerts_created,
                     error_message=detail if scan.data_gaps else "")
+            if spec.kind == "sector_rotation_report":
+                # 行业轮动日报：生成即落盘（data/sector_rotation/），
+                # 任一数据源失败只让对应板块为空，整份报告仍产出 ——
+                # 只有"连交易日都定不下来"才算作业失败。
+                # cron 是"15:40 主生成 + 每小时补跑到 23:40"：补跑命中
+                # "已是最新"时直接跳过（幂等），只有真的落伍才付一轮取数。
+                from src.sector_rotation import service as rotation_service
+                from src.sector_rotation import store as rotation_store
+
+                if rotation_store.latest_date() and not rotation_service.is_stale():
+                    return run_log.finish(
+                        record, status="success", records_processed=0,
+                        error_message=f"报告已是最新（{rotation_store.latest_date()}），跳过取数")
+                payload = await rotation_service.generate(force=True)
+                meta = payload.get("meta") or {}
+                boards = len(payload.get("industries") or [])
+                if not meta.get("trade_date"):
+                    return run_log.finish(
+                        record, status="failed", records_processed=0,
+                        error_message="所有数据源均不可用，无法确定交易日")
+                detail = (f"交易日 {meta['trade_date']}：行业板块 {boards} 个，"
+                          f"指数 {len(payload.get('indices') or [])} 个")
+                return run_log.finish(
+                    record,
+                    status="success" if boards else "partial",
+                    records_processed=boards,
+                    error_message=detail[:500])
             if spec.kind == "mainline_warm":
                 # 与 `mainline_daily` 同一形态：detail 是 dict，失败时带 `failed`
                 processed, warm_detail = await _mainline_warm()

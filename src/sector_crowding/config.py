@@ -25,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from src.core.errors import (
     BRIEF_DEFAULT,
@@ -59,6 +59,59 @@ class WindowConfig:
     alert_threshold: float = 0.8
     high_alert_threshold: float = 0.9
     min_bars_for_water_level: int = 60
+    #: 水位分母的**样本量偏差校正**（2026-09-27）。
+    #:
+    #: ## 问题：这是"样本最大值偏差"，不是"数据不够"
+    #:
+    #: 水位 = `ma5_crowding / 该板块自己的历史最大值`，分母是**样本最大值**
+    #: `M_n`。次序统计量的基本结论：**`E[M_n]` 随 n 单调上升** ——
+    #: 历史短的板块分母系统性偏小 → 水位**系统性虚高** → 误告警。
+    #:
+    #: 项目用 `min_bars_for_water_level`（750）堵过一次（60 根时曾有 218 个
+    #: 板块报 ≥80%）。但**二值门槛只把悬崖挪了个位置**：`750~1460` 根有 1033 个、
+    #: `>=1460` 根有 457 个，两组 `E[M_n]` 仍不等价。
+    #:
+    #: ## ⚠️ 先试了"向同类中位数收缩"，**回测证伪、已放弃**
+    #:
+    #: James-Stein 式收缩 `denom = exp(w·ln(M_T) + (1-w)·ln(M_peer))`
+    #: 在截断回测里**一致变差**：`M_peer` 是横截面中位数，各板块 `M_T` 与之
+    #: 比有高有低，向中位数收缩等于把高于中位的分母**调小** → 水位更高。
+    #: 实测系统性偏差 k=0 时 +0.047、k=250 时 +0.099（越收越偏）。
+    #:
+    #: ## 最终方案：**尺度校正**（截断回测标定，已验证）
+    #:
+    #: ```
+    #: r(T)  = median( M_full / M_T )     在满窗板块（n >= 1460）上估计
+    #: denom = M_T · r(n)
+    #: ```
+    #:
+    #: 截断回测结果（`scripts/calibrate_shrink_k.py` → `docs/_water_bias_curve.txt`）：
+    #:
+    #:     T     r(T)    朴素偏差   校正后偏差   MAE改善
+    #:     60   2.6207   +0.3502    -0.0612     54.3%
+    #:    250   1.7021   +0.1801    -0.0241     27.0%
+    #:    500   1.1469   +0.0793    +0.0288      1.3%
+    #:    750   1.0000   +0.0470    +0.0470      0.0%
+    #:   1460   1.0000   +0.0002    +0.0002      0.0%
+    #:
+    #: `T >= 750` 时 `r = 1` 是**实测结论**（大多数满窗板块的极值就在最近 750 天内），
+    #: 不是人为设的 —— 所以 750 以上行为完全不变，改动只影响 750 以下。
+    bias_correction_enabled: bool = True
+    #: 校正曲线 `{根数: 分母放大系数}`，中间值线性插值，超出上界取 1.0。
+    #: 由 `scripts/calibrate_shrink_k.py` 生成，**不要手改**。
+    bias_curve: dict[str, float] = field(default_factory=lambda: {
+        "60": 2.620654, "120": 2.377244, "250": 1.702132,
+        "375": 1.301285, "500": 1.146894, "625": 1.04693,
+        "750": 1.0,
+    })
+    #: 校正规程下的**发布下限**（根数低于它仍不出水位）。
+    #:
+    #: 与 `min_bars_for_water_level` 的分工：
+    #:   * `min_bars_for_water_level` = **满信心**门槛（750），前端据此标「参考」
+    #:   * `min_bars_publish`         = **能不能出数**的下限（60），只挡噪声
+    #:
+    #: 60 是"MA5 至少暖机 5 天、分母至少有一点自身信息"的最低要求。
+    min_bars_publish: int = 60
 
 
 @dataclass
@@ -118,6 +171,48 @@ class MetricConfig:
     #: 为什么要有下限：提纯里存在"退化"结果（885699 原始 256 只压到 1 只），
     #: 拿单只股票算资金流，噪声远大于信号。实测全池只有 3 个板块低于 5 只。
     min_purified_members: int = 3
+    #: 周频 4 列**只算看板清单里可见的板块**（`sector_crowding_list.visible=1`）。
+    #:
+    #: ## 为什么要收口（2026-09-27 改）
+    #:
+    #: 改之前：`compute_all_metrics()` 对 `compute_water_changes()` 返回的
+    #: **全部**板块算 —— 实测一周 **1878 个**，而看板清单里可见的只有
+    #: **554 个**。也就是说 **71% 的计算结果从来没有被渲染过**。
+    #:
+    #: 注意这不等于「主线那套 20 日胜率门槛」：拥挤度刻意**不**吃
+    #: `sector_blacklist.yaml`（604 条），因为它刻意保留行业指数
+    #: （"以后想看行业拥挤度不用重跑 6 年"，见 `metrics._sector_blacklist`）。
+    #: 这里收的是**看板可见性**，不是题材优劣。
+    #:
+    #: ## 代价（有意的）
+    #:
+    #: 被移出清单（`visible=0`）的板块，4 列会**停止更新**。它已经落库的历史行
+    #: 不动，重新加回清单后下一次重算就能补上（`force=True` 或下一周）。
+    #: 所以这是"按需计算"，不是数据丢失。
+    #:
+    #: 想恢复全量：设 `pool_only: false`（对照/回填历史周时用）。
+    pool_only: bool = True
+    #: `pool_only` 的收口**只算概念板块**（`sector_meta.is_concept = 1`）。
+    #:
+    #: ## 为什么必须跟看板默认视图一致（2026-09-27 修）
+    #:
+    #: 看板的「只看概念板块」勾选框**默认是勾上的**
+    #: （`web/src/components/SectorCrowdingTab.tsx` → `useState(true)`），
+    #: 也就是 `config_list?concepts_only=true` —— 第一版收口漏了这一点，
+    #: 用了 `concepts_only=false`，于是"清单可见"取到 **554**，
+    #: 而用户实际看到的清单只有 **262**：差的那 **292 个是非概念板块**
+    #: （行业指数 / 地区 / 指数样本 / 同花顺自建组合，见 `is_concept_board`）。
+    #:
+    #: 收口的**唯一理由**是"别算渲染不出来的东西"，所以判据必须等于
+    #: **默认渲染集合**，不是"可能被渲染的集合"。勾选框是逃生口
+    #: （它自己的 tooltip 就写着"数据本身是全量落库的，取消勾选即可查看全部"），
+    #: 不是默认口径。
+    #:
+    #: ## 代价
+    #:
+    #: 取消勾选「只看概念板块」时，那 292 行的 4 列会显示「—」。
+    #: 想让逃生口也有数：设 `pool_concepts_only: false`（回到 554）。
+    pool_concepts_only: bool = True
 
 
 @dataclass
@@ -192,6 +287,16 @@ def _build(raw: dict[str, Any]) -> SectorCrowdingConfig:
             alert_threshold=float(window.get("alert_threshold", 0.8)),
             high_alert_threshold=float(window.get("high_alert_threshold", 0.9)),
             min_bars_for_water_level=int(window.get("min_bars_for_water_level", 60)),
+            bias_correction_enabled=bool(
+                window.get("bias_correction_enabled", True)),
+            # ⚠️ 必须区分"YAML 没写"和"YAML 写了空"：写成
+            # `{...} or None` 会在没配时把 dataclass 的**默认曲线**覆盖成 None，
+            # 于是偏差校正静默失效、水位全部退回旧口径（实测踩到：
+            # r(n) 恒为 1.0，60 根以下直接不出数）。
+            **({"bias_curve": {str(k): float(v) for k, v in
+                               window["bias_curve"].items()}}
+               if window.get("bias_curve") else {}),
+            min_bars_publish=int(window.get("min_bars_publish", 60)),
         ),
         data=DataConfig(
             board_source=str(data.get("board_source", "ths_index+dim_concept")),
@@ -218,6 +323,8 @@ def _build(raw: dict[str, Any]) -> SectorCrowdingConfig:
             flow_weekday=int(metric.get("flow_weekday", 2)),
             use_purified_members=bool(metric.get("use_purified_members", True)),
             min_purified_members=int(metric.get("min_purified_members", 3)),
+            pool_only=bool(metric.get("pool_only", True)),
+            pool_concepts_only=bool(metric.get("pool_concepts_only", True)),
         ),
         logging=LoggingConfig(
             level=str(log.get("level", "INFO")),
@@ -379,6 +486,61 @@ def load_crowding_exclusions(filename: str = "crowding_exclusions.yaml"
         return None
 
 
+_EXCL_ENTRY_RE = re.compile(r'^\s*-\s*\{.*?code:\s*"([^"]+)".*?\}\s*$')
+
+
+def remove_crowding_exclusions(codes: Iterable[str]) -> int:
+    """把若干代码从**剔除清单**里摘掉，返回实际摘掉几条。
+
+    ## 为什么需要它（2026-09-27）
+
+    剔除清单一旦收入某个板块，`db.query_list_view()` 就会把它从
+    `/config_list` 里过滤掉。而 `POST /config_list`（新增）与
+    `POST /config_list/restore`（恢复）只写 `visible = 1`、**不碰清单** ——
+    于是会出现一个静默陷阱：界面回 `{"restored": 1}`，但板块**不出现**，
+    因为它在清单里被挡住了。用户只会以为"恢复坏了"。
+
+    所以**用户显式新增/恢复 = 撤销当初的剔除决定**，这里把代码摘出去。
+
+    ## 只改 entries 行，不动文件头
+
+    文件是 `scripts/prune_crowding.py --emit-config` 生成的，头部注释有
+    来历说明，不该被这次改写抹掉。所以按行处理：只删命中的 `- { code: ... }`
+    行并同步 `count:`，其余原样保留。
+
+    ## 重新生成会不会把它加回来
+
+    不会（对「看板移除」那一类）：它现在的 `visible = 1`，
+    `resolve_hidden()` 查的是 `visible = 0`，所以不会重新收入。
+    只有「点名」那一类（脚本里写死的名称清单）会被重新生成加回来 ——
+    那种情况要连 `RAW` 一起改。
+    """
+    path = PROJECT_ROOT / "configs" / "crowding_exclusions.yaml"
+    if not path.exists():
+        return 0
+    want = {str(code) for code in codes if str(code or "").strip()}
+    if not want:
+        return 0
+    lines = path.read_text(encoding="utf-8").splitlines()
+    kept: list[str] = []
+    removed = 0
+    for line in lines:
+        match = _EXCL_ENTRY_RE.match(line)
+        if match and match.group(1) in want:
+            removed += 1
+            continue
+        kept.append(line)
+    if not removed:
+        return 0
+    left = sum(1 for line in kept if _EXCL_ENTRY_RE.match(line))
+    out = [f"count: {left}" if line.startswith("count:") else line
+           for line in kept]
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    _cached_exclusions.cache_clear()
+    logger.info("拥挤度剔除清单：摘掉 %d 条，剩 %d 条", removed, left)
+    return removed
+
+
 __all__ = [
     "CONFIG_PATH",
     "PROJECT_ROOT",
@@ -392,4 +554,5 @@ __all__ = [
     "is_concept_board",
     "load_config",
     "load_crowding_exclusions",
+    "remove_crowding_exclusions",
 ]

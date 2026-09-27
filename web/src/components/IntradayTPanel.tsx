@@ -1,5 +1,4 @@
 import { getParam, setParam } from "../route";
-import Disclaimer from "./Disclaimer";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api, intradayWsUrl, IntradayBacktest, IntradaySnapshot, IntradayWatchItem,
@@ -1108,7 +1107,6 @@ export default function IntradayTPanel({ view = "t", onEditProfile }: {
 
   return (
     <div className="intraday-root">
-      <Disclaimer compact />
       <div className="intraday-toolbar">
         {/* 自选侧边栏开合：不必先进设置，一个图标按钮直接切 */}
         <button className={`btn-ghost drawer-toggle${drawerOpen ? " active" : ""}`}

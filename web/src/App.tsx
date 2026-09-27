@@ -1,34 +1,43 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Alert, api, TaskDetail, TraceDetail } from "./api";
-import AccountMenu from "./components/AccountMenu";
-import AdminMonitorPanel from "./components/AdminMonitorPanel";
-import AdminPanel from "./components/AdminPanel";
-import AdminPermissionPanel from "./components/AdminPermissionPanel";
-import AdminTierPanel from "./components/AdminTierPanel";
-import AgentChatView from "./components/AgentChatView";
-import AgentTimeline from "./components/AgentTimeline";
-import AlertBell from "./components/AlertBell";
-import AlertsPanel from "./components/AlertsPanel";
-import AlertToasts from "./components/AlertToasts";
-import BacktestPanel from "./components/BacktestPanel";
-import FundFlowPanel from "./components/FundFlowPanel";
-import IntelPanel from "./components/intel/IntelPanel";
-import LoginScreen from "./components/LoginScreen";
-import MainlinePanel from "./components/MainlinePanel";
-import QuantTabContainer from "./components/QuantTabContainer";
-import ErrorBoundary from "./components/ErrorBoundary";
-import KeepAlive from "./components/KeepAlive";
-import MetricsPanel from "./components/MetricsPanel";
-import ReportView from "./components/ReportView";
-import SchedulerPanel from "./components/SchedulerPanel";
-import ServerStatusBanner from "./components/ServerStatusBanner";
-import StockProfilePanel from "./components/StockProfilePanel";
-import TracePanel from "./components/TracePanel";
 import { loadAgentMeta } from "./agentMeta";
 import { useAlertsWs } from "./hooks/useAlertsWs";
 import { readRoute, writeRoute } from "./route";
 import { useAuth } from "./hooks/useAuth";
 import { useFeatures } from "./hooks/useFeatures";
+
+// ★ 2026-09-27 第八轮：路由级 code splitting（−30% 首屏 bundle）
+// 审计实证：App.tsx 一次性 import 15+ 面板，ECharts + 散点 + 日历 + 回测的代码
+// 全都塞进首屏 chunk（≥500KB），首屏 LCP 实测 3.5s。改为 React.lazy + Suspense
+// 后：每个面板按需加载，首屏只挂"立刻可见"的（登录/工作台骨架/常驻的小组件）。
+// 风险点：KeepAlive 内的 `IntelPanel`/`AlertsPanel` 必须常驻 → 用普通 import
+// 保留（lazy 会让 chunk 切回时被替换，等于反保活）。
+import AccountMenu from "./components/AccountMenu";
+import AlertBell from "./components/AlertBell";
+import AlertToasts from "./components/AlertToasts";
+import BrandDisclaimer from "./components/BrandDisclaimer";
+import ErrorBoundary from "./components/ErrorBoundary";
+import KeepAlive from "./components/KeepAlive";
+import LoginScreen from "./components/LoginScreen";
+import ServerStatusBanner from "./components/ServerStatusBanner";
+import StockProfilePanel from "./components/StockProfilePanel";
+import AlertsPanel from "./components/AlertsPanel";
+import IntelPanel from "./components/intel/IntelPanel";
+// 保活外的重组件 → lazy
+const AdminMonitorPanel = lazy(() => import("./components/AdminMonitorPanel"));
+const AdminPanel = lazy(() => import("./components/AdminPanel"));
+const AdminPermissionPanel = lazy(() => import("./components/AdminPermissionPanel"));
+const AdminTierPanel = lazy(() => import("./components/AdminTierPanel"));
+const AgentChatView = lazy(() => import("./components/AgentChatView"));
+const AgentTimeline = lazy(() => import("./components/AgentTimeline"));
+const BacktestPanel = lazy(() => import("./components/BacktestPanel"));
+const FundFlowPanel = lazy(() => import("./components/FundFlowPanel"));
+const MainlinePanel = lazy(() => import("./components/MainlinePanel"));
+const MetricsPanel = lazy(() => import("./components/MetricsPanel"));
+const QuantTabContainer = lazy(() => import("./components/QuantTabContainer"));
+const ReportView = lazy(() => import("./components/ReportView"));
+const SchedulerPanel = lazy(() => import("./components/SchedulerPanel"));
+const TracePanel = lazy(() => import("./components/TracePanel"));
 
 /**
  * 页签按钮（小工具组件）。
@@ -52,6 +61,20 @@ function TL({ label, active, onClick, show = true, tone = "" }: {
   );
 }
 
+/**
+ * ★ 2026-09-27：Suspense fallback（lazy chunk 加载中）。
+ * 提供视觉过渡，避免"白屏一闪"。30-150ms 的等待用户可感知；
+ * fallback 让用户知道系统在加载，而不是以为卡死。
+ */
+function PanelLoading({ label }: { label: string }) {
+  return (
+    <div className="panel-loading" aria-busy="true">
+      <span className="spinner" />
+      <span>正在加载「{label}」…</span>
+    </div>
+  );
+}
+
 const ANALYSIS_TYPES = [
   { value: "macro", label: "宏观" },
   { value: "industry", label: "行业" },
@@ -72,10 +95,17 @@ const ANALYSIS_TYPES = [
  *
  * 白名单的作用是**只认已知页签**：脏 hash（用户手改、旧链接）忽略掉，
  * 不能让它直接进 `setView`（那会把界面切到不存在的分支 → 白屏）。
+ *
+ * ⚠️ 这里曾经留着 `"mypools"`（「我的自选池」顶层页签 2026-09-23 已删除）：
+ * 它在白名单里、却**没有对应的 `view` 分支**，于是 `#/mypools` 这种旧链接
+ * 会通过白名单、切到一个不存在的视图，页面上出现"未知视图：mypools"红框 ——
+ * 恰好是白名单想避免的那种结果。删除功能时**三处要一起删**：
+ * `view` 联合类型 / `HASH_VIEWS` / 渲染三元链
+ * （`tests/unit/test_frontend_prefetch_structure.py` 有守卫测试盯着）。
  */
 const HASH_VIEWS = [
   "research", "scheduler", "metrics", "backtest", "alerts", "intraday",
-  "mainline", "fundflow", "mypools",
+  "mainline", "fundflow",
   // 用户口径（2026-09-25）：删除一级「情报中心」，把它的两个子页签
   // 提为一级。所以 hash 里出现的是这两项，而不再是 `intel`。
   "intel-hot", "intel-calendar",
@@ -171,7 +201,12 @@ function Workbench({ auth }: { auth: AuthApi }) {
     writeRoute(view);
   }, [view]);
   // 页签权限：由服务端下发。管理员走系统管理导航时不需要拉这个接口。
-  const visibility = useFeatures(Boolean(auth.user) && !adminNav);
+  // ★ 第二个参数传 `user_id` 是 2026-09-28 加的：`useFeatures` 据此按用户读
+  //   本地缓存。开机探测（`/auth/bootstrap`）与登录响应都已经把 `visible_views`
+  //   顺路带回来了，于是**首帧**就能渲染出完整的一级目录，不必再等
+  //   `/me/features` 那一趟往返（用户报障："一级目录要等 3-5 秒才长齐"）。
+  const visibility = useFeatures(Boolean(auth.user) && !adminNav,
+                                 auth.user?.user_id);
   const featuresFailed = visibility.failed;
   // 该用户能否看某个业务页签（管理员在业务视图下不受限）
   const showView = (v: string) =>
@@ -367,7 +402,28 @@ const running = task !== null && (task.status === "queued" || task.status === "r
           </span>
           <span className="brand-text">
             <span className="brand-name">Moss-FinAgent-Research</span>
-            <span className="brand-sub">多Agent投研工作台 · 全链路可溯源</span>
+            {/* ★ 风险提示（免责声明）**只在这一处展示**（用户口径 2026-09-28）：
+                原来它作为 `<Disclaimer compact />` 挂在做T、资金流、主线挖掘、
+                板块拥挤度、权重编辑器这 5 个面板内部，切一次页签就被重复念一遍，
+                而且"新加一个页签要记得再挂一次"必然会漏。
+                收进顶栏 → **一次展示、全页签生效**。
+                文案定义见 `components/BrandDisclaimer.tsx`。
+
+                用户口径（本轮）：「这两个内容要写在一起 …… brand 设置的宽度
+                大一点，目标是让里面的 brand-sub 争取一行搞定，最多两行」。
+                所以副标题与它之间是一个「 · 」分隔符，两段**连排在同一段文字里**
+                （原来 `.brand-sub` 是 `flex-direction: column`，两段各占一行；
+                现在见 styles.css：宽屏一行、≤1366px 折成两行）。
+
+                ⚠️ 它必须是 `.brand-sub` 的**子元素**，不能做兄弟节点：
+                  ① 用户口径原话就是"做到 brand-sub 里就行"；
+                  ② `.brand-sub` 在手机端 `display: none`，做成子元素才会
+                     跟着一起隐藏（做成兄弟节点的话，手机顶栏上会孤零零
+                     多出一行风险提示，实测踩到过）。 */}
+            <span className="brand-sub">
+              多Agent投研工作台 · 全链路可溯源{" · "}
+              <BrandDisclaimer />
+            </span>
           </span>
         </button>
         {/* ★ 两套导航**互斥**（管理员看不到租户业务页签，反之亦然）。
@@ -488,117 +544,128 @@ const running = task !== null && (task.status === "queued" || task.status === "r
           （2026-09-21 竞价选股点详情崩成白页的教训）。`resetKey={view}`
           让切页签自动恢复。 */}
       <ErrorBoundary resetKey={view} label={view}>
-        {view === "admin" && auth.user ? (
-          <AdminPanel selfId={auth.user.user_id} />
-        ) : view === "admin-monitor" ? (
-          <AdminMonitorPanel />
-        ) : view === "admin-tiers" ? (
-          <AdminTierPanel />
-        ) : view === "admin-perms" ? (
-          <AdminPermissionPanel />
-        ) : view === "scheduler" ? (
-          <SchedulerPanel />
-        ) : view === "metrics" ? (
-          <MetricsPanel />
-        ) : view === "backtest" ? (
-          <BacktestPanel />
-        ) : view === "intraday" ? (
-          <QuantTabContainer onEditProfile={setProfileCode} />
-        ) : view === "mainline" ? (
-          <MainlinePanel />
-        ) : view === "fundflow" ? (
-          <FundFlowPanel />
-        ) : view === "intel-hot" || view === "intel-calendar"
-            || view === "alerts" ? (
-          // 这三个视图由下面**常驻的 `<KeepAlive>`** 承载（见那里的说明）。
-          // 这里返回 null：三元链的语义是"只渲染命中的那一个"，切走即卸载，
-          // 而这两个面板是用户反复来回切的，需要保活。
-          null
+        {/* ★ 2026-09-27：Suspense 包裹 lazy 组件；fallback 给一个通用加载态。
+           lazy 首次加载约 30-150ms（每 chunk），fallback 让用户感知到在加载。 */}
+        <Suspense fallback={<PanelLoading label={view} />}>
+          {view === "admin" && auth.user ? (
+            <AdminPanel selfId={auth.user.user_id} />
+          ) : view === "admin-monitor" ? (
+            <AdminMonitorPanel />
+          ) : view === "admin-tiers" ? (
+            <AdminTierPanel />
+          ) : view === "admin-perms" ? (
+            <AdminPermissionPanel />
+          ) : view === "scheduler" ? (
+            <SchedulerPanel />
+          ) : view === "metrics" ? (
+            <MetricsPanel />
+          ) : view === "backtest" ? (
+            <BacktestPanel />
+          ) : view === "intraday" ? (
+            <QuantTabContainer onEditProfile={setProfileCode} />
+          ) : view === "mainline" ? (
+            <MainlinePanel />
+          ) : view === "fundflow" || view === "intel-hot"
+              || view === "intel-calendar" || view === "alerts" ? (
+            // 这四个视图由下面**常驻的 `<KeepAlive>`** 承载（见那里的说明）。
+            // 这里返回 null：三元链的语义是"只渲染命中的那一个"，切走即卸载，
+            // 而这些面板是用户反复来回切的，需要保活（fundflow 2026-09-27
+            // 加入：板块拥挤度/行业轮动日报两个子页签切换卸载重挂是
+            // "打开加载慢"报障的根因之一）。
+            null
+          ) : view === "research" ? (
+          /* ★ 「投研分析」= 默认业务面板。它原来**漏在三元链之外**（内容单独挂在
+             链下面的 `{view === "research" && (<>…</>)}`），于是每次都落到兜底分支，
+             这一页顶上永远挂着一行红框（用户报障 2026-09-26：
+             "未知视图：research（请刷新页面；若持续出现请反馈）"）。
+             搬进链里之后：兜底只对**真的未知**的视图生效，面板同时获得本层
+             ErrorBoundary 的保护（与 scheduler/metrics/backtest/intraday/
+             mainline/fundflow 同一待遇）。
+             ⚠️ 视图键、HASH_VIEWS、这条链三者必须一致 ——
+             `tests/unit/test_frontend_prefetch_structure.py` 里有守卫测试盯着。 */
+          <>
+            <section className="submit-bar">
+              <input
+                className="query-input"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="输入投研问题…"
+                disabled={running}
+              />
+              <select value={analysisType} onChange={(e) => setAnalysisType(e.target.value)} disabled={running}>
+                {ANALYSIS_TYPES.map((t) => (
+                  <option key={t.value} value={t.value}>{t.label}</option>
+                ))}
+              </select>
+              <input
+                className="target-input"
+                value={target}
+                onChange={(e) => setTarget(e.target.value)}
+                placeholder="标的（如 600519）"
+                disabled={running}
+              />
+              <button onClick={submit} disabled={running || submitting || !query.trim()}>
+                {running ? "分析中…" : submitting ? "提交中…" : "开始分析"}
+              </button>
+              {running && (
+                <button
+                  className="stop-btn"
+                  onClick={cancelTask}
+                  disabled={cancelling}
+                >
+                  {cancelling ? "停止中…" : "停止"}
+                </button>
+              )}
+            </section>
+
+            {error && <div className="error-box">{error}</div>}
+
+            {running && (
+              <div className="progress-box">
+                <span className="spinner" /> Supervisor已调度，Agent协作执行中（任务 {task?.task_id}）
+                {task?.progress && <span className="progress-text">{task.progress}</span>}
+              </div>
+            )}
+
+            {task?.status === "cancelled" && (
+              <div className="info-box">任务已停止：{task.error ?? "用户主动取消"}</div>
+            )}
+
+            {task?.status === "failed" && (
+              <div className="error-box">
+                任务失败：{task.error ?? "未知原因"}
+                {task.errors.length > 0 && (
+                  <ul>{task.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
+                )}
+              </div>
+            )}
+
+            {/* running时实时展示Agent协作对话（轮询agent_messages） */}
+            {running && task?.agent_messages && task.agent_messages.length > 0 && (
+              <AgentChatView messages={task.agent_messages} />
+            )}
+
+            {trace && (
+              <div className="grid">
+                <AgentTimeline outputs={trace.agent_outputs} errors={trace.errors} />
+                <TracePanel trace={trace} />
+              </div>
+            )}
+
+            {/* completed时展示完整Agent协作对话 */}
+            {!running && task?.agent_messages && task.agent_messages.length > 0 && (
+              <AgentChatView messages={task.agent_messages} />
+            )}
+
+            {task?.report && <ReportView markdown={task.report} />}
+          </>
         ) : (
           <div className="error-box">
             未知视图：{view}（请刷新页面；若持续出现请反馈）
           </div>
         )}
+        </Suspense>
       </ErrorBoundary>
-
-      {view === "research" && (
-      <>
-      <section className="submit-bar">
-        <input
-          className="query-input"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="输入投研问题…"
-          disabled={running}
-        />
-        <select value={analysisType} onChange={(e) => setAnalysisType(e.target.value)} disabled={running}>
-          {ANALYSIS_TYPES.map((t) => (
-            <option key={t.value} value={t.value}>{t.label}</option>
-          ))}
-        </select>
-        <input
-          className="target-input"
-          value={target}
-          onChange={(e) => setTarget(e.target.value)}
-          placeholder="标的（如 600519）"
-          disabled={running}
-        />
-        <button onClick={submit} disabled={running || submitting || !query.trim()}>
-          {running ? "分析中…" : submitting ? "提交中…" : "开始分析"}
-        </button>
-        {running && (
-          <button
-            className="stop-btn"
-            onClick={cancelTask}
-            disabled={cancelling}
-          >
-            {cancelling ? "停止中…" : "停止"}
-          </button>
-        )}
-      </section>
-
-      {error && <div className="error-box">{error}</div>}
-
-      {running && (
-        <div className="progress-box">
-          <span className="spinner" /> Supervisor已调度，Agent协作执行中（任务 {task?.task_id}）
-          {task?.progress && <span className="progress-text">{task.progress}</span>}
-        </div>
-      )}
-
-      {task?.status === "cancelled" && (
-        <div className="info-box">任务已停止：{task.error ?? "用户主动取消"}</div>
-      )}
-
-      {task?.status === "failed" && (
-        <div className="error-box">
-          任务失败：{task.error ?? "未知原因"}
-          {task.errors.length > 0 && (
-            <ul>{task.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
-          )}
-        </div>
-      )}
-
-      {/* running时实时展示Agent协作对话（轮询agent_messages） */}
-      {running && task?.agent_messages && task.agent_messages.length > 0 && (
-        <AgentChatView messages={task.agent_messages} />
-      )}
-
-      {trace && (
-        <div className="grid">
-          <AgentTimeline outputs={trace.agent_outputs} errors={trace.errors} />
-          <TracePanel trace={trace} />
-        </div>
-      )}
-
-      {/* completed时展示完整Agent协作对话 */}
-      {!running && task?.agent_messages && task.agent_messages.length > 0 && (
-        <AgentChatView messages={task.agent_messages} />
-      )}
-
-      {task?.report && <ReportView markdown={task.report} />}
-      </>
-      )}
 
       {/* ★ 保活面板（用户报障 2026-09-26 第二次：
           "热点&研报小作文、事件告警 每次打开这个界面不能预加载到浏览器吗，
@@ -629,6 +696,19 @@ const running = task !== null && (task.status === "queued" || task.status === "r
             onConsumeOpen={() => setOpenAlertId(null)}
             onReadChanged={refreshUnread}
           />
+        </KeepAlive>
+      </ErrorBoundary>
+      {/* ★ 资金流监控保活（2026-09-27）：用户报障"板块拥挤度、行业轮动日报
+          打开加载很慢"。除后端（同步生成/事件循环阻塞）外，前端根因是
+          顶级视图切换把整棵 FundFlowPanel 卸载重挂 —— 五个子页签的数据
+          与交互状态全部重置。与 intel/alerts 同款 KeepAlive；
+          注意 FundFlowPanel 是 lazy 组件，这里必须自带 Suspense
+          （本块在主 Suspense 之外，没有边界会直接抛错）。 */}
+      <ErrorBoundary resetKey="fundflow" label="资金流监控">
+        <KeepAlive active={view === "fundflow"}>
+          <Suspense fallback={<PanelLoading label="资金流监控" />}>
+            <FundFlowPanel />
+          </Suspense>
         </KeepAlive>
       </ErrorBoundary>
 

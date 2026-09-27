@@ -149,9 +149,14 @@ async def require_admin(request: Request) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    """真实客户端 IP。只认 Cloudflare 覆盖的 `CF-Connecting-IP`。"""
-    return (request.headers.get("CF-Connecting-IP")
-            or (request.client.host if request.client else "") or "")
+    """真实客户端 IP。**统一委托 `core.client_ip`**（代理链感知）。
+
+    管理操作的审计留痕全靠它，所以尤其不能三份实现各自漂移 ——
+    见 `src/core/client_ip.py` 的模块说明。
+    """
+    from src.core.client_ip import client_ip
+
+    return client_ip(request)
 
 
 def _iso_days_from_now(days: int) -> str:

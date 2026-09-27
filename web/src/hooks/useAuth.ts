@@ -31,6 +31,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AuthUser, LoginMode, MeResult, authApi } from "../api";
+import { clearFeaturesCache, seedFeaturesViews } from "../featuresCache";
 import { UNAUTHORIZED_EVENT, UNAUTHORIZED_NOTICE } from "../unauthorized";
 
 export type AuthPhase = "checking" | "anonymous" | "authenticated";
@@ -94,6 +95,10 @@ export function useAuth() {
       logProbe(r.authenticated ? (r.renewed ? "续期成功" : "已有会话")
                                : "未登录", performance.now() - t0);
       if (r.authenticated) {
+        // ★ 页签清单随探测一起回来了（`/auth/bootstrap` 顺路带回），**先落盘**：
+        //   `AppInner` 挂载时 `useFeatures` 会同步读到它，一级目录首帧就完整，
+        //   不必再等 `/me/features` 那一趟往返。见 featuresCache.ts 开头说明。
+        seedFeaturesViews(r.user_id, r.visible_views, r.is_admin);
         setState({
           phase: "authenticated",
           user: toUser(r),
@@ -157,6 +162,12 @@ export function useAuth() {
       phase: "authenticated", user: result.user ?? null, me: null,
       notice: "",
     }));
+    // ★ 登录响应里也带着页签清单（后端 `_features_payload`）：**先落盘**，
+    //   让紧接着挂载的 `useFeatures` 首帧就有完整的一级目录。
+    //   这是"第一次"登录（本机还没有任何缓存）唯一能省掉的那趟往返 ——
+    //   用户报障里的"首次登录进去"说的正是这条路径。
+    seedFeaturesViews(result.user?.user_id ?? "", result.visible_views,
+                      result.is_admin);
     // ★ 预加载事件告警与情报流。
     //
     // 这里**保留**（登录是"用户马上就会用到"的时刻，越早取越好），
@@ -195,6 +206,10 @@ export function useAuth() {
         const { resetPrefetchState } = await import("../panelPrefetch");
         resetPrefetchState();
       } catch { /* 同上 */ }
+      // 页签清单缓存同理（2026-09-28）。`readFeaturesCache` 本来就会校验
+      // `user_id`（换个人读不到上一个人的），这里清掉只是让状态更干净 ——
+      // 与上面两个缓存保持一致，避免"到底清了哪些"要靠读代码才知道。
+      clearFeaturesCache();
       // 即使请求失败也要回到登录页：留在界面上只会让人以为还登着
       setState({ phase: "anonymous", user: null, me: null, notice: "",
                  loginMode: null });

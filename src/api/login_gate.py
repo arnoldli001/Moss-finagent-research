@@ -166,14 +166,25 @@ def _session_cookie_name() -> str:
 
 
 def _client_ip(request: Request) -> str:
-    """真实客户端 IP。**只认 Cloudflare 覆盖的 `CF-Connecting-IP`**。
+    """真实客户端 IP。**统一委托 `core.client_ip`**（代理链感知）。
 
-    ⚠️ 不要退回 `request.client.host`：接上 Cloudflare Tunnel 之后，
-    所有公网请求在 TCP 层都来自本机的 `cloudflared`（127.0.0.1），
-    日志里会变成"全网访问都来自本机"，等于没有来源信息。
+    这里原来自己实现了一份"只认 Cloudflare 覆盖的 `CF-Connecting-IP`"。
+    两个问题（2026-09-26）：
+
+    1. **同样的实现在三个文件里各有一份**（本文件 / `routes/auth.py` /
+       `routes/admin.py`）。客户端 IP 是**安全判据**（限流计数、图形码判定、
+       审计追溯），三份实现必然分叉，而分叉的症状只是"某个接口限流莫名失效"
+       —— 不报错，只是有人能多试几次密码。
+    2. **上香港 VPS + nginx 后会全盘失效**：那条路没有 `CF-Connecting-IP`，
+       于是所有用户退化成本机地址 = 共用一个限流计数。
+
+    现在统一走 `src/core/client_ip.py`：它按"直连我的那一跳是否可信"
+    决定采信 `CF-Connecting-IP`（CF 形态）还是 `X-Forwarded-For`（nginx 形态），
+    两者都不满足就退回直连 peer。
     """
-    return (request.headers.get("CF-Connecting-IP")
-            or (request.client.host if request.client else "") or "")
+    from src.core.client_ip import client_ip
+
+    return client_ip(request)
 
 
 async def _session_is_alive(session_id: str) -> bool:

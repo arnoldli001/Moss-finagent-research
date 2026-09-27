@@ -1,4 +1,4 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -115,3 +115,10 @@ node_modules/
 /tests/unit/test_moss_selector.py
 /tests/unit/test_selector_labels_and_buckets.py
 /tests/unit/test_preheat_cache.py
+
+# ---- 香港 VPS + frp（2026-09-26）----
+# frpc.toml 里有隧道 auth.token：泄露 = 别人能把你 VPS 的端口暴露到公网。
+# 入库的只有占位符版本 scripts/frpc.toml.example。
+/frpc.toml
+# frp 客户端二进制（体积大、平台特定，不入库）
+/bin/frpc.exe

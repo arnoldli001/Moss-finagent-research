@@ -87,22 +87,86 @@ def test_keep_alive_is_not_mounted_inside_the_ternary_chain():
 
 
 def test_panels_are_not_rendered_in_the_ternary_chain():
-    """两个面板不能再出现在三元链里 —— 否则与保活副本双份渲染。"""
+    """保活面板不能再出现在三元链里 —— 否则与保活副本双份渲染。"""
     part = _ternary_part()
-    for comp in ("<IntelPanel", "<AlertsPanel"):
+    for comp in ("<IntelPanel", "<AlertsPanel", "<FundFlowPanel"):
         assert comp not in part, (
             f"{comp} 仍在三元链里渲染 —— 会与保活副本同时挂载，出现双份面板")
 
 
 def test_ternary_returns_null_for_keepalive_views():
-    """三元链对这三个视图必须返回 `null`（内容已交给保活层）。"""
+    """三元链对这四个视图必须返回 `null`（内容已交给保活层）。"""
     part = _ternary_part()
-    assert 'view === "intel-hot"' in part and 'view === "alerts"' in part, (
-        "三元链里没有对 intel/alerts 视图的显式分支 —— 会落到未知视图兜底")
+    for key in ("intel-hot", "alerts", "fundflow"):
+        assert f'view === "{key}"' in part, (
+            f"三元链里没有对 {key} 视图的显式分支 —— 会落到未知视图兜底")
     idx = part.find('view === "alerts"')
     tail = part[idx:idx + 300]
     assert re.search(r"\?\s*\(\s*null", tail), (
-        "intel/alerts 分支应返回 null（内容由 KeepAlive 承载）")
+        "intel/alerts/fundflow 分支应返回 null（内容由 KeepAlive 承载）")
+
+
+# ------------------------------------------------- 视图键三处一致（2026-09-26 报障）
+
+def _view_keys() -> list[str]:
+    """`useState` 里那个 `view` 联合类型的全部视图键。"""
+    src = _read("App.tsx")
+    m = re.search(r"useState<\s*([^>]*?)\s*>\s*\(\s*\"", src, re.S)
+    assert m, "找不到 `view` 的 useState 联合类型"
+    keys = re.findall(r'"([A-Za-z0-9_-]+)"', m.group(1))
+    assert len(keys) >= 10, f"解析出来的视图键太少（{keys}），正则可能失效了"
+    return keys
+
+
+def _hash_view_keys() -> list[str]:
+    """`HASH_VIEWS`（可写进 URL 的白名单）。"""
+    src = _read("App.tsx")
+    m = re.search(r"const HASH_VIEWS = \[(.*?)\]\s*as const", src, re.S)
+    assert m, "找不到 HASH_VIEWS"
+    return re.findall(r'"([A-Za-z0-9_-]+)"', m.group(1))
+
+
+def test_every_view_key_has_an_explicit_branch():
+    """每个视图键都必须有显式分支 —— 漏一个就静默落到"未知视图"红框。
+
+    用户报障 2026-09-26：「未知视图：research（请刷新页面；若持续出现请反馈）」。
+    「投研分析」正是漏掉的那个：它的内容单独挂在三元链**之外**
+    （`{view === "research" && (<>…</>)}`），链里没有它的分支，
+    于是**每次打开这一页**顶上都会多一行红框 —— 功能其实正常，纯噪声，
+    所以谁都没在 review 里看出来。现在它已经搬进链里，这条守卫防它再被搬出去。
+    """
+    part = _ternary_part()
+    missing = [k for k in _view_keys() if f'view === "{k}"' not in part]
+    assert not missing, (
+        f"这些视图键在三元链里没有分支：{missing} —— 会落到「未知视图：…」兜底。"
+        "要么在链里补分支；要么（确实由链外承载时）按 intel/alerts 的写法"
+        "显式返回 null 并写清理由。")
+
+
+def test_hash_whitelist_matches_view_keys():
+    """`HASH_VIEWS` 与 `view` 联合类型必须一一对应（多了少了都是 bug）。
+
+    实测踩到过两种方向：
+      · **多**：`"mypools"`（「我的自选池」2026-09-23 已删除）留在白名单里，
+        旧书签 `#view=mypools` 会通过校验、切到不存在的视图，页面上出现
+        "未知视图：mypools"红框 —— 白名单本来就是为了避免这个；
+      · **少**：新加的页签忘了进白名单 → 刷新/发链接回不到那一页（静默退化）。
+    """
+    keys, hash_keys = set(_view_keys()), set(_hash_view_keys())
+    assert not (hash_keys - keys), (
+        f"HASH_VIEWS 里有 view 联合类型中不存在的键：{sorted(hash_keys - keys)} —— "
+        "旧链接会切到不存在的视图（未知视图红框）")
+    assert not (keys - hash_keys), (
+        f"这些视图键不在 HASH_VIEWS 里：{sorted(keys - hash_keys)} —— "
+        "该页签刷新后会掉回默认页")
+
+
+def test_unknown_view_fallback_is_last_resort():
+    """兜底分支必须还在链尾 —— 它是"脏 hash 别白屏"的最后一道，不能删。"""
+    src = _read("App.tsx")
+    assert "未知视图" in src, "「未知视图」兜底分支被删了 —— 脏 hash 会白屏"
+    part = _ternary_part()
+    assert part.rstrip().endswith(")}"), "三元链结构变了，兜底分支可能不在链尾"
 
 
 def test_keep_alive_lazily_mounts():

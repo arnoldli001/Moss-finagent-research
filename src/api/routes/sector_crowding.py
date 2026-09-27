@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from typing import Any
 
@@ -24,11 +25,39 @@ from src.core.errors import (
     brief,
 )
 from src.sector_crowding import db, metrics, refresh
-from src.sector_crowding.config import load_config
+from src.sector_crowding.config import load_config, remove_crowding_exclusions
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/sector_crowding", tags=["sector-crowding"])
+
+
+async def _warm_metrics(codes: list[str]) -> dict:
+    """用户新增/恢复板块后，**立刻临时算**这些板块的周频 4 列。
+
+    ## 用户 2026-09-27 定的产品规则
+
+    > 前端已配置数据要提前算，用户打开前端直接就加载算好的数据，而不是等结果。
+    > 对于非前端配置数据，在用户**新增**概念板块到前端时，**再临时算**。
+
+    所以范围切成两段：
+    * **预计算** = 清单里已配置且可见的（`visible = 1`）→ 打开页面就有数
+    * **按需**   = 用户新增的那个 → 就是这里
+
+    ## 两个实现约束
+
+    1. **必须放线程池**：`compute_metrics_for_codes` 是同步阻塞的（要读 SQLite +
+       仓库库），直接在 async 处理函数里跑会堵住事件循环，连带拖慢所有请求。
+    2. **失败不能反过来让"新增"失败**：补算是一次便利性优化，
+       它挂了只该记日志 —— 否则用户加板块会因为一次指标计算失败而加不进去。
+    """
+    if not codes:
+        return {"computed": 0, "failed": []}
+    try:
+        return await asyncio.to_thread(metrics.compute_metrics_for_codes, codes)
+    except Exception as exc:  # noqa: BLE001 补算失败不该拖垮新增
+        logger.warning("新增板块后临时算失败：%s", brief(exc, BRIEF_DEFAULT))
+        return {"computed": 0, "failed": list(codes)}
 
 
 def _conn():
@@ -36,8 +65,30 @@ def _conn():
     return db.get_db_connection(load_config())
 
 
+#: DDL 只在进程内跑一次（★ 2026-09-27 性能修复）。
+#: 原先每个请求都 `executescript(_SCHEMA)` + `PRAGMA table_info` + `commit()`：
+#: 幂等但每请求白付 2~5ms，且 executescript 的隐式事务与后台刷新线程的
+#: 写事务存在锁交互窗口（读路径不该碰写锁 —— 事件告警 500 故障的同款教训）。
+#: 后台刷新线程/定时任务自己也会调 `db.init_tables()`，双保险仍在。
+_TABLES_READY = threading.Event()
+
+
 def _ensure_tables() -> None:
+    if _TABLES_READY.is_set():
+        return
     db.init_tables()
+    _TABLES_READY.set()
+
+
+def _run_db(fn, /, *args, **kwargs):
+    """同步 SQLite 工作 → 线程池（★ 2026-09-27 性能修复，不让事件循环阻塞）。
+
+    本路由的 handler 此前全是 `async def` 里直接跑同步 SQLite —— 单进程下
+    事件循环是全局稀缺资源，一条 5ms~1.7s 的查询会冻结**全站所有请求**
+    （含 /health 与其它页面的轮询）。与告警仓储修复
+    （`event_sqlite_base.py` 的 `asyncio.to_thread` 范式）对齐。
+    """
+    return asyncio.to_thread(fn, *args, **kwargs)
 
 
 # ================================================================
@@ -102,6 +153,10 @@ async def recompute() -> dict:
 #: "近 6 年最高平滑拥挤度"按板块一次 GROUP BY 要扫 217 万行（实测 1.7s），
 #: 不能每个请求都算。清单/告警面板整表渲染要用它，所以在进程内缓存；
 #: 数据只可能被刷新/重算改动，那两处会主动清掉它（见 `_invalidate_max_cache`）。
+#:
+#: ★★★ 2026-09-27 第八轮：物化表 `sector_crowding_max_ma5` 上线后，
+#: db.max_ma5_map() 已是 O(N) 主键读（< 5ms），进程内缓存的边际收益已很小；
+#: 保留以应对"前端 60s 轮询"高频场景，仍按 300s TTL 收敛。
 _MAX_MA5_CACHE: dict[str, Any] = {"at": 0.0, "map": {}}
 _MAX_MA5_TTL = 300.0
 
@@ -115,10 +170,21 @@ def _cached_max_ma5(conn) -> dict[str, float]:
     now = time.monotonic()
     if _MAX_MA5_CACHE["map"] and now - float(_MAX_MA5_CACHE["at"]) < _MAX_MA5_TTL:
         return _MAX_MA5_CACHE["map"]  # type: ignore[return-value]
+    # ★ 物化表查询 < 5ms（替代 0.4-1.7s GROUP BY）
     mapping = db.max_ma5_map(conn)
     _MAX_MA5_CACHE["at"] = now
     _MAX_MA5_CACHE["map"] = mapping
     return mapping
+
+
+def _sectors_max_ma5_sync() -> dict:
+    conn = _conn()
+    try:
+        mapping = _cached_max_ma5(conn)
+        return {"count": len(mapping), "cached_at": _MAX_MA5_CACHE["at"],
+                "max_ma5": mapping}
+    finally:
+        conn.close()
 
 
 @router.get("/sectors_max_ma5")
@@ -129,13 +195,7 @@ async def sectors_max_ma5() -> dict:
     每次读清单都重算 1.7s 不划算。刷新/重算完成后缓存会被清掉。
     """
     _ensure_tables()
-    conn = _conn()
-    try:
-        mapping = _cached_max_ma5(conn)
-        return {"count": len(mapping), "cached_at": _MAX_MA5_CACHE["at"],
-                "max_ma5": mapping}
-    finally:
-        conn.close()
+    return await _run_db(_sectors_max_ma5_sync)
 
 
 @router.post("/metrics/compute")
@@ -147,7 +207,10 @@ async def metrics_compute(
     """立即重算周频异动指标（立即返回 task_id，后台线程执行）。
 
     正常节奏由调度器每周自动跑一次（`crowding_metrics_weekly`）；这个接口是
-    给"刚刷完拥挤度、想立刻看到 4 列"用的。一轮约 3~5 分钟（要按板块抓成分股），
+    给"刚刷完拥挤度、想立刻看到 4 列"用的。一轮只算**看板默认视图真正渲染**的
+    板块（`MetricConfig.pool_only` + `pool_concepts_only`，即"可见 + 概念板块"，
+    约 262 个；改之前是全量 1479 个）：热缓存下是本地 SQL 聚合，实测几秒；
+    冷缓存要按板块抓成分股，可能 3~5 分钟。
     所以同样走"后台任务 + 进度轮询"，不要同步等。
     """
     _ensure_tables()
@@ -166,19 +229,10 @@ async def metrics_status(task_id: str = Query(default="")) -> dict:
 async def metrics_summary() -> dict:
     """周频指标的元信息：最新周、各基准日、4 列各自的覆盖板块数。"""
     _ensure_tables()
-    return metrics.metrics_summary()
+    return await _run_db(metrics.metrics_summary)
 
 
-@router.get("/latest")
-async def latest(
-    concepts_only: bool = Query(default=False),
-    trade_date: str = Query(default=""),
-    use_list: bool = Query(
-        default=False,
-        description="只返回持久化清单里**可见**的板块（散点总览用；未配置过时=全部）"),
-) -> dict:
-    """全板块最新交易日的水位（散点总览）。"""
-    _ensure_tables()
+def _latest_sync(*, concepts_only: bool, trade_date: str, use_list: bool) -> dict:
     conn = _conn()
     try:
         codes = db.list_visible_codes(conn, concepts_only=concepts_only) \
@@ -197,28 +251,30 @@ async def latest(
         conn.close()
 
 
-@router.get("/alerts")
-async def alerts(
-    threshold: float = Query(default=0.0, ge=0.0, le=1.0,
-                             description="水位阈值（0=用配置默认 0.8）"),
-    concepts_only: bool = Query(default=True),
+@router.get("/latest")
+async def latest(
+    concepts_only: bool = Query(default=False),
     trade_date: str = Query(default=""),
-    use_list: bool = Query(default=False,
-                           description="按持久化清单里可见的板块过滤"),
-    all: bool = Query(default=False,
-                      description="返回清单**全部板块**（≥阈值标红、置顶在前），"
-                                  "而不是只返回触发告警的"),
+    use_list: bool = Query(
+        default=False,
+        description="只返回持久化清单里**可见**的板块（散点总览用；未配置过时=全部）"),
 ) -> dict:
-    """水位 ≥ 阈值的板块列表；`all=1` 时返回清单全量并标记告警。"""
+    """全板块最新交易日的水位（散点总览）。"""
     _ensure_tables()
-    config = load_config()
-    cut = float(threshold) if threshold > 0 else config.window.alert_threshold
+    return await _run_db(
+        _latest_sync, concepts_only=concepts_only,
+        trade_date=trade_date, use_list=use_list)
+
+
+def _alerts_sync(*, threshold: float, concepts_only: bool, trade_date: str,
+                 use_list: bool, all_: bool, cut: float,
+                 high_threshold: float) -> dict:
     conn = _conn()
     try:
         codes = db.list_visible_codes(conn, concepts_only=concepts_only) \
             if use_list else None
         target = db.latest_trade_date(conn)
-        if all:
+        if all_:
             # 全量清单：基准行来自"清单"本身（`sector_meta` 里有的板块），
             # 而不是当日 K 线 —— 否则刚加入、当天还没数据的板块会凭空消失，
             # 用户会以为"添加没生效"。
@@ -227,7 +283,10 @@ async def alerts(
             snapshots = {row["sector_code"]: row for row in
                          db.query_all_latest_water_level(
                              conn, concepts_only=False, trade_date=target)}
-            maxima = db.max_ma5_map(conn)
+            # ★ 2026-09-27：改走 `_cached_max_ma5`（300s 进程内缓存）——
+            # 原来这里直连 `db.max_ma5_map(conn)`，物化表上线前每次请求
+            # 都付 1.7s 全表 GROUP BY，是告警面板"绕过了缓存"的那条热路径。
+            maxima = _cached_max_ma5(conn)
             # 本周的周频异动指标（4 列）
             weekly = db.query_metrics(conn)
             wanted = None if codes is None else set(codes)
@@ -266,16 +325,38 @@ async def alerts(
             alert_count = len(rows)
         return {
             "threshold": cut,
-            "high_threshold": config.window.high_alert_threshold,
+            "high_threshold": high_threshold,
             "trade_date": target,
             "updated_at": refresh.get_refresh_progress().get("finished_at", ""),
             "count": len(rows),
             "alert_count": alert_count,
-            "all": bool(all),
+            "all": bool(all_),
             "alerts": rows,
         }
     finally:
         conn.close()
+
+
+@router.get("/alerts")
+async def alerts(
+    threshold: float = Query(default=0.0, ge=0.0, le=1.0,
+                             description="水位阈值（0=用配置默认 0.8）"),
+    concepts_only: bool = Query(default=True),
+    trade_date: str = Query(default=""),
+    use_list: bool = Query(default=False,
+                           description="按持久化清单里可见的板块过滤"),
+    all: bool = Query(default=False,
+                      description="返回清单**全部板块**（≥阈值标红、置顶在前），"
+                                  "而不是只返回触发告警的"),
+) -> dict:
+    """水位 ≥ 阈值的板块列表；`all=1` 时返回清单全量并标记告警。"""
+    _ensure_tables()
+    config = load_config()
+    cut = float(threshold) if threshold > 0 else config.window.alert_threshold
+    return await _run_db(
+        _alerts_sync, threshold=threshold, concepts_only=concepts_only,
+        trade_date=trade_date, use_list=use_list, all_=bool(all), cut=cut,
+        high_threshold=config.window.high_alert_threshold)
 
 
 # ================================================================
@@ -345,23 +426,7 @@ def _read_list(conn, *, concepts_only: bool = False,
             for row in db.query_list_view(conn, concepts_only=concepts_only)]
 
 
-@router.get("/config_list")
-async def config_list(
-    concepts_only: bool = Query(
-        default=True,
-        description="只返回概念板块（前端「只看概念板块」开关的默认口径）"),
-) -> dict:
-    """看板清单（可见/隐藏/置顶 + 最新水位）。
-
-    "该看哪些板块"的**唯一真相来源**：散点总览与告警面板都读它。
-    返回全量（含隐藏项），前端需要时自行过滤，便于做"已隐藏"回显。
-
-    首次调用会把当前默认可见的板块**种子化落库**（幂等）：落库之后
-    "用户删掉全部板块"（全 visible=0）与"从没配置过"才区分得开 ——
-    否则用户清空清单后界面又会长回全量。
-    """
-    _ensure_tables()
-    config = load_config()
+def _config_list_sync(*, concepts_only: bool, config) -> dict:
     conn = _conn()
     try:
         seeded = db.seed_list(conn, concepts_only=True)
@@ -369,7 +434,12 @@ async def config_list(
         # 用 `force=False`：只标记从未标记过的行，所以跑多少次结果都一样，
         # 也不会把"用户手动恢复过"的空壳又自动藏回去 —— 自动清理只做一次，
         # 之后要不要再藏，由用户点「清理空壳板块」决定。
-        hidden = db.hide_dead_boards(conn, force=False)
+        #
+        # ★ 2026-09-27 加 SELECT 守卫：UPDATE 即使 0 行命中也要开写事务，
+        # 这条接口被前端 60s 轮询 —— 每次读都抢写锁正是"读路径藏写"反模式
+        # （事件告警 500 故障同款）。先查有没有候选行，通常没有就纯读。
+        hidden = (db.hide_dead_boards(conn, force=False)
+                  if db.has_hideable_dead_boards(conn) else 0)
         rows = _read_list(conn, concepts_only=concepts_only)
         return {
             "items": rows,
@@ -394,6 +464,27 @@ async def config_list(
         }
     finally:
         conn.close()
+
+
+@router.get("/config_list")
+async def config_list(
+    concepts_only: bool = Query(
+        default=True,
+        description="只返回概念板块（前端「只看概念板块」开关的默认口径）"),
+) -> dict:
+    """看板清单（可见/隐藏/置顶 + 最新水位）。
+
+    "该看哪些板块"的**唯一真相来源**：散点总览与告警面板都读它。
+    返回全量（含隐藏项），前端需要时自行过滤，便于做"已隐藏"回显。
+
+    首次调用会把当前默认可见的板块**种子化落库**（幂等）：落库之后
+    "用户删掉全部板块"（全 visible=0）与"从没配置过"才区分得开 ——
+    否则用户清空清单后界面又会长回全量。
+    """
+    _ensure_tables()
+    config = load_config()
+    return await _run_db(_config_list_sync, concepts_only=concepts_only,
+                         config=config)
 
 
 class AlertUpsertRequest(BaseModel):
@@ -529,24 +620,37 @@ async def config_list_restore(
     body: ListDeleteRequest,
     concepts_only: bool = Query(default=True),
 ) -> dict:
-    """恢复被隐藏/删除的板块（批量）。与 `batch_delete` 正好相反。"""
+    """恢复被隐藏/删除的板块（批量）。与 `batch_delete` 正好相反。
+
+    ⚠️ 必须同时把它们从**剔除清单**里摘出去（2026-09-27 修）：清单一旦收入
+    某个板块，`db.query_list_view()` 就会把它过滤掉 —— 只写 `visible = 1`
+    的话接口回 `{"restored": N}` 而板块**不出现**，静默失败。
+    用户的显式恢复 = 撤销当初的剔除决定。
+    """
     _ensure_tables()
     if not body.sector_codes:
         raise HTTPException(status_code=422, detail="sector_codes 不能为空")
     conn = _conn()
     try:
         restored = 0
+        touched: list[str] = []
         for code in body.sector_codes:
             text = str(code or "").strip()
             if not text:
                 continue
             db.upsert_list_item(conn, text, visible=True, source=db.SOURCE_MANUAL)
+            touched.append(text)
             restored += 1
+        if touched:
+            remove_crowding_exclusions(touched)
+        # 同 `config_list_add`：**先补算再读列表**，否则响应里那一行还是「—」
+        fresh = await _warm_metrics(touched)
         rows = _read_list(conn, concepts_only=concepts_only)
         return {"ok": True, "restored": restored, "items": rows,
                 "count": len(rows),
                 "visible_count": sum(1 for row in rows if row["visible"]),
-                "pinned_count": sum(1 for row in rows if row["pinned"])}
+                "pinned_count": sum(1 for row in rows if row["pinned"]),
+                "metrics": fresh}
     finally:
         conn.close()
 
@@ -556,7 +660,11 @@ async def config_list_add(
     body: ListUpsertRequest,
     concepts_only: bool = Query(default=True),
 ) -> dict:
-    """新增/恢复一个板块到清单（幂等）。"""
+    """新增/恢复一个板块到清单（幂等）。
+
+    ⚠️ 同样要摘掉剔除清单（理由见 `config_list_restore`）：用户主动加一个板块，
+    不该被一份历史剔除清单静默挡住。
+    """
     _ensure_tables()
     conn = _conn()
     try:
@@ -568,10 +676,17 @@ async def config_list_add(
         except ValueError as exc:
             raise HTTPException(
                 status_code=422, detail=brief(exc, BRIEF_DEFAULT)) from exc
+        remove_crowding_exclusions([body.sector_code])
+        # ⚠️ 顺序很重要：**先补算，再读列表**。
+        # 反过来的话，`_read_list` 拿到的还是旧快照 → 响应里这一行仍是「—」，
+        # 用户得等下一次 60 秒轮询才看到数 —— 而补算只要几百毫秒，
+        # 那 60 秒全是白等（这是第一版写反的地方）。
+        fresh = await _warm_metrics([body.sector_code])
         rows = _read_list(conn, concepts_only=concepts_only)
         return {"ok": True, **outcome, "items": rows, "count": len(rows),
                 "visible_count": sum(1 for row in rows if row["visible"]),
-                "pinned_count": sum(1 for row in rows if row["pinned"])}
+                "pinned_count": sum(1 for row in rows if row["pinned"]),
+                "metrics": fresh}
     finally:
         conn.close()
 
@@ -658,11 +773,7 @@ async def config_list_reset(
         conn.close()
 
 
-@router.get("/sectors")
-async def sectors(keyword: str = Query(default=""),
-                  limit: int = Query(default=20, ge=1, le=200)) -> dict:
-    """板块搜索（前端"输入板块名称查询"）。"""
-    _ensure_tables()
+def _sectors_sync(keyword: str, limit: int) -> dict:
     conn = _conn()
     try:
         return {"sectors": db.search_sectors(conn, keyword, limit=limit)}
@@ -670,10 +781,15 @@ async def sectors(keyword: str = Query(default=""),
         conn.close()
 
 
-@router.get("/members/{sector_code}")
-async def members(sector_code: str) -> dict:
-    """板块成分股（参考数据，不参与拥挤度计算）。"""
+@router.get("/sectors")
+async def sectors(keyword: str = Query(default=""),
+                  limit: int = Query(default=20, ge=1, le=200)) -> dict:
+    """板块搜索（前端"输入板块名称查询"）。"""
     _ensure_tables()
+    return await _run_db(_sectors_sync, keyword, limit)
+
+
+def _members_sync(sector_code: str) -> dict:
     conn = _conn()
     try:
         return {"sector_code": sector_code,
@@ -682,9 +798,14 @@ async def members(sector_code: str) -> dict:
         conn.close()
 
 
-@router.get("/watchlist")
-async def watchlist() -> dict:
+@router.get("/members/{sector_code}")
+async def members(sector_code: str) -> dict:
+    """板块成分股（参考数据，不参与拥挤度计算）。"""
     _ensure_tables()
+    return await _run_db(_members_sync, sector_code)
+
+
+def _watchlist_sync() -> dict:
     conn = _conn()
     try:
         rows = db.list_watchlist(conn)
@@ -692,6 +813,12 @@ async def watchlist() -> dict:
                 "threshold": load_config().window.alert_threshold}
     finally:
         conn.close()
+
+
+@router.get("/watchlist")
+async def watchlist() -> dict:
+    _ensure_tables()
+    return await _run_db(_watchlist_sync)
 
 
 class WatchRequest(BaseModel):
@@ -730,12 +857,7 @@ async def watchlist_remove(sector_code: str) -> dict:
         conn.close()
 
 
-@router.get("/{sector_code}")
-async def sector_detail(sector_code: str,
-                        limit: int = Query(default=0, ge=0, le=5000,
-                                           description="只取最近 N 个交易日（0=全部）")) -> dict:
-    """单板块历史曲线（含水位）。放在最后注册，避免吃掉上面的固定路径。"""
-    _ensure_tables()
+def _sector_detail_sync(sector_code: str, limit: int) -> dict:
     conn = _conn()
     try:
         rows = db.query_sector_crowding(conn, sector_code)
@@ -761,10 +883,16 @@ async def sector_detail(sector_code: str,
         conn.close()
 
 
-@router.get("")
-async def root() -> dict:
-    """模块自检：表是否建好、有多少数据、上次刷新状态。"""
+@router.get("/{sector_code}")
+async def sector_detail(sector_code: str,
+                        limit: int = Query(default=0, ge=0, le=5000,
+                                           description="只取最近 N 个交易日（0=全部）")) -> dict:
+    """单板块历史曲线（含水位）。放在最后注册，避免吃掉上面的固定路径。"""
     _ensure_tables()
+    return await _run_db(_sector_detail_sync, sector_code, limit)
+
+
+def _root_sync() -> dict:
     conn = _conn()
     try:
         config = load_config()
@@ -782,3 +910,10 @@ async def root() -> dict:
         }
     finally:
         conn.close()
+
+
+@router.get("")
+async def root() -> dict:
+    """模块自检：表是否建好、有多少数据、上次刷新状态。"""
+    _ensure_tables()
+    return await _run_db(_root_sync)

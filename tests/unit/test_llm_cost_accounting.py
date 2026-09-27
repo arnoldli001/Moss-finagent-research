@@ -135,16 +135,35 @@ def test_local_models_are_free_not_cheap() -> None:
 
 
 def test_unpriced_model_is_estimated_and_flagged() -> None:
-    """旧模型名（`deepseek-v4-flash`）不在配置里 → 用兜底价**估算**并计数。"""
-    assert model_is_priced("deepseek-v4-flash") is False
-    assert call_cost_cny(provider="deepseek", model="deepseek-v4-flash",
+    """未登记价格的模型名 → 用兜底价**估算**并计数。
+
+    ★ 2026-09-27 第八轮更新：原测试用 `deepseek-v4-flash`（该项目已经在
+    models.yaml 登记了真实价格 → 旧断言假阳性失败）。改用真实未登记的
+    虚拟模型名 `unknown-model-x` 保留测试意图。
+    """
+    assert model_is_priced("unknown-model-x") is False
+    assert call_cost_cny(provider="deepseek", model="unknown-model-x",
                          tokens_in=1000, tokens_out=1000) > 0
-    cost = aggregate_llm_cost([_row(model="deepseek-v4-flash",
+    cost = aggregate_llm_cost([_row(model="unknown-model-x",
                                     tokens_in=1000, tokens_out=1000)])
     assert cost["unpriced_calls"] == 1
-    assert cost["unpriced_models"] == [("deepseek-v4-flash", 1)]
+    assert cost["unpriced_models"] == [("unknown-model-x", 1)]
     notes = " ".join(cost_basis_notes(cost))
-    assert "deepseek-v4-flash" in notes and "估算" in notes
+    assert "unknown-model-x" in notes and "估算" in notes
+
+
+def test_priced_model_is_not_flagged_as_unpriced() -> None:
+    """★ 2026-09-27 第八轮：已登记价格的模型**不**被算 unpriced。
+
+    修复了 audit 实证的"线上 deepseek-v4-flash 跑了 309 次算成 0 元"事故：
+    登记后该模型应按真实价格计入，且不出现 unpriced_calls。
+    """
+    assert model_is_priced("deepseek-v4-flash") is True
+    cost = aggregate_llm_cost([_row(model="deepseek-v4-flash",
+                                    tokens_in=1000, tokens_out=1000)])
+    assert cost["unpriced_calls"] == 0
+    assert cost["unpriced_models"] == []
+    assert cost["total_cny"] > 0  # 真实价格计入
 
 
 # ======================================================================

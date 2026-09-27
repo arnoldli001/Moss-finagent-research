@@ -71,6 +71,10 @@ from src.mainline.config import (
     load_sector_blacklist,
     load_theme_exclusions,
 )
+# ★ 2026-09-27：主线池要与拥挤度共用同一份"最终要哪些板块"的事实来源。
+# `sector_crowding.config` 不反向依赖 mainline（它只在函数内惰性 import
+# `mainline.config.load_removed_concepts`），所以模块级导入不会成环。
+from src.sector_crowding.config import load_crowding_exclusions
 from src.mainline.models import (
     BoardBar,
     BoardFlow,
@@ -355,6 +359,37 @@ def _shift_days(stamp: str, days: int) -> str:
 # ==================================================================
 # 同步台账
 # ==================================================================
+
+
+#: 冻结概念池文件名（`configs/` 下）。读到了就以它为准，读不到退回动态口径。
+_FROZEN_POOL_FILE = "mainline_frozen_pool.yaml"
+
+
+def load_frozen_pool(filename: str = _FROZEN_POOL_FILE) -> set[str] | None:
+    """读**冻结概念池**（`configs/mainline_frozen_pool.yaml`）。
+
+    用户口径（2026-09-27）：「把这 [按 20 日胜率筛出的] 概念板块**写死在**
+    主线挖掘的概念池里，后续只关注这些，**不会再有变动**。」
+
+    返回 `None` = 文件不存在/读不到/内容为空 → **退回原来的动态口径**
+    （与 `load_sector_blacklist` / `load_crowding_exclusions` 的
+    「不可用 = 不过滤」约定一致）。空集不在这里表达"没有板块"——
+    文件存在但 `boards:` 为空时也返回 `None`，因为那更可能是写坏了，
+    而不是"主线不该看任何板块"。
+    """
+    path = Path(__file__).resolve().parents[2] / "configs" / str(filename)
+    if not path.exists():
+        return None
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 冻结名单坏了不该让整条链挂掉
+        logger.warning("冻结概念池读取失败，本轮退回动态口径", exc_info=True)
+        return None
+    codes = {str(item.get("code")) for item in (raw.get("boards") or [])
+             if isinstance(item, dict) and item.get("code")}
+    return codes or None
 
 
 @dataclass
@@ -1836,6 +1871,28 @@ class MainlineDataStore:
         blacklist = load_sector_blacklist(
             getattr(self.config.universe, "blacklist_file",
                     "sector_blacklist.yaml"))
+        # ★ 2026-09-27：**再减去拥挤度的剔除清单**，让两个子系统共用同一份池子。
+        #
+        # 用户口径：「主线挖掘也只看这 262 个概念板块，把其他的处理掉」。
+        #
+        # 为什么在这里减而不是去改 `sector_blacklist.yaml`：
+        #   * `sector_blacklist.yaml` 是**主线池级**排除（604 条，含历史遗留的
+        #     865xxx 概念体系 / GICS / 地域），语义与拥挤度那份不同；
+        #   * 拥挤度那份（`crowding_exclusions.yaml`）现在是把范围收窄到
+        #     「可见 + 概念」262 个之后落下的 2255 条，**它才是"最终要哪 262 个"
+        #     的事实来源** —— 主线跟着它走，两边才不会各说各话。
+        #
+        # 读不到时退回空集 = 不过滤（与两份清单各自的"不可用=不过滤"约定一致）。
+        crowding_excluded = load_crowding_exclusions() or frozenset()
+        # ★ 2026-09-27：**冻结概念池**优先。
+        #
+        # 用户口径：「把这 [按 20 日胜率筛出的] 概念板块**写死在**主线挖掘的
+        # 概念池里，后续只关注这些，**不会再有变动**。」
+        #
+        # 读了冻结名单就以它为准（只保留名单内的），读不到则退回
+        # 原来的动态口径（全表 − 黑名单），保证可回退。
+        frozen = load_frozen_pool()
+        off_pool: list[str] = []
         try:
             with sqlite3.connect(f"file:{Path(path).as_posix()}?mode=ro",
                                  uri=True) as connection:
@@ -1867,10 +1924,25 @@ class MainlineDataStore:
             name = str(row["sector_name"] or "")
             if not code:
                 continue
-            if blacklist is not None and code in blacklist:
+            if frozen is not None and code not in frozen:
+                # 不在冻结概念池里 → 不入池（冻结口径优先于一切动态规则）
+                off_pool.append(code)
+                continue
+            # ⚠️ 有冻结名单时**不再叠加拥挤度的剔除清单**（2026-09-27 修正）：
+            # 拥挤度那份是「拥挤度功能不看这些」的范围收窄，与主线该看什么无关。
+            # 实测它会把 6 个「有告警且 20 日胜率过关」的板块一起踢出主线
+            # （885652/886021/886026/886066/886076/886102）—— 那是**过头**了。
+            # 只在没有冻结名单（退回动态口径）时才沿用旧的叠加行为。
+            if frozen is None and ((blacklist is not None and code in blacklist)
+                                   or code in crowding_excluded):
                 # 被有意排除的板块：既不入池也不同步行情/资金流。
                 # 单独计数而不是并进 excluded —— 两者的成因不同，
                 # 「被黑名单挡掉多少」是这份清单是否生效的直接证据。
+                blocked.append(code)
+                continue
+            if frozen is not None and blacklist is not None \
+                    and code in blacklist:
+                # 冻结名单里若确有一条被主线**自己的**池级黑名单点掉，以黑名单为准
                 blocked.append(code)
                 continue
             if universe.is_excluded(name):
@@ -1916,6 +1988,8 @@ class MainlineDataStore:
         else:
             result.message = (
                 f"复用拥挤度板块池（{mode}）：{result.rows} 个入池"
+                + (f"，不在冻结概念池 {len(off_pool)} 个"
+                   if off_pool else "")
                 + (f"，黑名单挡掉 {len(blocked)} 个" if blocked else "")
                 + (f"，排除 {len(excluded)} 个非概念指数" if excluded else "")
                 + (f"，按代码剔除 {len(non_concept)} 个 GICS/地域/统计板块"

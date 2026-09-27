@@ -128,11 +128,17 @@ class OllamaProvider:
             payload["format"] = json_schema
         elif json_mode:
             payload["format"] = "json"
+        # ★ 应用侧并发闸（见 `local_gate` 的模块说明）：Ollama 只有**一个**
+        #   计算槽位，并发请求会在它内部排队；把等待挪到这里，超时就只计
+        #   生成时间，而不是"排队排到 120 秒"被记成调用失败。
+        from src.infrastructure.llm.local_gate import get_local_gate
+
         try:
-            resp = await self._client.post(
-                f"{spec.base_url}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+            async with get_local_gate().slot(spec.model_name):
+                resp = await self._client.post(
+                    f"{spec.base_url}/api/chat", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             raise _gateway_error("Ollama", spec.model_name, exc) from exc
         return _wrap_response(

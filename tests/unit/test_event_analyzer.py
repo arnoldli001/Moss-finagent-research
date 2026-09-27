@@ -11,6 +11,8 @@ from src.core.exceptions import LLMGatewayError
 from src.domain.alerts.analyzer import (
     AGENT_ID,
     ALLOW_CLOUD_ENV,
+    STAGE1_ATTEMPTS,
+    STAGE1_BATCH,
     STAGE1_TIER,
     STAGE2_BATCH,
     STAGE2_TIER,
@@ -38,7 +40,8 @@ class FakeGateway:
 
     def __init__(self, stage1: dict | None = None, stage2: dict | None = None,
                  fail: tuple[str, ...] = (), bad_json_tier: str = "",
-                 fail_batches: tuple[int, ...] = ()) -> None:
+                 fail_batches: tuple[int, ...] = (),
+                 fail_stage1_batches: tuple[int, ...] = ()) -> None:
         self.stage1 = stage1
         self.stage2 = stage2
         #: 让哪些阶段/层级失败。可写阶段名（`stage1`/`stage2`）或层级名。
@@ -46,6 +49,8 @@ class FakeGateway:
         self.bad_json_tier = bad_json_tier
         #: 让第 N 个**阶段二**调用失败（1 起）—— 验证"单批失败只丢那一批"
         self.fail_batches = fail_batches
+        #: 同上，针对阶段一
+        self.fail_stage1_batches = fail_stage1_batches
         self.stage2_seen = 0
         #: 第一次阶段一调用故意返回不可解析内容（验证重试）
         self.stage1_bad_once = False
@@ -70,12 +75,21 @@ class FakeGateway:
             self.stage2_seen += 1
         if task_tier in self.fail or stage in self.fail:
             raise LLMGatewayError(f"{stage}/{task_tier} 不可用")
+        if stage == "stage1" and self.stage1_seen in self.fail_stage1_batches:
+            raise LLMGatewayError(f"stage1 第 {self.stage1_seen} 批不可用")
         if stage == "stage2" and self.stage2_seen in self.fail_batches:
             raise LLMGatewayError(f"stage2 第 {self.stage2_seen} 批不可用")
         if (task_tier == self.bad_json_tier or stage == self.bad_json_tier
                 or (stage == "stage1" and self.stage1_bad_once
                     and self.stage1_seen == 1)):
             content = "不是JSON"
+        elif stage == "stage1" and self.stage1 is None:
+            # 按 prompt 里出现的事件 id 逐条产出（分批正确性靠它验证）
+            ids = list(dict.fromkeys(re.findall(r"\b(e\d+)\b", prompt)))
+            content = json.dumps({"events": [
+                {"event_id": i, "event_type": "policy", "sentiment": "neutral",
+                 "entities": {"industries": [], "companies": [], "regions": []},
+                 "summary": f"摘要{i}"} for i in ids]}, ensure_ascii=False)
         elif stage == "stage2" and self.stage2 is None:
             # 按 prompt 里出现的事件 id 逐条产出 —— 这样才能验证"分批后
             # 每条事件都由它所在那批给出评估"（固定 payload 会掩盖分批错误）
@@ -311,13 +325,12 @@ async def test_stage2_is_batched_to_fit_the_local_output_budget():
     一次塞 30 条 → 输出被截断（尾部事件丢评估）且易撞 120 秒超时。
     所以按 `STAGE2_BATCH` 分批，并保证**每条事件都由它所在那批**给出评估。
     """
-    n = STAGE2_BATCH * 2 + 1              # 17 条 → 3 批（8/8/1）
+    n = STAGE2_BATCH * 2 + 1              # 17 条 → 阶段二 3 批（8/8/1）
     events = [_event(f"e{i}", title=f"事件{i}") for i in range(1, n + 1)]
     gateway = FakeGateway(stage1={"events": []})
     results = await EventAnalyzer(gateway, resolver=_resolver).analyze(events)
 
-    stage2_calls = [c for c in gateway.calls if c[0] == STAGE2_TIER][1:]
-    assert len(stage2_calls) == 3, f"应有 3 批，实际 {len(stage2_calls)}"
+    assert gateway.stage2_seen == 3, f"阶段二应有 3 批，实际 {gateway.stage2_seen}"
     assert len(results) == n, "分批后每条事件都要有评估（不能只出第一批）"
     assert {a.event_id for a in results} == {e.event_id for e in events}
 
@@ -346,6 +359,51 @@ def test_stage2_batch_fits_the_local_output_budget():
     """
     assert 0 < STAGE2_BATCH <= 10, "太大：撞输出上限/超时"
     assert STAGE2_BATCH * 330 < 4096, "首批输出会超过 local_medium 的 max_tokens"
+
+
+@pytest.mark.asyncio
+async def test_stage1_is_batched_too():
+    """★ 阶段一也要分批（生产日志实证的截断）。
+
+    实测：140 条事件的一轮扫描里，阶段一一条调用要输出全部事件的
+    `{event_id,event_type,sentiment,entities,summary}`，而 qwen3:8b 是思考型
+    模型（一次调用约 560 token 花在思考上）→ 被 `max_tokens` **从字符串中间
+    截断**（`Unterminated string starting at: line 76`），整批退回关键词兜底。
+    schema 只保证结构合法，**不保证生成跑得完** —— 预算得靠分批。
+    """
+    n = STAGE1_BATCH * 2 + 1                 # 21 条 → 3 批（10/10/1）
+    events = [_event(f"e{i}", title=f"事件{i}") for i in range(1, n + 1)]
+    gateway = FakeGateway()
+    results = await EventAnalyzer(gateway, resolver=_resolver).analyze(events)
+    assert gateway.stage1_seen == 3, f"阶段一应分 3 批，实际 {gateway.stage1_seen}"
+    assert len(results) == n, "分批后每条事件都要有评估"
+
+
+@pytest.mark.asyncio
+async def test_one_failed_stage1_batch_keeps_the_others():
+    """阶段一单批失败只影响那一批：失败的批次退关键词兜底，另一批照常。
+
+    注意失败的表现是**降级**而不是丢事件：兜底仍会给每条事件一个
+    「类型沿用 + 情感 neutral + 摘要空」的占位，所以评估条数不变 ——
+    但不该让整个扫描退回兜底（那是修这个 bug 之前的行为）。
+    """
+    n = STAGE1_BATCH * 2
+    events = [_event(f"e{i}", title=f"事件{i}") for i in range(1, n + 1)]
+    # 让第 1 批的**两次尝试**都失败（只失败一次的话重试会救回来 ——
+    # 那也是一种正确行为，但验不到"单批失败不拖累其它批"）
+    gateway = FakeGateway(fail_stage1_batches=(1, 2))
+    results = await EventAnalyzer(gateway, resolver=_resolver).analyze(events)
+
+    assert gateway.stage1_seen == 1 + STAGE1_ATTEMPTS, \
+        "第 1 批两次尝试都失败后才兜底，第 2 批再调一次"
+    assert len(results) == n
+    by_id = {a.event_id: a for a in results}
+    last = f"e{n}"                      # 第 2 批的最后一条
+    # 第 2 批（e7..e12）拿到真正的分类结果
+    assert by_id[last].summary, "第 2 批不该被第 1 批的失败带下水"
+    # 第 1 批（e1..e6）是兜底：摘要为空、情感中性
+    assert by_id["e1"].summary == ""
+    assert by_id["e1"].sentiment == "neutral"
 
 
 @pytest.mark.asyncio

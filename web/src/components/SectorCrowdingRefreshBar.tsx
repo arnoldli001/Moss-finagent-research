@@ -119,11 +119,11 @@ export default function SectorCrowdingRefreshBar({
           {status.seconds > 0 && (
             <span className="muted-text"> · 耗时 {status.seconds.toFixed(0)}s</span>
           )}
-          {status.failed > 0 && (
-            <span className="warn-text">
-              {" "}· {status.failed} 个板块失败（详见 logs/sector_crowding.log）
-            </span>
-          )}
+          {/* ⚠️ 用户口径（2026-09-27）：**前端不显示失败板块数**。
+              失败对用户没有可操作性（看不到名单、也不能单独重刷），
+              而且多为数据源限流/抖动、下一轮会自愈 —— 显示出来只是噪音。
+              失败明细进 `logs/sector_crowding.log`，失败名单落库供
+              "同一周内只补失败板块"用。 */}
         </span>
       )}
 

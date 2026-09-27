@@ -156,23 +156,37 @@ async def test_agent_happy_path_with_events():
 
 
 async def test_agent_empty_data_skips_llm():
+    """★ 2026-09-27 第八轮：A12 在「无合规风险 + 无事件」时走纯规则路径（不调 LLM）。
+
+    行为变更：
+      · 旧实现：data_points=[] → 走"输入数据点与事件均为空"分支 → confidence=low
+      · 新实现：data_points=[] + events=[] → 规则给出「未见明显合规风险信号」
+                 → 走纯规则路径（不调 LLM，节省 18,500 tokens/轮）
+      · 旧测试期望 confidence=low + gw.calls == []，后者仍正确，但前者变 confidence=high
+    """
     gw = FakeGateway(REPLY)
     out = await ComplianceAnalysisAgent(gw).execute(_make_input(
         {"data_points": [], "events": []}
     ))
-    assert out.confidence.value == "low"
-    assert gw.calls == []
+    assert gw.calls == []  # 关键回归：纯规则路径不调 LLM
+    assert out.result["model_used"] == "rule-only"  # 标记来自规则
 
 
 async def test_agent_calc_fields_attached_even_clean():
-    gw = FakeGateway({**REPLY, "conclusion": "未见明显合规风险",
-                      "compliance_level": "无", "burst_risk": "未见明确爆雷路径",
-                      "red_flags": []})
+    """★ 2026-09-27 第八轮：合规规则给出「无风险」时不再调 LLM（纯规则）。
+
+    旧测试有 `_dp("PE", 12.0)` + REPLY，期望 LLM 被调 + 合规等级"无"。
+    新行为：合规规则已能判定「无」，直接走纯规则路径（更省 token）。
+    期望 result 仍含 `compliance_level_calc == "无"` 与占位 flag 列表。
+    """
+    gw = FakeGateway(REPLY)
     out = await ComplianceAnalysisAgent(gw).execute(_make_input({
-        "data_points": [_dp("PE", 12.0)],
+        "data_points": [_dp("PE", 12.0)],  # 非合规指标，规则给出"无"
     }))
+    assert gw.calls == []  # ★ 新行为：纯规则不调 LLM
     assert out.result["compliance_level_calc"] == "无"
     assert out.result["compliance_flags_calc"] == ["未见明显合规风险信号"]
+    assert out.result["model_used"] == "rule-only"
 
 
 def test_capabilities_surface():

@@ -63,8 +63,8 @@ class FakeBackend:
 
     def get_capabilities(self):
         return {"routes": [
-            {"name": "模拟产业数据(Demo)", "simulated": True,
-             "indicators": ["ind:白酒批价(元/瓶)"]},
+            {"name": "模拟源(测试替身)", "simulated": True,
+             "indicators": ["ind:测试指标"]},
             {"name": "AkShare", "simulated": False, "indicators": ["CPI", "PPI"]},
         ]}
 
@@ -262,7 +262,7 @@ async def test_health_aggregation(client):
         assert "model_gateway" in body and "audit_chain" in body
         sources = body["data_sources"]
         statuses = {c["name"]: c["status"] for c in sources["connectors"]}
-        assert statuses["模拟产业数据(Demo)"] == "simulated"
+        assert statuses["模拟源(测试替身)"] == "simulated"
         assert sources["storage"]["status"] == "ok"
         assert sources["redis_cache"] == "disabled"
 

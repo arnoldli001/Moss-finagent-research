@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -78,9 +80,82 @@ async def list_factors() -> dict:
 
 @router.get("/data-status")
 async def data_status(universe: str = "a_share", root: str = DEFAULT_ROOT) -> dict:
-    """本地因子数据缓存体检（前端顶部数据条用）。"""
+    """本地因子数据缓存体检（前端顶部数据条用）。
+
+    ## ⚠️ 这个体检**必须在线程里跑**，否则会把整个后端按住（2026-09-27 线上事故）
+
+    它的活是**同步阻塞**的：逐个数据集 `iterdir()` 扫分区 → 读 manifest 算
+    `coverage()` → 调 `warehouse_status()` 对仓库每张表做 `MIN/MAX(日期)`
+    （没有索引 = 全表扫描）。原来这些**全部写在 `async def` 里**，也就是跑在
+    **事件循环线程**上 —— 单进程 uvicorn 只有一个循环，于是：
+
+      · 首屏那一批请求里只要有一个它，其它请求（别的页签、连 0 I/O 的
+        `/api/v1/health/live`）全部排队等循环；
+      · 前端探针 `pingServer` 是 **3 秒**超时 → 弹「后端服务当前不可达」；
+      · 用户看到的现象：**点开「策略回测」半天不出来，切到「主线挖掘」/
+        「资金流监控」也跟着不出来**，还间歇报后端不可达。
+
+    实测证据（请求风暴期间 `py-spy dump` 的 MainThread 连续 4 次都停在这里）：
+
+        stat → is_file → keys (dataset_store.py:127)
+        coverage (dataset_store.py:186) → data_status (routes/quant.py:92)
+        stats (warehouse.py:833) → warehouse_status (warehouse.py:1454)
+        → data_status (routes/quant.py:110)
+
+    同一场风暴里 `/health/live` 最慢一次 **12.75 秒**（判死线 3 秒）。
+
+    ## 两条一起修，缺一条都还会疼
+
+    1. **`asyncio.to_thread`**：把整段体检挪出事件循环（同文件 `/ic` 的写法）；
+    2. **60 秒结果缓存**：数据条是"看一眼"的体检结论，一分钟内重复拉取没有任何
+       新信息，而每次体检都要重扫一遍目录 + 逐表 MIN/MAX。前端每次打开面板都会
+       拉它，缓存把"每个用户每次开面板扫一遍"降成"每分钟最多扫一次"。
+    """
+    key = (universe, root)
+    with _DATA_STATUS_LOCK:
+        hit = _DATA_STATUS_CACHE.get(key)
+    if hit is not None and time.monotonic() - hit[0] < _DATA_STATUS_TTL:
+        return {**hit[1], "cached": True}
+    payload = await asyncio.to_thread(_collect_data_status, universe, root)
+    with _DATA_STATUS_LOCK:
+        _DATA_STATUS_CACHE[key] = (time.monotonic(), dict(payload))
+    return payload
+
+
+#: 数据条缓存（键 = `(universe, root)`）。
+#:
+#: TTL 取 **300 秒**（不是 60）：体检里最贵的一步是仓库逐表 `MIN/MAX(trade_date)`，
+#: 而本地仓库是 SQLite、10 张表、约 1 亿行、**日期列没有索引** —— 实测
+#: `stats()` 单独跑 **7.18s**，走公网首屏 **13.09s**。数据条反映的是"数据同步到
+#: 哪一天了"，一天才变一次，300 秒的陈旧度对它是零代价；换来的是"绝大多数打开
+#: 面板的请求都命中缓存"。`cached: true` 会如实告诉前端这是缓存结果。
+_DATA_STATUS_TTL = 300.0
+_DATA_STATUS_LOCK = threading.Lock()
+_DATA_STATUS_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+
+
+async def warm_data_status(universe: str = "a_share",
+                           root: str = DEFAULT_ROOT) -> None:
+    """后台预热数据条缓存（启动时调一次，见 `api/main.py`）。
+
+    ⚠️ 密钥必须与路由**完全一致**，否则预热等于没做（第一版就栽在这）：
+    这里原来写死 `root="data/quant"`，而路由的默认是
+    `DEFAULT_ROOT = "data/quant/tushare"` → 缓存键对不上，第一个用户照样等 11 秒，
+    而日志里**看不出任何异常**。所以现在两个默认值都从 `DEFAULT_ROOT` 取，
+    不再手写字面量。
+    """
+    payload = await asyncio.to_thread(_collect_data_status, universe, root)
+    with _DATA_STATUS_LOCK:
+        _DATA_STATUS_CACHE[(universe, root)] = (time.monotonic(), dict(payload))
+
+
+def _collect_data_status(universe: str, root: str) -> dict:
+    """体检的实体（**同步、阻塞**，只能在线程里调用）。
+
+    与路由分开是为了让"在线程里跑"这件事一眼可见：函数签名里没有 `async`，
+    想在事件循环里误用都难。
+    """
     datasets: list[dict] = []
-    import os
     from pathlib import Path
 
     dataset_root = Path(root) / universe
@@ -664,13 +739,17 @@ async def quick_ic(start: str = "2026-01-01", end: str = "",
 
     start_key = start.replace("-", "")
     end_key = (end or time.strftime("%Y%m%d")).replace("-", "")
-    store = DatasetStore("daily_basic")
-    days = [day for day in store.keys() if start_key <= day <= end_key][-120:]
-    if len(days) < 40:
-        raise HTTPException(status_code=400,
-                            detail=f"缓存里只有 {len(days)} 个交易日，至少需要 40 天")
 
     def work() -> dict:
+        # ⚠️ `store.keys()`（扫分区目录）也放在线程里：它同样是阻塞 I/O，
+        #    写在 `async def` 里就会占住事件循环 —— 同 `/data-status` 那个
+        #    2026-09-27 线上事故（见那里的注释）。
+        store = DatasetStore("daily_basic")
+        days = [day for day in store.keys() if start_key <= day <= end_key][-120:]
+        if len(days) < 40:
+            raise HTTPException(
+                status_code=400,
+                detail=f"缓存里只有 {len(days)} 个交易日，至少需要 40 天")
         panels = build_panels(days)
         factors = compute_factors(panels)
         table = ic_table(factors, forward_returns(panels.price("close"), horizon))

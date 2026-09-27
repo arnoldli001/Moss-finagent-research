@@ -79,9 +79,13 @@ async def test_all_real_sources_fail_raises_chain():
 
 
 async def test_never_fallback_to_simulated_after_real_failure():
-    """真实源失败后不得静默回退模拟源（红线：假数据不得冒充真实）。"""
+    """真实源失败后不得静默回退模拟源（红线：假数据不得冒充真实）。
+
+    产业层的模拟连接器已随最后一条模拟指标退役而删除，但这条红线仍必须钉死 ——
+    将来任何新接入的"占位/合成"源都不许在真实源失败后顶上来。
+    """
     real = _FakeConnector("AkShare", fail=True)
-    mock = _FakeConnector("模拟产业数据(Demo)", simulated=True,
+    mock = _FakeConnector("合成源(测试替身)", simulated=True,
                           points=["fake_point"])
     router = ConnectorRouter([
         (real, lambda i: i == "ind:社会消费品零售总额同比"),
@@ -93,11 +97,15 @@ async def test_never_fallback_to_simulated_after_real_failure():
 
 
 async def test_simulated_only_indicator_still_served_directly():
-    """无真实源覆盖的指标：模拟连接器作为首个（唯一）命中者正常服务。"""
-    mock = _FakeConnector("模拟产业数据(Demo)", simulated=True,
+    """某指标**只有**合成源命中时，它作为首个命中者仍可正常服务。
+
+    现行注册表里已经没有这种指标（产业层全部真实源），这条用例守的是路由语义：
+    "跳过合成源"只在**真实源已经试过并失败**之后才生效。
+    """
+    mock = _FakeConnector("合成源(测试替身)", simulated=True,
                           points=["demo1"])
-    router = ConnectorRouter([(mock, lambda i: i == "ind:白酒批价(元/瓶)")])
-    assert await router.fetch("ind:白酒批价(元/瓶)") == ["demo1"]
+    router = ConnectorRouter([(mock, lambda i: i == "ind:某占位指标")])
+    assert await router.fetch("ind:某占位指标") == ["demo1"]
 
 
 async def test_unexpected_error_propagates_not_swallowed():

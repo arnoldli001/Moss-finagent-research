@@ -23,6 +23,7 @@ from src.api.routes.quant import router as quant_router
 from src.api.routes.research import router as research_router
 from src.api.routes.scheduler import router as scheduler_router
 from src.api.routes.sector_crowding import router as sector_crowding_router
+from src.api.routes.sector_rotation import router as sector_rotation_router
 from src.api.routes.skills import router as skills_router
 
 # 以下两个模块属私有商业版资产（竞价选股/量化选股），公开仓库不含其实现；
@@ -69,6 +70,8 @@ if quant_select_router is not None:
 api_router.include_router(code_engineer_router)
 api_router.include_router(skills_router)
 api_router.include_router(sector_crowding_router)
+# 行业轮动日报：行业热力图 + 主力流向 + 规则研判（前缀 /api/v1/sector_rotation）
+api_router.include_router(sector_rotation_router)
 # 主线挖掘：挂在「资金流监控」页签左侧面板后面（前缀 /api/v1/mainline）
 api_router.include_router(mainline_router)
 # 舆情情报：情报雷达 / 盘前简报 / 事件处置（前缀 /api/v1/intel）

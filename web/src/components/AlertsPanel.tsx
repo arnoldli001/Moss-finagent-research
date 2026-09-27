@@ -278,7 +278,22 @@ export default function AlertsPanel(
         {error && <div className="error-box">{error}</div>}
 
         <ul className="alert-items">
-          {alerts.map((a) => (
+          {/* ★ 2026-09-27 第八轮：冷加载骨架（避免"白屏 2 秒"）
+              已加载 → 显示列表；加载中 + 0 条 → 5 行占位骨架；加载中 + 有数据
+              → 维持旧行为（数据不闪）。 */}
+          {loading && alerts.length === 0
+            ? Array.from({ length: 5 }, (_, i) => (
+                <li key={`skel-${i}`} className="alert-item skeleton-alert"
+                    aria-hidden="true">
+                  <div className="skeleton-block"
+                       style={{ width: "30%", height: 12, marginBottom: 8 }} />
+                  <div className="skeleton-block"
+                       style={{ width: "70%", height: 16, marginBottom: 6 }} />
+                  <div className="skeleton-block"
+                       style={{ width: "50%", height: 10 }} />
+                </li>
+              ))
+            : alerts.map((a) => (
             <li
               key={a.alert_id}
               className={`alert-item level-${a.alert_level} ${a.status}`}

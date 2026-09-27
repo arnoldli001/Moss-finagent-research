@@ -111,10 +111,13 @@ class RefreshTask:
                     + (f"（当前：{self.current_sector}）" if self.current_sector else ""))
         if self.status == "failed":
             return f"刷新失败：{self.error}"
+        # ⚠️ 用户口径（2026-09-27）：**前端不要显示失败信息**。
+        # 失败板块对用户没有可操作性（他既看不到名单，也不能单独重刷），
+        # 显示出来只是噪音 —— 而且失败大多是可自愈的（数据源限流/抖动），
+        # 下一轮会自动补上。失败明细进日志，需要时查
+        # `logs/sector_crowding.log`；失败名单另存库用于"同周只补失败板块"。
         return (f"刷新完成，本次新增 {self.inserted} 条记录，"
-                f"最后更新日期 {self.last_update_date or '—'}"
-                + (f"；{len(self.failed_sectors)} 个板块失败（详见日志）"
-                   if self.failed_sectors else ""))
+                f"最后更新日期 {self.last_update_date or '—'}")
 
 
 def get_refresh_progress(task_id: str = "") -> dict[str, Any]:
@@ -149,8 +152,36 @@ def _register(task: RefreshTask) -> None:
 # 计算
 # ======================================================================
 
+def bias_factor(bars: int, curve: dict[str, float] | None) -> float:
+    """按根数取分母放大系数 `r(n)`（线性插值，超出上界取 1.0）。
+
+    `r(T) = median(M_full / M_T)`，在满窗板块上由
+    `scripts/calibrate_shrink_k.py` 标定。语义：**只有这么长的历史时，
+    样本最大值平均比真实 6 年极值小多少倍** —— 补上这个倍数，
+    水位才与满窗板块可比。
+    """
+    if not curve:
+        return 1.0
+    points = sorted((int(k), float(v)) for k, v in curve.items())
+    if not points:
+        return 1.0
+    if bars <= points[0][0]:
+        return points[0][1]
+    if bars >= points[-1][0]:
+        return points[-1][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if x0 <= bars <= x1:
+            if x1 == x0:
+                return y1
+            ratio = (bars - x0) / (x1 - x0)
+            return y0 + (y1 - y0) * ratio
+    return 1.0
+
+
 def compute_series(rows: list[dict[str, Any]], *, ma_window: int = 5,
-                   lookback_years: int = 6, min_bars: int = 60
+                   lookback_years: int = 6, min_bars: int = 60,
+                   bias_curve: dict[str, float] | None = None,
+                   min_bars_publish: int = 60
                    ) -> list[dict[str, Any]]:
     """给"板块日成交额 + 全市场成交额"序列补上拥挤度 / MA / 水位（纯函数）。
 
@@ -160,6 +191,18 @@ def compute_series(rows: list[dict[str, Any]], *, ma_window: int = 5,
     水位分母 = 该板块**近 lookback_years 年**内 `ma5_crowding` 的最大值，
     且**逐日 expanding**（第 i 天的分母只看到第 i 天为止）—— 这是"回看时
     当时的水位是多少"的正确口径，也避免未来函数。
+
+    ## 分母的样本量偏差校正（`bias_curve`，2026-09-27）
+
+    分母是**样本最大值**，`E[M_n]` 随 n 单调上升 → 历史短的板块水位系统性虚高。
+    原来用二值门槛（750 根）堵，但那只是把悬崖挪了个位置（750~1460 根有 1033 个
+    板块，与 >=1460 根那组仍不等价）。
+
+    现在改成**尺度校正** `denom = M_n · r(n)`，`r` 由截断回测标定：偏差随 n
+    连续收敛，`n >= 750` 时 `r = 1`（实测结论），所以**满窗板块行为完全不变**。
+
+    ⚠️ 曾先试"向同类中位数收缩"（James-Stein 式），**截断回测证伪**：
+    越收越偏（k=0 偏差 +0.047 → k=250 时 +0.099）。原因见 config 注释。
     """
     if not rows:
         return []
@@ -177,7 +220,7 @@ def compute_series(rows: list[dict[str, Any]], *, ma_window: int = 5,
     frame["raw_crowding"] = frame["sector_amount"] / frame["market_amount"].where(
         frame["market_amount"] > 0)
     # MA5：min_periods=1 让开头几天也有值（不足窗口时是"已有天数的均值"），
-    # 但水位会用 min_bars 另行把关，避免用 2 天数据算出的水位
+    # 但水位会用发布下限另行把关，避免用 2 天数据算出的水位
     frame["ma5_crowding"] = frame["raw_crowding"].rolling(
         max(1, int(ma_window)), min_periods=1).mean()
 
@@ -202,15 +245,20 @@ def compute_series(rows: list[dict[str, Any]], *, ma_window: int = 5,
         maxima.append(running_max)
     frame["_max_ma5"] = maxima
 
+    # 校正规程下发布下限放宽到 min_bars_publish；不给曲线时退回原二值门槛
+    floor = int(min_bars_publish) if bias_curve else int(min_bars)
+
     water: list[float | None] = []
     valid_count = frame["ma5_crowding"].notna().cumsum().tolist()
     for index, maximum in enumerate(maxima):
         value = ma_values[index]
-        if (value != value or maximum is None or maximum <= 0
-                or valid_count[index] < int(min_bars)):
+        count = int(valid_count[index])
+        if value != value or maximum is None or maximum <= 0 or count < floor:
             water.append(None)
-        else:
-            water.append(round(float(value / maximum), 6))
+            continue
+        denominator = float(maximum) * bias_factor(count, bias_curve)
+        water.append(round(float(value / denominator), 6) if denominator > 0
+                     else None)
     frame["water_level"] = water
 
     # ⚠️ pandas 会把 float 列里的 None **还原成 nan**（`None` 只在 object 列里成立）。
@@ -221,6 +269,18 @@ def compute_series(rows: list[dict[str, Any]], *, ma_window: int = 5,
         "raw_crowding", "ma5_crowding", "water_level"]].to_dict("records")
     return [{key: (None if isinstance(value, float) and value != value else value)
              for key, value in row.items()} for row in out]
+
+
+def peer_max_median(conn: Any, config: SectorCrowdingConfig) -> float | None:
+    """**已废弃**：这是"向同类中位数收缩"用的先验，截断回测证伪后不再使用。
+
+    保留函数是为了让任何旧调用点显式报错而不是静默取到 None
+    （静默 None 会让水位悄悄退回旧口径，是最难发现的一类故障）。
+    """
+    raise RuntimeError(
+        "peer_max_median 已废弃：向同类中位数收缩在截断回测里一致变差"
+        "（k=0 偏差 +0.047 → k=250 时 +0.099）。现用尺度校正 "
+        "`bias_factor(bars, config.window.bias_curve)`，见 docs/_water_bias_curve.txt")
 
 
 def recompute_stored_water_levels(*, config: SectorCrowdingConfig | None = None,
@@ -248,11 +308,15 @@ def recompute_stored_water_levels(*, config: SectorCrowdingConfig | None = None,
         codes = [str(row["sector_code"]) for row in conn.execute(
             f"SELECT DISTINCT sector_code FROM {db.DAILY_TABLE} "
             f"ORDER BY sector_code")]
+        # 校正规程按根数查表，不需要横截面先验 —— 逐板块调用也没有 O(N²) 问题
+        floor = (int(config.window.min_bars_publish)
+                 if config.window.bias_correction_enabled
+                 else int(config.window.min_bars_for_water_level))
         for code in codes:
             try:
                 rows = db.query_sector_crowding(conn, code)
-                if len(rows) < int(config.window.min_bars_for_water_level):
-                    # 样本不足：水位必须清成 NULL（可能上一轮用更低的 min_bars 写过值）
+                if len(rows) < floor:
+                    # 低于发布下限：水位必须清成 NULL（可能上一轮用更低的门槛写过值）
                     db.upsert_sector_crowding(conn, [
                         {"trade_date": item["trade_date"], "sector_code": code,
                          "sector_name": item.get("sector_name", ""),
@@ -266,7 +330,11 @@ def recompute_stored_water_levels(*, config: SectorCrowdingConfig | None = None,
                 computed = compute_series(
                     rows, ma_window=config.ma_window,
                     lookback_years=config.lookback_years,
-                    min_bars=config.window.min_bars_for_water_level)
+                    min_bars=config.window.min_bars_for_water_level,
+                    bias_curve=(config.window.bias_curve
+                                if config.window.bias_correction_enabled
+                                else None),
+                    min_bars_publish=config.window.min_bars_publish)
                 # commit=False：整批重算只在最后提交一次（逐板块提交要 656 秒）
                 db.upsert_sector_crowding(conn, [
                     {**item, "sector_code": code,
@@ -280,6 +348,10 @@ def recompute_stored_water_levels(*, config: SectorCrowdingConfig | None = None,
             if progress is not None:
                 progress(code)
         conn.commit()          # 整批一次提交
+        # ★ 2026-09-27 第八轮：重算完成后**全量重建** max_ma5 物化表
+        #   整批一次写，避免循环内每板块一次 UPSERT
+        rebuilt = db.rebuild_max_ma5_table(conn, sector_codes=codes)
+        logger.info("recompute: 重建 max_ma5 物化表 %d 行", rebuilt)
         stats["seconds"] = round(time.perf_counter() - started, 1)
         logger.info("本地重算完成：%d 个板块 / %d 行，跳过 %d，耗时 %.1fs",
                     stats["sectors"], stats["rows"], stats["skipped"],
@@ -389,7 +461,10 @@ def calculate_and_store(sector_code: str, start_date: str, end_date: str,
         computed = compute_series(
             history, ma_window=config.ma_window,
             lookback_years=config.lookback_years,
-            min_bars=config.window.min_bars_for_water_level)
+            min_bars=config.window.min_bars_for_water_level,
+            bias_curve=(config.window.bias_curve
+                        if config.window.bias_correction_enabled else None),
+            min_bars_publish=config.window.min_bars_publish)
         db.upsert_sector_crowding(conn, [
             {**item, "sector_code": sector_code, "sector_name": sector_name}
             for item in computed])
@@ -471,6 +546,14 @@ def refresh_single_sector(sector_code: str, *, conn: Any = None,
             outcome.get("start"), outcome.get("end"), outcome.get("inserted", 0),
             outcome.get("bars", 0), elapsed,
             "（全量回填）" if full_backfill else "")
+        # ★ 2026-09-27 第八轮：每板块 refresh 后**增量**更新 max_ma5 物化表
+        #   全量回填（首次）→ 真正计算 max；增量刷新 → max(老值, 新批次 max)
+        #   这是单板块的 UPSERT，避免扫全表
+        try:
+            db.rebuild_max_ma5_table(conn, sector_codes=[sector_code])
+        except Exception as exc:  # noqa: BLE001 物化表刷新失败不影响主流程
+            logger.warning("max_ma5 物化表增量更新失败 %s: %s",
+                           sector_code, brief(exc, BRIEF_DEFAULT))
         return {"sector_code": sector_code, "status": "ok",
                 "start": outcome.get("start", ""), "end": outcome.get("end", ""),
                 "inserted": outcome.get("inserted", 0),
@@ -488,6 +571,33 @@ def refresh_single_sector(sector_code: str, *, conn: Any = None,
 # ======================================================================
 # 全量/增量刷新（一键刷新入口）
 # ======================================================================
+
+#: 全量刷新台账的键（存在 `METRIC_META_TABLE` 这个通用 KV 表里，不另建表）
+_FULL_WEEK_KEY = "full_refresh_week"
+_FULL_FAILED_KEY = "full_refresh_failed"
+
+
+def _week_key() -> str:
+    """ISO 周键，如 `2026-W39`（与 `metrics.week_key` 同口径）。"""
+    iso = datetime.now().astimezone().date().isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def _last_full_refresh(conn: Any) -> tuple[str, list[str]]:
+    """上次**全量**刷新所在的周 + 那一次失败的板块代码。"""
+    meta = db.get_metric_meta(conn)
+    failed = str(meta.get(_FULL_FAILED_KEY) or "")
+    return (str(meta.get(_FULL_WEEK_KEY) or ""),
+            [code for code in failed.split(",") if code])
+
+
+def _record_full_refresh(conn: Any, week: str, failed: list[str]) -> None:
+    """记下这次全量刷新：周键 + 失败名单（供"同周只补失败板块"用）。"""
+    db.set_metric_meta(conn, {
+        _FULL_WEEK_KEY: week,
+        _FULL_FAILED_KEY: ",".join(sorted(set(failed))),
+    })
+
 
 def _drop_blacklisted(boards: list[dict[str, Any]]
                       ) -> tuple[list[dict[str, Any]], int]:
@@ -596,6 +706,28 @@ def refresh_all_incremental(*, task_id: str = "", config: SectorCrowdingConfig |
                                "本次退回全量刷新")
         if max_sectors > 0:
             boards = boards[:max_sectors]
+
+        # ── 同一周内不重复全量刷新（用户口径 2026-09-27）──────────────────
+        #
+        # 「如果上次全量刷新时间和这次手动触发是同一周，就不要全量刷新了，
+        #   只刷新上次失败的概念板块即可。」
+        #
+        # 为什么合理：全量刷新实测 **1845 个板块 / 220 秒**，而这 1845 个里
+        # 绝大多数上周已经刷过、数据没变；重复跑的唯一效果是**再撞一次数据源
+        # 限流**（实测 8 个板块因 `ths_daily` 500次/分钟 超限而失败）。
+        is_full = not pool_only
+        if is_full:
+            last_week, last_failed = _last_full_refresh(conn)
+            this_week = _week_key()
+            if last_week == this_week and last_failed:
+                wanted = set(last_failed)
+                before = len(boards)
+                boards = [item for item in boards
+                          if str(item.get("sector_code") or "") in wanted]
+                logger.info("本周（%s）已全量刷过，改为只补上次失败的 %d 个板块"
+                            "（原 %d 个）", this_week, len(boards), before)
+                if not boards:
+                    logger.info("上次失败名单已全部补齐，本次无板块需要刷新")
         task.total = len(boards)
         task.full_backfill = not db.latest_trade_date(conn)
         logger.info("一键刷新开始：%d 个板块（%s）", task.total,
@@ -609,7 +741,22 @@ def refresh_all_incremental(*, task_id: str = "", config: SectorCrowdingConfig |
         logger.info("全市场成交额：%d 个交易日（%s ~ %s）",
                     len(market_map), market_start, latest)
 
+        # ⚠️ `workers` 必须在这里定义 —— 2026-09-27 我改这段时误删了它，
+        # 结果是运行到 `ThreadPoolExecutor(max_workers=workers)` 直接
+        # `NameError: name 'workers' is not defined`，**「一键刷新」整条路挂掉**。
+        # 单测没兜住它，因为测试跑的是 `compute_series` / `recompute_*`，
+        # 没有一条会走到这里 —— 见 tests 里新增的
+        # `test_refresh_all_defines_workers`。
         workers = max(1, min(int(config.performance.worker_threads), 16))
+        # 偏差校正是**按根数查表**，不需要横截面先验 —— 所以没有 O(N²) 问题，
+        # worker 里直接查 config.window.bias_curve 即可（纯本地、无 IO）。
+        floor = (int(config.window.min_bars_publish)
+                 if config.window.bias_correction_enabled
+                 else int(config.window.min_bars_for_water_level))
+        logger.info("一键刷新：%d 线程；分母偏差校正%s（发布下限 %d 根）",
+                    workers,
+                    "开启" if config.window.bias_correction_enabled else "关闭",
+                    floor)
         inserted_total = 0
         done = 0
         with ThreadPoolExecutor(max_workers=workers,
@@ -641,6 +788,15 @@ def refresh_all_incremental(*, task_id: str = "", config: SectorCrowdingConfig |
         task.processed = task.total
         task.status = "done"
         task.last_update_date = latest
+        # 记全量刷新台账：周键 + 失败名单（供"同周只补失败板块"）。
+        # 失败名单只取代码 —— `task.failed_sectors` 是 `code:原因` 形式。
+        if is_full and conn is not None:
+            try:
+                codes = [str(item).split(":", 1)[0]
+                         for item in task.failed_sectors]
+                _record_full_refresh(conn, _week_key(), codes)
+            except Exception:  # noqa: BLE001 台账写失败不该让刷新算失败
+                logger.warning("全量刷新台账写入失败", exc_info=True)
         logger.info("一键刷新完成：处理 %d，写入 %d，失败 %d，耗时 %.1fs",
                     task.total, inserted_total, len(task.failed_sectors),
                     time.perf_counter() - started)

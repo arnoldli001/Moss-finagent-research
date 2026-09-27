@@ -42,6 +42,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN_DB = ROOT / "data" / "moss_finagent.db"
 CONFIG = ROOT / "configs" / "crowding_exclusions.yaml"
 
+# Windows 控制台默认 GBK，`⚠️` / `✅` 这类字符会直接抛 UnicodeEncodeError
+# 把脚本打断（2026-09-27 实际踩到：同名不同码的告警行一打就崩，
+# 而配置**还没写**，看起来像"跑了但没生效"）。这里统一成 UTF-8。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 RAW = """
 粤港澳大湾区、股权转让（并购重组）、京津冀一体化、中俄贸易概念、肝炎概念、POE胶膜、
 国企改革、AIGC概念、摘帽、蓝筹地产股、生物医药B类、网红经济、自由贸易港、新股与次新股、
@@ -107,9 +113,49 @@ def resolve(conn: sqlite3.Connection, names: list[str]) -> tuple[list[dict], lis
             assert str(row["sector_name"]) == real, (code, row["sector_name"], real)
             out.append({"code": code, "name": real,
                         "visible": int(row["visible"]),
+                        "reason": "点名",
                         "note": ("用户原文精确命中" if given not in FUZZY
                                  else f"用户写「{given}」，按唯一最相近名称推定")})
     return out, miss
+
+
+def resolve_hidden(conn: sqlite3.Connection) -> list[dict]:
+    """清单里 `visible = 0` 的板块 —— 用户**从看板移除**的那些（2026-09-27 加）。
+
+    ## 为什么把它并进剔除清单
+
+    用户口径（2026-09-27）：
+
+    > 记住被剔除的几百个概念板块，拉入黑名单，不进行任何拥挤度计算，
+    > 不妨碍后续有新概念板块可以加进来。
+
+    在此之前，`visible = 0` 只是"前端不显示"：日更靠 `pool_only` 顺带躲开，
+    但**全量刷新（`pool_only=False`）仍会把它们重算一遍**，而且没有任何东西
+    记住"这些是已经决定不要的"。写进剔除清单后，三处机制一起生效 ——
+    `refresh._drop_blacklisted`（停日更）、`metrics.compute_all_metrics`
+    （不算指标）、`db.query_metrics`（不显示）。
+
+    ## 为什么不会挡住新概念
+
+    剔除清单是**冻结的快照**，不是"凡不在可见池里就排除"的动态规则。
+    新概念板块不在快照里 → 照常被 `seed_list` 种进清单 → 照常参与计算。
+    反过来，动态规则会造成死锁：新板块不在可见池 → 被判剔除 →
+    `seed_list` 跳过它 → 永远进不了可见池。
+
+    ## 代码来源
+
+    这些代码**本来就来自库**（`sector_crowding_list.visible = 0`），
+    不经过"名称 → 代码"解析，所以不存在本文件顶部那种手写代码删错板块的风险。
+    """
+    rows = conn.execute(
+        "SELECT sector_code, sector_name FROM sector_crowding_list"
+        " WHERE visible = 0 ORDER BY sector_code").fetchall()
+    return [{"code": str(row["sector_code"]),
+             "name": str(row["sector_name"] or ""),
+             "visible": 0,
+             "reason": "看板移除",
+             "note": "用户从看板移除（visible=0）"}
+            for row in rows]
 
 
 def main() -> int:
@@ -125,7 +171,7 @@ def main() -> int:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=60000")
     rows, miss = resolve(conn, names)
-    print(f"清单 {len(names)} 项 → 命中 **{len(rows)} 个板块代码**"
+    print(f"点名清单 {len(names)} 项 → 命中 **{len(rows)} 个板块代码**"
           f"（含同名不同码）")
     if miss:
         print(f"⚠️ 仍未命中 {len(miss)} 项：{miss}")
@@ -137,6 +183,16 @@ def main() -> int:
     for row in rows:
         flag = "" if row["visible"] == 1 else "（已隐藏）"
         print(f"  {row['code']:<12}{row['name']}{flag}")
+
+    # 第二个来源：用户从看板移除的（visible=0）。与点名结果按 code 去重。
+    hidden = resolve_hidden(conn)
+    known = {r["code"] for r in rows}
+    merged = rows + [h for h in hidden if h["code"] not in known]
+    added = len(merged) - len(rows)
+    print(f"\n看板已移除（visible=0）：{len(hidden)} 个，"
+          f"其中新增进清单 {added} 个（已在点名结果里的不重复）")
+    print(f"合并后清单共 **{len(merged)}** 条")
+    rows = merged
 
     if args.emit_config:
         body = [
@@ -155,13 +211,29 @@ def main() -> int:
             "# `metrics.compute_all_metrics`（不算指标）、`db.query_metrics` /",
             "# `query_all_latest_water_level`（前端不显示）。`visible = 0` 是",
             "# 额外一步。只挡更新、不删历史。",
+            "#",
+            "# ## 两个来源（2026-09-27 起）",
+            "#",
+            "#   1. `reason: 点名`     —— 用户在 2026-09-22 点名要删的那 82 个，",
+            "#      走「名称 → 库里查代码」，含同名不同码。",
+            "#   2. `reason: 看板移除` —— 用户从看板移除的（`visible = 0` 的全量快照）。",
+            "#      用户 2026-09-27 口径：「记住被剔除的几百个概念板块，拉入黑名单，",
+            "#      不进行任何拥挤度计算」。**这是冻结快照，不是动态规则** ——",
+            "#      新概念不在快照里，照常被 `seed_list` 种进清单并参与计算。",
+            "#",
+            "# ⚠️ 本清单**不影响** `/config_list/hidden`：`db.query_hidden_boards()`",
+            "# 不过滤黑名单，所以「已隐藏板块」列表里仍然看得到它们、可以勾选恢复。",
+            "# 而且 `POST /config_list/restore` 与 `POST /config_list` 会**自动把代码",
+            "# 从本文件摘掉**（`config.remove_crowding_exclusions`）—— 用户的显式",
+            "# 恢复 = 撤销当初的剔除决定。手工恢复也可以直接从本文件删掉那一行。",
             "version: 1",
-            f'decided: "2026-09-22"',
+            f'decided: "2026-09-27"',
             f"count: {len(rows)}",
             "entries:",
         ]
         for row in rows:
-            body.append(f'  - {{ code: "{row["code"]}", name: "{row["name"]}" }}')
+            body.append(f'  - {{ code: "{row["code"]}", name: "{row["name"]}",'
+                        f' reason: "{row.get("reason", "点名")}" }}')
         CONFIG.write_text("\n".join(body) + "\n", encoding="utf-8")
         print(f"\n配置 → {CONFIG}（{len(rows)} 条）")
 

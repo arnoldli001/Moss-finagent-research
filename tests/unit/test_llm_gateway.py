@@ -42,6 +42,20 @@ def gateway_env(tmp_dir):
     return settings, tmp_dir
 
 
+@pytest.fixture(autouse=True)
+def _fresh_circuit_breakers(monkeypatch):
+    """每个用例一套**干净的熔断器**。
+
+    熔断器是进程级的：某个用例把 ollama/deepseek 打挂之后，后面的用例会直接
+    吃到 `circuit_open`（实测报错 `'circuit_open: ollama' != 'boom'`，
+    而且失败信息指向那个无辜的用例，排查方向完全错）。
+    """
+    from src.infrastructure.llm import circuit_breaker as cbmod
+
+    monkeypatch.setattr(cbmod, "_registry", cbmod.CircuitBreakerRegistry())
+    yield
+
+
 async def test_routes_light_to_ollama_primary(gateway_env):
     settings, _ = gateway_env
     providers = {"ollama": FakeProvider(), "deepseek": FakeProvider()}
@@ -55,16 +69,49 @@ async def test_routes_light_to_ollama_primary(gateway_env):
     assert resp.tokens_out == 20
 
 
-async def test_fallback_chain_on_primary_failure(gateway_env):
+async def test_fallback_chain_works_on_reasoning_tier(gateway_env):
+    """降级链本身照常工作（用 `reasoning` 层验证：云端主 → 本地备）。
+
+    ⚠️ 不再用 `light` 验证"云端兜底"：那一层自 2026-09-26 起在
+    `configs/models.yaml` 里钉了 `local_only: true`（见下一个用例）。
+    """
+    settings, _ = gateway_env
+    providers = {"ollama": FakeProvider(),
+                 "deepseek": FakeProvider(error=LLMGatewayError("云端挂了"))}
+    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+
+    resp = await gw.complete("reasoning", "系统", "任务")
+    assert resp.model_used == "qwen3:8b-q4_K_M"   # reasoning 层 fallback
+    assert resp.fallback_used
+    # ⚠️ `provider_chain` 记的是**配置里的名字**，`model_used` 才是真模型名
+    assert resp.provider_chain == ["deepseek-flash", "local_medium"]
+
+
+async def test_light_and_medium_never_fall_back_to_paid(gateway_env):
+    """★★ 结构修补：`light` / `medium` 两层**默认就不许**降级到付费云端。
+
+    这两层的 primary 是本地模型、fallback 却是付费的 deepseek-flash ——
+    实测踩过：本地一抖动就悄悄花钱（事件告警阶段一 0.0196 元；
+    `_dbg_hot.py` 这类探针更隐蔽）。靠"每个调用点记得传 local_only=True"
+    靠不住，所以在配置里给这两层钉死，**新调用方默认就是安全的**。
+
+    要花云端必须**显式** `local_only=False`（少数场景），链本身没被改掉。
+    """
     settings, _ = gateway_env
     providers = {"ollama": FakeProvider(error=LLMGatewayError("本地模型挂了")),
                  "deepseek": FakeProvider()}
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
 
-    resp = await gw.complete("light", "系统", "任务")
-    assert resp.model_used == "deepseek-flash"  # light层fallback
-    assert resp.fallback_used
-    assert resp.provider_chain == ["local_light", "deepseek-flash"]
+    for tier in ("light", "medium"):
+        with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
+            await gw.complete(tier, "系统", f"任务-{tier}")
+    assert providers["deepseek"].calls == [], \
+        "light/medium 默认仍然调了云端（会花钱）"
+
+    # 显式退出才允许付费：配置里那条链本身没被改掉
+    resp = await gw.complete("light", "系统", "任务2", local_only=False)
+    assert resp.model_used == "deepseek-flash"
+    assert providers["deepseek"].calls == ["deepseek-flash"]
 
 
 async def test_local_only_never_spends_cloud_tokens(gateway_env):
@@ -74,8 +121,6 @@ async def test_local_only_never_spends_cloud_tokens(gateway_env):
     `deepseek-flash`（云端、按 token 计费）。用户口径："本地模型推理不费钱，
     浪费就浪费……只要不用云端tokens就行" —— 本地挂了**宁可失败**（调用方退回
     规则层），也不能悄悄花钱。
-
-    ⚠️ 同时确认它**不改配置里那份链**：别的地方照样能用云端兜底。
     """
     settings, _ = gateway_env
     providers = {"ollama": FakeProvider(error=LLMGatewayError("本地模型挂了")),
@@ -85,11 +130,6 @@ async def test_local_only_never_spends_cloud_tokens(gateway_env):
     with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
         await gw.complete("light", "系统", "任务", local_only=True)
     assert providers["deepseek"].calls == [], "local_only 仍然调了云端（会花钱）"
-
-    # 链没有被就地改掉：不带 local_only 时云端兜底照旧
-    resp = await gw.complete("light", "系统", "任务")
-    assert resp.model_used == "deepseek-flash"
-    assert providers["deepseek"].calls == ["deepseek-flash"]
 
 
 async def test_cache_hit_skips_provider(gateway_env):
@@ -177,16 +217,22 @@ async def test_audit_records_all_calls(gateway_env):
 
 
 async def test_failure_is_audited(gateway_env):
+    """失败的每一跳都要留审计（含模型名）。
+
+    用 `reasoning` 层（云端主→本地备）：light/medium 现在默认钉死本地，
+    整条链上只有一个模型，验不出"两跳都留痕"。
+    """
     settings, tmp = gateway_env
     providers = {"ollama": FakeProvider(error=LLMGatewayError("boom")),
                  "deepseek": FakeProvider(error=LLMGatewayError("boom2"))}
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
     with pytest.raises(LLMGatewayError):
-        await gw.complete("light", "系统", "任务T")
+        await gw.complete("reasoning", "系统", "任务T")
 
     entries = LLMAuditLog(tmp).read_all()
-    assert [e["error"] for e in entries] == ["boom", "boom2"]
-    assert entries[0]["model"] == "qwen2.5:1.5b-instruct-q4_K_M"
+    assert [e["error"] for e in entries] == ["boom2", "boom"]
+    assert entries[0]["model"] == "deepseek-flash"
+    assert entries[1]["model"] == "qwen3:8b-q4_K_M"
 
 
 # ---------------------------------------------------------------------------

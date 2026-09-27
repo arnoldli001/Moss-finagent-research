@@ -37,8 +37,7 @@ INDICATOR_CATALOG: list[dict[str, str]] = [
     {"id": "ind:动力煤价格(元/吨)", "desc": "动力煤价格（周期行业）"},
     {"id": "ind:重点电厂煤炭库存(万吨)", "desc": "电厂煤炭库存（周期行业）"},
     {"id": "ind:周期行业PE(TTM)", "desc": "周期行业PE估值"},
-    {"id": "ind:创新药IND申报数量(个)", "desc": "创新药IND申报（医药行业）"},
-    {"id": "ind:医保集采药品均价同比", "desc": "集采均价同比（医药行业）"},
+    {"id": "ind:创新药IND申报数量(个)", "desc": "创新药IND申报件数（医药行业，CDE受理，月度）"},
     {"id": "ind:医药行业PE(TTM)", "desc": "医药行业PE估值"},
     # 申万行业估值截面（AKShare sw_index_third_info，335个三级行业）
     {"id": "ind:sw_third_pe_ttm:all", "desc": "申万三级行业PE-TTM截面（335个行业，日频）"},

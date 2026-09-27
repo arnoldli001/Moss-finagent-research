@@ -1013,9 +1013,29 @@ def cmd_status(_args: argparse.Namespace) -> int:
 
 
 def cmd_test(args: argparse.Namespace) -> int:
-    """隔离环境运行 pytest：所有数据目录重定向到临时目录。"""
-    import pytest
+    """隔离环境运行 pytest：所有数据目录重定向到临时目录。
 
+    ## 为什么**经子进程 + Job Object** 跑，而不是进程内 `pytest.main()`
+
+    原来是进程内调用。那样本身不会产生孤儿（pytest 与本进程同生共死），
+    但实测**有人/AI 直接调 pytest**（`python -m pytest tests/unit ...`），
+    于是留下了一个卡死的孤儿：父进程已退出、CPU = 0、HandleCount = 0、
+    **一天多没动过**，却一直占着资源与数据库句柄。
+
+    根因两条（缺一不可）：
+
+      1. **Windows 没有 `PR_SET_PDEATHSIG`** —— 内核不会在父进程死亡时
+          自动回收子进程（Linux 上的默认配套机制，Windows 上不存在）；
+      2. **pytest 自己不检测父进程** —— 父一死它就成了无主进程继续挂着。
+
+    所以这里统一走 `scripts/run_tests_in_job.py`：它把 pytest 放进一个
+    `KILL_ON_JOB_CLOSE` 的 **Job Object**，父进程一旦消失，
+    **内核**就连带终止整棵测试进程树。机制保证，不依赖谁记得清理。
+
+    ⚠️ 用 `sys.executable` 而不是拼 `python`：必须与当前解释器**同一个**，
+    否则可能跑到另一个环境（实测过 VN Studio 自带的 python 与项目 `.venv`
+    两套并存，跑出完全不同的结果）。
+    """
     tmp_dir = tempfile.mkdtemp(prefix="moss_finagent_test_env_")
     env = build_test_env(tmp_dir)
     os.environ.update(env)
@@ -1028,7 +1048,18 @@ def cmd_test(args: argparse.Namespace) -> int:
 
     print(f"[test] 隔离数据目录：{tmp_dir}", file=sys.stderr)
     print("[test] 隔离项：SQLite/LLM缓存(关)/审计日志/调度记录", file=sys.stderr)
-    return int(pytest.main(list(getattr(args, "pytest_args", []))))
+    print("[test] 经 Job Object 运行：父进程消失时测试进程树一并被终止"
+          "（杜绝孤儿）", file=sys.stderr)
+
+    runner = ROOT / "scripts" / "run_tests_in_job.py"
+    if not runner.exists():
+        # 兜底：运行器不在就退回进程内（行为与改动前一致，不会更差）
+        import pytest
+
+        return int(pytest.main(list(getattr(args, "pytest_args", []))))
+    return subprocess.run(
+        [sys.executable, str(runner), *getattr(args, "pytest_args", [])],
+        cwd=str(ROOT), check=False).returncode
 
 
 def cmd_frontend(args: argparse.Namespace) -> int:
@@ -1216,6 +1247,100 @@ def _record_incident(event: str, **fields: object) -> None:
         print(f"⚠️ 值守事件写入失败：{exc}", file=sys.stderr)
 
 
+def memory_snapshot() -> dict[str, object]:
+    """当前内存/提交量快照（**只读**，用于给事故现场留证据）。
+
+    ## 为什么要记这个数
+
+    "服务被静默终止"最常见的两类诱因都与内存有关：
+    **提交量耗尽**（Windows 真正会杀进程的条件，物理内存不够只会去换页）
+    和**页面文件太小**。事后追查时，如果流水里只有"某时刻端口空了"，
+    根本判断不了当时是不是内存触顶 —— 而那一刻的数值**过去了就没了**。
+
+    所以每次发现进程消失都顺手记一份，下一次就能直接回答
+    "是不是内存问题"，而不是靠推测。
+    """
+    out: dict[str, object] = {}
+    try:
+        # ⚠️ 让 PowerShell 只回**字节数**，单位换算放在 Python 里做：
+        #    第一版在 PS 里除 `1KB`（应是 1MB），于是"可用内存"算出 2909 GB
+        #    这种离谱值 —— 而它看起来只是个数字，不核对就发现不了。
+        info = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "$o=Get-CimInstance Win32_OperatingSystem;"
+             "$p=Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory;"
+             "'{0}|{1}|{2}|{3}' -f "
+             "[int64]$o.FreePhysicalMemory, [int64]$o.TotalVisibleMemorySize,"
+             "[int64]$p.CommittedBytes, [int64]$p.CommitLimit"],
+            capture_output=True, text=True, timeout=25,
+            encoding="utf-8", errors="replace",
+            creationflags=_NO_CONSOLE).stdout.strip()
+        free_kb, total_kb, committed, limit = (int(x) for x in info.split("|"))
+        out["mem_free_gb"] = round(free_kb / 1024 ** 2, 2)
+        out["mem_total_gb"] = round(total_kb / 1024 ** 2, 1)
+        out["commit_used_gb"] = round(committed / 1024 ** 3, 2)
+        out["commit_limit_gb"] = round(limit / 1024 ** 3, 2)
+        out["commit_pct"] = round(100 * committed / limit) if limit else 0
+    except Exception:  # noqa: BLE001 拿不到就少记几个字段，不该影响值守
+        out["mem_error"] = "无法读取内存快照"
+    return out
+
+
+def job_membership(pid: int) -> str:
+    """`pid` 是否在某个 Job Object 里 → `"none"` / `"in_job"` / `"unknown"`。
+
+    ## 为什么值守要记这一项
+
+    `KILL_ON_JOB_CLOSE` 的 Job 一关闭，成员进程会被**内核**终止且
+    **不留任何日志** —— 与实测的静默终止表现一致。但"在不在 Job 里"
+    是**运行期状态**，事后无法回溯。所以每次事故现场都记一次：
+    下次再发生，就能直接排除或确认这条杀因。
+    """
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "job_status.py"),
+             "--pid", str(pid)],
+            capture_output=True, text=True, timeout=30, cwd=str(ROOT),
+            # ⚠️ 必须显式 utf-8：子进程的输出是 UTF-8（它自己 reconfigure 过），
+            #    而中文 Windows 上 `text=True` 默认按 **GBK** 解码 →
+            #    `UnicodeDecodeError` 直接抛出来。没写这一行时
+            #    `job_membership` 永远返回 "unknown"，而那是**静默失效**：
+            #    字段看着有值，其实每次都拿不到。
+            encoding="utf-8", errors="replace",
+            creationflags=_NO_CONSOLE)
+        if proc.returncode != 0:
+            return "unknown"
+        return "none" if "[OK]" in proc.stdout else "in_job"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _service_state(name: str) -> str | None:
+    """Windows 服务的状态（`Running` / `Stopped` / …）；服务不存在返回 `None`。
+
+    ## 为什么用服务而不是 PID
+
+    `cloudflared` 在本机是**以服务方式运行**的（`Cloudflared`，
+    `SERVICE_START_NAME=LocalSystem`）—— 也就是说它的生命周期由
+    **SCM** 管，我们不该自己去 `taskkill` + `Start-Process`。
+    那样会和 SCM 的自动恢复（`RESTART -- Delay = 20000ms`）打架，
+    造出**两个实例**（实测事故，见 `cmd_tunnel_ensure` 的注释）。
+
+    问 SCM"服务在不在跑"比自己枚举进程可靠：进程名可能相同但归属不同，
+    而服务状态是唯一权威。
+    """
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-Service -Name '{name}' -ErrorAction SilentlyContinue).Status"],
+            capture_output=True, text=True, timeout=25,
+            encoding="utf-8", errors="replace", creationflags=_NO_CONSOLE)
+        state = proc.stdout.strip()
+        return state or None
+    except Exception:  # noqa: BLE001 查不到就当服务不存在（调用方会如实报错）
+        return None
+
+
 def cmd_ensure(args: argparse.Namespace) -> int:
     """**值守**：后端不在就拉起来；在就什么都不做。
 
@@ -1273,7 +1398,11 @@ def cmd_ensure(args: argparse.Namespace) -> int:
             log_path.stat().st_mtime).isoformat(timespec="seconds")
     _record_incident("restart", port=port, env=env,
                      last_activity=last_activity,
-                     reason="端口无监听（进程已消失）")
+                     reason="端口无监听（进程已消失）",
+                     # ★ 事故现场：内存/提交量 + 是否在 Job 里。
+                     #   这两项都是**运行期状态、事后无法回溯**的，
+                     #   不当时记下来，下次又只能靠推测。
+                     **memory_snapshot())
 
     code = _ensure_restart(env=env, port=port, name=args.name)
     if code == 0:
@@ -1283,6 +1412,187 @@ def cmd_ensure(args: argparse.Namespace) -> int:
         _record_incident("restart_failed", port=port, exit_code=code)
         print(f"❌ 值守重启失败（退出码 {code}），详见 {INCIDENT_LOG}", file=sys.stderr)
     return code
+
+
+#: 隧道值守的事件流水（与 `INCIDENT_LOG` 分开：一个管后端，一个管隧道）。
+TUNNEL_INCIDENT_LOG = RUN_DIR / "tunnel_incidents.jsonl"
+
+#: 隧道健康探测：连续几次失败才判定"需要重启"。
+#:
+#: ⚠️ **不能一次失败就重启**：实测单次失败率约 10~15%，而重启隧道本身会
+#: 断连几秒 —— 一次抖动就重启等于自己制造故障。
+#:
+#: ## 为什么是 4 次 × 5 秒（2026-09-26 实测调整）
+#:
+#: 第一版是 3 次 × 2 秒（总窗口 12 秒），**实测太短**：CF 这条路径
+#: 会有 15~30 秒的瞬时超时（同一时段实测到一次 8.3 秒、一次 15.9 秒），
+#: 于是"一次抖动"就被判成故障，触发了一次不必要的重启。
+#:
+#: 现在总窗口约 **60 秒**：足以跨过一次瞬时抖动，又能在真故障时
+#: 一分钟内恢复（对一个"客户打不开"的场景是可以接受的响应时间）。
+TUNNEL_PROBE_ATTEMPTS = 4
+TUNNEL_PROBE_GAP_SECONDS = 5.0
+TUNNEL_PROBE_TIMEOUT = 12.0
+
+
+def cmd_tunnel_ensure(args: argparse.Namespace) -> int:
+    """**隧道值守**：公网入口连续探测失败就重启 cloudflared。
+
+    ## 为什么要它（2026-09-26 实测）
+
+    后端本机稳定在 **1.9~3.4 毫秒、5/5 成功**，而**同一时刻走公网**是
+    **1.14~11.5 秒、9/10 成功**（1 次直接挂死）。用户看到的是"后台挂了"，
+    实际挂在隧道上。
+
+    更关键的是实测到**重启隧道能恢复**：
+
+        | | 重启前 | 重启后 |
+        |---|---|---|
+        | 成功率 | 9/10（1 次挂死） | **10/10** |
+        | 中位延迟 | 3.34 s | **1.60 s** |
+
+    也就是说这条链路会**随时间劣化**（前一次是连续跑了 35 小时后劣化，
+    这一次是 23 分钟后重新测到同样的形态）。把它做成自动的，
+    用户就不必等"下次不知道什么时候来的一波抖动"。
+
+    ## 判据：连续 N 次失败（不是一次就重启）
+
+    见 `TUNNEL_PROBE_ATTEMPTS` 的说明。**宁可不重启，也不要误重启** ——
+    重启隧道本身会中断所有在途请求。
+
+    ## 它不做的事
+
+    · **不改隧道配置**：换线路（国内中转 frp）需要决策与主机，不在自动化范围。
+    · **不重启后端**：那是 `manage.py ensure` 的职责，两者互不干扰。
+    """
+    url = args.url or "https://moss.wujiaitool.cn/api/v1/health/live"
+
+    # ⚠️ 判据：**只有"连不上/超时/5xx"才算失败，4xx 一律算成功**。
+    #
+    # 踩过的坑（2026-09-26 实测）：第一版把任何非 200 都当失败，于是在
+    # "隧道完全正常、但探测这个路径被登录门槛拦下"时误判为故障，
+    # **白白重启了一次隧道**（重启本身会中断所有在途请求）。
+    #
+    # 而 4xx 恰恰是**链路通的证据**：能拿到业务错误码，说明请求走完了
+    # cloudflared → 后端 → 再回来整条路。401/403/404 都只说明
+    # "这个路径要登录/不存在"，与隧道健康无关。
+    #
+    # 所以探测地址最好选**公开路径**（如 `/api/v1/health/live`，它连登录
+    # 门槛都在白名单里）；但即使选错了，下面的判据也不会误重启。
+    # 记录每次探测的**真实延迟/错误**：事后追查"为什么重启了"时，
+    # "4 次都是 TimeoutError"与"4 次都很快但 500"是完全不同的两件事。
+    probe_log: list[str] = []
+    last = ""
+    for attempt in range(1, TUNNEL_PROBE_ATTEMPTS + 1):
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(
+                    urllib.request.Request(url), timeout=TUNNEL_PROBE_TIMEOUT) as r:
+                ms = int((time.monotonic() - t0) * 1000)
+                probe_log.append(f"{attempt}:{r.status}/{ms}ms")
+                if args.verbose:
+                    print(f"[tunnel] 第 {attempt} 次探测成功（HTTP {r.status}，{ms}ms）。")
+                return 0
+        except urllib.error.HTTPError as exc:
+            ms = int((time.monotonic() - t0) * 1000)
+            # 4xx = 链路通（只是这个路径要登录/不存在）→ 成功
+            if 400 <= exc.code < 500:
+                probe_log.append(f"{attempt}:{exc.code}(4xx=通)/{ms}ms")
+                if args.verbose:
+                    print(f"[tunnel] 第 {attempt} 次探测成功"
+                          f"（HTTP {exc.code} 属 4xx：链路通，仅该路径需登录）。")
+                return 0
+            last = f"HTTP {exc.code}"
+            probe_log.append(f"{attempt}:{exc.code}/{ms}ms")
+            if args.verbose:
+                print(f"[tunnel] 第 {attempt} 次失败：{last}")
+        except Exception as exc:  # noqa: BLE001 连接层异常才算真失败
+            ms = int((time.monotonic() - t0) * 1000)
+            last = type(exc).__name__
+            probe_log.append(f"{attempt}:{last}/{ms}ms")
+            if args.verbose:
+                print(f"[tunnel] 第 {attempt} 次失败：{last}（{ms}ms）")
+        if attempt < TUNNEL_PROBE_ATTEMPTS:
+            time.sleep(TUNNEL_PROBE_GAP_SECONDS)
+
+    # 连续失败 → 重启 cloudflared
+    #
+    # ★★ 必须走 **Windows 服务**，不能自己起进程（2026-09-26 实测事故）
+    #
+    # 这台机器上 cloudflared 是**以服务方式运行**的：
+    #
+    #     Cloudflared 服务  state=Running  StartMode=Auto
+    #     SERVICE_START_NAME = LocalSystem
+    #     FAILURE_ACTIONS    = RESTART -- Delay = 20000 milliseconds
+    #
+    # 也就是说 **SCM 自己会在进程挂掉 20 秒后把它拉起来**。
+    # 而原来这里做的是"taskkill 全部 cloudflared + 自己 Start-Process 一个"，
+    # 于是形成死循环：
+    #
+    #     我杀掉服务进程 → SCM 20 秒后拉起一个（PID A）
+    #                    → 我又起一个（PID B）＝ **两个实例**
+    #
+    # 两个实例各自向 CF 注册连接器（实测 `tunnel info` 里出现两个
+    # connector，创建时间相差 16 秒），互相抢同一个隧道 —— 不但没修好，
+    # 还让"重启"本身成了不稳定源。
+    #
+    # 正确做法：**用 `sc.exe` / `Restart-Service` 让 SCM 去管**。
+    # 这样永远只有一个实例，且不依赖我们自己去拼命令行。
+    service = "Cloudflared"
+    svc_state = _service_state(service)
+    _record_tunnel_incident(
+        "restart", url=url, attempts=TUNNEL_PROBE_ATTEMPTS,
+        probe_log=probe_log, last_error=last,
+        service=service, service_state=svc_state,
+        reason="公网入口连续探测失败",
+        **memory_snapshot())
+
+    if svc_state is None:
+        # 服务不存在 → 说明这套部署不是服务形态，退回"自己起一个"，
+        # 但**先确保没有残留实例**（否则又会造出两个）
+        _record_tunnel_incident("restart_failed", reason="找不到 Cloudflared 服务")
+        print("❌ 找不到 Cloudflared 服务；本机可能不是服务方式部署。"
+              "请确认 `sc query Cloudflared`，或改用 cloudflared 官方服务安装。",
+              file=sys.stderr)
+        return 1
+
+    if svc_state.lower() == "running":
+        # 服务在跑但公网不通 → 重启服务（SCM 会先停干净再起，不会留重复）
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        f"Restart-Service -Name {service} -Force"],
+                       capture_output=True, creationflags=_NO_CONSOLE)
+    else:
+        subprocess.run(["powershell", "-NoProfile", "-Command",
+                        f"Start-Service -Name {service}"],
+                       capture_output=True, creationflags=_NO_CONSOLE)
+    time.sleep(30)   # 等它建连（SCM 恢复策略本身还带 20 秒延迟）
+
+    # 重启后再探一次，如实记账（成功与否都要记 —— "重启了但没用"是最需要知道的情况）
+    healthy = False
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(url), timeout=TUNNEL_PROBE_TIMEOUT) as r:
+            healthy = r.status == 200
+    except urllib.error.HTTPError as exc:
+        healthy = 400 <= exc.code < 500      # 4xx 同样证明链路已通
+    except Exception:  # noqa: BLE001
+        healthy = False
+    _record_tunnel_incident("restart_ok" if healthy else "restart_ineffective")
+    print(("✅ 隧道已重启并恢复（%s）" if healthy else "⚠️ 隧道已重启但仍不通（%s）")
+          % url)
+    return 0 if healthy else 1
+
+
+def _record_tunnel_incident(event: str, **fields: object) -> None:
+    """追加一条隧道值守事件（失败只警告）。"""
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        row = {"at": datetime.now().isoformat(timespec="seconds"),
+               "event": event, **fields}
+        with TUNNEL_INCIDENT_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 隧道值守事件写入失败：{exc}", file=sys.stderr)
 
 
 def _ensure_restart(*, env: str, port: int, name: str) -> int:
@@ -1494,6 +1804,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_ensure.add_argument("--verbose", action="store_true",
                           help="正常时也打印一行（默认静默，避免计划任务刷日志）")
     p_ensure.set_defaults(func=cmd_ensure)
+
+    p_tunnel = sub.add_parser(
+        "tunnel-ensure",
+        help="隧道值守：公网入口连续探测失败就重启 cloudflared")
+    p_tunnel.add_argument("--url", default="",
+                          help="探测地址（默认公网健康检查）")
+    p_tunnel.add_argument("--exe", default="", help="cloudflared 可执行文件路径")
+    p_tunnel.add_argument("--config", default="", help="cloudflared 配置路径")
+    p_tunnel.add_argument("--verbose", action="store_true",
+                          help="正常时也打印探测过程")
+    p_tunnel.set_defaults(func=cmd_tunnel_ensure)
 
     p_doctor = sub.add_parser(
         "doctor", help="体检/自愈本地 SQLite（陈旧 -wal/-shm 导致 disk I/O error）")

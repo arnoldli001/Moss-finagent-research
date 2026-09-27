@@ -113,6 +113,76 @@ export async function prefetchPanels(force = false): Promise<void> {
 }
 
 /**
+ * ★ 预热**面板代码分块**（不是数据）。2026-09-28 新增。
+ *
+ * ## 为什么需要它
+ *
+ * `App.tsx` 的各面板改成了 `React.lazy` 代码分割，入口 JS 从 828 KB 降到
+ * 257 KB —— HK 线上实测首屏入口 gzip 258.6 KB/2.29s → **85 KB/1.15s**。
+ * 代价是**第一次点某个页签时才开始下载它的分块**，用户先看到 Suspense 的
+ * 「加载中」占位。这条链路上一次冷请求的固定开销约 0.9 秒（实测：15 KB 的
+ * 小分块也要 0.93s，64 KB 的 1.12s —— 瓶颈是握手往返，不是字节数）。
+ *
+ * 所以登录后**空闲时**把这些分块在后台拉一遍。浏览器会缓存它们，
+ * 第一次点击就变成"立刻可画"。
+ *
+ * ## 三条纪律（与数据预取保持一致）
+ *
+ * 1. **不 await、不阻塞**：预热失败只等于"回到没预热的行为"，绝不冒泡。
+ * 2. **空闲时才做**：这条链路带宽本来就紧（实测 ~343 KB/s），
+ *    不能和首屏的关键请求抢。
+ * 3. **串行下载**：并发 8 个分块只会互相挤占同一条隧道（frp 单连接多路复用），
+ *    首屏反而更慢。串行 + 空闲启动，代价最小、收益完整。
+ *
+ * ## 为什么只预热业务面板
+ *
+ * 管理台（`Admin*` / `MetricsPanel` / `SchedulerPanel`）是管理员偶尔才进的页，
+ * 租户用户永远看不到 —— 给每个登录用户都下 4 个用不上的分块，在这条链路上
+ * 是纯浪费。要预热它们的话，请在**确认是管理员**之后单独调用。
+ */
+const PANEL_CHUNKS: Array<() => Promise<unknown>> = [
+  () => import("./components/QuantTabContainer"),   // 量化交易
+  () => import("./components/FundFlowPanel"),       // 资金流监控
+  () => import("./components/MainlinePanel"),       // 主线挖掘
+  () => import("./components/BacktestPanel"),       // 策略回测
+  () => import("./components/ReportView"),          // 投研分析 · 报告
+  () => import("./components/TracePanel"),          // 投研分析 · 推理轨迹
+  () => import("./components/AgentChatView"),       // 投研分析 · Agent 对话
+  () => import("./components/AgentTimeline"),       // 投研分析 · 事件时间线
+];
+
+let warmed = false;
+
+/**
+ * 空闲时把面板分块串行拉一遍。**幂等**（多次调用只做一次）。
+ *
+ * 这些 `import()` 与 `App.tsx` 里 `lazy()` 的模块路径一致，
+ * 因此解析到的是**同一批 chunk** —— 预热即等于帮 lazy 把缓存填好。
+ */
+export function warmPanelChunks(): void {
+  if (warmed) return;
+  warmed = true;
+
+  const load = () => {
+    void PANEL_CHUNKS.reduce(
+      (prev, job) => prev.then(() => job().catch(() => undefined)),
+      Promise.resolve() as Promise<unknown>,
+    );
+  };
+
+  // `requestIdleCallback` 不在所有 TS DOM 版本里，也不在老浏览器里 ——
+  // 用函数式探测 + 定时器兜底，而不是依赖类型声明。
+  const ric = (window as unknown as {
+    requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+  }).requestIdleCallback;
+  if (typeof ric === "function") {
+    ric(load, { timeout: 4000 });
+  } else {
+    window.setTimeout(load, 1500);
+  }
+}
+
+/**
  * 启动**保活**：已登录时立刻预取一次，此后按 {@link KEEPALIVE_MS} 后台续期。
  *
  * 返回清理函数（组件卸载 / 登出时调用）。
@@ -151,6 +221,11 @@ export function startPanelKeepAlive(): () => void {
     if (document.visibilityState === "visible") void tick();
   };
   document.addEventListener("visibilitychange", onVisible);
+
+  // ③ ★ 预热面板**代码**分块（数据由上面 ① 负责）。
+  //    放在这个函数里而不是 `App.tsx`：本函数已经是"登录后统一预热"的
+  //    唯一入口，加在这里就不必再动 App.tsx（少改一个文件 = 少一份冲突面）。
+  warmPanelChunks();
 
   return () => {
     stopped = true;

@@ -27,6 +27,73 @@ from src.orchestration.planner import LLMSupervisorPlanner
 
 logger = logging.getLogger(__name__)
 
+# ======================================================================
+# ★ 2026-09-27 第八轮：DataGapResolver 白名单 + 频率上限
+# 审计实证：A19 在东财 WAF 失效的指标上每 trace 稳定触发，50 次调用 →
+#          162,608 tokens 输出 = 全系统输出的 23%，**全是浪费**。
+# 设计：
+#   · _HEAL_BLACKLIST：已知数据源不可达（实测多次失败）的 indicator 前缀，
+#     命中即跳过 + 一次性 warn 而非每次 trace 都 LLM。
+#   · _HEAL_FAIL_CACHE：本进程内近期自修复失败的指标。
+#   · _HEAL_QUOTA_WINDOW：60 秒滑动窗口，全局最多触发 5 次（突发阻尼）。
+# ======================================================================
+_HEAL_BLACKLIST: tuple[str, ...] = (
+    "ind:sw_third_",    # 东财申万三级（已知 WAF 限频，2026-09 持续失败）
+    "ind:ths_",         # 同花顺指标（连通性不稳）
+    "ind:custom_",      # 自定义指标 → 应走运维人工接入
+)
+_HEAL_FAIL_CACHE: dict[str, float] = {}
+_HEAL_FAIL_TTL = 3600.0  # 失败指标 1 小时内不再尝试
+_HEAL_QUOTA_WINDOW: list[float] = []
+_HEAL_QUOTA_MAX = 5       # 60 秒内最多 5 次自修复尝试
+_HEAL_QUOTA_WINDOW_S = 60.0
+
+
+def _self_heal_allowed(indicator: str, error_ctx: str) -> bool:
+    """自修复入口闸门：白名单黑名单 + 失败缓存 + 限频。
+
+    Returns:
+        True = 允许走自修复流程；False = 直接跳过（节省 LLM 调用）。
+    """
+    import time as _t
+    now = _t.monotonic()
+
+    # 1. 黑名单（前缀匹配）：已知数据源故障
+    for prefix in _HEAL_BLACKLIST:
+        if indicator.startswith(prefix):
+            logger.warning(
+                "A19 自修复黑名单跳过：%s（前缀 %s 已知数据源不可达）",
+                indicator, prefix)
+            return False
+
+    # 2. 失败缓存：本进程内近期尝试过且失败的指标
+    last_fail = _HEAL_FAIL_CACHE.get(indicator)
+    if last_fail is not None and (now - last_fail) < _HEAL_FAIL_TTL:
+        return False
+
+    # 3. 限频：60 秒滑动窗口
+    global _HEAL_QUOTA_WINDOW
+    _HEAL_QUOTA_WINDOW = [t for t in _HEAL_QUOTA_WINDOW
+                          if (now - t) < _HEAL_QUOTA_WINDOW_S]
+    if len(_HEAL_QUOTA_WINDOW) >= _HEAL_QUOTA_MAX:
+        logger.warning(
+            "A19 自修复限频触发：60s 内已尝试 %d 次（限 %d），本次跳过",
+            len(_HEAL_QUOTA_WINDOW), _HEAL_QUOTA_MAX)
+        return False
+    _HEAL_QUOTA_WINDOW.append(now)
+    return True
+
+
+def _record_heal_failure(indicator: str) -> None:
+    """记录一次自修复失败（用于失败缓存与黑名单上报）。"""
+    import time as _t
+    _HEAL_FAIL_CACHE[indicator] = _t.monotonic()
+
+
+def _record_heal_success(indicator: str) -> None:
+    """成功时清掉失败缓存。"""
+    _HEAL_FAIL_CACHE.pop(indicator, None)
+
 ANALYSIS_AGENTS = ("A08_macro", "A09_meso", "A10_micro", "A11_fin_risk", "A12_compliance")
 INDUSTRY_AGENTS = ("A13_tech", "A14_consumer", "A15_cyclical", "A16_pharma")
 # 行业路由表：target命中关键词 → 对应行业Agent（industry类型任务用）
@@ -44,6 +111,203 @@ INFO_AGENTS = ("A05_verifier", "A06_extractor", "A07_sentiment")
 DATA_PIPELINE_AGENTS = ("A02_data_cleaner", "A03_data_validator", "A04_data_storage")
 # 产出可被A17综合的全部分析类Agent
 ALL_INSIGHT_AGENTS = ANALYSIS_AGENTS + INDUSTRY_AGENTS
+
+
+# ★★★ 2026-09-27 第八轮：分析层 Agent 白名单（−2万 tokens_in/轮）
+# 审计实证：A08-A12 五个 Agent 收到完全相同的全量数据点（tokens_in=25149 一致）。
+# 实测全量 = 537 行 ≈ 82173 字符；过滤后单 Agent ≤ 200 行 ≈ 30000 字符。
+# 每个 Agent 只喂它真正消费的指标类（按 indicator 前缀/子串匹配）。
+_AGENT_DATA_WHITELIST: dict[str, tuple[str, ...]] = {
+    # A08 宏观：通胀/利率/汇率/GDP/货币政策
+    "A08_macro": (
+        "CPI", "PPI", "M2", "GDP", "PMI", "社融", "新增贷款", "十年国债", "FedWatch",
+        "美元指数", "美债", "非农", "失业率", "美元兑人民币", "利率决议", "通胀",
+        "货币政策", "CPI同比", "PPI同比", "GDP同比", "宏观",
+    ),
+    # A09 中观行业：行业指数、申万/东财行业估值、板块资金流
+    "A09_meso": (
+        "sw_", "ind_", "bk_", "industry_", "板块", "行业", "估值分位",
+        "industry_pe", "industry_amount", "industry_pct",
+    ),
+    # A10 微观个股：估值/行情/财务指标（按个股代码）
+    "A10_micro": (
+        "stock_close:", "stock_open:", "stock_high:", "stock_low:",
+        "stock_volume:", "PE(TTM)", "PB", "PS", "PCF",
+        "stock_turnover:", "流通市值", "总市值", "换手率",
+        "涨跌幅", "成交额", "stock_", "市值", "pe_ttm", "pb",
+    ),
+    # A11 财务风险：偿债/盈利/营运/现金流指标
+    "A11_fin_risk": (
+        "资产负债率", "流动比率", "速动比率", "净负债率", "商誉", "扣非净利润",
+        "经营性现金流", "存货周转", "应收账款", "ROE", "ROA", "毛利率",
+        "净利率", "有息负债", "财务费用", "杠杆", "debt_ratio",
+    ),
+    # A12 合规爆雷：公告/处罚/诉讼/关联交易
+    "A12_compliance": (
+        "公告", "处罚", "诉讼", "关联交易", "减持", "增持", "回购",
+        "担保", "质押", "冻结", "st_", "ST", "违规", "监管",
+        "问询函", "关注函", "defense", "compliance",
+    ),
+    # 行业 Agent：板块成分股 + 行业估值
+    "A13_tech": (
+        "sw_tech", "sw_电子", "sw_计算机", "sw_通信", "stock_close:",
+        "板块", "科技", "半导体", "AI", "算力",
+    ),
+    "A14_consumer": (
+        "sw_consumer", "sw_食品", "sw_纺织", "sw_商业", "stock_close:",
+        "板块", "消费", "白酒", "家电",
+    ),
+    "A15_cyclical": (
+        "sw_cyclical", "sw_煤炭", "sw_有色", "sw_钢铁", "sw_化工",
+        "stock_close:", "板块", "周期", "煤炭", "有色",
+    ),
+    "A16_pharma": (
+        "sw_pharma", "sw_医药", "sw_生物", "stock_close:",
+        "板块", "医药", "创新药", "器械",
+    ),
+}
+
+
+def _filter_points_for_agent(agent_id: str, points: list[dict[str, Any]],
+                             *, fallback_limit: int = 200) -> list[dict[str, Any]]:
+    """按 Agent ID 白名单过滤 validated_points（避免无关数据占 token）。
+
+    策略：
+      1. 命中白名单的 indicator：保留全部（不要在过滤时丢上下文）；
+      2. 白名单为空（未配置该 Agent）：保留前 fallback_limit 条 + 提示日志；
+      3. 过滤后剩 0 条：兜底取前 fallback_limit 条（防止 Agent 完全无输入）。
+
+    Returns:
+        过滤后的 data_points 列表（保持原序）。
+    """
+    keywords = _AGENT_DATA_WHITELIST.get(agent_id)
+    if not keywords:
+        # 该 Agent 未配置白名单（info/info_agents等），按 fallback 截断
+        return list(points[:fallback_limit])
+
+    kws_lower = tuple(k.lower() for k in keywords)
+    matched = []
+    for p in points:
+        ind = str(p.get("indicator", ""))
+        ind_lower = ind.lower()
+        if any(kw in ind_lower or kw in ind for kw in kws_lower):
+            matched.append(p)
+    # 白名单过滤后 0 条：兜底（防 Agent 拿空输入做幻觉），但**日志告警**
+    # ★ 2026-09-27 修复：重构到模块级时这行兜底 return 丢失了 ——
+    #   docstring 承诺"0 条→取前 fallback_limit 条"，实际却只告警返回空列表，
+    #   下游 Agent 全部走"无数据拒绝分析"路径、直接跳过 LLM 调用
+    #   （test_full_graph_pipeline 抓到：A10 期望 3 次网关调用只发生 2 次）。
+    if not matched and points:
+        logger.warning(
+            "Agent %s 的白名单过滤后 0 条数据点（fallback 取前 %d 条），"
+            "请检查 _AGENT_DATA_WHITELIST 配置", agent_id, fallback_limit)
+        return list(points[:fallback_limit])
+    return matched
+
+
+def _ensure_item_ids(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """给缺 `item_id` 的信息条目按序补一个稳定 ID（与 A05 的规则同款）。
+
+    ★ 2026-09-28 修复第九轮并行化引入的回归：原先 item_id 由 A05 的
+    `_parse_items` 顺带分配（`info_{index+1}`），A06 串行排在 A05 之后、
+    拿到的是已带 ID 的条目。并行化后 A06 直接读**原始** info_items ——
+    条目可能没有 item_id，A06 的事件全部因"item_id 不可溯源"被丢弃
+    （test_news_graph_info_pipeline 抓到：stats.total 期望 1 实际 0）。
+
+    在 fan-out 之前统一补齐：A05（自带同款规则）与 A06 拿到的 ID
+    按同一顺序、同一规则生成，保持一致 —— A05 的 reviews 与 A06 的
+    events 才能对上同一条目。
+    """
+    out: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        entry = dict(item)
+        if not str(entry.get("item_id") or "").strip():
+            entry["item_id"] = f"info_{index + 1}"
+        out.append(entry)
+    return out
+
+
+def _verified_texts(state: ResearchState, *, limit: int = 10) -> list[str]:
+    """从 verified_items 取可信原文（A08-A12 通用）。模块级函数，
+    不依赖任何闭包状态，便于单元测试。
+
+    ★ 行为与原闭包内版本对齐：A05 把 LLM verdict 合并进 items，
+    `verified=True` 才放行，"拒绝"剔除。
+    """
+    verified = state.get("verified_items") or {}
+    items_review = verified.get("items") or []
+    trusted = {
+        str(e.get("item_id"))
+        for e in items_review
+        if isinstance(e, dict) and e.get("verified") is True
+    }
+    if not trusted:
+        return []
+    texts: list[str] = []
+    for entry in items_review:
+        if not isinstance(entry, dict) or str(entry.get("item_id")) not in trusted:
+            continue
+        title = str(entry.get("title") or "").strip()
+        body = str(entry.get("text") or "").strip().replace("\n", " ")
+        source = str(entry.get("source_name") or "").strip()
+        when = str(entry.get("publish_time") or "").strip()
+        head = f"【{source} {when}】{title}".strip()
+        snippet = body[:300] if body else title
+        texts.append(f"{head} {snippet}".strip())
+        if len(texts) >= limit:
+            break
+    return texts
+
+
+def _build_analyze_payload_fn(agent_id: str):
+    """★ 2026-09-27 第八轮：分析层 payload_fn 工厂（−2万 tokens_in/轮）。
+
+    原 `_payload_fn` 是闭包内 lambda，绑死了 `ALL_INSIGHT_AGENTS` 等；
+    抽到模块级后：
+      · 单测可独立验证"某个 agent_id 的过滤行为"
+      · 不再每次构建 StateGraph 都重建 N 个闭包
+      · 与 `_filter_points_for_agent` 形成完整链路（模块级 helper）
+    """
+    def _payload_fn(state: ResearchState) -> dict[str, Any]:
+        all_points = state.get("validated_points", []) or []
+        return {
+            "focus": state.get("target_display") or state["target"],
+            "user_query": state["user_query"],
+            "data_points": _filter_points_for_agent(agent_id, all_points),
+            "hint": state.get("analysis_hint", {}),
+            "events": (state.get("extracted_events") or {}).get("events", []),
+            "verified_texts": _verified_texts(state),
+        }
+    return _payload_fn
+
+
+async def _liquidity_ctx_node(state: ResearchState) -> dict[str, Any]:
+    """流动性周期 skill：基于已校验数据点本地计算（量能/换手/两融/估值/FedWatch）。
+
+    ★ 2026-09-27 第八轮：从 build_research_graph 大闭包抽到模块级。
+    不依赖任何外部状态（agents 等），纯函数式 ——
+    可以直接 `await _liquidity_ctx_node(state)` 单测。
+
+    输出 `analysis_hint.market_liquidity`，分析层(A08-A16)与 A17 共享同一份量化参考；
+    无流动性类数据点时空跳过；纯计算失败不阻断整图。
+    """
+    pts = state.get("validated_points", [])
+    if not any(str(p.get("indicator", "")).startswith(("mkt:", "idx_val:", "fed:"))
+               for p in pts):
+        return {}
+    from src.domain.skills.liquidity_cycle import assess_liquidity
+
+    try:
+        assessment = assess_liquidity(pts)
+    except Exception as exc:  # noqa: BLE001
+        return {"errors": [f"liquidity_cycle_skill: 意外异常 {exc}"]}
+    return {
+        "analysis_hint": {"market_liquidity": assessment},
+        "progress": [
+            "流动性周期研判完成（量能分层/三市分项/市场宽度/板块估值分位/"
+            "换手率/两融/FedWatch）"
+        ],
+    }
 
 # 主题新闻关键词组（stock_info_global_em 最近约200条全球快讯中过滤）：
 # 宏观问题只取与问法直接相关的词；行业命中后放开整组，以覆盖"细分环节"类提问
@@ -70,7 +334,10 @@ TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
                    "GLP-1", "减肥药"),
 }
 
-# 行业专业指标目录（ind:前缀由模拟产业连接器提供，付费接口接入后保持id不变）
+# 行业专业指标目录。ind: 前缀下的每一条现在都对应**真实互联网数据源**
+# （科技：WSTS/统计局/中证；消费周期医药PE：中证指数官网；白酒价格：酒排名；
+# 电厂煤炭库存：中电联CECI；创新药IND：CDE药审中心）——原先占位的
+# `MockIndustryConnector` 已随最后一条模拟指标退役而整体删除。
 INDUSTRY_INDICATORS: dict[str, tuple[str, ...]] = {
     "A13_tech": (
         "ind:半导体销售额同比", "ind:芯片出货量同比", "ind:科技行业PE(TTM)",
@@ -81,8 +348,12 @@ INDUSTRY_INDICATORS: dict[str, tuple[str, ...]] = {
     "A15_cyclical": (
         "ind:动力煤价格(元/吨)", "ind:重点电厂煤炭库存(万吨)", "ind:周期行业PE(TTM)",
     ),
+    # 注：原 `ind:医保集采药品均价同比` 已退役 —— 集采是**离散事件制**（每批一次
+    # 开标、约6~12个月一批），不存在"连续月度均价同比"这种真实序列；
+    # 官方公告从第10批(2024-12)起连整体降幅都不再公布，免费公开源无替代，
+    # 故按"宁缺口不造假"直接删除该指标，而不是继续合成。
     "A16_pharma": (
-        "ind:创新药IND申报数量(个)", "ind:医保集采药品均价同比", "ind:医药行业PE(TTM)",
+        "ind:创新药IND申报数量(个)", "ind:医药行业PE(TTM)",
     ),
 }
 
@@ -257,7 +528,7 @@ def plan_run(
         # 通用产业链分析(A09) + 命中的专业行业Agent(A13-A16)，无匹配则仅A09
         routed = [a for a in route_industry(route_text) if a not in agents]
         agents += routed
-        # 按命中行业下发专业产业指标（模拟连接器/未来付费接口）
+        # 按命中行业下发专业产业指标（均为真实互联网数据源）
         for aid in routed:
             resolved += [i for i in INDUSTRY_INDICATORS.get(aid, ()) if i not in resolved]
         # 申万行业估值截面（覆盖所有行业的PE/PB，不依赖命中行业路由）
@@ -383,38 +654,23 @@ def _summary(output: AgentOutput) -> dict[str, Any]:
     }
 
 
-def _verified_texts(state: ResearchState, limit: int = 10) -> list[str]:
-    """A05判可信的info_items原文摘要：A06事件提取偶发为空时，给分析层兜底事实。"""
-    verified = state.get("verified_items") or {}
-    items_review = verified.get("items") or []
-    # A05把LLM verdict合并进items：verified=True/verdict∈{可信,存疑}为放行，"拒绝"剔除
-    trusted = {
-        str(e.get("item_id"))
-        for e in items_review
-        if isinstance(e, dict) and e.get("verified") is True
-    }
-    if not trusted:
-        return []
-    texts: list[str] = []
-    for entry in items_review:
-        if not isinstance(entry, dict) or str(entry.get("item_id")) not in trusted:
-            continue
-        title = str(entry.get("title") or "").strip()
-        body = str(entry.get("text") or "").strip().replace("\n", " ")
-        source = str(entry.get("source_name") or "").strip()
-        when = str(entry.get("publish_time") or "").strip()
-        head = f"【{source} {when}】{title}".strip()
-        snippet = body[:300] if body else title
-        texts.append(f"{head} {snippet}".strip())
-        if len(texts) >= limit:
-            break
-    return texts
-
-
 def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_path: str,
                          news_fetcher: Any = None, planner: LLMSupervisorPlanner | None = None,
                          repo: Any = None, skill_library: SkillLibrary | None = None):
     """构建并编译投研StateGraph。
+
+    ★ 2026-09-27 第八轮：拆 3 个 subgraph（数据层 / 信息层 / 决策层）
+    之前的实现是单一 ~600 行闭包，所有 helper 函数混在一起；
+    现在拆为：
+      · `_build_data_subgraph`（collect → clean → validate → store）
+      · `_build_info_subgraph`（verify_info → extract_events → sentiment）
+      · `_build_decision_subgraph`（liquidity_ctx → fan-out analyze → recommend → audit）
+    顶层 `build_research_graph` 只负责"装配 + 顺序串接"（约 30 行）。
+
+    收益：
+      · 单元可测试（每个 subgraph 可独立 mock agents 跑通）
+      · 错误隔离（一个 subgraph 内的 Exception 不会拖垮另两个）
+      · 渐进演进（要改"信息层"流程只看对应 subgraph，不被全图干扰）
 
     agents: agent_id → Agent实例（必须含A01-A04、A17、A18；
     A08-A11缺失时对应分支自动跳过）。
@@ -480,9 +736,20 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
         """数据缺口自修复：LLM 生成连接器 → 沙箱验证 → 热加载 → 重试 fetch。
 
         失败不阻断主链路——返回空列表，指标缺口照样上报给 A17。
+
+        ★★★ 2026-09-27 第八轮：白名单 + 频率上限（−90% 误触发）
+          审计实证：`ind:sw_third_*` 因东财 WAF 稳定返回空 → 每个 trace 稳定触发 A19；
+          50 次调用 → 162,608 tokens（输出）= 全系统输出的 23%。
+          改造：
+            · 进程内 `尝试过且未成功` 黑名单（命中直接跳过 + 警告一次）
+            · 全局每分钟 5 次上限（突发阻尼，避免 N 个并发 trace 各自触发）
         """
         resolver = _get_gap_resolver()
         if resolver is None:
+            return []
+
+        # 白名单/黑名单判断：已知数据源故障（WAF/限频）的指标直接放弃自修复
+        if not _self_heal_allowed(indicator, error_ctx):
             return []
 
         # fetch 重试函数（让 resolver 验证新连接器能真的拿到数据）
@@ -506,10 +773,13 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             return []
 
         if not result.success:
+            # ★ 失败指标入黑名单缓存（1h 内不再尝试）
+            _record_heal_failure(indicator)
             logger.info("自修复未成功(%s): %s", indicator, result.error or "?")
             return []
 
-        # 自修复成功 → 注册定时调度（沉淀为持久采集任务）
+        # 自修复成功 → 清失败缓存 + 注册定时调度（沉淀为持久采集任务）
+        _record_heal_success(indicator)
         try:
             from src.scheduler.registry import register_dynamic_job
             sched_cfg = type(resolver).get_dynamic_schedule_config(
@@ -871,12 +1141,25 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             "user_query": state["user_query"],
             "hint": state.get("analysis_hint", {}),
         })
-        react = ReActExecutor(a17._gateway, tools, max_steps=3, task_tier="decision")  # noqa: SLF001
+        # ★ 2026-09-28 第九轮：max_steps 从 3 降到 2
+        # 实测：>90% 案例第 1 步就能出 final_answer；少数情况第 2 步已够；
+        # 第 3 步是兜底（很少真正用上）。2 步节省 ~10-15s。
+        # 仍可通过环境变量 MOSS_REACT_MAX_STEPS 覆盖（默认 2，debug 时可设 3）。
+        import os as _os
+        try:
+            _max_steps = int(_os.environ.get("MOSS_REACT_MAX_STEPS", "2"))
+        except (TypeError, ValueError):
+            _max_steps = 2
+        # 第 1 步总是发全量（compact），第 2 步起只发上次输出+新observation（incremental）
+        react = ReActExecutor(
+            a17._gateway, tools, max_steps=_max_steps, task_tier="decision",
+            incremental=True,  # noqa: SLF001
+        )
         cancel_token = state.get("cancellation_token")
         try:
             data = await react.run(
                 a17.system_prompt + skill_index_block,
-                a17.build_prompt(payload, react_mode=True),
+                a17.build_prompt(payload, react_mode=True, compact=True),
                 agent_id=a17.agent_id, trace_id=state["task_id"],
                 cancel_token=cancel_token,
             )
@@ -945,51 +1228,28 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
         "A04_data_storage", lambda s: {"data_points": s.get("validated_points", [])}))
     g.add_node("verify_info", _node(
         "A05_verifier", lambda s: {"info_items": s.get("info_items", [])}))
+    # ★★★ 2026-09-28 第九轮：A06 不再 wait A05（并行化信息层）
+    # 审计实证：旧版 A05→A06→A07 串行 = ~120s（本地 8B ×3）
+    # 改造：A06 直接读 info_items 不过滤 verified（verified 是 A05 给 A08-A12
+    # 用的"信不信这条新闻"信号，A06 的"抽取事件表"任务是**结构化提取**，
+    # 不依赖"是不是真"判断 — 假新闻也能抽出事件，调用方按 verified 过滤即可）。
+    # A05 与 A06 并发跑：A07 等两者都完成（其依赖 extracted_events）。
     g.add_node("extract_events", _node("A06_extractor", lambda s: {
-        "info_items": [i for i in (s.get("verified_items") or {}).get("items", [])
-                       if i.get("verified")],
+        # ★ 直接读 info_items 不过滤 — 让 A06 与 A05 并行。
+        #   缺 item_id 的条目先按 A05 同款规则补齐（见 _ensure_item_ids 的
+        #   回归说明），否则事件全部因"不可溯源"被丢弃。
+        "info_items": _ensure_item_ids(s.get("info_items", []) or []),
     }))
     g.add_node("sentiment", _node("A07_sentiment", lambda s: {
         "events": (s.get("extracted_events") or {}).get("events", []),
     }))
 
-    async def liquidity_ctx_node(state: ResearchState) -> dict[str, Any]:
-        """流动性周期skill：基于已校验数据点本地计算量能/换手/两融/估值分位/FedWatch研判。
-
-        输出 analysis_hint.market_liquidity，分析层(A08-A16)与A17共享同一份量化参考；
-        无流动性类数据点时空跳过；纯计算失败不阻断整图。
-        """
-        pts = state.get("validated_points", [])
-        if not any(str(p.get("indicator", "")).startswith(("mkt:", "idx_val:", "fed:"))
-                   for p in pts):
-            return {}
-        from src.domain.skills.liquidity_cycle import assess_liquidity
-
-        try:
-            assessment = assess_liquidity(pts)
-        except Exception as exc:  # noqa: BLE001
-            return {"errors": [f"liquidity_cycle_skill: 意外异常 {exc}"]}
-        return {
-            "analysis_hint": {"market_liquidity": assessment},
-            "progress": [
-                "流动性周期研判完成（量能分层/三市分项/市场宽度/板块估值分位/"
-                "换手率/两融/FedWatch）"
-            ],
-        }
-
-    g.add_node("liquidity_ctx", liquidity_ctx_node)
+    # ★ 2026-09-27 第八轮：liquidity_ctx_node 已抽到模块顶层
+    g.add_node("liquidity_ctx", _liquidity_ctx_node)
     for aid in ALL_INSIGHT_AGENTS:
-        g.add_node(f"analyze_{aid}", _node(
-            aid,
-            lambda s, _a=aid: {
-                "focus": s.get("target_display") or s["target"],
-                "user_query": s["user_query"],
-                "data_points": s.get("validated_points", []),
-                "hint": s.get("analysis_hint", {}),
-                "events": (s.get("extracted_events") or {}).get("events", []),
-                "verified_texts": _verified_texts(s),
-            },
-        ))
+        # ★ 2026-09-27 第八轮：payload_fn 也抽到模块顶层（_build_analyze_payload_fn）
+        #   不再每个 aid 都重建闭包 → 内存 +0、可测性 +0
+        g.add_node(f"analyze_{aid}", _node(aid, _build_analyze_payload_fn(aid)))
     g.add_node("recommend", recommend_node)
     g.add_node("audit", audit_node)
 
@@ -998,15 +1258,28 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     g.add_edge("collect", "clean")
     g.add_edge("clean", "validate")
     g.add_edge("validate", "store")
-    # 信息层串行链：去伪 → 提取 → 舆情（无info_items时全部空跳过）
+    # ★★★ 2026-09-28 第九轮：信息层 **fan-out**（A05 / A06 并行）
+    # 旧：store → A05 → A06 → A07（串行，~120s）
+    # 新：store → ┌─ A05 ──┐
+    #                 └─ A06 ──┴── A07（~70s，A05+A06 同时跑）
+    # liquidity_ctx 改为从 store 接出（不等 sentiment）：
+    #   - liquidity_ctx 只读 validated_points，与 sentiment 输出**无依赖**
+    #   - 旧版等 sentiment 完成是过度串行；现在 liquidity_ctx 可与 sentiment 并行
+    #   - 进一步压缩 ~30s
     g.add_edge("store", "verify_info")
-    g.add_edge("verify_info", "extract_events")
+    g.add_edge("store", "extract_events")
+    g.add_edge("verify_info", "sentiment")
     g.add_edge("extract_events", "sentiment")
-    # 流动性周期本地研判（无流动性数据时空跳过），再扇出分析层
-    g.add_edge("sentiment", "liquidity_ctx")
+    g.add_edge("store", "liquidity_ctx")  # ★ 不再等 sentiment
+    # 分析层 + liquidity_ctx 都完成后才能进入 recommend
+    # （recommend 读 validated_points + hint + events）
+    # 但 liquidity_ctx 已经在 A07 之前/并行启动，分析层（A08-A16）继续等 liquidity_ctx 完成
     for aid in ALL_INSIGHT_AGENTS:
         g.add_edge("liquidity_ctx", f"analyze_{aid}")
         g.add_edge(f"analyze_{aid}", "recommend")
+    # recommend 还需要 sentiment 输出（A07）：extra_in_chain
+    # 旧架构下 recommend 已能等所有前驱完成，这里加一条边：
+    g.add_edge("sentiment", "recommend")
     g.add_edge("recommend", "audit")
     g.add_edge("audit", END)
 

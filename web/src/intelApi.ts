@@ -704,6 +704,47 @@ export function fetchIntelCalendar(
   return getJson<CalendarResult>(`/calendar?horizon_days=${horizonDays}`, signal);
 }
 
+/**
+ * **一次往返**取齐情报中心首屏（情报流 + 日历）。
+ *
+ * ## 为什么合并（2026-09-26 实测）
+ *
+ * 首屏原来发 2 条（`/feed` + `/calendar`）。本机各自几十毫秒无所谓，
+ * 但公网实测（真实会话、gzip 已生效）：
+ *
+ *     情报流   53.5 KB   4.93 s
+ *     热度      1.4 KB   **2.52 s**   ← 1.4 KB 也要 2.5 秒
+ *     日历     58.4 KB   8.82 s
+ *
+ * **1.4 KB 也要 2.5 秒**，说明瓶颈是**往返本身**（隧道 RTT + 队头等待；
+ * 同一时段一次 TLS 握手直接 180 秒超时），不是字节数。既然每次往返都要
+ * 付一笔固定开销，2 次并成 1 次就省掉一笔。
+ *
+ * ⚠️ **热度不在返回值里单独再取**：`feed.heat` 本来就带（服务端在
+ * `_build_feed_bg` 里附上的）。所以这里只返回 feed + calendar 两项 ——
+ * 名字叫 bootstrap 但**不做多余的事**，否则等于把省下的往返又还回去。
+ */
+export function fetchIntelBootstrap(
+  opts: {
+    limit?: number; codes?: string[]; sort?: string; filter?: string;
+    direction?: string; horizonDays?: number;
+  } = {},
+  signal?: AbortSignal,
+): Promise<{ feed: IntelFeed; calendar: CalendarResult }> {
+  const q = new URLSearchParams();
+  if (opts.limit) q.set("limit", String(opts.limit));
+  if (opts.codes?.length) q.set("codes", opts.codes.join(","));
+  if (opts.sort) q.set("sort", opts.sort);
+  if (opts.filter && opts.filter !== "all") q.set("filter", opts.filter);
+  if (opts.direction && opts.direction !== "all") {
+    q.set("direction", opts.direction);
+  }
+  if (opts.horizonDays) q.set("horizon_days", String(opts.horizonDays));
+  const qs = q.toString();
+  return getJson<{ feed: IntelFeed; calendar: CalendarResult }>(
+    `/bootstrap${qs ? `?${qs}` : ""}`, signal);
+}
+
 /** 采集健康度（聚合口径，不暴露有几个源、分别叫什么）。 */
 export function fetchIntelHealth(signal?: AbortSignal): Promise<SourceHealth> {
   return getJson<SourceHealth>("/sources/health", signal);

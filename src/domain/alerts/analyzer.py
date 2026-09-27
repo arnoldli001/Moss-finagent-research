@@ -3,7 +3,7 @@
 阶段一 medium：批量分类/情感/实体（失败回退本地关键词分类，不阻断）；
 阶段二 reasoning：批量风险/机会打分、受影响个股、传导路径（失败返回空）。
 单事件JSON非法或评分数值越界（FR-6）→ 丢弃该事件，不影响其他事件。
-每次扫描网关调用：阶段一 1 次 + 阶段二 ⌈N/8⌉ 次（N = 候选事件数）。
+每次扫描网关调用：阶段一 ⌈N/10⌉ 次 + 阶段二 ⌈N/8⌉ 次（N = 候选事件数）。
 空候选零调用。
 证券名称解析器由装配层注入（domain不依赖infrastructure）。
 
@@ -85,6 +85,28 @@ STAGE2_TIER: str = "medium"
 #: "每条事件都有评估"而不是"前十几条有、后面的没有"。
 STAGE2_BATCH: int = 8
 
+#: 阶段一每次调用处理的事件数上限。**按实测输出开销算出来的**：
+#:
+#:     本地 qwen3:8b 实测（含思考 token）：
+#:       10 条短事件 → 1792 token 输出（179/条）
+#:        生产真实事件（标题+正文 300 字+行业/公司实体）≈ 350~400 token/条
+#:     预算：local_medium 的 max_tokens = 4096，其中约 600 花在思考上
+#:       → 可用于正文 ≈ 3500 token → 3500 / 400 ≈ 8 条，取 6 留出余量
+#:     时间：6 条 ≈ 2400 token ÷ 44 t/s ≈ 55 秒 < llm_timeout_seconds(120)
+#:
+#: 为什么必须分批（**生产日志实证**，2026-09-26）：
+#:
+#:     阶段一分类失败，使用本地兜底: alert_analyzer LLM输出非合法JSON:
+#:     Unterminated string starting at: line 76 column 5 (char 1487)
+#:
+#: 140 条事件的一轮扫描里，阶段一一条调用要输出全部事件的
+#: `{event_id,event_type,sentiment,entities,summary}`。本地 qwen3:8b 是**思考型**
+#: 模型（实测约 560 个输出 token 花在思考上、正文只有 ~320 字符），事件一多就被
+#: `max_tokens=4096` **从字符串中间截断** —— schema 只保证"结构合法"，
+#: **不保证生成能跑完**。截断后整批退回关键词兜底（情感恒 neutral、
+#: 摘要为空、行业/公司全丢）。分批把每批输出压回预算内。
+STAGE1_BATCH: int = 6
+
 #: 允许降级到**付费**云端模型的环境开关。默认关闭。
 ALLOW_CLOUD_ENV: str = "MOSS_ALERT_ALLOW_CLOUD"
 
@@ -141,13 +163,17 @@ def _stage1_fallback(events: list[Event]) -> dict[str, dict[str, Any]]:
     }
 
 
-def salvage_assessments(content: str) -> list[dict[str, Any]]:
-    """从可能被max_tokens截断的输出中抢救assessments数组里完整的对象。
+def _salvage_objects(content: str, key: str) -> list[dict[str, Any]]:
+    """从被 max_tokens 截断的输出里抢救 `key` 数组里**完整的对象**。
 
-    reasoning模型思维链挤占输出预算时尾部JSON易截断；逐项raw_decode，
-    遇到第一个不完整对象即停止（其余事件保持未分析，下轮重试）。
+    `salvage_assessments` 的通用版（阶段一 / 阶段二共用）。逐项 `raw_decode`，
+    遇到第一个不完整对象即停止 —— 剩下的保持未处理，下一轮重试。
+
+    为什么两段都要它：schema 只约束"结构合法"，**不约束生成能跑完**；
+    本地思考型模型的输出预算被思考吃掉一截，长批次必然截断。
+    有了抢救，截断只是"这一批少几条"，而不是"整批退回关键词兜底"。
     """
-    marker = content.find("assessments")
+    marker = content.find(key)
     start = content.find("[", marker) if marker >= 0 else -1
     if start < 0:
         return []
@@ -166,6 +192,20 @@ def salvage_assessments(content: str) -> list[dict[str, Any]]:
             out.append(obj)
         pos = end
     return out
+
+
+def salvage_assessments(content: str) -> list[dict[str, Any]]:
+    """从可能被max_tokens截断的输出中抢救assessments数组里完整的对象。
+
+    reasoning模型思维链挤占输出预算时尾部JSON易截断；逐项raw_decode，
+    遇到第一个不完整对象即停止（其余事件保持未分析，下轮重试）。
+    """
+    return _salvage_objects(content, "assessments")
+
+
+def salvage_events(content: str) -> list[dict[str, Any]]:
+    """同上，抢救阶段一的 `events` 数组。"""
+    return _salvage_objects(content, "events")
 
 
 class EventAnalyzer:
@@ -235,18 +275,35 @@ class EventAnalyzer:
     async def _run_stage1(
         self, events: list[Event], *, force: bool = False,
     ) -> dict[str, dict[str, Any]]:
-        """分类/情感/实体/摘要。失败（含重试后仍失败）→ 本地关键词兜底。
+        """分类/情感/实体/摘要。**分批**（每批 `STAGE1_BATCH` 条）。
 
-        ## 为什么带 `json_schema` 且重试
+        ## 为什么带 `json_schema`、要重试、还要分批
 
-        提示词里写了"只输出JSON"，但那对小模型只是**建议**：实测 qwen3:8b
-        有一次返回 `{ }`（正文空对象）。传 schema 后 Ollama 走受约束解码，
-        结构由采样器保证；重试再兜一层（本地调用免费，只花十几秒）。
-        两道都没有才退回 `_stage1_fallback` —— 那时情感恒为 neutral、
-        摘要为空，属于**质量下降但功能可用**，不是失败。
+        提示词里写了"只输出JSON"，但那对小模型只是**建议**（实测 qwen3:8b
+        有一次返回 `{ }`）。传 schema 后 Ollama 走受约束解码，结构由采样器
+        保证 —— 可它**只保证结构合法，不保证生成能跑完**：思考 token 先吃掉
+        一部分预算，事件一多就被 `max_tokens` 从字符串中间截断
+        （生产日志实证：`Unterminated string starting at: line 76`）。
+        所以：schema 管结构、**分批**管预算、重试管抖动；
+        三者都没有才退回 `_stage1_fallback`（情感恒 neutral、摘要为空，
+        属于**质量下降但功能可用**，不是失败）。
+
+        单批失败**只影响那一批**：其余批次的分类结果照常保留。
         """
+        out: dict[str, dict[str, Any]] = {}
+        chunks = [events[i:i + STAGE1_BATCH]
+                  for i in range(0, len(events), STAGE1_BATCH)]
+        for index, chunk in enumerate(chunks, 1):
+            out.update(await self._classify_batch(
+                chunk, force=force, tag=f"{index}/{len(chunks)}"))
+        return out
+
+    async def _classify_batch(
+        self, events: list[Event], *, force: bool = False, tag: str = "",
+    ) -> dict[str, dict[str, Any]]:
         last = ""
         for attempt in range(1, max(1, STAGE1_ATTEMPTS) + 1):
+            resp = None
             try:
                 resp = await self._gateway.complete(
                     STAGE1_TIER, prompts.STAGE1_SYSTEM,
@@ -266,9 +323,20 @@ class EventAnalyzer:
                 return self._parse_stage1(data.get("events"), events)
             except Exception as exc:  # noqa: BLE001 降级为本地分类，扫描不中断
                 last = brief(exc, BRIEF_DEFAULT)
+                # ★ 截断抢救：schema 保证结构合法，但**不保证生成跑得完**
+                #   （思考 token 挤占预算 → 尾部截在字符串中间）。
+                #   抢救出完整前缀，总比整批退回关键词兜底强。
+                salvaged = salvage_events(resp.content) if resp is not None \
+                    else []
+                if salvaged:
+                    logger.info("阶段一JSON截断（第%s批），抢救出%d/%d条分类",
+                                tag, len(salvaged), len(events))
+                    return self._parse_stage1(salvaged, events)
                 if attempt < STAGE1_ATTEMPTS:
-                    logger.info("阶段一第 %d 次失败（重试）：%s", attempt, last)
-        logger.warning("阶段一分类失败，使用本地兜底: %s", last)
+                    logger.info("阶段一第 %d 次失败（第%s批，重试）：%s",
+                                attempt, tag, last)
+        logger.warning("阶段一分类失败（第%s批，%d条），使用本地兜底: %s",
+                       tag, len(events), last)
         return _stage1_fallback(events)
 
     def _parse_stage1(

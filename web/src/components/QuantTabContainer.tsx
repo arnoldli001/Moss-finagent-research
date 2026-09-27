@@ -91,16 +91,14 @@ export default function QuantTabContainer({ onEditProfile }: {
             {item.label}
           </button>
         ))}
-        {/* 风险提示（用户口径 2026-09-23）：放在三个模块页签**右侧**，
-            原文照抄不加改写 —— 这类免责声明被"润色"过就不再是用户要表达的意思。
-            `margin-left:auto` 把它推到行尾；窄屏页签占满一行时它换到第二行右端
-            （见 .quant-tabs-disclaimer）。
-            ⚠️ 类名**不能**叫 `.quant-disclaimer`：那是多因子面板底部免责声明在用的类
-            （`QuantFactorPanel.tsx`，`margin-top:14px`），复用会让这条被顶下去 14px、
-            也会把 `margin-left:auto` 反向泄漏到那个段落上。 */}
-        <span className="quant-tabs-disclaimer">
-          本工具仅供参考学习研究，投资有风险，非指导建议，盈亏自负
-        </span>
+        {/* ★ 原来这里有一个 `<span class="quant-tabs-disclaimer">`（用户口径
+            2026-09-23 加的：把"本工具仅供参考学习研究，投资有风险，非指导建议，
+            盈亏自负"放在三个模块页签**右侧**）。
+            2026-09-28 用户口径改为「这个做到 brand-sub 里就行，删除每个页签下的
+            显示」—— 全站只留顶栏那一处（见 `components/BrandDisclaimer.tsx`）。
+            所以这里连同 `.quant-tabs-disclaimer` 样式一起删除。
+            ⚠️ 别再往页签行里加回这类提示：它挂在"量化交易"这一个页签下，
+            别的页签就没有了，覆盖必然不全（这正是收进顶栏的理由）。 */}
       </nav>
 
       {view === "auction" ? (

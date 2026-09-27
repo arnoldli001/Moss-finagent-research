@@ -696,7 +696,30 @@ def test_monitor_cost_per_tenant_and_tenant_row(env, llm_audit) -> None:
 
 
 def test_monitor_flags_unpriced_model(env, llm_audit) -> None:
-    """未登记价格的模型名：金额按兜底价估算，但**必须**被标出来。"""
+    """未登记价格的模型名：金额按兜底价估算，但**必须**被标出来。
+
+    ★ 2026-09-27 第八轮更新：用未登记的虚拟模型名 `unknown-model-x`（之前用
+    `deepseek-v4-flash`，但该项目已经在 models.yaml 登记了真实价格 → 旧断言
+    会假阳性失败）。
+    """
+    c, _ = env
+    make_and_login(c, "admin")
+    write_llm_audit(llm_audit, [
+        cost_llm_row(path="/api/v1/research/analyze", tenant="vip",
+                     model="unknown-model-x"),
+    ])
+    cost = c.get("/api/v1/admin/platform/monitor").json()["llm_cost"]
+    assert cost["unpriced_calls"] == 1
+    assert cost["unpriced_models"] == [["unknown-model-x", 1]]
+    assert any("unknown-model-x" in n for n in cost["basis_notes"])
+
+
+def test_monitor_does_not_flag_priced_models(env, llm_audit) -> None:
+    """★ 2026-09-27 第八轮：已登记价格的模型**不**应被标 unpriced。
+
+    修复了"配置里 deepseek-v4-flash 没登记 → 309 次调用被算成 0 元"的事故。
+    登记后再用这个模型名，应该不在 unpriced 列表里。
+    """
     c, _ = env
     make_and_login(c, "admin")
     write_llm_audit(llm_audit, [
@@ -704,9 +727,11 @@ def test_monitor_flags_unpriced_model(env, llm_audit) -> None:
                      model="deepseek-v4-flash"),
     ])
     cost = c.get("/api/v1/admin/platform/monitor").json()["llm_cost"]
-    assert cost["unpriced_calls"] == 1
-    assert cost["unpriced_models"] == [["deepseek-v4-flash", 1]]
-    assert any("deepseek-v4-flash" in n for n in cost["basis_notes"])
+    # ★ 这条断言是关键回归：登记后 unpriced_calls 应该是 0
+    assert cost["unpriced_calls"] == 0
+    assert cost["unpriced_models"] == []
+    # 但 cost 已经被按 v4-flash 的价格计入（不为 0）
+    assert cost["total_cny"] > 0
 
 
 def test_monitor_missing_llm_audit_is_not_zero_cost(env, llm_audit) -> None:

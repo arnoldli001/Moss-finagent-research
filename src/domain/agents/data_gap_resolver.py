@@ -293,12 +293,18 @@ class DataGapResolverAgent:
             "只输出 Python 代码，不要任何解释。"
         )
 
+        # ★ 2026-09-27 第八轮：trace_id 用稳定 hash（之前用时间戳 → 缓存永不命中）
+        #   同样指标 + 同样错误上下文 + 同样 attempt → 命中缓存
+        #   只有 attempt 变了（说明上一次失败要换思路）→ key 变 → 重新生成
+        import hashlib as _hl
+        stable_input = f"{indicator}|{error_context[:200]}|{attempt}"
+        stable_trace = _hl.sha1(stable_input.encode()).hexdigest()[:16]
         response = await self._gateway.complete(
             "reasoning", _SYSTEM_PROMPT, prompt,
             agent_id="data_gap_resolver",
-            trace_id=f"gap_{int(time.time())}_{attempt}",
+            trace_id=f"data_gap:{stable_trace}",
             json_mode=False,
-            use_cache=False,
+            use_cache=True,  # ★ 改成 True：稳定 trace_id 下重复调用可命中
         )
         code = response.content.strip()
         # 提取 ```python ... ``` 块（LLM 可能包裹 markdown）

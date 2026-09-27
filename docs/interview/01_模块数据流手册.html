@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>模块数据流手册 · 比 AI 深一层（面试版）</title>
+<style>
+  :root{--ink:#1c2333;--sub:#5b6472;--line:#dde3ec;--bg:#f6f8fb;--card:#fff;
+        --accent:#2456c8;--warn:#b45309;--ok:#1a7f4e;--bad:#c0291f;}
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+       background:var(--bg);color:var(--ink);line-height:1.75;padding:32px 16px 80px;}
+  .wrap{max-width:980px;margin:0 auto;}
+  h1{font-size:26px;letter-spacing:.5px;margin-bottom:6px;}
+  .meta{color:var(--sub);font-size:13px;margin-bottom:18px;}
+  .toc{background:var(--card);border:1px solid var(--line);border-radius:12px;
+       padding:16px 20px;margin-bottom:24px;font-size:14px;}
+  .toc a{color:var(--accent);text-decoration:none;margin-right:14px;white-space:nowrap;}
+  .mod{background:var(--card);border:1px solid var(--line);border-radius:14px;
+       padding:22px 24px;margin-bottom:26px;}
+  .mod h2{font-size:19px;margin-bottom:2px;}
+  .mod .path{font-size:12px;color:var(--sub);font-family:Consolas,monospace;margin-bottom:10px;}
+  .pos{font-size:14px;color:var(--accent);font-weight:600;margin-bottom:14px;}
+  h3{font-size:14.5px;margin:16px 0 8px;color:var(--ink);
+     border-left:4px solid var(--accent);padding-left:8px;}
+  /* 流程图：纯 CSS，纵向盒 + 箭头，打印安全 */
+  .flow{background:#fbfcfe;border:1px solid var(--line);border-radius:10px;
+        padding:14px 18px;font-size:13px;}
+  .fn{background:#fff;border:1px solid var(--line);border-left:4px solid var(--accent);
+      border-radius:8px;padding:7px 12px;margin:0;}
+  .fn b{color:var(--accent);}
+  .fn .n{color:var(--sub);font-size:12px;}
+  .fn.key{border-left-color:var(--warn);background:#fffaf2;}
+  .fa{text-align:center;color:var(--accent);font-size:12px;padding:2px 0;}
+  .fbranch{display:flex;gap:10px;margin:0;}
+  .fbranch>div{flex:1;min-width:0;}
+  .note{font-size:12.5px;color:var(--sub);margin-top:8px;}
+  /* 表格 */
+  table{width:100%;border-collapse:collapse;font-size:13px;margin:8px 0;}
+  th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top;}
+  th{background:#eef2fa;}
+  /* 追问卡 */
+  .qa{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:10px 0;
+      background:#fff;}
+  .qa .q{font-weight:700;color:var(--bad);font-size:13.5px;}
+  .qa .a{margin-top:4px;font-size:13.5px;}
+  .qa .a b{color:var(--ok);}
+  .check{background:#f2f8f4;border:1px solid #cfe6d8;border-radius:10px;
+         padding:10px 14px;font-size:13px;margin-top:10px;}
+  .check li{margin-left:18px;margin-top:3px;}
+  .tip{background:#fff8ec;border:1px solid #f2ddb0;border-radius:10px;
+       padding:10px 14px;font-size:13px;margin:12px 0;}
+  .print-hint{background:#eef2ff;border:1px solid #c9d6f5;border-radius:12px;
+       padding:12px 18px;font-size:13.5px;margin-bottom:22px;}
+  @media print{
+    body{background:#fff;padding:0;}
+    .mod{border:none;border-top:2px solid var(--line);border-radius:0;
+         padding:12px 0;page-break-inside:avoid;}
+    .toc{display:none;}
+    .print-hint{display:none;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>模块数据流手册 · 比 AI 深一层</h1>
+<div class="meta">Moss-FinAgent-Research 面试版 · 2026-09-27 · 全部数据流与决策均以当前仓库代码为准，标注了文件位置可现场核对</div>
+<div class="print-hint"><b>转 PDF 方法</b>：浏览器打开本文件 → Ctrl+P → 目标打印机选「另存为 PDF」→ 勾选「背景图形」→ 保存。目录在打印版自动隐藏。</div>
+<div class="toc">
+  <b>目录：</b>
+  <a href="#m1">M1 投研主链路</a><a href="#m2">M2 LLM网关</a><a href="#m3">连接器路由</a><a href="#m4">事件告警</a><a href="#m5">情报中心</a><a href="#m6">板块拥挤度</a><a href="#m7">行业轮动</a><a href="#m8">SQLite并发</a><a href="#m9">竞价选股</a><a href="#m10">多租户合规</a><a href="#m11">前端架构</a><a href="#m12">成本治理</a>
+</div>
+
+<!-- M1 -->
+<div class="mod" id="m1">
+<h2>M1 · 投研分析主链路（LangGraph Supervisor）</h2>
+<div class="path">src/orchestration/supervisor.py · src/api/routes/research.py · src/domain/agents/</div>
+<div class="pos">一句话：Planner 规划 → 数据管线 → 信息层并行 → 分析层扇出 → A17 ReAct 综合 → A18 哈希链审计。</div>
+<div class="flow">
+  <div class="fn"><b>POST /research/analyze</b> <span class="n">research.py:216</span>：qhash 查结果缓存(600s/500条) → 同问合流(leader 模式，相同问题挂 Future 不重跑) → 准入信号量 <b>Semaphore(4)</b> + 队列超时 30s(满则明确报错) → create_task 后台执行</div>
+  <div class="fa">↓</div>
+  <div class="fn"><b>supervisor 规划</b>：Planner LLM（本地 1.5B，light 层，3~5s 零成本）产出 indicators+agents → <b>sanitize_indicators</b>（个股指标强制补 6 位代码后缀，否则连接器全不认）→ append_liquidity_indicators（规则式补齐 mkt:/idx_val:/fed:）→ LLM 规划失败回退 plan_run 纯规则路由</div>
+  <div class="fa">↓</div>
+  <div class="fn"><b>collect（A01）</b>：指标并发 gather，单指标失败隔离 → 存储降级（最近快照）→ 仍无数据 → 自修复（LLM 生成 connector → AST 静态校验 → 子进程沙箱 15s 冒烟 → 注册复用）</div>
+  <div class="fa">↓</div>
+  <div class="fn">clean(A02) → validate(A03) → store(A04)（纯规则，无 LLM）</div>
+  <div class="fa">↓ fan-out（第九轮：信息层并行）</div>
+  <div class="fbranch">
+    <div><div class="fn">A05 去伪<br><span class="n">规则评分+LLM复核→verified_items</span></div></div>
+    <div><div class="fn">A06 抽取事件<br><span class="n">直读原始 info_items（_ensure_item_ids 补 ID）</span></div></div>
+    <div><div class="fn">liquidity_ctx<br><span class="n">纯本地 skill：量能/两融/估值分位 → analysis_hint</span></div></div>
+  </div>
+  <div class="fa">↓（A05、A06 汇合后）A07 舆情</div>
+  <div class="fn key">analyze_A08…A16（8~9 个并行）——<b>payload 按白名单过滤</b>（supervisor.py:_filter_points_for_agent，过滤 0 条兜底取前 200 条）</div>
+  <div class="fa">↓</div>
+  <div class="fn key"><b>A17 ReAct ≤3 步</b>（decision 层=deepseek-v4-pro）：compact=True 压缩上游（每块≤400字）→ 第1步全量任务 → 第2/3步只发「任务头+上次输出摘要+新观察+任务要求」→ 工具 ask_agent/query_data/load_skill → 空结论回退单次直答</div>
+  <div class="fa">↓</div>
+  <div class="fn">A18 审计：<b>零 LLM</b>，prompt/response 哈希链封存（200 并发实测链完整）→ final_report</div>
+</div>
+<div class="note">信息层并行收益：A05→A06→A07 串行 ≈120s（本地 8B×3）→ A05∥A06 后 ≈70s；liquidity_ctx 从 store 直出不等 sentiment 再省 ≈30s。</div>
+<h3>关键决策（为什么不用备选方案）</h3>
+<table>
+<tr><th>决策</th><th>理由（可当场讲）</th></tr>
+<tr><td>LangGraph StateGraph，不用 AutoGen/CrewAI</td><td>需要<b>可控的 fan-out/fan-in</b>（A08-A16 并行汇合到 A17）与失败边界；group chat 是黑盒，控不了并发度、取消传播与 reducer 语义。StateGraph 的 operator.add reducer 让并行写状态天然安全。</td></tr>
+<tr><td>分析层白名单 + 空结果兜底</td><td>审计实证 5 个 Agent 收完全相同全量（tokens_in=25,149 一致）；白名单按 indicator 关键字过滤，<b>过滤后 0 条必须兜底取前 200 条</b>——否则 Agent 全部走"无数据拒绝分析"静默跳过 LLM（集成测试抓到过这个回归）。</td></tr>
+<tr><td>A17 用最贵的 v4-pro</td><td>跨源冲突仲裁是全链路唯一不可降级环节；且 compact+增量协议后其成本占比已从 55% 大幅下降；空结论回退单次直答保可用性。</td></tr>
+</table>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：LangGraph 里并行节点怎么保证状态不互相踩？</div><div class="a">三个隔离层：① 每请求独立 ResearchState（无跨请求共享可变状态）；② 并行写同一键的字段（agent_outputs/errors）走 <b>operator.add reducer</b>，LangGraph 聚合而非覆盖；③ 全局资源（审计链）用 threading.Lock + seq 续链，实测 200 并发封存链完整、seq 全唯一（55.6ms）。</div></div>
+<div class="qa"><div class="q">Q2：Planner 用 1.5B 会不会规划错？</div><div class="a">会，所以有三道护栏：① sanitize_indicators 修正常见的"裸指标名"契约错误；② append_liquidity_indicators 用规则确定性补齐 LLM 漏掉的流动性指标；③ 规划失败整体回退 plan_run 纯规则路由。规划错一个 Agent 的代价远小于每轮省下的 15 秒云端等待。</div></div>
+<div class="qa"><div class="q">Q3：准入上限为什么是 4？</div><div class="a">按 <b>LLM 配额定，不按用户数定</b>：DeepSeek RPM/并发限制 ÷ 单任务平均 LLM 调用数（8~15 次）≈ 4；满员时明确返回"队列已满（N/4）"而不是无限排队——排队不可见比报错更伤体验。</div></div>
+<div class="check"><b>盲测自检</b>（合上文档能做到才算过）：<ul><li>闭卷画出从 submit_analyze 到 final_report 的完整数据流（含 3 个并行点）</li><li>说清白名单兜底为什么必须存在（举出测试抓到的回归）</li><li>说清 A17 三步各自发什么内容、量级多少 token</li></ul></div>
+</div>
+
+<!-- M2 -->
+<div class="mod" id="m2">
+<h2>M2 · LLM 网关（架构红线）</h2>
+<div class="path">src/infrastructure/llm/gateway.py · cache.py · circuit_breaker.py · audit.py</div>
+<div class="pos">一句话：所有 Agent 禁止直连模型 API，必须过网关——一处控制成本、可靠性、审计。</div>
+<div class="flow">
+  <div class="fn"><b>complete(tier, system, prompt, agent_id, trace_id)</b></div>
+  <div class="fa">↓ ①</div>
+  <div class="fn">取消令牌检查（用户点停止 → 不再产生任何费用）</div>
+  <div class="fa">↓ ②</div>
+  <div class="fn">输入硬截断：<b>6000 字符，保头保尾 7:3</b>（头=用户问题+核心数据；尾=任务要求+JSON schema）</div>
+  <div class="fa">↓ ③</div>
+  <div class="fn key">两级缓存（cache.py，aget 走线程池不阻塞事件循环）：精确命中（规范化后 SHA256）→ 语义命中（字符 3-gram 余弦 ≥0.85，<b>按 agent_id+scope 隔离</b>，TTL 24h）。实测全站命中率 60.4%</div>
+  <div class="fa">↓ ④</div>
+  <div class="fn">token 预算：单任务（trace_id 口径）累计超限 → 直接拒绝；max_tokens <b>双层上限</b>（模型配置 + 全局硬上限 32768），防某 Agent 配置写 100k 打穿预算</div>
+  <div class="fa">↓ ⑤</div>
+  <div class="fn key">降级链：for model in routing[tier] → <b>熔断器按 provider 计数</b>（60s 内 3 失败→OPEN 30s→HALF_OPEN 2 次成功→CLOSED）→ provider.chat() → 失败 record_failure 换下一个 → local_only=True 时把付费 provider 从链上裁掉</div>
+  <div class="fa">↓ ⑥</div>
+  <div class="fn">审计落盘 llm_audit.jsonl：ts/agent_id/tier/model/prompt_hash/response_hash/tokens_in/out/latency/cache_kind/fallback/provider_chain —— 成本归因的唯一数据源</div>
+</div>
+<h3>关键决策</h3>
+<table>
+<tr><th>决策</th><th>理由</th></tr>
+<tr><td>熔断按 provider 而非 model</td><td>v4-pro 与 flash 同端点同 key——model 级熔断在 provider 故障时主备一起失败=没兜底。实测踩过：投研报"全部模型调用失败（链: v4-pro→flash）"，decision 层 fallback 随即改为 local_medium（跨 provider）。</td></tr>
+<tr><td>截断保头保尾而非只保头</td><td>只保头会把尾部的 JSON schema 切掉 → 模型输出非法 JSON → 修复重试（use_cache=False、prompt 更长）成本翻倍，<b>且重试仍被同样截断</b>。实测修这一个点省掉一类"必然失败的重试"。</td></tr>
+<tr><td>local_only 钉在 models.yaml 配置</td><td>靠每个调用点记得传参数靠不住——实测事件告警阶段一 0.0196 元就是这样花掉的。配置层钉死，新调用方默认安全；真要付费云端必须显式 local_only=False。</td></tr>
+</table>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：语义缓存为什么按 agent_id 隔离？跨 agent 复用会怎样？</div><div class="a">A05 核验与 A06 抽取的输入大量重叠，跨 agent 复用会<b>"结论串台"</b>——A06 拿到 A05 的核验输出当抽取输入，错误静默传播。0.85 阈值是保守值：<b>宁可不命中，不能错命中</b>。已知局限：字符 3-gram 在长 prompt 下区分度下降，命中里大部分是"同 Agent 重复跑"，真正的语义泛化少——改进路线是 embedding 向量库（roadmap P2），且长 prompt 场景先关语义层只留精确层。</div></div>
+<div class="qa"><div class="q">Q2：语义缓存在事件循环上同步扫描的问题你是怎么发现和修的？</div><div class="a">并发评估实测：冷启动未命中扫描 3108 个缓存文件 <b>682ms</b>、稳态 9ms/次——同步跑在事件循环上且<b>串行累加</b>（N 个并发用户 = N×9ms 全站延迟），缓存还单调增长。最小修法是 aget() 把扫描挪到 to_thread；彻底修法是把索引（agent_id/scope/向量）建进内存，未命中从 O(文件数) 降为纯内存计算。两步都做了/规划了。</div></div>
+<div class="qa"><div class="q">Q3：网关是单点吗？</div><div class="a">是进程内单例，但<b>无状态</b>（状态只有缓存目录与审计文件）——水平扩容时缓存换 Redis、审计进管道即可；熔断器状态是唯一的多实例不一致点（各 worker 独立计数，实际阈值×N），宁可宽松不可误熔断，可接受。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>闭卷默写 complete() 的 6 步管线及每步的存在理由</li><li>讲清一次"缓存命中"与一次"降级到本地"在审计 jsonl 里分别长什么样（cache_kind / provider_chain 字段）</li><li>解释为什么 max_tokens 要双层上限</li></ul></div>
+</div>
+
+<!-- M3 -->
+<div class="mod" id="m3">
+<h2>M3 · 数据连接器路由（三级故障转移）</h2>
+<div class="path">src/infrastructure/connectors/router.py · 各 connector</div>
+<div class="pos">一句话：分档 TTL 缓存 → per-key 锁防击穿 → 多源链按健康分排序取数 → 全失败宁可报缺口。</div>
+<div class="flow">
+  <div class="fn"><b>请求 indicator</b>（带 6 位代码后缀校验）</div>
+  <div class="fa">↓</div>
+  <div class="fn key">分档 TTL 缓存：月频宏观 24h / 估值 12h / 行情 4h / 实时流动性 5min <span class="n">——按数据发布周期定 TTL，统一 TTL 必然两头错</span></div>
+  <div class="fa">↓ 未命中</div>
+  <div class="fn key"><b>per-key asyncio.Lock（single-flight）</b>：同 key 并发只放一个到远端；持锁后<b>二次检查</b>缓存（等锁期间可能已被填上）</div>
+  <div class="fa">↓</div>
+  <div class="fn">源链按<b>健康分 rank</b> 排序（样本&lt;3 次时照抄配置顺序当先验）：日线 AkShare→腾讯→Tushare→baostock→CSV→[QMT 最后且默认关]；分钟/快照 腾讯→新浪→东财</div>
+  <div class="fa">↓ 任一级 DataFetchError 自动降级下一级</div>
+  <div class="fn key"><b>全失败 → DataFetchError 报数据缺口</b>（绝不回退 simulated；上游 WAF 漂移时东财只做链尾备用）</div>
+  <div class="fa">↓ 成功</div>
+  <div class="fn">写 TTL + 更新健康分 + 数据点带 source_url/publish_time/fetch_time/raw_content_hash 溯源四件套</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：为什么宁可报缺口也不给模拟数据？</div><div class="a">这是刻意的工程主张：<b>假数据进了投研建议，比"这次没数据"危险得多</b>——用户会把编的数字当成真的。代价是演示偶尔"没数据"、需要人工补数据源，我把这个取舍写成明确的价值主张而不是藏起来。配套：DataGapResolverAgent 让系统自己补连接器（LLM 生成代码 → AST 白名单校验 → 子进程沙箱 15s 冒烟 → 双通过才落库复用），把"等开发者"变成"自愈"。</div></div>
+<div class="qa"><div class="q">Q2：QMT 为什么排最后且默认关？</div><div class="a">本机 QMT 终端失去行情权限，放在任何位置都贡献一次必然失败的连接等待（实测 4~5s）。两个坑：顺序与开关<b>表达同一个意图，两处都要改对</b>——健康分在样本&lt;3 次时照抄配置顺序当先验，只改开关不改顺序，QMT 仍会顶到链首。这是"配置顺序=默认顺序"的隐性耦合。</div></div>
+<div class="qa"><div class="q">Q3：健康分怎么防止一次抖动把好源打下去？</div><div class="a">健康分基于滑动样本统计而非单次成败；且样本不足时回到配置先验——新源/低频源不会被一两偶然失败永久压底。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>画出一次"缓存未命中+首源失败"的完整时序（含二次检查）</li><li>说清溯源四件套各自防什么问题</li></ul></div>
+</div>
+
+<!-- M4 -->
+<div class="mod" id="m4">
+<h2>M4 · 事件告警（两阶段 LLM，全本地）</h2>
+<div class="path">src/domain/alerts/analyzer.py · service.py · thresholds.py · src/api/routes/alerts.py</div>
+<div class="pos">一句话：事件采集去重入库 → 两阶段批量 LLM（分类+打分，全本地零费用）→ 阈值 → 冷却去重 → WS/邮件。</div>
+<div class="flow">
+  <div class="fn">采集（多源，单源失败隔离）→ 标准化 → <b>跨源去重</b>（event_id=内容 sha1，天然幂等）→ 入库 fact_events</div>
+  <div class="fa">↓ 候选 ≤30/轮</div>
+  <div class="fn key"><b>阶段一</b>：medium 层（本地 qwen3:8b）批 ≤6 条：分类/情感/实体/摘要。schema 受约束解码管结构；<b>分批管预算</b>（8B 每条事件 330~400 输出 token 含思考，4096 预算批&gt;8 必截断）；截断抢救（逐项 raw_decode 救完整前缀）；2 次重试；整批失败退关键词兜底（质量降级但可用）</div>
+  <div class="fa">↓</div>
+  <div class="fn key"><b>阶段二</b>：medium 层批 ≤8 条：风险分/机会分/置信/受影响个股/传导路径。评分越界 → <b>丢弃该事件不钳制</b>（FR-6：钳制会把"模型疯了"伪装成"极高告警"）</div>
+  <div class="fa">↓</div>
+  <div class="fn">阈值引擎 → <b>24h 冷却 + 唯一约束</b>去重 → WS 广播 / 邮件</div>
+  <div class="fa">↓</div>
+  <div class="fn">前端：WS 推送 + alertsCache（localStorage SWR）+ 登录/刷新两路预取 + KeepAlive；读接口的懒过期 UPDATE 设计成"0.4s 抢锁只试一次、可降级"（500 故障产物）</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：批大小 6/8 是拍脑袋吗？</div><div class="a">是实测算出来的：本地 qwen3:8b 每条事件输出 330~400 token（思考型模型，思考也占 num_predict 预算），4096 上限扣 ~600 思考 → 可用 ≈3500 → 3500/400≈8，取 6/8 留余量；时间上限 6 条 ≈2400 token ÷ 44 t/s ≈ 55s &lt; 120s 超时。生产日志实证过 30 条一批的下场：<b>Unterminated string 从字符串中间截断，整批退回兜底</b>。分批代价只是多几次调用——本地模型不按 token 计费。</div></div>
+<div class="q a"></div>
+<div class="qa"><div class="q">Q2：告警为什么从"每次 0.32 元"变成"0 元"？讲讲决策链。</div><div class="a">用户质疑"信息是网上抓的，为什么要花 token"→ 审计归因：53 次调用 0.32 元，其中阶段二写死 reasoning 层而 reasoning 的 primary 是付费 deepseek（28×调用 ¥0.30）——<b>先花钱，本地模型闲着</b>。修复分两层：调用点换层 + <b>local_only=True 钉进配置</b>（不靠人记参数）。验收：3 条真实事件本地跑 23s 出分且区分度良好（政策利好→机会 60/把握 0.7；暴雷→风险 85/0.9；花絮→双低 15/0.3）。</div></div>
+<div class="qa"><div class="q">Q3：LLM 挂了告警还能用吗？</div><div class="a">分批失败只丢那批；阶段一整批失败退关键词分类+中性情感（功能可用质量降级）；阶段二失败该批无评估但其余批次照常；评分越界丢单条不丢整批。fail-open 在"质量"维度、fail-fast 在"越界伪造"维度——两个方向是刻意分开的。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>默写两阶段的批大小及推导过程</li><li>画出"截断抢救"的处理分支</li><li>讲清 FR-6 为什么丢弃而不是钳制</li></ul></div>
+</div>
+
+<!-- M5 -->
+<div class="mod" id="m5">
+<h2>M5 · 热点&小作文（情报中心）</h2>
+<div class="path">src/domain/intel/*（24 个文件）· src/api/routes/intel.py · web/src/intelCache.ts</div>
+<div class="pos">一句话：六源采集 → L0 规则 → L1 本地模型 → L2 云端（三闸门）→ 存储 → feed"请求永不等待"。</div>
+<div class="flow">
+  <div class="fn">六源采集（雪球/东财/同花顺/财联社/人气榜/韭研 + zsxq 增量，定时任务，水位线去重）</div>
+  <div class="fa">↓</div>
+  <div class="fn key"><b>L0 规则层（默认，零成本）</b>：噪声正则（盘面播报直接跳过）→ 政策词表归类 → 多空词计数定倾向（置信度封顶 0.9，只代表"原文这么说"）</div>
+  <div class="fa">↓ 规则定不了</div>
+  <div class="fn"><b>hot_scan 确定性股票匹配</b>：5567 只 A 股名录字符串匹配（4 字名直接命中；3 字名需同条 6 位代码佐证+白名单——防"机器人(300024)"行业词误报；宁可漏不可错）</div>
+  <div class="fa">↓</div>
+  <div class="fn"><b>L1 本地模型</b>：tone_job 每 2h 一批 ≤40 条，全文按句边界切 ≤600 字段逐段抽取（实测 26.5s/次，平均 1.9 段/条，串行 35min/批）；summarize 抽取式摘要：<b>数字必须能在原文找到，否则整体丢弃退回原文截断</b></div>
+  <div class="fa">↓ 语义任务且过了闸门</div>
+  <div class="fn key"><b>L2 云端三闸门</b>（llm_policy.py）：显式 allow_cloud + 单任务 8000 token 预算 + 当日 20 次上限（计数从审计链读）——任一不过<b>降级 L1 而不是报错</b>（情报降级只是质量略降，报错是功能不可用）</div>
+  <div class="fa">↓</div>
+  <div class="fn">存储按 content_hash 幂等 → feed 构建（冷 2.18s/热 1.01s）：<b>请求永不等待</b>——进程内缓存立即回（冷启动回空壳+refreshing）→ 后台重建 → WS 推送 → 前端按 seq 收敛；筛选在服务端 500 条大池上做（前端过滤会"假空"）</div>
+  <div class="fa">↓</div>
+  <div class="fn">前端：intelCache（localStorage SWR，按 filter|sort|direction 分键，refreshing 强制 false）+ 登录/刷新两路预取 + 4min 续期（&lt; 最短 TTL 5min）+ KeepAlive</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：抽股票为什么放弃模型？</div><div class="a">实测（2026-09-25，160 条真实快讯）：1.5B 两批只抽出 1 只还是港股，且有一批连 JSON 都没输出——快讯里 A 股名字稀疏，小模型在这种输入上是抛硬币。而"谁被提到了"根本不需要语义：<b>名录字符串匹配精确、免费、可解释</b>（能给出在哪条里提到）。模型只留给它真正擅长的：一句话摘要与倾向归类。这是"能用确定性求解的绝不进模型"的典型案例。</div></div>
+<div class="qa"><div class="q">Q2：分段抽取是被什么逼出来的？</div><div class="a">一条 3452 字的会议纪要按旧逻辑只取两头 591 字——"天岳先进""第三代半导体"在被切掉的中间 2500 字里，实体字段全空。<b>不是模型失败，是它没看见那段原文</b>。改为按句边界切段逐段调用+确定性合并，实测平均 1.9 段/条；成本可控（本地零 token 费），调用次数有 MAX_EXTRACT_SEGMENTS=6 上限防失控。</div></div>
+<div class="qa"><div class="q">Q3：feed 冷启动返回空壳，前端怎么收敛？</div><div class="a">全局递增 seq：后台建完 seq+1 并 WS 推送；前端比较"手里的 seq &lt; status.seq"决定是否重拉——任何一次重建都会收敛，不依赖推送必达（WS 断线有短轮询兜底 /feed/status，那条接口只读进程内计数器，被高频调用所以必须微秒级）。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>默写 L0/L1/L2 三层各自解决什么、闸门条件是什么</li><li>讲清"请求永不等待"契约下冷启动的完整时序（含 seq 收敛）</li></ul></div>
+</div>
+
+<!-- M6 -->
+<div class="mod" id="m6">
+<h2>M6 · 板块拥挤度</h2>
+<div class="path">src/sector_crowding/* · src/api/routes/sector_crowding.py · web/src/components/SectorCrowding*</div>
+<div class="pos">一句话：板块成交额占全市场比 → MA5 平滑 → 除以近 6 年最高得"水位" → 物化加速读 → 散点+告警面板。</div>
+<div class="flow">
+  <div class="fn key"><b>口径链</b>：板块日成交额 = 同花顺板块指数 vol×avg_price；原始拥挤度 = 板块/全市场；平滑 = MA5；<b>水位 = 平滑 / 近 6 年平滑最大值</b>（分母来自物化表）；样本 &lt;750 根（≈3 年）→ 水位恒空显示"数据不足"——"不知道"和"不拥挤"是两件事，NULL 不参与告警</div>
+  <div class="fa">↓ 写路径（后台线程，pool 554 板块）</div>
+  <div class="fn">refresh_all_incremental：每板块按 last_update_date 水位线增量回填 → upsert（UNIQUE(trade_date,sector_code)，整批一次 commit——逐板块提交 217 万行 656s vs 整批 80s）→ <b>max_ma5 物化表</b>：recompute 全量重建 / 单板块刷新增量更新</div>
+  <div class="fa">↓ 读路径（全部 to_thread，不阻塞事件循环）</div>
+  <div class="fn">/config_list（唯一真相源，种子化幂等 + hide_dead_boards 带 SELECT 守卫）→ /sectors_max_ma5（进程内 300s 缓存 + 物化表 &lt;5ms）→ /latest（散点）→ /alerts?all=1（清单全量+水位快照+物化 max+周频 4 列合并）</div>
+  <div class="fa">↓</div>
+  <div class="fn">前端：KeepAlive 保活 + 60s 轮询（document.hidden 跳过）+ 散点总览/告警表共用同一份清单（useCrowdingList 单一所有者，写后用响应体回传的整份清单覆盖本地，省一次往返）</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：读接口为什么要加 SELECT 守卫？</div><div class="a">UPDATE 即使 0 行命中也要开写事务、抢一次写锁；这个接口被 60s 轮询——后台刷新批量写入期间，每次读都排队等写锁（busy_timeout 30s），正是"读路径藏写"的锁竞争窗口（事件告警 500 故障同款机制）。守卫后通常纯读，真有空壳才付一次写。</div></div>
+<div class="qa"><div class="q">Q2：水位分母为什么是"近 6 年最高"而不是分位数？</div><div class="a">拥挤度交易上关心的是"相对自身历史热度的位置"——用最高值归一到 0~100% 直观且可跨板块比较；代价是历史短的板块"历史最高"就是最近几天 → 恒 100% 误告警，所以配 750 根门槛 + 前端把空值显示成"数据不足 N/750"而不是"—"（用户曾被空白误导过，这是真实报障驱动的口径）。</div></div>
+<div class="qa"><div class="q">Q3：为什么散点图只画清单内板块？</div><div class="a">全市场 2517 个板块全画不可读；清单是"该看哪些板块"的唯一真相源（服务端持久化，两面板共享单所有者），删的是看板显示、历史数据仍保留——可逆。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>默写口径链四步与每步的单位</li><li>解释批量 commit 80s vs 逐板块 656s 的机制（每个 commit 一次 WAL 落盘）</li></ul></div>
+</div>
+
+<!-- M7 -->
+<div class="mod" id="m7">
+<h2>M7 · 行业轮动日报</h2>
+<div class="path">src/sector_rotation/* · src/api/routes/sector_rotation.py · src/scheduler/registry.py</div>
+<div class="pos">一句话：收盘后四道防线保证"一天一份"落盘报告；读取"读盘优先 + 落伍秒开旧报告 + 后台补生成"。</div>
+<div class="flow">
+  <div class="fn"><b>调度</b>：工作日 15:40 主生成（等东财/Tushare 日频结算留 40min 余量）+ 16:40~23:40 每小时补跑（is_stale 已最新则零成本跳过）+ 启动自检（重启是用户唯一确定会做的动作）+ 读取自愈</div>
+  <div class="fa">↓ generate（三路全并行）</div>
+  <div class="fn">腾讯指数快照 ∥ akshare 大盘资金流（子进程隔离）∥ Tushare 板块截面 → assemble（板块去重/分层）→ 5 日净额（≤10 次 Tushare）→ <b>研判纯规则</b>（narrate 纯函数：普涨/普跌阈值、风格差 ≥1.5pct、连续性提示——可复算可单测，不存在数字与文字对不上的幻觉）</div>
+  <div class="fa">↓ 落盘 data/sector_rotation/report_YYYYMMDD.{json,html}</div>
+  <div class="fn key"><b>读取契约</b>：新鲜 → 直接回（毫秒）；落伍且有旧报告 → <b>立刻回旧报告</b>（meta.background_refreshing）+ 后台补生成 + HTML 注入横幅（轮询 build_status，seq 变化自动 reload）；一份都没有 → 同步生成；生成失败进 15min 冷却</div>
+  <div class="fa">↓</div>
+  <div class="fn">报告页：ECharts 本地 vendored（/echarts.min.js，缓存 7 天；历史旧 HTML 读取时替换 CDN 地址）</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：为什么"落伍"判定用交易日历不用墙上时钟？</div><div class="a">落伍 = 落盘交易日 &lt; 应有交易日，应有交易日来自本地日历 latest_complete_trade_date()——节假日/周末天然正确且零网络。若用"距今天&gt;N 小时"这类时钟逻辑，节假日会误判落伍触发无谓取数。</div></div>
+<div class="qa"><div class="q">Q2：为什么"先回旧报告"而不是等新报告？</div><div class="a">用户口径原话："界面打开的时候应该立即能加载到"。等待的体验成本 &gt; 看到 40 分钟前旧数据（且横幅明示"当前是旧一份，生成完自动刷新"）。这与告警 500 故障"读路径不阻塞"是同一价值观的两个表现：<b>读路径永远不让用户等写路径</b>。</div></div>
+<div class="qa"><div class="q">Q3：Celery Beat 不补跑错过的触发，你怎么兜？</div><div class="a">四道防线叠加：落伍判定（核心，幂等）→ 每小时补跑（覆盖主机关机晚上开机）→ 启动自检（覆盖补跑窗口也错过）→ 读取自愈（最后兜底，现在优化为不阻塞用户）。单点会失效，防线叠加才幂等。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>默写四道防线及各自覆盖的故障场景</li><li>讲清"秒开旧报告"的完整时序（含 seq/横幅/冷却）</li></ul></div>
+</div>
+
+<!-- M8 -->
+<div class="mod" id="m8">
+<h2>M8 · SQLite 并发范式（500 故障修复）</h2>
+<div class="path">src/infrastructure/repositories/event_sqlite_base.py · alert_sqlite_repo.py · macro_repo.py</div>
+<div class="pos">一句话：WAL + 统一连接范式 + 超时按业务代价分级 + 读路径不藏写。</div>
+<div class="flow">
+  <div class="fn"><b>故障</b>：告警页"立即扫描"后列表 500，单发复现不了</div>
+  <div class="fa">↓ 定位（先建事实不猜：16 组参数探测全 200 → 日志抓完整 traceback → database is locked 全日志 85 处）</div>
+  <div class="fn key"><b>三因叠加</b>：① 读路径藏写（懒过期 UPDATE）② 主库 2.37GB 被做T/量化/资金流多链并发写 ③ 事件仓储裸 sqlite3.connect（默认 busy_timeout 仅 5s，游离于项目 15~30s 范式外）</div>
+  <div class="fa">↓ 方案演进</div>
+  <div class="fn key"><b>方案 A（被否）</b>：读路径超时调大到 20s → 占锁 12s 压测：4 连请求全部超时——单事件循环+默认线程池下每个排队请求占死一个线程，<b>局部错误升级为全局阻塞，比 500 更糟</b>。<br><b>方案 C（采纳）三档</b>：关键写 20s+retry_on_locked（丢告警=丢推送+邮件，值得排队）/ 交互读写 2s（快速失败让前端重试）/ 懒过期 0.4s 只试一次且可降级（&lt; 前端 1.5s 轮询间隔，失败无副作用下次自然补）</div>
+  <div class="fa">↓ 验收</div>
+  <div class="fn">8 条锁竞争回归测试（另一连接 BEGIN IMMEDIATE 真占锁）+ <b>反向验证</b>（还原旧实现必红、报错与生产一致）+ 运行实例日志连续 200 无新 traceback</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：为什么 retry_on_locked 只重试锁错误？</div><div class="a">locked/busy 是瞬时、可重试的；no such table / schema 错误是确定性失败，重试只会拖延暴露问题。重试范围必须等于"瞬时错误"的集合，这是失败语义的一部分。</div></div>
+<div class="qa"><div class="q">Q2：为什么不用连接池？为什么不上 PostgreSQL？</div><div class="a">连接池：sqlite3 默认 check_same_thread 不跨线程，与 to_thread"每操作一连接"模型天然匹配；池要额外处理 WAL 事务边界与跨线程归还，收益不明确。换库：项目定位是 SQLite 零依赖单机可跑，故障根因是连接参数与读路径写操作，<b>不是 SQLite 能力问题</b>——换库是"用架构变更掩盖工程问题"；真要演进，先做写入收敛（单写者队列）再谈换库。</div></div>
+<div class="qa"><div class="q">Q3：懒过期为什么放读路径而不是后台定时任务？</div><div class="a">方案 B（后台任务）语义最干净但要引入后台任务生命周期（启动/取消/幂等），改动面从仓储扩散到应用装配——止血阶段优先最小爆炸半径；把"懒迁移+幂等+可失败"三个性质守住后，读路径里的它是安全的。这个权衡我明确记录为后续演进方向而不是拍死。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>默写三档表（数值+理由+失败行为）</li><li>讲清"反向验证"怎么做、为什么它比"测试通过"更可信</li></ul></div>
+</div>
+
+<!-- M9 -->
+<div class="mod" id="m9">
+<h2>M9 · 集合竞价选股（规则总表 + 位掩码）</h2>
+<div class="path">src/auction_select/rulebook.py · features.py · ecology_cache.py · tests/unit/test_auction_golden.py</div>
+<div class="pos">一句话：329 处 if/elif 重构为声明式规则总表 + 两遍纯函数 + uint16 位掩码；黄金回归逐位保证行为不变。</div>
+<div class="flow">
+  <div class="fn"><b>compile_rules(config)</b> → RuleSet：预过滤 9 条 · 打标 1 条 · 否决 10 条（位掩码）· 12 维分档表（进程启动编译一次）</div>
+  <div class="fa">↓</div>
+  <div class="fn key"><b>Pass1 打标签 / Pass2 否决</b>（两遍纯函数）：旧实现"规则6必须先于规则5"的隐性顺序耦合消失——Pass2 按 Pass1 之后的标签集合算豁免，谁先谁后结果一致</div>
+  <div class="fa">↓</div>
+  <div class="fn">生态序列走<b>盘前缓存</b>（一天一变的结果盘前算一次落盘 JSON）：决策链路 1231ms → 36ms（34×）</div>
+  <div class="fa">↓</div>
+  <div class="fn key"><b>黄金回归</b>：冻结真实行情录像带，47 只 × 12 维逐位比对（564 处一致）——抓出两个肉眼绝对看不出的 bug：Curve.at 越界兜底两边同取首段 y_lo（1.0 倍率被判 0 分）；Seg.hit 把 lo 写成开区间（换手率恰 3.0 的票两段都不命中）</div>
+  <div class="fa">↓</div>
+  <div class="fn">可读性验收：python -m src.auction_select.rulebook --dump 一张纸打印全部规则；--explain 600630 单票逐条溯源</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：34× 提速的功劳在规则还是数据？</div><div class="a">profile 实测：1231ms 里 99.3% 是生态序列每轮读三张全市场表（208 万次 pandas 元素操作），规则判定只占 8.1ms（0.66%）——<b>直接优化规则的天花板只有 0.66%</b>。所以提速记在"把一天一变的结果挪出热路径"上，规则侧买的是可读性与可测试性。先测再改，比先改再测重要。</div></div>
+<div class="qa"><div class="q">Q2：纯重构为什么要做逐位回归？抓到过什么？</div><div class="a">重构的正确性主张是"行为不变"，逐位比对是把主张变成可证伪的证据。两个 bug（越界兜底、开区间）都在"边界条件 × 多文件联动"的盲区，肉眼 review 与单测都抓不到——只有冻结输入下的逐位 diff 能抓到。定位手段：把 git HEAD 旧实现加载进来做逐维对比。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>画 Pass1/Pass2 如何消除顺序耦合（举规则5/6的例子）</li><li>讲清 uint16 位掩码的落库与统计价值</li></ul></div>
+</div>
+
+<!-- M10 -->
+<div class="mod" id="m10">
+<h2>M10 · 多租户与合规</h2>
+<div class="path">src/core/tenancy.py · policy.py · redaction.py · src/api/tenancy_middleware.py · infrastructure/security/rls.py · domain/quota/</div>
+<div class="pos">一句话：凭证派生身份 → RBAC×ABAC×信息隔离墙三维正交授权（默认拒绝）→ RLS 双层隔离 → 写侧脱敏 → 合规红线做成 CI 门禁。</div>
+<div class="flow">
+  <div class="fn"><b>tenancy_middleware</b>：凭证 → Principal（租户/用户/角色）；<b>不提供"从请求头设租户"的接口</b>——未认证是可检测状态而非默认租户；默认 401</div>
+  <div class="fa">↓</div>
+  <div class="fn">policy.py：RBAC（角色）× ABAC（数据四级分档）× Chinese Wall（研究/投资/控制三组，跨墙需显式审批凭据并留痕）——三维正交、默认拒绝</div>
+  <div class="fa">↓</div>
+  <div class="fn">RLS：应用层查询期下推 + PG FORCE ROW LEVEL SECURITY；"未登记租户列的表直接报错"——漏配表现为失败而非静默无隔离</div>
+  <div class="fa">↓</div>
+  <div class="fn">redaction.py 写侧脱敏（异常文案是最常见的意外泄漏通道，brief() 默认先过 redact）；额度服务端强制（套餐→额度表只定义一处）；每个管理动作记流水（谁/对谁/改了什么）</div>
+  <div class="fa">↓</div>
+  <div class="fn key">合规红线 → <b>CI 门禁</b>（tests/unit/test_compliance_gate.py）：上线当天抓到 3 个真问题——默认 DB 密码、真实个人邮箱、形似真 key 的占位符</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：RLS 为什么要重写？原版怎么了？</div><div class="a">原版是"取了租户但 return stmt"的<b>假实现</b>——文档宣称 RLS、代码没有隔离，面试被追问就是信誉灾难。重写为"只做能做到的事并写明边界"：SQLite 无原生 RLS → 应用层下推；PG 有 → FORCE RLS；两层的分工与失效模式都写进文档。</div></div>
+<div class="qa"><div class="q">Q2：管理员为什么不能改自己的套餐/停用自己？</div><div class="a">否则会失去唯一管理入口，只能改库救回；同时每个管理动作必须可归因到人——匿名管理员在合规上等于没有管理员（四眼原则）。这两条都是服务端强制，不是界面藏入口。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>画出请求从中间件到仓储的租户上下文传播路径</li><li>举出 CI 门禁抓到的 3 个真问题</li></ul></div>
+</div>
+
+<!-- M11 -->
+<div class="mod" id="m11">
+<h2>M11 · 前端架构（报障驱动的三次迭代）</h2>
+<div class="path">web/src/App.tsx · KeepAlive.tsx · panelPrefetch.ts · alertsCache.ts · intelCache.ts · vite.config.ts</div>
+<div class="pos">一句话：hash 路由 + 三元链渲染（非保活视图）+ KeepAlive 常驻（高频切换视图）+ 两路预取保活 + SWR 缓存 + lazy 分包。</div>
+<div class="flow">
+  <div class="fn"><b>路由</b>：hash 白名单（HASH_VIEWS 与 view 联合类型一一对应，守卫测试盯着）→ ErrorBoundary(resetKey=view) → Suspense → 三元链渲染非保活视图</div>
+  <div class="fa">↓ 常驻层（在主 ErrorBoundary 之外，各自包独立边界）</div>
+  <div class="fn key"><b>&lt;KeepAlive&gt;</b>：intel/intel-calendar/alerts/fundflow 四视图常驻，display:none 切显隐——切回是"显示"不是"重建"，数据+滚动+筛选全保留；惰性挂载（从没打开过不付成本）；三条摆放约束（不进三元链/不进带 resetKey 的边界/独立 ErrorBoundary）<b>14 条结构守卫测试 + 反向验证</b>（故意写错必红）</div>
+  <div class="fa">↓</div>
+  <div class="fn"><b>panelPrefetch 保活预取</b>：挂在"已登录状态"（覆盖带 Cookie 刷新那条真实路径——只挂 login 动作时缓存永远为空，这是第二次报障的根因）→ 每 4 分钟续期（&lt; 最短 TTL 5min，force=true 绕过新鲜度去重）→ 页面隐藏跳过、回前台补 → allSettled 互相隔离、绝不抛</div>
+  <div class="fa">↓</div>
+  <div class="fn"><b>缓存</b>：alertsCache / intelCache（localStorage SWR：先画缓存再后台核对；按 filter|sort|direction 分键防"切到高可信档拿到全部的列表"；登出清空防换账号串数据）</div>
+  <div class="fa">↓</div>
+  <div class="fn"><b>构建</b>：React.lazy 按 view 切 chunk + Suspense fallback——首屏 829KB → 264KB（gzip 85KB，51KB/s 隧道 ≈1.7s）；KeepAlive 内的面板用静态 import（避免 chunk 语义干扰保活）</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：为什么没有 React Query / 虚拟滚动？</div><div class="a">完整回答见《架构师面试必修》前端专节——核心：缓存是为报障服务的不是为架构美感服务的；数据量级（清单 554 行/列表 ≤100 条）未到虚拟滚动的必要性阈值；统一数据层已进 roadmap，触发时机是"第三个缓存出现时+并发 P0 落地后"。</div></div>
+<div class="qa"><div class="q">Q2：没有前端测试框架，怎么防"写错不报错只让延迟回来"？</div><div class="a">用<b>源码结构断言</b>：把 App.tsx/KeepAlive.tsx 当文本，去注释后断言结构不变式（KeepAlive 不在三元链、面板不在链里、保活视图返回 null、续期间隔 &lt; 最短 TTL、两条进入路径都预取）。并做<b>反向验证</b>：故意把 KeepAlive 挪进三元链，2 条用例立刻变红——证明守卫真的守得住。这是没有测试框架时的务实替代，vitest 在 roadmap 上。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>默写 KeepAlive 三条摆放约束及"写错会怎样"</li><li>讲清预取从"挂 login 动作"改到"挂已登录状态"的原因</li></ul></div>
+</div>
+
+<!-- M12 -->
+<div class="mod" id="m12">
+<h2>M12 · 成本治理全景（审计归因闭环）</h2>
+<div class="path">data/audit/llm_audit.jsonl · src/domain/platform/llm_cost.py · src/core/budget.py · configs/models.yaml</div>
+<div class="pos">一句话：先归因后优化——44,213 条审计逐条折钱，发现 95% 成本在离线脚本；交互链路三层模型压到趋零；账单按功能/租户/天闭环。</div>
+<div class="flow">
+  <div class="fn"><b>观测</b>：网关逐次落审计（tokens/模型/延迟/缓存/降级链）——"没有观测就别谈优化"</div>
+  <div class="fa">↓ 归因（14 天 44,213 条，剔除命中后 16,343 次付费）</div>
+  <div class="fn key"><b>结果推翻直觉</b>：主线挖掘离线脚本 ¥200.98（94.9%）≫ 投研 ¥7.79 ≫ 告警 ¥0.32 ≈ 热点 ¥0 ——<b>钱根本不在我以为的 Agent 链路上</b>；语义缓存全站命中率 60.4%（没它成本 ×2.5）</div>
+  <div class="fa">↓ 治理（按调用方分层）</div>
+  <div class="fn">交互链路：L0/L1/L2 三层模型 + local_only 钉配置 + 预算闸 → 告警 ¥0.32→¥0、热点 ≈¥0；离线脚本：先归因可见（ops.script 单列，不污染前端功能账单），预算闸是下一个 OKR</div>
+  <div class="fa">↓ 闭环</div>
+  <div class="fn">llm_cost.py：按 HTTP path（新数据）或 agent_id（历史行，<b>如实标注"这是推断不是账单"</b>）→ 功能 key（与功能权限同 key，能回答"该不该给这个等级开这一项"）→ 管理员控制台按功能/租户/天展示</div>
+</div>
+<h3>比 AI 深一层：追问卡</h3>
+<div class="qa"><div class="q">Q1：为什么离线脚本花了 200 元才被发现？</div><div class="a">因为它"不在任何人的视野里"：没有页面入口、没有预算闸、失败无人看审计。这正是"成本治理要按调用方收费"的论据——修复顺序是：先让账单按功能可见（历史行如实标"推断"）→ 再给 ops.script 桶加日预算闸。<b>审计日志里 path 字段 0/44213 的断层也要如实讲</b>（AccountingMiddleware 是后来加的，历史行只能按 agent 推断）。</div></div>
+<div class="qa"><div class="q">Q2：语义缓存命中 60.4% 是怎么算的、可信吗？</div><div class="a">逐条统计 cache_hit 布尔字段（44,213 条）。可信但要说清构成：大部分命中是"同 Agent 重复跑同一任务"（精确层），真正的语义泛化命中少——所以它救的是重复调用，不是"语义理解"。3-gram 的局限（长 prompt 区分度下降）与改进路线（embedding）都如实讲。</div></div>
+<div class="check"><b>盲测自检</b>：<ul><li>默写归因漏斗（总量→命中→付费→按功能）与三个关键数字</li><li>讲清"推断 vs 账单"的诚实边界为什么必须显示在界面上</li></ul></div>
+</div>
+
+<div class="tip"><b>使用方法</b>：① 每个模块先读"一句话定位"和流程图，能复述再往下；② 追问卡先自己答再看答案；③ 盲测自检全部通过后，让人（或另一个 AI 扮演面试官）随机抽模块拷问。<b>深一层的标志：每个"为什么"能追到第二条"为什么"</b>（例：为什么分批→因为截断→为什么截断→思考 token 占预算→为什么不用更大 max_tokens→成本/超时/正文截断三连）。</div>
+</div>
+</body>
+</html>

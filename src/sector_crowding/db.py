@@ -57,6 +57,10 @@ METRIC_TABLE = "sector_crowding_metric"
 METRIC_META_TABLE = "sector_crowding_metric_meta"
 #: 自定义告警阈值（每板块一条：高于/低于某个水位就告警）
 ALERT_TABLE = "sector_crowding_alert"
+# ★★★ 2026-09-27 第八轮：max_ma5 物化表（−1.5s 首屏）
+# 原 `max_ma5_map` 每次都 GROUP BY 扫 217 万行（实测 0.4-1.7s）。
+# 新增专用表：refresh / recompute 时增量更新；查询 O(N)（按主键扫一次）
+MAX_MA5_TABLE = "sector_crowding_max_ma5"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {DAILY_TABLE} (
@@ -159,6 +163,15 @@ CREATE TABLE IF NOT EXISTS {ALERT_TABLE} (
     note        TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
+);
+
+-- ★★★ 2026-09-27 第八轮：max_ma5 物化表（−1.5s 首屏）
+-- 替代 `MAX(ma5_crowding) GROUP BY sector_code` 扫 217 万行（实测 0.4-1.7s）。
+-- refresh/recompute 完成后增量 UPSERT；查询 = 全表 SELECT（主键已建索引）。
+CREATE TABLE IF NOT EXISTS {MAX_MA5_TABLE} (
+    sector_code  TEXT PRIMARY KEY,
+    max_ma5      REAL NOT NULL,
+    updated_at   TEXT NOT NULL
 );
 """
 
@@ -789,6 +802,29 @@ def hide_dead_boards(conn: sqlite3.Connection, *, force: bool = False) -> int:
     return int(cursor.rowcount or 0)
 
 
+def has_hideable_dead_boards(conn: sqlite3.Connection, *,
+                             force: bool = False) -> bool:
+    """是否存在 `hide_dead_boards(force)` 会命中的行（同 WHERE 的 SELECT 版）。
+
+    ★ 2026-09-27：`/config_list`（前端 60s 轮询）每次读取前想知道"要不要
+    跑清理 UPDATE"。UPDATE 即使 0 行命中也要开写事务、抢一次写锁 ——
+    在后台刷新线程批量写入期间，这就是"读路径藏写"的锁竞争窗口
+    （事件告警 500 故障同款）。通常没有候选行 → 跳过 UPDATE，纯读。
+    """
+    guard = "" if force else f" AND COALESCE(source, '') <> '{SOURCE_HIDDEN}'"
+    row = conn.execute(f"""
+        SELECT 1 FROM {LIST_TABLE}
+         WHERE visible = 1
+           AND COALESCE(source, '') <> '{SOURCE_MANUAL}'
+           AND EXISTS (SELECT 1 FROM {META_TABLE} m
+                        WHERE m.sector_code = {LIST_TABLE}.sector_code
+                          AND m.bars = 0)
+           {guard}
+         LIMIT 1
+    """).fetchone()
+    return row is not None
+
+
 def query_hidden_boards(conn: sqlite3.Connection, *, keyword: str = "",
                         limit: int = 0) -> list[dict[str, Any]]:
     """被系统隐藏（或用户删除）的板块，供「已隐藏板块」恢复列表用。
@@ -838,15 +874,64 @@ def count_hidden_dead(conn: sqlite3.Connection) -> int:
 def max_ma5_map(conn: sqlite3.Connection) -> dict[str, float]:
     """每个板块的历史最高平滑拥挤度（"近6年最高"那一列）。
 
-    一次 GROUP BY 拿全量，供清单/告警面板整表渲染用。
+    ★★★ 2026-09-27 第八轮：走**物化表** `sector_crowding_max_ma5`（O(N) 主键读）。
+    原实现是 GROUP BY 扫 217 万行，实测 0.4-1.7s；改为读物化表 < 5ms。
+    物化表由 `rebuild_max_ma5_table()` 在 refresh/recompute 完成后增量更新；
+    冷启动（首次跑 / 表为空）回退到 GROUP BY 一次性回填。
+
     **不要**用它替代 `query_alerts` 里的相关子查询场景：那里只需要几十行，
-    而这里一次扫 217 万行（实测 ~0.4s），只在"要显示整张表"时调一次。
+    而这里要显示整张表的"近6年最高"列时调用。
     """
+    # 1. 物化表为空 → 一次性回填（兼容老库；理论上首次启动后表就有数据）
+    has_data = conn.execute(
+        f"SELECT 1 FROM {MAX_MA5_TABLE} LIMIT 1").fetchone()
+    if not has_data:
+        rebuild_max_ma5_table(conn)
+
     rows = conn.execute(
-        f"SELECT sector_code, MAX(ma5_crowding) AS mx FROM {DAILY_TABLE} "
-        f"WHERE ma5_crowding IS NOT NULL GROUP BY sector_code").fetchall()
-    return {str(row["sector_code"]): float(row["mx"])
-            for row in rows if row["mx"] is not None}
+        f"SELECT sector_code, max_ma5 FROM {MAX_MA5_TABLE}").fetchall()
+    return {str(row["sector_code"]): float(row["max_ma5"])
+            for row in rows if row["max_ma5"] is not None}
+
+
+def rebuild_max_ma5_table(conn: sqlite3.Connection, *,
+                          sector_codes: list[str] | None = None) -> int:
+    """重建 max_ma5 物化表。
+
+    Args:
+        sector_codes: 只更新这些板块（refresh 时增量）；None = 全量重建。
+
+    Returns:
+        写入行数。
+    """
+    stamp = _now()
+    if sector_codes is None:
+        # 全量：GROUP BY 一次性扫日线表（只在首次或 recompute 时跑一次）
+        rows = conn.execute(
+            f"SELECT sector_code, MAX(ma5_crowding) AS mx FROM {DAILY_TABLE} "
+            f"WHERE ma5_crowding IS NOT NULL GROUP BY sector_code").fetchall()
+        payload = [(str(r["sector_code"]), float(r["mx"]), stamp)
+                   for r in rows if r["mx"] is not None]
+    else:
+        # 增量：按板块代码分别取（少量板块，避免扫全表）
+        payload = []
+        for code in sector_codes:
+            row = conn.execute(
+                f"SELECT MAX(ma5_crowding) AS mx FROM {DAILY_TABLE} "
+                f"WHERE sector_code = ? AND ma5_crowding IS NOT NULL",
+                (code,)).fetchone()
+            if row and row["mx"] is not None:
+                payload.append((code, float(row["mx"]), stamp))
+    if not payload:
+        return 0
+    conn.executemany(
+        f"INSERT INTO {MAX_MA5_TABLE}(sector_code, max_ma5, updated_at) "
+        f"VALUES (?, ?, ?) "
+        f"ON CONFLICT(sector_code) DO UPDATE SET "
+        f"max_ma5 = excluded.max_ma5, updated_at = excluded.updated_at",
+        payload)
+    conn.commit()
+    return len(payload)
 
 
 def count_list_rows(conn: sqlite3.Connection) -> int:

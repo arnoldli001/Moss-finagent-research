@@ -14,17 +14,32 @@ import {
 /**
  * ETF 份额监控 · 总览（环境横幅 → 核心宽基指标卡 → 多产品共振指示灯）。
  *
- * ## 为什么环境横幅必须在最上面，而且"不放行"要写成一句话
+ * ## 环境横幅现在只留"事实"，门控提示不再说第二遍（用户口径）
  *
  * 回测结论是**机会信号只在熊市有效**（牛市/震荡市方向相反），所以后端在非放行
- * 环境会把机会信号 `gated=true` 降级为观察项。用户如果在牛市里看到一排
- * "🟢 机会信号"却不知道它们已被门控，就会拿熊市的口径去建仓 —— 这是这个面板
- * **最容易造成实际亏损的误解**。因此这里做了两件事，而不是只挂一个小标签：
+ * 环境会把机会信号 `gated=true` 降级为观察项。这件事原来在**两个地方**各说一遍：
  *
- * 1. `opportunity_allowed === false` 时，横幅里直接写出
- *    "当前环境机会信号不放行，仅进观察列表"；
- * 2. 把后端给的 `source_notes`（口径由后端定义）**原文**列出来 ——
- *    前端只负责转述，不自己编一套说明。
+ *   ① 页签上方那条 `.etf-flow-gate-strip`（跨四个子视图可见，见 EtfFlowPanel）；
+ *   ② 本文件环境横幅下的 `.etf-flow-regime-warn` 说明块
+ *      （"当前环境机会信号不放行，仅进观察列表" + 原因 + `source_notes` + gaps）。
+ *
+ * 用户口径（本轮）：「etf-flow-regime-warn 这个内容 …… 提示的这些都不要显示，
+ * 上方 etf-flow-gate-strip 也提示了，出现了重复」→ **② 已删除**，
+ * 门控提示由 ① 独家承担；横幅只留"参考指数 / 收益 / 收盘 / 两个放行标签"这些事实。
+ *
+ * ⚠️ 删掉它**没有丢信息**，三条都在别处还看得见（逐条核对过，别凭印象加回来）：
+ *   · `regime.gaps` —— 后端 `build_snapshot()` 里已经
+ *     `out.gaps.extend(out.regime.gaps)`（src/mainline/etf_flow.py），
+ *     由面板的「⚠️ 数据缺口」条显示；脚注「环境判定」那一行也再列一次；
+ *   · `source_notes` —— 由面板脚注的「来源：…」原文列出，后端那句
+ *     "机会信号仅在熊市有效，详见 docs/ETF_FLOW_BACKTEST.md" 就在那里；
+ *   · "原因"那段道理 —— 结论已由门控提示条一句话说完，展开的推导在
+ *     docs/ETF_FLOW_BACKTEST.md（脚注「来源」里也有指向）。
+ *
+ * ⚠️ 熊市里那条 `.etf-flow-regime-warn`（**风险**信号不放行）**保留**：
+ *    它讲的是另一条规则（风险信号默认排除熊市），而门控提示条只覆盖机会信号，
+ *    两者不重复 —— 别顺手一起删了。若将来要让风险门控也跨子视图可见，
+ *    正确做法是让状态条把两种门控都讲清楚，而不是把这块说明加回来。
  *
  * ## "对应指数分位"是怎么对上的
  *
@@ -53,7 +68,6 @@ export default function EtfFlowOverview({ snapshot, loading }: Props) {
   const positions = snapshot?.positions ?? [];
   const resonance = snapshot?.resonance ?? [];
   const indicators = snapshot?.indicators ?? [];
-  const notes = snapshot?.source_notes ?? [];
 
   const positionOf = useMemo(() => positionByIndex(positions), [positions]);
   const indexOfGroup = useMemo(() => indexByGroup(resonance), [resonance]);
@@ -106,30 +120,13 @@ export default function EtfFlowOverview({ snapshot, loading }: Props) {
             </span>
           </div>
 
-          {!regime.opportunity_allowed && (
-            <div className="etf-flow-regime-warn" role="status">
-              <b>当前环境（{regime.label || regime.key}）机会信号不放行，仅进观察列表</b>
-              ，不构成仓位建议。
-              <div className="muted-text">
-                原因：回测显示机会信号只在熊市有效，牛市与震荡市方向相反；
-                后端因此把非放行环境下的机会信号降级（`gated=true`），
-                它们仍会出现在「信号列表」里，但带着「已门控」标记 ——
-                与真正会告警的信号不是一回事。
-              </div>
-              {notes.length > 0 && (
-                <ul className="etf-flow-regime-notes">
-                  {notes.map((note, index) => (
-                    <li key={index}>{note}</li>
-                  ))}
-                </ul>
-              )}
-              {(regime.gaps ?? []).length > 0 && (
-                <div className="muted-text">⚠️ {regime.gaps?.join("；")}</div>
-              )}
-            </div>
-          )}
+          {/* ⚠️ 这里原来有一块"机会信号不放行"的说明（`.etf-flow-regime-warn`：
+              结论 + 原因 + source_notes + gaps）。用户口径（本轮）：它与页签上方的
+              `.etf-flow-gate-strip` **重复**，"提示的这些都不要显示" → 已删除，
+              门控提示只由那条状态条讲（信息去哪了见文件头注释）。 */}
 
-          {/* 风险信号的门控是另一条规则（默认排除熊市），不能只讲机会那一条 */}
+          {/* 风险信号的门控是另一条规则（默认排除熊市），门控提示条只覆盖机会信号
+              → 这条**不重复**，保留 */}
           {!regime.risk_allowed && (
             <div className="etf-flow-regime-warn" role="status">
               <b>当前环境（{regime.label || regime.key}）风险信号同样不放行</b>

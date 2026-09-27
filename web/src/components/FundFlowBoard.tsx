@@ -106,7 +106,10 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
     }
   }, []);
 
-  // 首次进入 + 每 60 秒取一次（服务端同节奏，命中缓存不会重复取数）
+  // 首次进入 + 每 60 秒取一次（服务端同节奏，命中缓存不会重复取数）。
+  // ★ 2026-09-27：本面板随 FundFlowPanel 进了 KeepAlive —— 顶级视图切走后
+  // 仍保持挂载，轮询会继续跑。加 document.hidden 守卫：页面不可见
+  // （最小化/切浏览器标签）时跳过本轮，可见后由下一次滴答自然补上。
   useEffect(() => {
     void load();
     void loadWatch().then((data) => {
@@ -115,7 +118,10 @@ export default function FundFlowBoard({ tab }: { tab: "sector" | "stock" }) {
         new Set([...data.sectors.map((item) => item.code),
                  ...data.stocks.map((item) => item.code)]));
     });
-    timerRef.current = window.setInterval(() => void load(), POLL_MS);
+    timerRef.current = window.setInterval(() => {
+      if (document.hidden) return;
+      void load();
+    }, POLL_MS);
     return () => {
       if (timerRef.current !== null) window.clearInterval(timerRef.current);
     };

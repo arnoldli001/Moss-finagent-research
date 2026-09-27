@@ -139,20 +139,20 @@ async def require_feature(request: Request, feature: str) -> tuple[str, str]:
     return user_id, tier
 
 
-@router.get("/features")
-async def my_features(request: Request) -> dict:
-    """我当前等级能看哪些页签 + 我的资源上限 + 功能定价。"""
-    user_id, tenant_id = await _current(request, write=False)
-    store = get_platform_config()
-    plan = store.plan(tenant_id)
+def is_admin_tier(tier: str) -> bool:
+    """该等级是不是管理员档。
 
-    enabled = {k: bool(plan.features.get(k, False)) for k in FEATURES}
-    # 管理员身份用既有的那一个判据（`admin.py` 的 `ADMIN_TIER`），
-    # 不在这里再写一遍字面量：两份判据迟早会分叉，而分叉的那一侧就是漏网之门。
-    # 延迟导入的写法与 `login_gate._session_cookie_name` 一致（避免路由模块互相 import）。
+    ⚠️ 判据**只此一处**：`admin.py` 的 `ADMIN_TIER` 是唯一来源，不在这里再写
+    一遍字面量 —— 两份判据迟早会分叉，而分叉的那一侧就是漏网之门。
+    延迟导入的写法与 `login_gate._session_cookie_name` 一致（避免路由模块互相 import）。
+    """
     from src.api.routes.admin import ADMIN_TIER
 
-    is_admin = str(tenant_id).strip().lower() == ADMIN_TIER
+    return str(tier).strip().lower() == ADMIN_TIER
+
+
+def build_visible_views(enabled: dict[str, bool], is_admin: bool) -> list[str]:
+    """由「功能开关表 + 是否管理员」算出可见页签清单。纯函数，便于单测。"""
     visible: list[str] = []
     for view, feature in VIEW_FEATURE.items():
         if view in ADMIN_ONLY_VIEWS:
@@ -170,6 +170,47 @@ async def my_features(request: Request) -> dict:
                 visible.append(view)
         elif enabled.get(feature, False):
             visible.append(view)
+    return visible
+
+
+def visible_views_for_tier(tier: str) -> tuple[list[str], bool]:
+    """某等级能看到哪些页签 + 是不是管理员。**全项目唯一实现。**
+
+    ## 为什么必须抽成纯函数（2026-09-28 用户报障）
+
+    > "首次登录进去，一级目录只显示投资日历、事件告警，而投研分析、策略回测、
+    >   量化交易、主线挖掘、资金流监控、热点&研报小作文都要等 3-5 秒才出来"
+
+    根因：页签清单原来**只有 `GET /me/features` 一个来源**，而那个请求必须等
+    认证结果就位之后才发得出去 —— 也就是「认证往返 → 权限往返」两次串行。
+    在这条公网链路上每次冷请求约 0.9 秒，页签就只能一条一条往外冒。
+
+    现在 `/auth/login` 与 `/auth/bootstrap` 把同一份清单**顺路带回**
+    （见 `auth.py` 的 `_features_payload`），前端一次往返就有页签。
+
+    所以这里必须是唯一实现：**两份拷贝一定会分叉**，而分叉的表现是
+    "刚登录时少一个页签、刷新一下又有了" —— 那是最难查的一类 bug。
+
+    配置读不到时按"什么都没开"处理（fail-closed），与
+    `feature_enabled_for_tier` 同一方向。
+    """
+    enabled = {k: feature_enabled_for_tier(tier, k) for k in FEATURES}
+    admin = is_admin_tier(tier)
+    return build_visible_views(enabled, admin), admin
+
+
+@router.get("/features")
+async def my_features(request: Request) -> dict:
+    """我当前等级能看哪些页签 + 我的资源上限 + 功能定价。"""
+    user_id, tenant_id = await _current(request, write=False)
+    store = get_platform_config()
+    plan = store.plan(tenant_id)
+
+    enabled = {k: bool(plan.features.get(k, False)) for k in FEATURES}
+    # ⚠️ 可见清单的算法**只有一处实现**（`build_visible_views`）——
+    # `/auth/login` 与 `/auth/bootstrap` 也调它把清单顺路带回，见函数说明。
+    is_admin = is_admin_tier(tenant_id)
+    visible = build_visible_views(enabled, is_admin)
 
     return {
         "user_id": user_id,
@@ -193,4 +234,6 @@ async def my_features(request: Request) -> dict:
     }
 
 
-__all__ = ["ADMIN_ONLY_VIEWS", "QUANT_ANY", "VIEW_FEATURE", "router"]
+__all__ = ["ADMIN_ONLY_VIEWS", "QUANT_ANY", "VIEW_FEATURE",
+           "build_visible_views", "is_admin_tier", "router",
+           "visible_views_for_tier"]

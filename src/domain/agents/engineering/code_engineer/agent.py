@@ -374,10 +374,19 @@ class CodeEngineerAgent(BaseAgent):
             "6. 直接输出最终代码，不要思考过程，不要解释。"
             f"{repair_block}"
         )
+        # ★ 2026-09-27 第八轮：trace_id 必须稳定才能让 cache_key 命中。
+        # 原实现 trace_id="" 意味着不同指标/缺口都用同一个空串，
+        # 加上 use_cache=False → 永远穿透、审计发现同一 prompt 被真调 85 次。
+        # 改为"指标 + 缺口描述 + 修复提示" 的 SHA1（16 字符）：
+        #   同样的缺口描述 + 同样的修复提示 → 命中缓存；
+        #   修复提示变了（新一次重试）→ key 变 → 自然重算。
+        import hashlib as _hl
+        stable_input = f"{indicator or prefix}|{gap}|{repair_hints!r}"
+        stable_trace = _hl.sha1(stable_input.encode()).hexdigest()[:16]
         response = await self._gateway.complete(
             "reasoning", _SYSTEM_PROMPT, prompt,
-            agent_id=self.agent_id, trace_id="",
-            json_mode=False, use_cache=False,
+            agent_id=self.agent_id, trace_id=f"code_engineer:{stable_trace}",
+            json_mode=False, use_cache=True,  # ★ 改成 True：稳定 trace + 同样 prompt 应命中
         )
         was_empty = not response.content.strip()
         # 只剥离首尾换行：保留首行缩进（strip()会剥掉首行前导空格，

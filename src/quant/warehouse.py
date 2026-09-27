@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -1365,6 +1366,35 @@ def strategy_case_store(root: str | Path = DEFAULT_ROOT, *,
 # ==================================================================
 
 
+# ★★★ 2026-09-27 第八轮：QuantWarehouse 进程级单例（−1.4ms/调用 + 避免 SELECT 1 探测）
+# 审计实证：load_dataset 每次新建实例 → 新建 engine → "SELECT 1" 探测 + 表存在性探测 = 1.4 ms/次
+# 同一进程 N 次调用就白花 1.4×N ms，且**数据库连接是 OS 级文件描述符**，反复开关有 fd 压力。
+# 单例化后只剩一次探测 + 一次连接。
+# 为什么不直接用 SQLAlchemy 连接池：现状后端是 SQLite（demo 阶段），连接池没收益；
+# 换 PostgreSQL 后 `engine.pool` 自带连接池，单例化是切换前置条件。
+_WAREHOUSE_CACHE: dict[tuple[str, str], "QuantWarehouse"] = {}
+_WAREHOUSE_LOCK = threading.Lock()
+
+
+def _get_warehouse_cached(root: str | Path, universe: str) -> "QuantWarehouse":
+    key = (str(root), str(universe))
+    cached = _WAREHOUSE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    with _WAREHOUSE_LOCK:
+        cached = _WAREHOUSE_CACHE.get(key)
+        if cached is None:
+            cached = QuantWarehouse(root=root, universe=universe)
+            _WAREHOUSE_CACHE[key] = cached
+        return cached
+
+
+def reset_warehouse_cache() -> None:
+    """清空连接单例缓存（仅测试用）。"""
+    with _WAREHOUSE_LOCK:
+        _WAREHOUSE_CACHE.clear()
+
+
 def load_dataset(dataset: str, *, start: str = "", end: str = "",
                  codes: Sequence[str] | None = None,
                  columns: Sequence[str] | None = None,
@@ -1378,9 +1408,11 @@ def load_dataset(dataset: str, *, start: str = "", end: str = "",
 
     `columns` 是**列裁剪**：实测 250 日区间下只取 3 列比取全列快约 2 倍
     （取数耗时几乎全在搬运多少列上）。CSV 分支做不到下推，只能取完再切。
+
+    ★ 2026-09-27 第八轮：QuantWarehouse 进程级单例（避免每次新建连接）。
     """
     if prefer in ("db", "mysql", "auto"):
-        warehouse = QuantWarehouse(root=root, universe=universe)
+        warehouse = _get_warehouse_cached(root, universe)
         if warehouse.available():
             try:
                 frame = warehouse.load(dataset, start=start, end=end, codes=codes,

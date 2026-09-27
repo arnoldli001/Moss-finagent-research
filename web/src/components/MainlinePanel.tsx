@@ -1,4 +1,3 @@
-import Disclaimer from "./Disclaimer";
 import { useCallback, useEffect, useRef, useState } from "react";
 import MainlineAlertFlow from "./MainlineAlertFlow";
 import MainlineBacktest from "./MainlineBacktest";
@@ -250,7 +249,6 @@ export default function MainlinePanel() {
 
   return (
     <div className="mainline-root">
-      <Disclaimer compact />
       {/* ① 顶部：交易日 + 时段 + 漏斗 */}
       <div className="mainline-head">
         <div className="mainline-head-top">

@@ -200,14 +200,16 @@ def _clear_auth_cookies(response: Response) -> None:
 
 
 def _client_ip(request: Request) -> str:
-    """真实客户端 IP。
+    """真实客户端 IP。**统一委托 `core.client_ip`**（代理链感知）。
 
-    ⚠️ 只认 `CF-Connecting-IP`（Cloudflare 会覆盖并由边缘保证真实性），
-    **不取 `X-Forwarded-For` 首段** —— 那是客户端可伪造的（§7.5 坑 2）。
+    ⚠️ 原来这里自己实现了一份"只认 `CF-Connecting-IP`"。它在
+    **香港 VPS + nginx** 形态下会全盘失效（那条路没有该头），
+    于是登录限流、图形码判定、审计追溯全部把所有人当成同一个 IP。
+    见 `src/core/client_ip.py` 的模块说明（含"为什么不能取 XFF 最左段"）。
     """
-    return (request.headers.get("CF-Connecting-IP")
-            or (request.client.host if request.client else "")
-            or "")
+    from src.core.client_ip import client_ip
+
+    return client_ip(request)
 
 
 def _device_label(request: Request) -> str:
@@ -421,11 +423,15 @@ async def login(body: LoginBody, request: Request, response: Response) -> dict:
         _set_auth_cookies(response, request, data)
         # 响应体里**不回显任何令牌** —— 令牌只走 HttpOnly Cookie，
         # 前端拿不到也就无法泄漏到 localStorage / 日志
+        raw_user = data.get("user")
         return {
             "ok": True,
             "message": outcome.message,
-            "user": _public_user(data.get("user")),
+            "user": _public_user(raw_user),
             "must_change_password": data.get("must_change_password", False),
+            # ★ 页签清单**顺路带回**（2026-09-28）：登录之后前端就不必再打一次
+            #   `/me/features` 才能渲染一级目录。理由见 `_features_payload`。
+            **_features_payload(str(getattr(raw_user, "applied_tier", "") or "")),
         }
     # 认证失败：记账（用于"下一次要不要图形码"的判断）
     limiter.note_failure(ip)
@@ -646,12 +652,40 @@ async def bootstrap(request: Request, response: Response,
     return payload
 
 
+def _features_payload(tier: str) -> dict[str, Any]:
+    """一级目录的页签清单（**与 `GET /me/features` 同一份实现**）。
+
+    ## 为什么塞进 auth 的响应里（2026-09-28 用户报障）
+
+    > "首次登录进去，一级目录只显示投资日历、事件告警，而投研分析、策略回测、
+    >   量化交易、主线挖掘、资金流监控、热点&研报小作文都要等 3-5 秒才出来"
+
+    原来前端渲染页签要等 `/me/features`，而那个请求必须等认证结果就位才发得
+    出去 —— **两次串行往返**是硬开销（这条链路上每次冷请求实测约 0.9 秒）。
+    可身份既然已经在这一趟里拿到了，"这个等级能看哪些页签"就是等级的
+    **纯函数**，没有理由再要一次往返。
+
+    ## 为什么用延迟导入
+
+    与 `login_gate._session_cookie_name` 同一理由：路由模块之间互相 import
+    会在 `main.py` 装配路由时形成环。
+    """
+    from src.api.routes.my_features import visible_views_for_tier
+
+    visible, is_admin = visible_views_for_tier(tier)
+    return {"visible_views": visible, "is_admin": is_admin}
+
+
 async def _me_payload(user_id: str, session_id: str) -> dict:
     """`/me` 与 `/bootstrap` 共用的载荷。
 
     抽出来是因为两者**必须逐字段一致** —— `/me` 是登录后各页面
     "重新读取自己的身份"用的，`/bootstrap` 是开机探测用的，一旦
     字段分叉，会出现"刚打开时头像/套餐正常、点一下刷新就变空"这种怪 bug。
+
+    ★ 页签清单（`visible_views`）也在这里下发：`/bootstrap` 是**开机探测**，
+    前端拿到它就能在同一趟里把一级目录渲染齐，不必再等一次权限往返。
+    `/me` 走同一个函数，于是两者依旧逐字段一致（见 `_features_payload`）。
     """
     service = get_auth_service()
     user = await service._repo.a_get_user(user_id)  # noqa: SLF001 只读当前用户
@@ -665,6 +699,9 @@ async def _me_payload(user_id: str, session_id: str) -> dict:
         "valid_until": "" if user is None else user.valid_until,
         "session_id": session_id,
         "contacts": contacts,
+        # 用户读不出来时 tier 传空 → 清单为空。前端把**空清单**当"没拿到"
+        # 处理（回退最小集合），不当"一个页签都没有"，见 featuresCache.ts。
+        **_features_payload("" if user is None else user.applied_tier),
     }
 
 

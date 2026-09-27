@@ -1,13 +1,14 @@
-import Disclaimer from "./Disclaimer";
 import { useState } from "react";
 import EtfFlowPanel from "./EtfFlowPanel";
 import FundFlowBoard from "./FundFlowBoard";
+import KeepAlive from "./KeepAlive";
 import SectorCrowdingTab from "./SectorCrowdingTab";
+import SectorRotationTab from "./SectorRotationTab";
 
 /**
  * 资金流监控面板（页签容器）。
  *
- * 四个页签：板块资金流 / 个股资金流 / **ETF份额监控** / **板块拥挤度**。
+ * 五个页签：板块资金流 / 个股资金流 / **ETF份额监控** / **行业轮动日报** / **板块拥挤度**。
  *
  * 「ETF份额监控」插在「个股资金流」与「板块拥挤度」之间（用户口径）：它读的是
  * 宽基 ETF 的份额申赎，与资金流是同一类"钱往哪走"的问题，放在两个资金流视图
@@ -29,16 +30,19 @@ import SectorCrowdingTab from "./SectorCrowdingTab";
  * 资金流那套 `useEffect` + 定时器只在它的页签激活时存在；ETF 份额监控的
  * 快照轮询同理（它自己带 300 秒轮询，见 `EtfFlowPanel`）。
  * 板块资金流/个股资金流的内部逻辑一行未改（整段搬进 `FundFlowBoard`）。
+ *
+ * ★ 2026-09-27 例外：「板块拥挤度」「行业轮动日报」两个子页签改用
+ * `<KeepAlive>` 保活（用户报障"打开加载很慢"，互切卸载重挂是根因之一，
+ * 见渲染处的说明）；其余三个子页签维持"切走即卸载"的语义不变。
  */
 
-type Tab = "sector" | "stock" | "etf" | "crowding";
+type Tab = "sector" | "stock" | "etf" | "rotation" | "crowding";
 
 export default function FundFlowPanel() {
   const [tab, setTab] = useState<Tab>("sector");
 
   return (
     <div className="fundflow-root">
-      <Disclaimer compact />
       <div className="fundflow-head">
         <div className="mode-switch">
           <button className={tab === "sector" ? "mode-btn active" : "mode-btn"}
@@ -53,6 +57,11 @@ export default function FundFlowPanel() {
                   onClick={() => setTab("etf")}
                   title="宽基 ETF 份额申赎监控：份额变化 + 指数分位 + 市场环境门控">
             ETF份额监控
+          </button>
+          <button className={tab === "rotation" ? "mode-btn active" : "mode-btn"}
+                  onClick={() => setTab("rotation")}
+                  title="行业轮动日报：行业热力图 + 主力流向（当日/近5日）+ 风格轮动 + 规则研判，每交易日收盘后自动生成">
+            行业轮动日报
           </button>
           <button className={tab === "crowding" ? "mode-btn active" : "mode-btn"}
                   onClick={() => setTab("crowding")}
@@ -74,13 +83,26 @@ export default function FundFlowPanel() {
         )}
       </div>
 
-      {tab === "crowding" ? (
-        <SectorCrowdingTab />
-      ) : tab === "etf" ? (
-        <EtfFlowPanel />
-      ) : (
+      {/* ★ 2026-09-27：拥挤度/行业轮动两个子页签接 KeepAlive（用户报障
+          "这两个界面打开加载很慢"）。原先五个子页签是三元切换 —— 互切即
+          卸载重挂：拥挤度要重拉 554 板块清单 + 近6年最高，行业轮动的
+          iframe（内嵌 1MB ECharts）整个销毁重建。保活后互切是 display
+          切换，数据与滚动/筛选状态都保留。
+          只保活这两个（报障点名、且最重）：板块/个股资金流与 ETF 面板
+          维持原卸载语义，各自的后台轮询不会在隐藏时继续跑。
+          ⚠️ KeepAlive 自身不能放进三元链（见 KeepAlive.tsx 的用法约束）。 */}
+      {tab === "sector" || tab === "stock" ? (
         <FundFlowBoard tab={tab} />
-      )}
+      ) : null}
+      {tab === "etf" ? (
+        <EtfFlowPanel />
+      ) : null}
+      <KeepAlive active={tab === "rotation"}>
+        <SectorRotationTab />
+      </KeepAlive>
+      <KeepAlive active={tab === "crowding"}>
+        <SectorCrowdingTab />
+      </KeepAlive>
     </div>
   );
 }

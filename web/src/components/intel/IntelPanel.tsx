@@ -28,13 +28,35 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CalendarResult, IntelFeed,
-  fetchIntelCalendar, fetchIntelFeed, fetchIntelFeedStatus, formatTime,
+  fetchIntelBootstrap, fetchIntelFeed, fetchIntelFeedStatus, formatTime,
 } from "../../intelApi";
 import IntelCalendarTab from "./IntelCalendarTab";
 import IntelFeedTab from "./IntelFeedTab";
 import {
   feedCacheKeyOf, readIntelFeed, writeIntelFeed,
 } from "../../intelCache";
+
+/**
+ * 首屏取数的**超时兜底**（毫秒）。
+ *
+ * ## 为什么必须有它（2026-09-26 实测）
+ *
+ * 隧道抖动时单次请求可能挂很久：同一时段实测有一次 **TLS 握手 180 秒超时**，
+ * 另一个 834 KB 的静态包三次分别 1.71 s / **35.8 s** / 1.67 s。
+ * 没有超时的话，用户就要对着转圈等这么久 —— 而这期间他**手里本来就有
+ * 上一次的数据**（localStorage 缓存）。
+ *
+ * 所以：超时后立刻解除忙碌态，让他先看手里那份；请求被 abort，
+ * 下次切页签/刷新重新取。**有缓存时不报错**（用户看不到失败，只是数据略旧），
+ * 没缓存时才如实说"请求超时"。
+ *
+ * ## 为什么是 6 秒
+ *
+ * 正常情况（本机 30 ms、公网热 1~3 秒）远到不了它；而抖动时的"谷底"是
+ * 几十秒 —— 6 秒足够区分"慢但会回来"与"卡住了"。取太小会把正常的
+ * 慢响应误判成超时，取太大就失去了兜底的意义。
+ */
+const LOAD_TIMEOUT_MS = 6000;
 
 /**
  * 等"后台采集完成"的轮询间隔（毫秒）。
@@ -203,43 +225,66 @@ export default function IntelPanel({ isAdmin = false, intelSeq = 0,
   const loadAll = useCallback(async (opts: { refresh?: boolean } = {}) => {
     // ★ 有本地缓存时**不要**进忙碌态：那会让"切回来立刻有内容"又退回
     //   "看起来在等"。与 `loadFeed` 的 stale-while-revalidate 配套 ——
-    //   缓存那份由 `loadFeed` 立刻画出来，这里只负责别盖住它。
+    //   缓存那份由下面立刻画出来，这里只负责别盖住它。
     const ck = feedCacheKeyOf(filter, sort, direction);
     const cached = opts?.refresh ? null : readIntelFeed(ck);
+    if (cached && alive.current) {
+      // 先把缓存那份画出来（切页签/二次访问就是"立刻有内容"）
+      setFeed(cached.feed);
+      setRefreshing(false);
+      setErrFeed("");
+    }
     setLoading(!cached);
     setLoadingCal(true);
     setErrFeed("");
     setErrCal("");
 
-    // ① 情报流：快（缓存命中时几十毫秒）。它一回来就解除整页忙碌态。
+    // ★ **一次往返**取齐情报流 + 日历（`/intel/bootstrap`）。
     //
-    // ⚠️ 这里原来还有第三路 `fetchIntelHealth()`，供页头的"采集正常 /
-    // 数据不完整"状态 chip。页头整行已删除（用户口径 2026-09-25），
-    // 于是那一路**没有任何消费方**了 —— 一并去掉，少打一个没人看的接口。
-    // （来源健康度在「运行指标」页的 `DataSourceHealth` 里仍然完整保留。）
+    // 原来是两条（`/feed` + `/calendar`）。公网实测：情报流 53.5 KB 要 4.93 s、
+    // 热度 **1.4 KB 也要 2.52 s** —— 说明瓶颈是**往返本身**（隧道 RTT +
+    // 队头等待），不是字节数。既然每次往返付一笔固定开销，2 次并 1 次就省一笔。
     //
-    // ⚠️ 必须传**当前的** `direction`，不能写死 "all"：
-    // 否则用户在"仅多"档位下切一次筛选，`loadAll` 会把倾向悄悄重置回全部，
-    // 而界面上那个选择器还停在"仅多" —— 看起来像筛选没生效。
+    // ⚠️ 热度不在这里另外取：`feed.heat` 本来就带（服务端附上的）。
+    //
+    // ⚠️ **超时兜底**：链路抖动时单次请求可能挂几十秒（实测有一次 TLS 握手
+    //    180 秒超时）。没有缓存的用户只能等；**有缓存的用户不该等** ——
+    //    超时后立刻解除忙碌态，让他先看手里那份，后台请求继续跑。
+    const ac = new AbortController();
+    const timer = window.setTimeout(() => ac.abort(), LOAD_TIMEOUT_MS);
     try {
-      await loadFeed(filter, sort, direction, { refresh: opts?.refresh });
-    } finally {
-      if (alive.current) setLoading(false);
-    }
-
-    // ② 投资日历：慢（服务端缓存未命中时可达十几秒）→ **不 await**，
-    //    让它自己 settle。失败只影响日历那一栏，不连累情报流。
-    void (async () => {
-      try {
-        const c = await fetchIntelCalendar(45);
-        if (alive.current) setCal(c);
-      } catch (e) {
-        if (alive.current) setErrCal(errText(e));
-      } finally {
-        if (alive.current) setLoadingCal(false);
+      const r = await fetchIntelBootstrap({
+        limit: 60, filter, sort, direction, horizonDays: 45,
+      }, ac.signal);
+      if (!alive.current) return;
+      setFeed(r.feed);
+      setErrFeed("");
+      setRefreshing(!!r.feed.refreshing);
+      setReadyTimeout(false);
+      writeIntelFeed(ck, r.feed);
+      if (typeof r.feed.seq === "number" && r.feed.seq > haveSeq.current) {
+        haveSeq.current = r.feed.seq;
       }
-    })();
-  }, [filter, sort, direction, loadFeed]);
+      if (r.calendar) setCal(r.calendar);
+    } catch (e) {
+      if (!alive.current) return;
+      // `AbortError` = 我们自己的超时。有缓存时**不报错**（用户看不到失败，
+      // 只是数据略旧），没缓存时才如实说。
+      const aborted = e instanceof DOMException && e.name === "AbortError";
+      if (!aborted) {
+        setErrFeed(errText(e));
+        setErrCal(errText(e));
+      } else if (!cached) {
+        setErrFeed("请求超时（链路较慢）。可稍后点刷新重试。");
+      }
+    } finally {
+      window.clearTimeout(timer);
+      if (alive.current) {
+        setLoading(false);
+        setLoadingCal(false);
+      }
+    }
+  }, [filter, sort, direction]);
 
   useEffect(() => {
     alive.current = true;

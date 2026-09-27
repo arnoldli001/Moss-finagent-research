@@ -208,6 +208,28 @@ class AnalysisAgentBase(BaseAgent):
     async def execute(self, input: AgentInput) -> AgentOutput:
         payload = self._parse_payload(input.payload)
         self._prepare(payload)
+        # ★ 2026-09-27 第八轮：A12 等可纯规则化的 Agent 走"零 LLM"路径
+        #   审计实证：A12 在"无风险信号"分支仍调云端 reasoning，浪费 18,500 tokens
+        if hasattr(self, "_should_skip_llm") and self._should_skip_llm(payload):
+            data = self._build_rule_only_result(payload)
+            return AgentOutput(
+                task_id=input.task_id, agent_id=self.agent_id,
+                conclusion=str(data.get("conclusion", "")),
+                confidence=coerce_confidence(data.get("confidence", "medium")),
+                data_refs=self._collect_refs(payload),
+                trace_id=input.task_id,
+                reasoning_steps=[TraceStep(
+                    step=1, step_type="indicator_calculation",
+                    description=(
+                        f"纯规则判定（跳过 LLM）；severe_flags={data.get('severe_flag_count', 0)} "
+                        f"level={data.get('compliance_level_calc', '无')}"
+                    ),
+                )],
+                result={**self._enrich_result(payload, data),
+                        "model_used": data.get("model_used", "rule-only"),
+                        "tokens_in": 0, "tokens_out": 0,
+                        "_rule_only": True},
+            )
         if not payload.data_points and not payload.events and not payload.verified_texts:
             question = payload.user_query or payload.focus or "相关主题"
             return AgentOutput(

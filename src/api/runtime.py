@@ -35,11 +35,11 @@ from src.infrastructure.connectors.a_share_liquidity_connector import (
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
 from src.infrastructure.connectors.baostock_connector import BaostockConnector
 from src.infrastructure.connectors.cached_news_fetcher import CachedNewsFetcher
-from src.infrastructure.connectors.dynamic_loader import get_dynamic_loader
-from src.infrastructure.connectors.fedwatch_connector import FedWatchConnector
 from src.infrastructure.connectors.coal_inventory_connector import (
     CoalInventoryConnector,
 )
+from src.infrastructure.connectors.dynamic_loader import get_dynamic_loader
+from src.infrastructure.connectors.fedwatch_connector import FedWatchConnector
 from src.infrastructure.connectors.index_valuation_connector import (
     IndexValuationConnector,
 )
@@ -53,7 +53,6 @@ from src.infrastructure.connectors.local_csv_connector import LocalCsvConnector
 from src.infrastructure.connectors.margin_trading_connector import (
     MarginTradingConnector,
 )
-from src.infrastructure.connectors.mock_industry_connector import MockIndustryConnector
 from src.infrastructure.connectors.news_fetcher import LocalFallbackNewsFetcher
 from src.infrastructure.connectors.northbound_flow_connector import (
     NorthboundFlowConnector,
@@ -61,6 +60,7 @@ from src.infrastructure.connectors.northbound_flow_connector import (
 from src.infrastructure.connectors.penetration_rate_connector import (
     PenetrationRateConnector,
 )
+from src.infrastructure.connectors.pharma_ind_connector import PharmaIndConnector
 from src.infrastructure.connectors.real_industry_connector import RealTechIndustryConnector
 from src.infrastructure.connectors.router import ConnectorRouter
 from src.infrastructure.connectors.star_chinext_connector import (
@@ -251,12 +251,9 @@ def build_runtime() -> Runtime:
     # 电厂煤炭库存：中电联CECI周报「纳入统计的发电企业煤炭库存」（官方JSON接口）
     coal_inventory = CoalInventoryConnector()
     routes.append((coal_inventory, CoalInventoryConnector.supports))
-    # ⚠️ 模拟产业连接器：**只作为尚未接入真实源的指标的兜底**，必须排在所有真实源之后。
-    #    已被真实源覆盖的指标（科技三指标、消费/周期/医药行业PE、白酒价格、电厂煤炭库存、
-    #    社零、煤价）永远不该走到这里 —— 排在真实源之前会把真数据挡在门外
-    #    （与 QMT/本地CSV 的链序教训同一条）。
-    mock_industry = MockIndustryConnector()
-    routes.append((mock_industry, MockIndustryConnector.supports))
+    # 创新药IND申报：CDE药审中心受理品种信息（公开JSON接口，月度件数）
+    pharma_ind = PharmaIndConnector()
+    routes.append((pharma_ind, PharmaIndConnector.supports))
     # 动态连接器（自修复生成的，热加载；优先级最低，不覆盖已有静态指标）
     # 同时恢复动态调度作业
     from src.scheduler.registry import load_dynamic_jobs

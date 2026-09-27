@@ -20,8 +20,8 @@ from src.infrastructure.repositories.intraday_profile_sqlite_repo import (
 )
 from src.infrastructure.repositories.macro_repo import MacroRepository
 from src.infrastructure.repositories.news_cache_sqlite_repo import (
-    NewsCacheSqliteRepository,
     NewsCacheRepository,
+    NewsCacheSqliteRepository,
 )
 from src.infrastructure.repositories.postgres_repo import PostgresRepository
 

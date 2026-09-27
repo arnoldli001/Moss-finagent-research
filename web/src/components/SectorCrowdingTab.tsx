@@ -1,4 +1,3 @@
-import Disclaimer from "./Disclaimer";
 import { useCallback, useEffect, useState } from "react";
 import SectorCrowdingAlertPanel from "./SectorCrowdingAlertPanel";
 import SectorCrowdingDetailModal from "./SectorCrowdingDetailModal";
@@ -55,8 +54,13 @@ export default function SectorCrowdingTab() {
 
   // 低频兜底轮询：服务端只有"一键刷新"会改数据，但刷新可能发生在另一个标签页；
   // 60 秒一次足够，且服务端是本地读库（毫秒级）。
+  // ★ 2026-09-27：本页签进了 KeepAlive（互切不卸载），轮询在隐藏期间仍会
+  // 跑 —— 加 document.hidden 守卫，页面不可见时跳过本轮（可见后自然补上）。
   useEffect(() => {
-    const timer = window.setInterval(() => { void list.reload(); }, POLL_MS);
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      void list.reload();
+    }, POLL_MS);
     return () => window.clearInterval(timer);
   }, [list.reload]);
 
@@ -74,7 +78,6 @@ export default function SectorCrowdingTab() {
 
   return (
     <div className="crowding-root">
-      <Disclaimer compact />
       {error && <div className="error-box">读取拥挤度数据失败：{error}</div>}
 
       {/* ① 一键刷新栏 */}
@@ -95,7 +98,8 @@ export default function SectorCrowdingTab() {
         <span style={{ flex: 1 }} />
         <button className="btn-ghost primary" disabled={metrics.running}
                 title="立即重算 4 列周频异动指标（近5日/近1月/近2月拥挤度变化 + 近1月资金净流入占比）。
-                       正常每周三 08:30 自动算一次，一轮约 3~5 分钟（要抓板块成分股）"
+                       正常每周三 08:30 自动算一次，只算当前视图里的板块（概念板块约 262 个）；
+                       热缓存几秒完成，冷缓存要按板块抓成分股，可能 3~5 分钟"
                 onClick={() => void metrics.compute(true)}>
           {metrics.running
             ? `异动指标计算中… ${(metrics.status?.progress ?? 0) * 100 | 0}%`

@@ -2255,39 +2255,57 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
    结构：运行状态条 → 运行摘要 → 选股池 → 差一点 → 个股详情 → 落选区。 */
 .quant-tab-root { display: flex; flex-direction: column; }
 
-/* ---- 顶部一级模块页签：量化选股 · 竞价选股 · 做T辅助（并列） ----
+/* ---- 量化交易 · 二级模块页签：量化选股 · 竞价选股 · 行情（并列） ----
    为什么放在页面最顶部、而不是各自的周期条里：这三个是**同级模块**
-   （前两个组合级、做T辅助个股级）。2026-09-23 之前「量化选股」混在做T的
+   （前两个组合级、行情个股级）。2026-09-23 之前「量化选股」混在做T的
    「周期」条里当第三种周期、「竞价选股」紧挨着它 —— 于是"周期口径"和
    "独立模块"长得一样，用户反馈层级混乱，要求把三者并列到顶部。
-   底部分隔线是关键：它把"一级模块"和模块内部的控制条（如 .mode-switch）
-   从视觉上分开；胶囊样式沿用头部导航的 .tab 口径（同一套交互语言）。 */
+   底部分隔线是关键：它把"二级模块"和模块内部的控制条（如 .mode-switch）
+   从视觉上分开。
+
+   ## ★ 尺寸必须**小于**一级页签（用户口径 2026-09-28）
+
+   原来这里是 `font-size: 14px; padding: 7px 18px`，而顶栏一级页签 `.tab`
+   是 `13px / 6px 14px` —— **二级比一级还大**，视觉层级是倒挂的。
+   用户口径：这三个二级页签要"比一级页签小一号"，字号与按钮都小 1~2 号，
+   并且**背景色上也要做区分**。
+
+   现行对照（改这几个值之前先看这张表）：
+
+   | 层级 | 类名 | 字号 | 内边距 | 圆角 | 背景 |
+   |---|---|---|---|---|---|
+   | 一级 | `.tab` | 13px | 6px 14px | 16px | `transparent`（只有描边） |
+   | 二级 | `.quant-module` | **12px** | **4px 12px** | 12px | **accent 淡填充 + 同色描边** |
+
+   背景区分的用意：一级页签是"透明的描边胶囊"，二级页签是"有底色的实心
+   小胶囊" —— 即使不看字号，也能一眼看出谁在谁里面（谁从属于谁）。
+   ⚠️ 不要为了"和顶栏统一风格"把二级改回 `transparent`：那正是层级倒挂的成因。 */
 .quant-modules {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
   margin-bottom: 12px; padding-bottom: 10px;
   border-bottom: 1px solid var(--border);
-  /* 用户口径 2026-09-23：这三个子页签（量化选股/竞价选股/做T辅助）
+  /* 用户口径 2026-09-23：这三个子页签（量化选股/竞价选股/行情）
      要**居中**显示，原来靠左。 */
   justify-content: center;
 }
 .quant-module {
-  background: transparent; color: var(--muted);
-  border: 1px solid var(--border); border-radius: 18px;
-  min-width: auto; padding: 7px 18px; font-size: 14px; cursor: pointer;
+  /* accent 淡填充（#4a9eff → rgba(74,158,255)）+ 同色描边：
+     与一级页签的"透明描边"形成明确的层级区分。 */
+  background: rgba(74, 158, 255, 0.10); color: var(--muted);
+  border: 1px solid rgba(74, 158, 255, 0.28); border-radius: 12px;
+  min-width: auto; padding: 4px 12px; font-size: 12px; cursor: pointer;
 }
-.quant-module:hover { color: var(--text); border-color: var(--accent); }
+.quant-module:hover {
+  color: var(--text); border-color: var(--accent);
+  background: rgba(74, 158, 255, 0.18);
+}
 .quant-module.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-/* 模块页签右侧的风险提示（用户口径 2026-09-23，原文照抄）。
-   用 `margin-left:auto` 顶到行尾；字号比页签小一档、颜色更淡 ——
-   它是免责声明而不是操作入口，不能和"量化选股 / 竞价选股 / 做T辅助"抢注意力。
-   窄屏（页签占满一行后）它会换到第二行，并被 `margin-left:auto` 推到**右端** ——
-   实测这个位置读起来仍然顺（贴着页签块的下缘），比孤零零的左侧更自然。
-   ⚠️ 类名与 `.quant-disclaimer`（多因子面板底部那条，`QuantFactorPanel.tsx`）**刻意分开**：
-   同名会让 `margin-top:14px` 把这条顶下去、也会把 `margin-left:auto` 泄漏给那个段落。 */
-.quant-tabs-disclaimer {
-  margin-left: auto; font-size: 12px; color: var(--muted);
-  letter-spacing: 0.2px; opacity: 0.9;
-}
+/* ⚠️ `.quant-tabs-disclaimer`（模块页签右侧那条风险提示，2026-09-23 加）
+   **已删除**（2026-09-28 用户口径：提示块收进顶栏 `.brand-disclaimer`，
+   删除每个页签下的显示）。别再把它加回来 —— 它只覆盖"量化交易"这一个页签，
+   别的页签没有就是漏覆盖。
+   另注：`.quant-disclaimer`（多因子面板底部那条，`QuantFactorPanel.tsx`）
+   仍在用，与上面那条**本来就不是同一个类名**，删除无影响。 */
 
 .auction-root { display: flex; flex-direction: column; gap: 10px; }
 /* 调度状态 + 「↻ 刷新」「▶ 重跑一次」：跟在「竞价选股池（n）」标题那一行的最右端
@@ -3288,8 +3306,10 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 
    三处刻意做强的对比（都是为了防止同一个误读：把被门控的信号当成告警）：
    ① 环境横幅整块带牛/熊/震荡底色，不只靠一行文字；
-   ② 门控提示条（.etf-flow-gate-strip / .etf-flow-regime-warn）用黄色告警底，
-      并且在四个子视图里都可见；
+   ② 门控提示条 `.etf-flow-gate-strip` 用黄色告警底，并且在四个子视图里都可见
+      —— 它是"机会信号不放行"的**唯一**展示位（用户口径本轮：总览横幅里那块
+      复述同样内容的 `.etf-flow-regime-warn` 属重复，已删；剩下的
+      `.etf-flow-regime-warn` 只讲**风险**信号在熊市不放行）；
    ③ 已门控的信号（.etf-flow-signal.gated、tr.row-gated）灰化 + 虚线边框，
       与"会告警"的信号一眼可分，但**不隐藏**（复盘门控本身要用）。 */
 
@@ -3452,16 +3472,17 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   color: var(--medium); border-color: rgba(217,161,59,0.6);
   background: rgba(217,161,59,0.14);
 }
-/* 不放行的说明块：整个模块里最该被读到的一段字 */
+/* 不放行的说明块。⚠️ 现在**只剩风险信号那一条**（熊市里 `risk_allowed=false`）：
+   "机会信号不放行"原来在这里也有一块，用户口径（本轮）说它与页签上方的
+   `.etf-flow-gate-strip` 重复、"提示的这些都不要显示" → 那块已从
+   `EtfFlowOverview.tsx` 删除。**这个类不要跟着删** —— 风险门控仍在用它
+   （门控提示条只覆盖机会信号，风险那条不重复）。 */
 .etf-flow-regime-warn {
   font-size: 12px; line-height: 1.75; color: var(--medium);
   background: rgba(217,161,59,0.10); border: 1px solid rgba(217,161,59,0.45);
   border-radius: 4px; padding: 6px 9px;
 }
 .etf-flow-regime-warn b { color: var(--medium); font-size: 12.5px; }
-.etf-flow-regime-notes {
-  margin: 4px 0 0; padding-left: 18px; font-size: 11px; line-height: 1.7;
-}
 
 .etf-flow-grid {
   display: grid; gap: 6px;
@@ -4111,6 +4132,32 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   background: none; border: 1px solid transparent; border-radius: 10px;
   cursor: pointer; text-align: left; color: var(--text);
   transition: border-color 0.12s, background 0.12s;
+  /* ★ 品牌列加宽（用户口径："brand 设置的宽度大一点，目标是让里面的
+     brand-sub 争取一行搞定，最多两行"）。
+     `flex: 0 1 auto` = **品牌可以被压缩，把宽度让给右边那排页签**。
+     口径演变（两轮，别退回锁死品牌）：
+       · 上一轮：「brand 设置的宽度大一点，目标是让里面的 brand-sub 争取一行
+         搞定，最多两行」→ 当时是 `flex: 0 0 auto`，页签不够就自己折行；
+       · 本轮（管理员业务视图）：「这个顶部一级页签 …… 还有空白间距（框出来的
+         地方），可以再调大一级页签的 tab 宽度，使所有一级页签在同一行」——
+         管理员业务视图有 **10 个**页签（多「调度管理/运行指标」），锁死品牌时
+         页签整排需 935px 却只分到 ~772px（1280~1900 档位实测），于是
+         「事件告警」被挤到第二行，左边还空出一截 —— 那截空白正是"页签被压缩
+         后右对齐"留下的，不是真的没用上。
+     压缩下限由 `.brand-sub` 的 `min-width: 260px` 兜住 ≈ 318px = 副标题折成
+     两行（用户口径允许的"最多两行"）。实测结果：
+       · 租户视图（8 个页签）：品牌仍一行、页签一行 —— 与上一轮一致；
+       · 管理员业务视图（10 个页签）：页签**一行**，品牌退成两行；
+         窗口更宽（≈1920 以上）时品牌也回到一行。
+     页签那一侧的配套规则见下面 `@media (min-width: 1560px)` 的
+     `.tabs { flex-shrink: 0 }`。
+
+     ⚠️ `min-width: min-content` 是**必需的**，它覆盖全局
+     `button { min-width: 100px }`（见文件上方基础样式）：不覆盖的话，
+     窄档位下品牌按钮会被压到 100px 而里面的文字照旧 260px 宽 ——
+     文字**溢出到页签上面**去（实测 721~1000px 档位，
+     `.brand` 195px 而 `.brand-text` 260px，右边界压住页签左边界）。 */
+  flex: 0 1 auto; min-width: min-content;
 }
 .brand:hover { border-color: var(--border); background: rgba(74,158,255,0.08); }
 .brand:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
@@ -4123,9 +4170,156 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.25; }
 .brand-name { font-size: 19px; font-weight: 700; letter-spacing: 0.2px;
   white-space: nowrap; }
-.brand-sub { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.brand-sub {
+  font-size: 11.5px; color: var(--muted);
+  /* ★ 副标题与免责声明**写在一起**（用户口径："这两个内容要写在一起 ……
+     brand 设置的宽度大一点，目标是让里面的 brand-sub 争取一行搞定，最多两行"）。
+     这里原来写的是 `display: flex; flex-direction: column`（两段各占一行），
+     现在改回普通块 + 子元素行内 → 两段是**同一段文字流**，连着排：
+       · 宽屏（≥1367px）：一行 —— 品牌列按内容宽度排布（见 `.brand` 的
+         `flex: 0 0 auto`），整段连排需 ~494px，放得下；
+       · 中窄屏（≤1366px）：折成两行 —— 由 `.brand` 那一档的 `flex: 0 1 auto`
+         让位给页签，`min-width` 兜住"最多两行"的下限。
+     `white-space: normal` 是折行的前提：原来是 `nowrap`，不覆盖的话
+     窄档位下这一段会顶出品牌列、把页签挤出屏幕。 */
+  display: block; white-space: normal;
+  /* ⚠️ "最多两行"的**下限**：整段连排需 ~494px，一半 ≈ 247px，取 260px。
+     不给下限、任由 flex 压缩时会折成 3~4 行（实测 1024px 下副标题 3.3 行）。 */
+  min-width: 260px;
+}
+
+/* ★ 风险提示（免责声明）—— **全站唯一一处展示位**，在站名/副标题之下。
+   用户口径 2026-09-28：「这个做到 brand-sub 里就行，删除每个页签下的显示」；
+   本轮追加：「这两段内容要写在一起」，所以它现在与副标题**同一段、同一行起排**
+   （行内元素跟着副标题的文字流走，中间用一个「 · 」分隔，见 `App.tsx`）。
+   文案与理由见 `components/BrandDisclaimer.tsx`。
+
+   ⚠️ 这里**不能**再有 `max-width`（原来是 `40ch`）：那个上限正是"它必然折成
+   两行"的原因 —— 28 个汉字被卡在 40ch 里，跟副标题分属两个块，谁也连不起来。
+   现在宽度由品牌列决定：≥1367px 一行、≤1366px 两行（见 `.brand-sub` 的注释）。
+
+   文字仍必须允许折行（`white-space: normal`）：它继承了 `.brand-sub` 的规则，
+   写死 `nowrap` 的话这句 28 个汉字会顶出品牌列、把页签挤出视口，
+   而"页面被撑宽"正是本项目记录过的布局错位根源。
+   手机上它随 `.brand-sub` 的 `display: none` 一起隐藏
+   （见 `@media (max-width: 720px)`），所以那一档不需要再单独处理。 */
+.brand-disclaimer {
+  font-size: 11px; line-height: 1.45; color: var(--muted); opacity: 0.9;
+  /* 显式 `inline`：它是**段落里的一段文字**，不是独立一行（原来靠父级
+     `flex-direction: column` 才各占一行，那个容器已经改成普通块）。 */
+  display: inline; white-space: normal;
+}
+
+/* ★ 一级页签的**一行优先权**（用户口径，本轮）
+   ------------------------------------------------------------------
+   「使所有一级页签在同一行」：管理员业务视图 10 个页签整排需 935px。
+   只要品牌让位（`.brand` 的 `flex: 0 1 auto`）就一定放得下 ——
+   但 flex 默认会**同时**压缩两边，页签只要被压掉 1px 就会折行，
+   所以这里把页签的收缩关掉：**空间不够时先压品牌（最多退到两行），
+   页签不收缩**。
+
+   ⚠️ 阈值 1560px 是算出来的，不是拍的：页签 935 + 铃铛/头像/间隙 ≈170
+   + 品牌两行下限 318 ≈ 1423px 布局宽，顶栏两侧还有 6% 内距
+   （`.app { padding: 1vw 3% }`）→ 视口 ≥ 1423 / 0.94 ≈ 1514px 才**保证**
+   不横向溢出；取 1560 留出余量（真实应用的铃铛/头像比测试页更宽）。
+   低于该档位时页签照旧可以收缩折行（那一档本来就是折 2~3 行的窄屏，
+   不锁死是为了**绝不允许横向溢出** —— 本项目最忌讳的布局事故）。
+   将来若再增加一级页签，先按上面的算式把阈值往上抬，别让它溢出。 */
+@media (min-width: 1560px) {
+  .brand { flex: 0 1 auto; }
+  .tabs { flex-shrink: 0; }
+}
+/* ★ 中宽档位（1367~1559px）：品牌**锁死成一行**（上一轮口径）。
+   这一档页签整排（10 个需 935px）无论如何都放不下：品牌退到两行下限 318px
+   加上铃铛/头像也只有 1423px 布局宽，而 1559×0.94 = 1465 才勉强够 ——
+   与其让品牌白白退成两行、页签照样折行（两头不讨好），不如保住品牌一行，
+   页签自己折行（这本就是加宽品牌之前的既有行为，没有回归）。 */
+@media (min-width: 1367px) and (max-width: 1559px) {
+  .brand { flex: 0 0 auto; }
+}
 /* 顶栏用 baseline 对齐（老样式），品牌是两行块 → 改成居中更整齐 */
 .header { align-items: center; }
+
+/* ==================================================================
+   ★ 顶栏冻结（用户口径 2026-09-28）
+
+   「非手机移动端使用本网站时，header 可以冻结在顶部，方便用户选一级页签」
+
+   所以桌面端把 `.header` 做成 `position: sticky; top: 0`：往下滚时
+   品牌 + 一排一级页签 + 铃铛 + 头像一直吸在窗口顶部，随时可切页签。
+   手机端（≤720px）由下面的 `@media (max-width: 720px)` 覆盖回 `static`
+   —— 手机上顶栏本来就是"品牌一行 + 可横滑页签一行"，冻住会吃掉
+   本来就紧张的首屏高度。
+
+   ## 三个必须一起写的点（漏一个就是"看起来没生效"）
+
+   ① **`sticky` 而不是 `fixed`**：`.app` 带 `zoom`（见文件顶部那段说明），
+      `zoom` 在本项目的 Chromium 实测里会建立包含块/缩放参考，
+      `fixed` 元素的位置与尺寸都要另行验证；`sticky` 是**同一布局流内**的
+      偏移，与 `zoom` 无交互，且不脱离文档流（不用给内容补 padding）。
+      已确认从 `.header` 到视口之间**没有任何 `overflow` 非 `visible` 的祖先**
+      （`html`/`body`/`.app` 都没有），这是 sticky 生效的前提。
+   ② **必须有底色**：不带底色的 sticky 元素，滚动时下面的内容会从它身上
+      穿过去糊在一起（本文件 `.crowding-alert-header` 的注释里记过同一条）。
+      这里**不用 `background` 而是 `::before` 负层级**，原因见 ③。
+   ③ **不能给 `.header` 自己加 `background`**：顶栏里有两个向下弹出的浮层
+      （`.account-menu`、`.alert-bell` 的告警面板），它们都是 `.header`
+      子元素的绝对定位后代。给 `.header` 上底色 → 底色按"祖先背景先于
+      后代绘制"的顺序画在浮层**上面**，下拉一拉出来就被顶栏的底色盖住。
+      改成 `::before { z-index: -1 }`：这一层落在 `.header` 的
+      **背景层**（在自身内容之下、在页面内容之上），于是
+        · 下面的内容被它挡住（该有的效果），
+        · 下拉浮层压在它上面（不被盖住）。
+      `bottom: -16px` + 渐变是**刻意的**：`.header` 的 `margin-bottom`
+      归零后在 `::before` 这里补回同样的 16px 节奏，色块往下多出的这一档
+      用渐变淡出 —— 冻结时下面滚上来的内容不会在色块下沿"啪"地被切断，
+      页面静止时的留白节奏与原来一致（都是 16px）。
+      ⚠️ 配套的一条写在 `::before` 规则下面：`.header + *` 要补
+      `margin-top: 16px`，否则**页面静止时**第一个内容行会落进这条渐隐带里
+      （用户报障 2026-09-26：「多因子（35个因子）这行显示有点被上方挤压遮挡了」）。
+
+   层级取 200：高于所有页面内容（含 `z-index` 30/50 的浮层、拥挤度/主线
+   表头 sticky 的 2~5、`.intraday-drawer` 的 sticky），低于全屏模态遮罩
+   （20/60/200/1000）—— 模态打开时顶栏依旧被遮罩压住，不会浮在模态之上。
+   ================================================================== */
+.header {
+  position: sticky; top: 0; z-index: 200;
+  /* 16px 的节奏交给 ::before 的 padding-bottom 承担（见下），
+     这里归零是为了不让"margin 在 sticky 盒子之外"留下一条没被遮住的缝 */
+  margin-bottom: 0;
+  padding: 2px 0;
+}
+.header::before {
+  content: ""; position: absolute; z-index: -1;
+  left: 0; right: 0; top: 0; bottom: -16px;
+  padding-bottom: 16px;
+  background:
+    linear-gradient(to bottom, var(--bg) 0, var(--bg) calc(100% - 16px),
+                    rgba(15, 20, 25, 0) 100%);
+  /* 视觉上纯背景，不该拦住鼠标（它盖住了内容区的上沿 16px） */
+  pointer-events: none;
+}
+
+/* ★ 内容这边必须**让开**顶栏下面那 16px 渐隐带（用户报障 2026-09-26）
+   ------------------------------------------------------------------
+   报障原话：「多因子（35个因子）这行显示有点被上方挤压遮挡了」。
+
+   根因：`.header` 的 `margin-bottom` 归零后，那 16px 留白改由 `::before` 的
+   渐隐带承担（见上面的说明）—— 但**留白只在顶栏那一侧补了，内容一侧没有**：
+   内容紧贴在顶栏底边（实测 `.mode-switch` 顶边 66px = 顶栏底边 66px），
+   而渐隐带从 66px 一直"洗"到 82px（越靠上越不透明），于是第一个内容行
+   （策略回测那排 `.mode-btn` 胶囊，67~93px）上半截被压在渐隐带里 = 看着被切掉。
+
+   所以顶栏之后的**第一个内容元素**要补回这 16px。用兄弟选择器而不是给每个
+   面板加 margin：视图是三元链切换渲染的（还有 fragment 让"第一个元素"
+   随视图变），逐个面板加必然漏掉下一个新面板 —— 而 `.header + *` 永远命中
+   真实渲染出来的第一个兄弟（后端可达性横幅在时就是它，其余时候是面板）。
+
+   ⚠️ 只在冻结生效的档位加：手机端（≤720px）顶栏是 `static`、`.header` 自己
+   还有 `margin-bottom: 10px`（见下面的媒体查询），这里再加一次就是 26px。 */
+@media (min-width: 721px) {
+  .header + * { margin-top: 16px; }
+}
 
 /* 顶栏只显示圆形头像（用户口径：不要身份徽标） */
 /* compact 模式（顶栏右上角）：人头 + 齿轮，**去掉所有外形**。
@@ -4283,12 +4477,20 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
      品牌（含 19px 的英文名，约 220px）+ 7 个不换行的页签挤在 390px 里，
      页签会折成 3~4 行，而且因为 `margin-left:auto` + `justify-content:flex-end`
      每一行都右对齐 —— 看起来就是"错位"。 */
+  /* ★ 顶栏在手机上**不冻结**（用户口径 2026-09-28："非手机移动端使用本网站时
+     header 可以冻结在顶部" —— 言下之意移动端不需要）。桌面那条 sticky 在
+     `.header`（见上方"顶栏冻结"一节），这里覆盖回普通流式排布。
+     同时撤掉桌面用的 `::before` 遮罩层与 `margin-bottom: 0`：
+       · `static` 之后 `::before` 的绝对定位会去找更外的包含块（会画到别处），
+         所以直接 `display: none`；
+       · 手机原本就有自己的 `margin-bottom: 10px`（下面几行），要把它放回来。 */
   .header {
+    position: static; margin-bottom: 10px;
     flex-wrap: wrap;
     row-gap: 8px;
     align-items: center;
-    margin-bottom: 10px;
   }
+  .header::before { display: none; }
   /* 用 `order` 把"品牌 + 铃铛 + 头像"排在第 1 行、页签排第 2 行。
      DOM 顺序是 品牌 → 页签 → 铃铛 → 头像，只靠 `flex-basis: 100%` 会把
      铃铛/头像挤到**第 3 行**（实测截图就是这样）—— 而它们本该在品牌右边。 */
@@ -4417,11 +4619,18 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   .admin-stat { padding: 3px 8px; font-size: 11px; }
 }
 
-/* ---- 风险提示（免责声明）：统一组件，见 components/Disclaimer.tsx ---- */
+/* ---- 风险提示（免责声明）----
+   `.disclaimer` 这条**保留**：它现在服务的是四个**模块级**免责声明
+   （`AlertDetail`、`IntradayDailyPanel`、`IntelCalendarTab`、`IntelBriefTab`），
+   文案与顶栏那条不同，是各模块自己的数据/口径说明，本次不动。
+   ⚠️ 别顺手删掉：删了它们会从"左侧竖线的引用块"退化成一行灰字。
+
+   `.disclaimer.compact` 变体已随 `components/Disclaimer.tsx` 一并删除 ——
+   它唯一的用途是那 5 个一级页签里的 `<Disclaimer compact />`，
+   用户口径 2026-09-28 已把这些提示块收进顶栏（见 `.brand-disclaimer`）。 */
 .disclaimer {
   margin: 10px 0 0; padding: 6px 10px;
   font-size: 11.5px; line-height: 1.6; color: var(--muted);
   border-left: 2px solid var(--border);
   background: rgba(255,255,255,0.02); border-radius: 0 6px 6px 0;
 }
-.disclaimer.compact { margin: 6px 0 0; padding: 4px 8px; font-size: 11px; }

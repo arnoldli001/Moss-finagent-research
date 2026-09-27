@@ -1804,6 +1804,17 @@ export type LoginResult = {
   message: string;
   user: AuthUser;
   must_change_password: boolean;
+  /**
+   * ★ 一级目录的页签清单，**顺路带回**（2026-09-28）。
+   *
+   * 原来它只有 `GET /me/features` 一个来源，而那个请求要等认证结果就位
+   * 才发得出去 —— 「认证往返 → 权限往返」两次串行，公网链路上就是 3~5 秒
+   * 页签才长齐（用户报障）。登录响应里本来就带着等级，而清单是等级的纯函数，
+   * 没有理由再要一次往返。见后端 `auth.py` 的 `_features_payload`。
+   */
+  visible_views?: string[];
+  /** 与服务端 `visible_views` 同一趟算出来的管理员判据。 */
+  is_admin?: boolean;
 };
 
 /** `/auth/me` 的返回：身份 + **脱敏**联系方式。
@@ -1826,6 +1837,14 @@ export type MeResult = {
   valid_until: string;
   session_id: string;
   contacts: MeContacts;
+  /**
+   * ★ 页签清单（`/me` 与 `/auth/bootstrap` **逐字段一致**，见后端 `_me_payload`）。
+   *
+   * `BootstrapResult` 继承本类型，所以开机探测也带着它 —— 前端因此能在
+   * **一次往返**内拿到"我是谁 + 我能看哪些页签"，页签不再需要第三次往返。
+   */
+  visible_views?: string[];
+  is_admin?: boolean;
 };
 
 export type SessionInfo = {

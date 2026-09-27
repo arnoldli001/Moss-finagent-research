@@ -1,0 +1,153 @@
+# 主线挖掘 · **冻结概念池**
+#
+# ⚠️ 本文件由 `scripts/build_frozen_pool_from_gate.py` **生成**，不要手改。
+#
+# ## 为什么冻结（用户口径 2026-09-27）
+#
+#   「主线板块所需计算的概念板块数量只有 122 个，不是 262 个，
+#     只是这 262 个里包含了这 122 个。」
+#   「根据一个板块历史告警的 20 日胜率 > 45% 还是 40% 我忘了，筛选出来的，
+#     你就把这当签的 122 个概念板块，**写死在主线挖掘的概念池里**，
+#     后续只关注这 122 个，**不会再有变动**。」
+#
+# ## 口径（= 复用官方门槛产物，不重新推导）
+#
+#   基准池     `import_crowding_pool` 的动态口径 → 138 个
+#   剔除清单   `configs/mainline_theme_exclusions.yaml` → 16 个
+#              规则：20 日胜率 <= 40% **且** 已走满窗口 >= 3 个
+#   冻结名单   138 - 16 = 122 个
+#
+# 出处：`mainline_theme_exclusions.yaml` 头部原文
+#     「本次：池内 138 个 → 剔除 16 个、留 122 个（其中 18 个在观察名单）」
+#
+# ⚠️ 第一版脚本自己重算门槛，只剔 7 个 → 算出 123。错在漏了
+#    「已走满窗口 >= 3 个」这个条件。**不要再自己重算。**
+#
+generated_at: "2026-09-27"
+version: 1
+base_pool: 138
+gated_out: 16
+count: 122
+boards:
+  - { code: "885311.TI", name: "智能电网" }
+  - { code: "885343.TI", name: "稀土永磁" }
+  - { code: "885362.TI", name: "云计算" }
+  - { code: "885398.TI", name: "煤化工概念" }
+  - { code: "885418.TI", name: "文化传媒概念" }
+  - { code: "885425.TI", name: "特高压" }
+  - { code: "885430.TI", name: "天然气" }
+  - { code: "885454.TI", name: "智能穿戴" }
+  - { code: "885457.TI", name: "手机游戏" }
+  - { code: "885497.TI", name: "旅游概念" }
+  - { code: "885525.TI", name: "白酒概念" }
+  - { code: "885530.TI", name: "黄金概念" }
+  - { code: "885543.TI", name: "家用电器" }
+  - { code: "885551.TI", name: "氟化工概念" }
+  - { code: "885564.TI", name: "无人机" }
+  - { code: "885571.TI", name: "核电" }
+  - { code: "885573.TI", name: "猪肉" }
+  - { code: "885578.TI", name: "基因测序" }
+  - { code: "885615.TI", name: "体育产业" }
+  - { code: "885620.TI", name: "参股券商" }
+  - { code: "885623.TI", name: "参股保险" }
+  - { code: "885633.TI", name: "染料" }
+  - { code: "885641.TI", name: "风电" }
+  - { code: "885650.TI", name: "碳纤维" }
+  - { code: "885652.TI", name: "钛白粉概念" }
+  - { code: "885692.TI", name: "地下管网" }
+  - { code: "885699.TI", name: "ST板块" }
+  - { code: "885700.TI", name: "军工" }
+  - { code: "885706.TI", name: "农机" }
+  - { code: "885709.TI", name: "虚拟现实" }
+  - { code: "885728.TI", name: "人工智能" }
+  - { code: "885730.TI", name: "量子科技" }
+  - { code: "885733.TI", name: "航运概念" }
+  - { code: "885736.TI", name: "无人驾驶" }
+  - { code: "885756.TI", name: "芯片概念" }
+  - { code: "885771.TI", name: "智能音箱" }
+  - { code: "885775.TI", name: "燃料电池" }
+  - { code: "885789.TI", name: "宁德时代概念" }
+  - { code: "885800.TI", name: "消费电子概念" }
+  - { code: "885808.TI", name: "养鸡" }
+  - { code: "885809.TI", name: "柔性屏(折叠屏)" }
+  - { code: "885811.TI", name: "玉米" }
+  - { code: "885812.TI", name: "农业种植" }
+  - { code: "885823.TI", name: "氢能源" }
+  - { code: "885829.TI", name: "丙烯酸" }
+  - { code: "885840.TI", name: "人民币贬值受益" }
+  - { code: "885860.TI", name: "中船系" }
+  - { code: "885863.TI", name: "磷化工" }
+  - { code: "885864.TI", name: "光刻胶" }
+  - { code: "885866.TI", name: "数字货币" }
+  - { code: "885868.TI", name: "无线耳机" }
+  - { code: "885874.TI", name: "云游戏" }
+  - { code: "885875.TI", name: "MiniLED" }
+  - { code: "885876.TI", name: "网红经济" }
+  - { code: "885886.TI", name: "超级电容" }
+  - { code: "885887.TI", name: "数据中心(AIDC)" }
+  - { code: "885897.TI", name: "中芯国际概念" }
+  - { code: "885903.TI", name: "环氧丙烷" }
+  - { code: "885904.TI", name: "代糖概念" }
+  - { code: "885908.TI", name: "第三代半导体" }
+  - { code: "885914.TI", name: "煤炭概念" }
+  - { code: "885921.TI", name: "储能" }
+  - { code: "885922.TI", name: "盐湖提锂" }
+  - { code: "885925.TI", name: "MCU芯片" }
+  - { code: "885928.TI", name: "钠离子电池" }
+  - { code: "885931.TI", name: "PVDF概念" }
+  - { code: "885936.TI", name: "绿色电力" }
+  - { code: "885937.TI", name: "培育钻石" }
+  - { code: "885945.TI", name: "汽车芯片" }
+  - { code: "885957.TI", name: "东数西算(算力)" }
+  - { code: "885959.TI", name: "PCB概念" }
+  - { code: "885960.TI", name: "民爆概念" }
+  - { code: "885966.TI", name: "跨境支付(CIPS)" }
+  - { code: "885967.TI", name: "化肥" }
+  - { code: "885973.TI", name: "金属铜" }
+  - { code: "885987.TI", name: "MicroLED概念" }
+  - { code: "885990.TI", name: "露营经济" }
+  - { code: "885995.TI", name: "粮食概念" }
+  - { code: "885999.TI", name: "汽车热管理" }
+  - { code: "886002.TI", name: "机器视觉" }
+  - { code: "886006.TI", name: "钙钛矿电池" }
+  - { code: "886008.TI", name: "减速器" }
+  - { code: "886009.TI", name: "先进封装" }
+  - { code: "886012.TI", name: "宠物经济" }
+  - { code: "886019.TI", name: "AIGC概念" }
+  - { code: "886020.TI", name: "PET铜箔" }
+  - { code: "886021.TI", name: "国企改革" }
+  - { code: "886026.TI", name: "POE胶膜" }
+  - { code: "886032.TI", name: "固态电池" }
+  - { code: "886033.TI", name: "共封装光学(CPO)" }
+  - { code: "886038.TI", name: "超导概念" }
+  - { code: "886042.TI", name: "存储芯片" }
+  - { code: "886044.TI", name: "液冷服务器" }
+  - { code: "886046.TI", name: "MR(混合现实)" }
+  - { code: "886047.TI", name: "脑机接口" }
+  - { code: "886048.TI", name: "英伟达概念" }
+  - { code: "886050.TI", name: "算力租赁" }
+  - { code: "886052.TI", name: "核污染防治" }
+  - { code: "886054.TI", name: "光刻机" }
+  - { code: "886058.TI", name: "华为昇腾" }
+  - { code: "886060.TI", name: "短剧游戏" }
+  - { code: "886063.TI", name: "PEEK材料" }
+  - { code: "886065.TI", name: "可控核聚变" }
+  - { code: "886066.TI", name: "飞行汽车(eVTOL)" }
+  - { code: "886067.TI", name: "低空经济" }
+  - { code: "886068.TI", name: "AI视频" }
+  - { code: "886069.TI", name: "人形机器人" }
+  - { code: "886070.TI", name: "AI手机" }
+  - { code: "886071.TI", name: "AI PC" }
+  - { code: "886076.TI", name: "军工信息化" }
+  - { code: "886078.TI", name: "商业航天" }
+  - { code: "886080.TI", name: "财税数字化" }
+  - { code: "886081.TI", name: "维生素" }
+  - { code: "886084.TI", name: "光纤概念" }
+  - { code: "886099.TI", name: "AI智能体" }
+  - { code: "886100.TI", name: "DeepSeek概念" }
+  - { code: "886101.TI", name: "兵装重组概念" }
+  - { code: "886102.TI", name: "中国AI 50" }
+  - { code: "886105.TI", name: "雅下水电概念" }
+  - { code: "886108.TI", name: "AI应用" }
+  - { code: "886111.TI", name: "玻璃基板" }
+  - { code: "886112.TI", name: "MLCC概念" }

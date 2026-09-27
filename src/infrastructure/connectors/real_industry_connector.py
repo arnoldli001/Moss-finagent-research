@@ -1,6 +1,6 @@
-"""科技行业真实产业数据连接器（免费公开数据源，替代模拟产业数据）。
+"""科技行业真实产业数据连接器（免费公开数据源）。
 
-覆盖指标（indicator id 与 MockIndustryConnector 保持一致，替换不改 id）：
+覆盖指标（indicator id 沿用行业层既有约定，替换数据源不改 id）：
 - ind:半导体销售额同比  → WSTS Historical Billings Report（全球月度销售额，自行计算同比%）
   数据源页：https://www.wsts.org/67/Historical-Billings-Report
   Excel 含 1986 年至今按区域（美洲/欧洲/日本/亚太/全球）月度销售额（千美元）。
@@ -13,7 +13,7 @@
 - 原始快照按日期落盘 data/industry_metrics/{wsts,nbs,csindex}/YYYY-MM-DD.json；
 - 网络失败但有历史快照时读取最近快照并在 extra 标记 storage_fallback=True；
 - 任何数据均带真实 source_name/source_url，confidence=0.9，verified=True，
-  与"模拟产业数据(Demo)"的 0.5/unverified 形成明确区分。
+  与 extra 里显式的 simulated=False 一起，保证"这条是真实数据"可被下游校验。
 """
 
 from __future__ import annotations

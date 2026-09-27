@@ -1,7 +1,8 @@
 """演示数据预热：提前拉取CPI/PPI并幂等入库，避免演示现场等待网络采集。
 
 运行：$env:PYTHONPATH="."; uv run python scripts/seed_demo_data.py
-说明：行业层指标为确定性模拟序列（MockIndustryConnector，运行时即时生成，无需预热）；
+说明：行业层指标已全部切到真实互联网数据源（中证指数官网/中电联CECI/CDE药审中心等），
+     由各自连接器在运行时按需拉取并落快照，本脚本无需预热它们；
      本脚本只预热真实宏观数据，重复执行安全（A04存储为幂等upsert）。
 """
 

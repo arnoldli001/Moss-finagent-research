@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from contextlib import asynccontextmanager
+from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
 
 from src.api.accounting_middleware import AccountingMiddleware
@@ -199,6 +202,41 @@ async def _warm_fundflow(runtime: Any,
     logger.info("资金流快照预热完成：%.2fs", time.monotonic() - t0)
 
 
+async def _warm_quant_data_status(*, delay: float = 12.0) -> None:
+    """后台预热「策略回测」的数据条体检（`/api/v1/quant/data-status`）。
+
+    为什么需要（2026-09-27 实测）：这个体检要逐表 `MIN/MAX(trade_date)`，而
+    本地仓库是 **SQLite、10 张表、约 1 亿行、日期列没有索引** →
+    `stats()` 单独量 **7.18s**，经公网首屏实测 **13.09s**。
+    也就是说**冷启动后第一个打开「策略回测」的用户**要盯着数据条等十几秒。
+
+    它现在已经不在事件循环上（见 `routes/quant.py` 的 `_collect_data_status`），
+    不会再拖累别人；这里再把"第一个用户"这一次也摘掉：启动十几秒后后台算一遍，
+    结果进 5 分钟 TTL 缓存，用户点开就是命中。
+
+    延迟 12 秒是刻意的：`.env`/`_BACKGROUND_WARM_DELAY` 那套说明记过
+    "预热与首屏抢资源"的教训，这个体检是纯磁盘 I/O，早跑会与首屏请求抢盘。
+    失败只记日志 —— 预热是优化，不是启动前置条件。
+    """
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        raise
+    started = time.monotonic()
+    try:
+        from src.api.routes.quant import warm_data_status  # noqa: PLC0415 启动期按需导入
+
+        # ⚠️ 不传参数：默认值（universe/root）必须与路由的默认一致，
+        #    否则缓存键对不上、预热等于没做（第一版写死 "data/quant" 就踩了）。
+        await warm_data_status()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 预热失败不影响任何功能
+        logger.info("数据条体检预热失败（忽略，按需自算）：%s", type(exc).__name__)
+        return
+    logger.info("数据条体检预热完成：%.2fs", time.monotonic() - started)
+
+
 async def _warm_external_sources(runtime: Any, *, delay: float = 8.0) -> None:
     """启动后台探测"可能不可达"的外网数据源，把故障冷却预先建立起来。
 
@@ -373,6 +411,39 @@ async def _run_intel_prewarm(runtime: Any) -> None:
         raise
     except Exception:  # noqa: BLE001 预热失败绝不能影响服务
         logger.warning("情报流预热循环异常退出（忽略）", exc_info=True)
+
+
+async def _check_sector_rotation_at_startup(*, delay: float = 60.0) -> None:
+    """行业轮动日报启动自检：落盘落伍就**自动补生成一次**。
+
+    场景：主机在 15:40 调度时点关机（Celery Beat 不补跑错过的触发），
+    晚上开机后虽然 cron 有每小时补跑窗口，但**重启本身就是最可靠的
+    触发器**（与 `_check_quant_sync_at_startup` 同一哲学）。
+
+    三条约束（同行情同步自检）：
+    1. **延迟 + 后台**：生成要 20~40 秒网络取数，绝不能占首屏；
+    2. **判定零网络**：`is_stale()` 只做"落盘日期 vs 本地交易日历"比较，
+       已最新时整个自检的总成本是一次内存字符串比较；
+    3. **任何异常只记日志**：补生成失败不该影响服务启动。
+    """
+    try:
+        await asyncio.sleep(delay)
+        from src.sector_rotation import service as rotation_service
+        from src.sector_rotation import store as rotation_store
+
+        if rotation_store.latest_date() and not rotation_service.is_stale():
+            logger.info("行业轮动日报已是最新（%s），启动自检跳过",
+                        rotation_store.latest_date())
+            return
+        logger.info("行业轮动日报落盘落伍（落盘 %s / 应有 %s），启动自动补生成",
+                    rotation_store.latest_date() or "无",
+                    rotation_service.expected_trade_date() or "?")
+        payload = await rotation_service.generate(force=True)
+        meta = payload.get("meta") or {}
+        logger.info("行业轮动日报启动补生成完成：%s（行业 %d 个）",
+                    meta.get("trade_date"), len(payload.get("industries") or []))
+    except Exception:  # noqa: BLE001 自检不是前置条件，失败只记日志
+        logger.warning("行业轮动日报启动自检异常（忽略）", exc_info=True)
 
 
 async def _run_event_alert_on_startup(scheduler: Any, runtime: Any, *,
@@ -606,6 +677,12 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(
         _check_quant_sync_at_startup(app.state.scheduler, runtime),
         name="quant-sync-startup-check")
+    # 行业轮动日报启动自检：主机关机错过 15:40 调度（或关机期间 Celery
+    # 补跑窗口也错过）时，**重启是唯一确定会发生的动作** —— 与上面行情
+    # 同步自检同一解法：启动后后台比对"落盘交易日 vs 应有交易日"，
+    # 落伍就自动补生成一次。已最新则零成本跳过（一次本地日历比较）。
+    asyncio.create_task(
+        _check_sector_rotation_at_startup(), name="sector-rotation-startup-check")
     # LLM 语义缓存索引预热：首次语义查找要扫描整个缓存目录建索引
     # （本机 3108 文件约 0.7s）。虽然是走线程池、不阻塞事件循环，
     # 但冷启动后第一个用户的第一次未命中要白等这一次。
@@ -616,6 +693,11 @@ async def lifespan(app: FastAPI):
     # 第一个用户就不必替所有人挨这一下。见 _warm_external_sources。
     asyncio.create_task(
         _warm_external_sources(runtime), name="external-source-warm")
+    # 「策略回测」数据条体检预热：仓库 10 张表约 1 亿行、日期列无索引，
+    # 冷算实测 7.18s（公网首屏 13.09s）。它已经不在事件循环上（不会再拖累别人），
+    # 这里再把"第一个用户"这一次也摘掉。见 _warm_quant_data_status。
+    asyncio.create_task(
+        _warm_quant_data_status(), name="quant-data-status-warm")
     # 事件告警启动补扫：**只要服务在启动就自动跑一次扫描**（用户口径 2026-09-24），
     # 让"盘中重启"不必干等到下一个定时点位。延迟 + 后台 + 失败只记日志，
     # 详见 `_run_event_alert_on_startup` 的说明。
@@ -716,8 +798,58 @@ async def lifespan(app: FastAPI):
     shutdown_infra_executors()
 
 
+class _SafeJSONResponse(JSONResponse):
+    """把非有限浮点（NaN / ±Inf）换成 `null` 再序列化。
+
+    ## 为什么需要它（2026-09-27 做T快照 500 的成因）
+
+    Starlette 的 `JSONResponse.render()` 用的是 `allow_nan=False`
+    （`.venv/Lib/site-packages/starlette/responses.py:198`）。于是响应体里
+    **出现任何一个 NaN / Infinity**，序列化就会抛
+
+        ValueError: Out of range float values are not JSON compliant
+
+    这个异常发生在**响应渲染阶段** —— 也就是**路由函数的 try/except 之外**。
+    所以业务侧那些"取数失败转 502"的兜底**完全拦不住它**：
+
+        用户看到：`SYS_5000 服务器开了点小差，请稍后重试`
+        真实原因：某个因子算出了 NaN
+
+    ## 为什么不逐点修
+
+    项目里已经有大量 `math.isfinite(...) else None` 的**逐点**护栏
+    （intraday / mainline / quant 里几十处）。逐点修的问题是：
+    **漏掉任何一处就整体 500**，而且 NaN 常来自 pandas/numpy 的中间计算，
+    靠人眼找不干净。
+
+    所以在**出口集中兜一次**：非有限 → `null`，语义上等于"这个数没有"，
+    与项目里 `None` 表示缺失的约定一致。**前端不需要改**。
+    """
+
+    @staticmethod
+    def _clean(value: Any) -> Any:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, Integral):
+            return int(value)
+        if isinstance(value, Real):
+            number = float(value)
+            return number if math.isfinite(number) else None
+        if isinstance(value, dict):
+            return {key: _SafeJSONResponse._clean(item)
+                    for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_SafeJSONResponse._clean(item) for item in value]
+        return value
+
+    def render(self, content: Any) -> bytes:
+        return super().render(self._clean(content))
+
+
 app = FastAPI(
     title=settings.app_name, version="0.1.0", lifespan=lifespan,
+    # 出口统一兜住 NaN/Inf —— 见 `_SafeJSONResponse` 的说明。
+    default_response_class=_SafeJSONResponse,
     # ⚠️ **公网环境（prod / pilot）根本不注册交互式文档**。
     #
     # `/docs`、`/redoc`、`/openapi.json` 不需要登录就能打开，会一次性

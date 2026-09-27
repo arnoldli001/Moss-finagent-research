@@ -96,6 +96,50 @@ def _sector_blacklist() -> frozenset[str]:
     return frozenset(out)
 
 
+def _scope_to_pool(conn: sqlite3.Connection, codes: list[str], *,
+                   pool_only: bool = True,
+                   concepts_only: bool = True) -> list[str]:
+    """把待算板块**收口到看板默认视图真正渲染的那些**。
+
+    ## 为什么收（2026-09-27）
+
+    改之前 `compute_all_metrics()` 对 `compute_water_changes()` 返回的**全部**
+    板块算 —— 实测一周 **1479 个**，而看板默认视图只渲染 **262 个**。
+
+    ## ⚠️ `concepts_only` 必须跟着看板的默认勾选状态
+
+    看板的「只看概念板块」勾选框**默认勾上**（`SectorCrowdingTab.tsx`
+    `useState(true)` → `config_list?concepts_only=true`）。
+    第一版收口漏了这点、用了 `concepts_only=False`，于是取到 **554**，
+    多算了 **292 个非概念板块**（行业指数 / 地区 / 指数样本 / 同花顺自建组合）。
+
+    判据必须是**默认渲染集合**，不是"可能被渲染的集合" —— 勾选框是逃生口
+    （tooltip 自己就写"数据本身是全量落库的，取消勾选即可查看全部"）。
+    取消勾选时那 292 行的 4 列会显示「—」，这是有意接受的代价。
+
+    ⚠️ 这**不是**主线那套「20 日胜率」门槛：拥挤度刻意**不**吃
+    `sector_blacklist.yaml`（604 条），因为它刻意保留行业指数
+    （"以后想看行业拥挤度不用重跑 6 年"，见 `_sector_blacklist`）。
+    这里收的是**看板可见性**，不是题材优劣。
+
+    ## 清单为空时退回全量
+
+    首装还没种子化、或用户把清单清空时，交集是空集。这时**不能**算成
+    "本周 0 个板块、0 行" —— 那会像一个成功的空周，把库里的历史周次
+    序列弄断。所以退回全量并告警：宁可多算，不可静默算空。
+    """
+    if not pool_only:
+        return codes
+    pool = set(db.list_visible_codes(conn, concepts_only=concepts_only))
+    kept = [code for code in codes if code in pool]
+    if not kept:
+        logger.warning("看板清单为空，本轮退回全量计算（%d 个板块）", len(codes))
+        return codes
+    logger.info("周频指标按看板清单收口：%d → %d 个板块（少算 %d，概念 only=%s）",
+                len(codes), len(kept), len(codes) - len(kept), concepts_only)
+    return kept
+
+
 logger = logging.getLogger(__name__)
 
 #: A 股交易日历近似：用 `quant_daily` 里真实出现过的日期，不要用自然日推算
@@ -171,7 +215,8 @@ def compute_water_changes(conn: sqlite3.Connection, *,
                           short_days: int = 5,
                           month_days: int = 20,
                           long_days: int = 40,
-                          min_base_water: float = 0.0
+                          min_base_water: float = 0.0,
+                          codes: "set[str] | None" = None
                           ) -> tuple[dict[str, dict[str, Any]], str]:
     """批量算所有板块的水位变化（一次全表扫描 + 内存分板块，别按板块查库）。
 
@@ -190,9 +235,16 @@ def compute_water_changes(conn: sqlite3.Connection, *,
     **唯一事实来源**。历史行保留不动（`db.DAILY_TABLE` 不删）。
     """
     blacklist = _sector_blacklist()
-    rows = conn.execute(
-        f"SELECT sector_code, trade_date, water_level FROM {db.DAILY_TABLE} "
-        f"ORDER BY sector_code, trade_date").fetchall()
+    sql = (f"SELECT sector_code, trade_date, water_level FROM {db.DAILY_TABLE} ")
+    params: list[Any] = []
+    if codes:
+        # 只算指定板块（用户新增板块时的"临时算"走这条路）：
+        # 全表 217 万行扫一遍要 2~3 秒，**单板块只查它自己的行**是毫秒级。
+        marks = ",".join("?" * len(codes))
+        sql += f"WHERE sector_code IN ({marks}) "
+        params.extend(sorted(codes))
+    sql += "ORDER BY sector_code, trade_date"
+    rows = conn.execute(sql, params).fetchall()
     if not rows:
         return {}, ""
 
@@ -404,6 +456,105 @@ def _register(task: MetricTask) -> None:
                 _TASKS.pop(stale.task_id, None)
 
 
+def compute_metrics_for_codes(codes: "list[str] | set[str]",
+                              *, config: SectorCrowdingConfig | None = None
+                              ) -> dict[str, Any]:
+    """**临时算**指定板块的周频 4 列（用户新增板块到前端时调用）。
+
+    ## 为什么需要它（用户 2026-09-27 定的产品规则）
+
+    > 前端已配置数据要提前算，用户打开前端直接就加载算好的数据，而不是等结果。
+    > 对于非前端配置数据，在用户**新增**概念板块到前端时，**再临时算**。
+
+    所以范围是这样切的：
+
+    * **预计算** = 清单里**已配置且可见**的板块（`visible = 1`，当前 554 个）
+      —— 打开页面就有数，不用等
+    * **按需计算** = 用户**新增**的那个板块 —— 就是本函数
+
+    ⚠️ 与 `compute_all_metrics()` 的区别只在**范围**：
+    本函数走 `codes=` 过滤，**不扫全表**（全表 217 万行要 2~3 秒，
+    单板块是毫秒级），所以可以在请求里同步等它跑完。
+
+    ⚠️ **不写 `metric_meta`**：那是"整周算过了吗"的台账，
+    局部补算不能把整周标记成已完成，否则下一轮周任务会误判跳过。
+    """
+    out: dict[str, Any] = {"requested": len(codes), "computed": 0,
+                           "failed": [], "week": ""}
+    wanted = {str(code) for code in codes if str(code or "").strip()}
+    if not wanted:
+        return out
+    config = config or load_config()
+    conn = None
+    conn_wh = None
+    try:
+        conn = db.get_db_connection(config)
+        db.init_tables(conn)
+        conn_wh = _open_warehouse(config)
+        changes, as_of = compute_water_changes(
+            conn, short_days=config.metrics.short_days,
+            month_days=config.metrics.month_trading_days,
+            long_days=(config.metrics.month_trading_days
+                       * config.metrics.long_month_multiplier),
+            min_base_water=config.metrics.min_base_water,
+            codes=wanted)
+        if not changes:
+            return out
+
+        flow_last = _latest_dataset_date(conn_wh, "quant_moneyflow")
+        span = max(1, int(config.metrics.month_trading_days))
+        calendar: list[str] = []
+        flow_base = ""
+        if flow_last:
+            calendar = trading_days(conn_wh, end=flow_last, limit=span + 1)
+            if len(calendar) >= span + 1:
+                flow_base = calendar[-1]
+
+        names = {str(row["sector_code"]): str(row["sector_name"] or "")
+                 for row in conn.execute(
+                     f"SELECT sector_code, sector_name FROM {db.META_TABLE}")}
+        week = week_key()
+        stamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        payload: list[dict[str, Any]] = []
+        for code in sorted(changes):
+            item = changes[code]
+            try:
+                net, mv, _members, member_source = _one_sector_flow(
+                    code, config, flow_base, flow_last, span)
+            except Exception as exc:  # noqa: BLE001 单板块失败不拖垮请求
+                out["failed"].append(code)
+                logger.warning("临时算·%s 失败：%s", code, exc)
+                continue
+            ratio = (round(net / mv * 100.0, 4)
+                     if net is not None and mv not in (None, 0) and mv > 0
+                     else None)
+            payload.append({
+                "sector_code": code, "sector_name": names.get(code, ""),
+                "compute_week": week, "computed_at": stamp,
+                "base_date_5d": item.get("base_date_5d", ""),
+                "chg_5d": item.get("chg_5d"),
+                "base_date_1m": item.get("base_date_1m", ""),
+                "chg_1m": item.get("chg_1m"),
+                "base_date_2m": item.get("base_date_2m", ""),
+                "chg_2m": item.get("chg_2m"),
+                "flow_base_date": flow_base, "flow_last_date": flow_last,
+                "net_inflow": net, "circ_mv_base": mv, "flow_ratio": ratio,
+                "member_source": member_source,
+            })
+        if payload:
+            out["computed"] = db.upsert_metrics(conn, payload)
+        out["week"] = week
+        out["as_of"] = as_of
+        logger.info("临时算完成：请求 %d，写入 %d，失败 %d",
+                    out["requested"], out["computed"], len(out["failed"]))
+        return out
+    finally:
+        if conn is not None:
+            conn.close()
+        if conn_wh is not None:
+            conn_wh.close()
+
+
 def compute_all_metrics(*, config: SectorCrowdingConfig | None = None,
                         force: bool = False, task_id: str = ""
                         ) -> MetricTask:
@@ -456,7 +607,9 @@ def compute_all_metrics(*, config: SectorCrowdingConfig | None = None,
                  for row in conn.execute(
                      f"SELECT sector_code, sector_name FROM {db.META_TABLE}")}
 
-        codes = sorted(changes)
+        codes = _scope_to_pool(conn, sorted(changes),
+                               pool_only=config.metrics.pool_only,
+                               concepts_only=config.metrics.pool_concepts_only)
         task.total = len(codes)
         logger.info("周频指标开算：%d 个板块，拥挤度截至 %s，资金流窗口 %s~%s",
                     len(codes), as_of, flow_base or "—", flow_last or "—")
@@ -519,6 +672,9 @@ def compute_all_metrics(*, config: SectorCrowdingConfig | None = None,
             "purified_sectors": str(source_tally.get("purified", 0)),
             "raw_sectors": str(source_tally.get("raw", 0)),
             "use_purified_members": str(bool(config.metrics.use_purified_members)),
+            # 收口开关也要留痕：否则无法回答"这一周到底按哪个范围算的"
+            "pool_only": str(bool(config.metrics.pool_only)),
+            "pool_concepts_only": str(bool(config.metrics.pool_concepts_only)),
         })
         task.status = "done"
         return task

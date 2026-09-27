@@ -1,6 +1,6 @@
 """消费/周期/医药行业估值（PE-TTM）真实数据连接器。
 
-替换 `MockIndustryConnector` 的另外三个模拟指标 —— 与
+替换行业层原先占位的三个合成指标 —— 与
 `RealTechIndustryConnector`（A13科技）同思路：**保持 indicator id 不变**，
 只把数据源从确定性合成序列换成免费公开的真实数据。
 

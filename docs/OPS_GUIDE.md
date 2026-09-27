@@ -148,26 +148,151 @@ try { Invoke-WebRequest https://moss.wujiaitool.cn/api/v1/health -TimeoutSec 20 
 | **HTTP 502** | ❌ 后端没起 / 端口不对 → 查 §2.1 |
 | 连不上 | ❌ cloudflared 挂了 → `Get-Process cloudflared` |
 
-### 2.6 对外实例的自动拉起（值守）
+### 2.6 ⚠️ 孤儿进程：为什么会发生、怎么根治
+
+**实测现象**：一个 pytest 进程成了孤儿 —— 父进程已退出、**CPU = 0 秒、
+HandleCount = 0、内存 1 MB**，从启动起就卡死，**一天多没动过**，
+却一直占着资源与数据库文件句柄。（另一次同类：全量测试跑到 82% 停住，
+13.5 分钟 CPU 零增长。）
+
+**根因两条，缺一不可**：
+
+1. **Windows 没有 `PR_SET_PDEATHSIG`** —— 内核**不会**在父进程死亡时
+   自动回收子进程。这是 Linux 上的默认配套机制，Windows 上不存在。
+2. **pytest 自己不检测父进程** —— 父一死它就成了无主进程继续挂着，
+   而它卡住的位置连超时都没有。
+
+于是形成稳定复现的配方：**pytest 因某个用例挂住 → 宿主（AI 工具调用 /
+交互式 shell）超时或被强杀 → pytest 变孤儿，永久留下。**
+
+**根治：经 Job Object 运行**（已落地，不依赖任何人记得清理）
+
+```powershell
+# ✅ 推荐：隔离环境 + Job Object（父死子亡，内核保证）
+.\.venv\Scripts\python.exe manage.py test tests/unit -q
+
+# ✅ 也可直接调用运行器（参数原样透传给 pytest）
+.\.venv\Scripts\python.exe scripts\run_tests_in_job.py tests -q -p no:randomly
+
+# ❌ 不要这样：父进程一被强杀就留孤儿
+python -m pytest tests/unit -q
+```
+
+`scripts/run_tests_in_job.py` 把 pytest 放进一个
+**`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`** 的 Job：Job 句柄只被运行器持有，
+运行器一消失（正常退出 / 被 taskkill / 控制台关闭 / 超时终止）→ 内核关闭
+该句柄 → **pytest 及其全部后代一并被终止**。
+
+**对照实验**（强杀父进程后看残留）：
+
+| 方式 | 结果 |
+|---|---|
+| 有 Job 保护 | ✅ 无残留（内核一并终止） |
+| 无保护（shell 启动，杀 shell） | ❌ 留下孤儿 pytest |
+
+**排查命令**：
+
+```powershell
+# 现在有没有孤儿 pytest（父 PID 已不存在的；CPU 长时间为 0 = 卡死，可直接 Stop-Process）
+Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+  Where-Object { $_.CommandLine -match 'pytest' } |
+  Select-Object ProcessId, ParentProcessId, CreationDate
+
+# 某进程是否在 Job Object 里（判定"Job 关闭陪葬"这条杀因）
+.\.venv\Scripts\python.exe scripts\job_status.py 8110
+```
+
+**为什么 Job Object 比"轮询父 PID"可靠**：轮询有两个洞 —— 轮询间隔内
+父死了它还在跑；以及父 PID 被复用会误判。Job Object 是内核级的，两个洞都没有。
+
+### 2.7 内存与"被强杀"的判据（2026-09-26 实测）
+
+**先说结论：Windows 不会因为物理内存紧张就杀进程。** 它只会把页换出去；
+真正触发终止的是**提交量（commit）耗尽**。所以判断"是不是内存杀的"，
+要看**提交量**而不是物理内存。
+
+实测当时的状态：
+
+| 指标 | 值 | 判读 |
+|---|---|---|
+| 物理内存 | 31.7 GB，可用 **3.1 GB（90% 已用）** | 偏紧，但**不足以杀进程** |
+| **提交量** | **49.05 / 63.74 GB（77%）**，剩 **14.78 GB** | 离耗尽很远 → **排除 OOM** |
+| 页面文件 | D 盘 32 GB（峰值用 8.8 GB），自动管理**关** | 提交量的后盾，够用 |
+| 内存大户 | llama-server **9.8 GB**、Trae CN 6.8 GB、WorkBuddy 3.0 GB | Ollama 模型常驻是最大项 |
+
+**"被强杀"的排查顺序**（本次结论：前三条全被排除）：
+
+1. **崩溃？** 看 `data/run/backend.log` 尾部有没有异常/退出记录。
+   强杀**不走 lifespan**，所以"日志干净地停在最后一个 200"就是强杀的特征。
+2. **OOM？** 看提交量（不是物理内存）。见上表 —— 77% 就排除了。
+3. **Job Object 陪葬？** 跑 `scripts/job_status.py <port>`。
+   实测结果：**不在任何 Job 里** → 排除。
+4. **那就是显式 `taskkill /F`**（或等价的外部强制终止）。
+
+**验证过的保护措施**：
+
+| 措施 | 作用 | 状态 |
+|---|---|---|
+| `MossPilotWatchdog` 计划任务 | 服务消失后 **≤5 分钟自动拉起**，现场入 `backend_incidents.jsonl` | ✅ 已启用（实测 19:12:43 死 → 19:15:17 恢复） |
+| 事故流水带内存现场 | 每次重启记录**当时**的可用内存/提交量/是否在 Job 里 —— 这些是**运行期状态、事后无法回溯**的 | ✅ `manage.py ensure` 已记录 |
+| 应用层缓存 + KeepAlive | 隧道抖动时表现为"数据略旧"而非"打不开" | ✅ `panelPrefetch` / `intelCache` / `alertsCache` |
+
+**可选的加固（需你决定，我没动）**：机器物理内存常年在 90%，
+最大项是 Ollama 的 **llama-server 9.8 GB**（两个实例）。
+若这个模型不常驻使用，把它改成按需加载可以把可用内存抬到 12 GB 以上 ——
+虽然**不解决**这次强杀（已排除 OOM），但对 SQLite 与行情任务的稳定性有实际好处。
+
+---
+
+### 2.8 对外实例的自动拉起（值守）
 
 | 项 | 值 |
 |---|---|
-| 计划任务 | **`MossPilotWatchdog`**（每 5 分钟一次；由用户在 Trae 里创建） |
+| 计划任务 | **`MossPilotWatchdog`**（**每 1 分钟**一次；2026-09-27 从 5 分钟收紧 —— 间隔 = 进程消失后**最长不可用时间**，用户侧表现为"间歇性打不开/后端不可达"） |
 | 包装脚本 | `scripts/pilot_watchdog.ps1` |
 | 实际动作 | `python manage.py ensure --env pilot --port 8110` |
-| 死亡现场 | `data/run/backend_incidents.jsonl`（JSONL，含**最后一次活动时刻**） |
+| 死亡现场 | `data/run/backend_incidents.jsonl`（JSONL，含**最后一次活动时刻** + 内存/提交量快照） |
 | 值守自身异常 | `data/run/pilot-watchdog.log`（**只在退出码非 0 时**写一行） |
+
+> ⚠️ **一次静默死亡的真实代价**（2026-09-27 复盘）：后端进程会**无声消失**
+> （`backend.log` 最后一行仍是 `200 OK`，事件日志无崩溃记录，像被强杀），
+> `ensure` 只能"发现端口空了再拉起来"。所以**间隔就是用户看到 502 的时长**：
+> 5 分钟 → 最长 5 分钟不可用；1 分钟 → 最长 1 分钟。
+> 若再次发生，优先看 `backend_incidents.jsonl` 的 `mem_free_gb/commit_pct`
+> 与 `last_activity`，并考虑用"父进程持有 uvicorn + 记录退出码"的守护方式
+> 换掉轮询（轮询拿不到退出码，这是它唯一的短板）。
+> 详见 `docs/INCIDENT_FIRST_SCREEN_LOOP_BLOCK_20260927.md` §三。
+
+**隧道值守（2026-09-26 新增，同一套思路）**：
+
+| 项 | 值 |
+|---|---|
+| 计划任务 | **`MossTunnelWatchdog`**（每 5 分钟一次） |
+| 包装脚本 | `scripts/tunnel_watchdog.ps1` |
+| 实际动作 | `python manage.py tunnel-ensure` |
+| 流水 | `data/run/tunnel_incidents.jsonl` |
+| 自身异常 | `data/run/tunnel-watchdog.log` |
+
+⚠️ **`tunnel-ensure` 的判据**：只有"连不上 / 超时 / **5xx**"才算失败，
+**4xx 一律算成功** —— 能拿到业务错误码就说明请求走完了
+cloudflared → 后端 → 回来的整条路。踩过的坑：第一版把任何非 200 当失败，
+于是探测路径被登录门槛拦下（401/403）时误判为故障，**白白重启了一次隧道**
+（重启会中断所有在途请求）。
 
 ```powershell
 # 看它有没有在干活 / 最近一次结果
 Get-ScheduledTaskInfo -TaskName 'MossPilotWatchdog' |
   Select-Object LastRunTime, LastTaskResult, NextRunTime
+Get-ScheduledTaskInfo -TaskName 'MossTunnelWatchdog' |
+  Select-Object LastRunTime, LastTaskResult, NextRunTime
 
 # 看历史上"死过几次、死在哪一刻"
 Get-Content data\run\backend_incidents.jsonl
+Get-Content data\run\tunnel_incidents.jsonl
 
 # 手动跑一次（健康时完全静默、不写任何日志）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\pilot_watchdog.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\tunnel_watchdog.ps1
 ```
 
 **三条必须知道的约束**（`manage.py ensure` 的判据，改之前先读）：
@@ -205,6 +330,7 @@ $t = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
 # 进程在不在
 Get-Process cloudflared
 
+
 # 配置（回源目标在这里）
 Get-Content "C:\Windows\System32\config\systemprofile\.cloudflared\config.yml"
 ```
@@ -214,6 +340,145 @@ Get-Content "C:\Windows\System32\config\systemprofile\.cloudflared\config.yml"
 
 > **踩坑记录**：曾把 8110 的实例误判为"僵尸进程"并停掉，导致公网 502。
 > **教训：动生产进程前先读隧道配置，不要靠"我测不通"推断。**
+
+### 3.1 ⚠️ 已知瓶颈：隧道本身慢且会挂死（2026-09-26 实测）
+
+这一节是**换隧道方案的决策依据**，别重复试。
+
+**同一条 `/api/v1/health/live`，同一时刻的对照**（这条对照是整节的核心）：
+
+| 路径 | 结果 |
+|---|---|
+| **后端本机** | **1.9 ~ 3.4 毫秒，5/5 成功** |
+| **走公网隧道** | **1.14 ~ 11.5 秒，9/10 成功（1 次直接挂死）** |
+
+**后端是 2 毫秒级的健康服务，问题全在隧道。** 用户看到"后台挂了"，
+实际挂在隧道上 —— 所以**别急着去查后端**，先照这张表对照一次。
+
+**★ 重启隧道能恢复**（实测两次，同一测法）：
+
+| | 重启前 | 重启后 |
+|---|---|---|
+| 成功率 | 9/10（1 次挂死） | **10/10** |
+| 中位延迟 | 3.34 s | **1.60 s** |
+| 最大延迟 | 11.5 s | 8.94 s |
+
+这条链路**会随时间劣化**：连续跑 35 小时后劣化、另一次 23 分钟后复现同样形态。
+所以已做成自动的 —— 见 §2.8 的 `MossTunnelWatchdog`。
+
+**排除过的两条错误假设**（都靠实测，别再走一遍）：
+
+1. **不是线路质量**：ping CF 边缘 **159 ms、0% 丢包**（min 160 / max 159，极稳）。
+2. **不是 cloudflared 连接老化**：把进程重启（当时已跑 35.2 小时）后，
+   仍然 15 秒超时 + 1.5~3.3 秒延迟 —— 但**重启确实改善了成功率与中位延迟**
+   （见上表）。两者不矛盾：重启清掉的是**劣化的连接池**，不是线路本身。
+
+**结论**：**部分 HTTP 流会永久挂住**（走到一半没有任何超时/重传救援）。
+这是 CF 免费隧道这条路径的固有行为，应用层改不动它。
+
+**已排除的替代方案**（都不需要改代码就能试）：
+
+| 方案 | 实测 | 可用性 |
+|---|---|---|
+| **localtunnel**（`npx localtunnel --port 8110`） | 热连接 ttfb **稳定 1.34~1.42 s**（约比 CF 快 2 倍） | ❌ **不可用**：浏览器访问会被插 interstitial 页（要访问者公网 IP 当密码），对真实网站是死的 |
+| **serveo.net**（SSH 反向隧道） | —— | ❌ **已停用**：`Permission denied (publickey,keyboard-interactive)`，现在要 SSH 公钥 |
+| pinggy.io | 未测 | ⚠️ 免费版需临时 SSH 公钥，且会话有**小时级时长上限**，不适合长期站点 |
+| ngrok | 未测 | ⚠️ 需注册拿 authtoken（没法无人值守开通）；免费版访问页有提示页 + 域名随机 |
+| **frp / rathole + 国内云主机** | 未测 | ✅ **推荐**：自建完全可控、无提示页、国内中转延迟**数量级**改善。代价是要一台 VPS（最低配即可） |
+
+**当前应对**（已落地，不依赖换隧道）：
+
+- 前端把"惰性"当一等公民：`panelPrefetch` + `KeepAlive` + `alertsCache`/`intelCache`
+  → **切页签与二次访问 ≈ 0 网络**，隧道再差也不影响这些路径。
+- `/intel/bootstrap` 把首屏 2 条请求并成 1 条（每次往返都有一笔固定开销）。
+- `IntelPanel` 的 `LOAD_TIMEOUT_MS = 6000`：超时即用缓存渲染并解除忙碌态，
+  让抖动表现为"数据略旧"而不是"转圈几十秒"。
+- `MossTunnelWatchdog`（每 5 分钟）：连续探测失败就自动重启 cloudflared。
+
+---
+
+### 3.2 ⚠️ 隧道值守的两个坑（2026-09-26 实测，都已修复）
+
+**坑 ①：`cloudflared` 是 Windows 服务，不能自己去杀+起**
+
+这台机器上它是**以服务方式运行**的，生命周期归 SCM 管：
+
+```
+Cloudflared 服务   StartMode = Auto
+SERVICE_START_NAME = LocalSystem
+FAILURE_ACTIONS    = RESTART -- Delay = 20000 milliseconds   ← SCM 会自动拉起来
+```
+
+原来的重启逻辑是"`taskkill` 全部 cloudflared + 自己 `Start-Process` 一个"，
+于是和 SCM 的自动恢复打架：
+
+```
+杀掉服务进程 → SCM 20 秒后拉起一个（PID A）
+            → 我们又起一个（PID B）＝ 两个实例
+```
+
+**症状**：`tunnel info` 里出现**两个 connector**（实测创建时间相差 16 秒），
+互相抢同一个隧道；而流水里连续两次 `restart_ineffective`
+（**重启不但没修好，重启本身成了不稳定源**）。
+
+**修法**：改走服务 —— `Restart-Service -Name Cloudflared`（在跑但不通）
+或 `Start-Service`（停了）。由 SCM 保证永远只有一个实例。
+
+**排查命令**：
+
+```powershell
+# 服务状态与恢复策略
+Get-CimInstance Win32_Service -Filter "Name = 'Cloudflared'" |
+  Select-Object State, StartMode, ProcessId
+sc.exe qfailure Cloudflared
+
+# 有没有重复实例（应只有 1 个，且 PID == 服务的 ProcessId）
+Get-CimInstance Win32_Process -Filter "Name = 'cloudflared.exe'" |
+  Select-Object ProcessId, CreationDate
+```
+
+#### ★ 更深一层的教训：**我们自己就是"服务意外终止"的原因**
+
+`Get-WinEvent` 里 SCM 会记 `7031 服务意外地终止`。查它的历史会发现：
+
+```
+09/25 00:29 ~ 00:43   计数一路涨到 28 次   ← 曾有一次真正的崩溃循环
+（之后一直稳定，没有人动它）
+09/25 08:34:57        第 1 次              ← 稳定期的孤立一次
+09/26 19:47:01        第 1 次              ← ★ 我开始手工重启隧道
+09/26 20:12:15        第 2 次              ← ★ 我的 tunnel-ensure 在杀进程
+09/26 20:14:16        第 3 次              ← ★ 同上
+09/26 21:56:56        第 4 次              ← ★ 同上
+```
+
+**新增的那 4 次崩溃全部由我的 `taskkill` 造成。**
+
+所以当时的推理链是错的：我拿"服务意外终止"的日志去证明"它不稳定"，
+而那些终止**正是我自己造成的**。**在拿日志当证据之前，先确认那段时间
+自己有没有动过它** —— 否则会把自己的动作当成系统的病症。
+
+**坑 ②：探测窗口太短，一次抖动就误重启**
+
+CF 这条路径会有 **15~30 秒的瞬时超时**（同一时段实测到 8.3 秒、15.9 秒各一次），
+而第一版探测是 3 次 × 2 秒（总窗口 12 秒）——**一次抖动就被判成故障**，
+触发了一次不必要的重启。
+
+现在改成 **4 次 × 5 秒（约 60 秒窗口）**：跨得过瞬时抖动，
+真故障也能在一分钟内恢复。每次探测的实际延迟/错误都记进流水
+（`probe_log`），事后能区分"4 次都超时"与"4 次都很快但 500"。
+
+**实测验证了这次调整的必要性**（`--verbose`）：
+
+```
+[tunnel] 第 1 次失败：TimeoutError（20531ms）   ← 20.5 秒超时
+[tunnel] 第 2 次探测成功（HTTP 403 属 4xx）      ← 但它其实通
+  退出码=0  总耗时=32.1s
+```
+
+按旧参数，这一次就会误判并重启一根**没坏**的隧道。
+
+> **这本身也说明**：CF 隧道不能作为正式入口。换香港（`docs/HK_VPS_MIGRATION.md`）
+> 的直接理由就是它 —— 不是"配置不对"，而是这条路径**固有地会瞬时挂死**。
 
 ---
 
@@ -473,7 +738,7 @@ ship 之后无需重启后端（`StaticFiles` 每次请求都读盘）。
 | `scripts/reset_admin_password.py` | **新增**：重置已有账号密码的引导入口（`--clip` / `--one-line` / `--expect-db`） |
 | `scripts/_list_admins_ro.py` | **新增**：只读列出各库管理员 |
 
-### 8.3 ⚠️ 两处会反复浪费时间的坑（已确认）
+### 8.3 ⚠️ 三处会反复浪费时间的坑（已确认）
 
 1. **全量测试会挂在 WebSocket 用例上**：
    `tests/integration/test_alert_api.py::test_ws_receives_alert_pushed_during_scan`
@@ -482,6 +747,8 @@ ship 之后无需重启后端（`StaticFiles` 每次请求都读盘）。
    `--deselect tests/integration/test_alert_api.py::test_ws_receives_alert_pushed_during_scan`
 2. **`pytest-randomly` 已装**：不加 `-p no:randomly` 每次顺序都变，
    "挂在第 N 个用例"这类定位会失效。
+3. **★ 别直接调 pytest，用 `manage.py test`** —— 否则会留下**孤儿进程**
+   （见 §2.7）。
 
 ### 8.4 「热点&研报小作文」首屏 5~10 秒（2026-09-26）
 

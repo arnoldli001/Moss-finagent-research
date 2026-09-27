@@ -724,6 +724,88 @@ async def intel_feed_status(request: Request) -> dict[str, Any]:
     return _feed_status()
 
 
+@router.get("/bootstrap")
+async def intel_bootstrap(
+    request: Request,
+    limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=200),
+    codes: str = Query(default=""),
+    sort: str = Query(default="credibility",
+                      pattern="^(credibility|time)$"),
+    filter: str = Query(default="all"),
+    direction: str = Query(default="all"),
+    horizon_days: int = Query(default=45, ge=1, le=180),
+) -> dict[str, Any]:
+    """**一次往返**取齐情报中心首屏要的全部东西（情报流 + 日历 + 热度）。
+
+    ## 为什么值得合并（2026-09-26 实测）
+
+    这面首屏原来要发 **3 条**请求：`/feed` + `/calendar` + `/heat`。
+    本机各自几十毫秒无所谓，但公网实测（真实会话、gzip 已生效）：
+
+        情报流   53.5 KB   4.93 s
+        事件告警 21.4 KB   9.26 s
+        热度      1.4 KB   2.52 s   ← 1.4 KB 也要 2.5 秒
+
+    **1.4 KB 也要 2.5 秒**，说明瓶颈不是字节数而是**往返本身**
+    （隧道 RTT + TLS/队头等待；同一时段一次 TLS 握手直接 180 秒超时）。
+    既然是"每次往返都要付一笔固定开销"，把 3 次并成 1 次就是直接省掉两笔。
+
+    ⚠️ **`/heat` 不在这里重复取**：情报流的 payload 里本来就带 `heat`
+    （`_build_feed_bg` 里 `payload["heat"] = await _build_heat(...)`）。
+    再调一次 `/heat` 是**纯浪费** —— 所以这条端点只发 feed + calendar，
+    前端从 `feed.heat` 拿热度。名字叫 bootstrap，但**不做多余的事**。
+
+    ## 与各端点缓存的关系（为什么它不会更慢）
+
+    - feed 走 `_FEED_CACHE`（TTL 60s，请求**从不等采集**，冷启动给空壳）；
+    - calendar 走慢聚合缓存（小时级 TTL，命中即零上游）；
+    - 所以这条端点在热路径上基本是**两次内存组装**，代价约为 0。
+
+    ⚠️ **不加 gzip 相关处理**：全局 `GZipMiddleware` 已经覆盖它。
+    """
+    from src.domain.intel.credibility import FILTERS
+
+    if filter not in FILTERS:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "bad_filter",
+                    "message": f"filter 必须是 {'/'.join(FILTERS)} 之一"})
+    if direction not in _DIRECTIONS:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "bad_direction",
+                    "message": f"direction 必须是 {'/'.join(_DIRECTIONS)} 之一"})
+
+    feed = await intel_feed(
+        request=request, limit=limit, codes=codes, sort=sort, filter=filter,
+        direction=direction, refresh=False)
+    calendar = await _slow_payload(
+        f"calendar_{horizon_days}",
+        _calendar_builder(horizon_days))
+    return {"feed": feed, "calendar": calendar}
+
+
+def _calendar_builder(horizon_days: int) -> Any:
+    """构造"现算一份日历 payload"的协程（供 `/calendar` 与 `/bootstrap` 共用）。
+
+    ⚠️ 抽出来是因为**两处必须逐字段一致**：日历的 `disclaimer` 是合规声明，
+    两份实现分叉就会出现"从日历页进来有声明、从首屏进来没有"这种
+    只在某一条路径上出现的缺失。
+    """
+    from src.domain.intel.calendar import build_calendar
+
+    async def _build() -> dict[str, Any]:
+        res = await build_calendar(horizon_days=horizon_days)
+        payload = res.to_public()
+        payload["disclaimer"] = (
+            "本日历只呈现已公布的日程安排与覆盖范围统计，"
+            "不含方向判断，不构成投资建议。"
+            "日程可能变更，请以交易所与公司公告为准。")
+        return payload
+
+    return _build
+
+
 @router.get("/item/{content_hash}")
 async def intel_item(content_hash: str, request: Request) -> dict[str, Any]:
     """单条**全文**（用户口径 2026-10-01："点击可以看全文"）。
@@ -941,22 +1023,12 @@ async def intel_calendar(
     """
     await require_feature(request, FEATURE_HOT)
 
-    from src.domain.intel.calendar import build_calendar
-
-    async def _build() -> dict[str, Any]:
-        res = await build_calendar(horizon_days=horizon_days)
-        payload = res.to_public()
-        payload["disclaimer"] = (
-            "本日历只呈现已公布的日程安排与覆盖范围统计，"
-            "不含方向判断，不构成投资建议。"
-            "日程可能变更，请以交易所与公司公告为准。")
-        return payload
-
     # ★ 走慢聚合缓存（命中则**零上游**）。实测这一条原来是 11.1 秒：
     #   宏观源按天逐个请求财经日历，光它就占 8.7 秒（见 `calendar.py`
     #   的 `FEED_FETCH_MAX_DAYS`）。而日程类内容一天之内几乎不变。
     try:
-        return await _slow_payload(f"calendar_{horizon_days}", _build)
+        return await _slow_payload(
+            f"calendar_{horizon_days}", _calendar_builder(horizon_days))
     except Exception as exc:  # noqa: BLE001
         logger.exception("投资日历聚合失败")
         raise HTTPException(

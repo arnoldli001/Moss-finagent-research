@@ -367,6 +367,39 @@ class Settings(BaseSettings):
     intel_slow_cache_hours: float = _env_field(
         "INTEL_SLOW_CACHE_HOURS", 6.0)
 
+    # ------------------------------------------------------------------
+    # 反向代理信任清单（2026-09-26，为"香港 VPS + frp + nginx"方案新增）
+    #
+    # ## 它解决什么
+    #
+    # 客户端真实 IP 是**安全判据**：登录限流、图形码触发、审计追溯全靠它。
+    # 而它只能从代理链的头部取，头部又**可以被客户端伪造** ——
+    # 所以"该不该采信这个头"必须先判断"直连我的那一跳是不是可信代理"。
+    #
+    # 本项目的两种部署形态：
+    #
+    #   ① Cloudflare Tunnel（现状，保留）
+    #      浏览器 → CF 边缘 → cloudflared → 127.0.0.1:8110
+    #      采信 `CF-Connecting-IP`（CF 会覆盖它）
+    #
+    #   ② 香港 VPS + frp + nginx（新）
+    #      浏览器 → VPS nginx(终止 TLS) → frps → frpc → 127.0.0.1:8110
+    #      采信 `X-Forwarded-For`（nginx 添加）
+    #
+    # 形态②下如果只认 `CF-Connecting-IP`，所有用户都会退化成本机地址 ——
+    # 表现为**所有人共用一个限流计数**：限流形同虚设、图形码永不触发，
+    # 而且不会有任何报错。
+    #
+    # ## 默认值刻意留空
+    #
+    # `127.0.0.1` / `::1` 由 `core/client_ip.py` **内置为可信**（cloudflared
+    # 与 frpc 都在本机，天然可信），不需要写在这里。这个配置项只用于
+    # "代理不在本机"的场景（比如将来 nginx 与 frps 分机器部署）。
+    #
+    # ⚠️ **不要**把 `0.0.0.0/0`、`*` 之类塞进来：那等于让任何人都能伪造 IP。
+    # ------------------------------------------------------------------
+    trusted_proxies: str = _env_field("MOSS_TRUSTED_PROXIES", "")
+
     # 数据源Token
     tushare_token: str = _env_field("TUSHARE_TOKEN", "")
 

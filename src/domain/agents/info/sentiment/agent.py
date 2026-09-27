@@ -17,9 +17,17 @@ _PHASES = ("乐观", "分歧", "谨慎", "恐慌", "不明确")
 
 
 class SentimentAgent:
-    """A07_sentiment。"""
+    """A07_sentiment。
 
-    task_tier: TaskTier = "reasoning"
+    ★ 2026-09-28 第九轮：task_tier 从 `reasoning` 降为 `light`
+      A07 输出"情绪三档 + 周期五档"，本质是**离散分类任务**，
+      1.5B 本地模型（受约束解码）完全够用，且 json_schema 已锁定输出结构。
+      旧实现走 reasoning 层（云端 deepseek 或本地 8B），实测 ~30s/批；
+      新实现走 light 层本地 1.5B，实测 ~3s/批。
+      节省 ~27s（−90%）。
+    """
+
+    task_tier: TaskTier = "light"
 
     def __init__(
         self, gateway: LLMGateway, agent_id: str = "A07_sentiment",
@@ -94,6 +102,19 @@ class SentimentAgent:
             "你是市场舆情分析师，负责把结构化事件表转译为情绪判读。"
             "只引用给定的指标数值，禁止编造数据。",
             prompt, agent_id=self.agent_id, trace_id=input.task_id, json_mode=True,
+            # ★ 2026-09-28 第九轮：1.5B 需要受约束解码（受 json_schema）才能稳定输出
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "conclusion": {"type": "string"},
+                    "confidence": {"type": "string",
+                                   "enum": ["high", "medium", "low"]},
+                    "sentiment_phase": {"type": "string",
+                                        "enum": ["乐观", "分歧", "谨慎", "恐慌", "不明确"]},
+                    "narrative": {"type": "string"},
+                },
+                "required": ["conclusion", "sentiment_phase"],
+            },
         )
         data = parse_llm_json(self.agent_id, response.content)
 

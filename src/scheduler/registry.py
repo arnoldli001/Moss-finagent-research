@@ -37,6 +37,7 @@ JobKind = Literal[
     "intel_tone_extract",   # 原文倾向抽取（本地模型，排在采集之后）
     "intel_hot_rank",     # 各平台人气/热搜榜（接口只读落盘结果，不再实时抓）
     "mainline_warm",      # 主线热快照预热（只读；消除 8~23 秒的冷启动）
+    "sector_rotation_report",  # 行业轮动日报：收盘后生成热力图+主力流向+规则研判
 ]
 
 
@@ -458,6 +459,23 @@ JOB_REGISTRY: dict[str, JobSpec] = {
             "主线挖掘·热快照预热：用当前本地数据重算一次全市场评分并落盘"
             "（data/mainline/warm_snapshot.json），让面板与重启后首个请求免于"
             "一次 8~23 秒的全市场重算。只读：不联网、不写 data/quant、不落库、不推送"
+        ),
+        params={},
+    ),
+    # 行业轮动日报：收盘后 15:40 主生成（A 股 15:00 收盘，等东财/Tushare
+    # 日频结算留出 40 分钟余量），随后每小时补跑到 23:40 —— 补跑是为
+    # "主机关机/服务没在跑而错过 15:40"的场景：开机后下一个整点 40 分
+    # 自动补上。补跑先查"落盘交易日 vs 应有交易日"，已最新则跳过取数
+    # （幂等，9 次空跑的总成本是 9 次本地日历比较）。
+    "sector_rotation_report": JobSpec(
+        name="sector_rotation_report",
+        cron="40 15-23 * * 1-5",
+        kind="sector_rotation_report",
+        description=(
+            "行业轮动与资金流向监控日报：Tushare 东财板块截面（行业热力图+主力净额）"
+            "+ 腾讯指数快照 + 大盘资金流，装配成 JSON/HTML 落盘 data/sector_rotation/；"
+            "规则生成研判（不用 LLM，确定性可复现）。15:40 主生成，16:40~23:40 "
+            "为关机补跑窗口（已最新则跳过）"
         ),
         params={},
     ),

@@ -14,13 +14,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import time
 from datetime import datetime
 from typing import Any
 
 import pandas as pd
 
-from src.core.errors import BRIEF_DEFAULT, BRIEF_TIGHT, brief
+from src.core.errors import BRIEF_TIGHT, brief
 from src.intraday.subproc import run_json_subprocess
 from src.sector_rotation import store
 
@@ -164,7 +163,7 @@ __emit(out)
     return {"series": series, "breadth": breadth}
 
 
-# ==================== 取数：Tushare 板块截面（东财口径，复用资金流监控同源链路） ====================
+# ============ 取数：Tushare 板块截面（东财口径，复用资金流监控同源链路） ============
 
 def _tushare_client() -> Any:
     from src.quant.tushare_source import TushareClient
@@ -187,33 +186,66 @@ def fetch_sector_frame() -> pd.DataFrame:
             .drop_duplicates(subset=["ts_code"], keep="last"))
 
 
+def _fetch_flow_5d_one(client, code: str) -> tuple[str, float | None]:
+    """单板块近 5 日净额（同步函数，给 gather 用）。"""
+    try:
+        frame = client.call("moneyflow_ind_dc", ts_code=code)
+        if frame is None or len(frame) == 0:
+            return code, None
+        frame = frame.copy()
+        frame["trade_date"] = frame["trade_date"].astype(str)
+        tail = frame.sort_values("trade_date").tail(5)
+        total = pd.to_numeric(tail["net_amount"], errors="coerce").sum()
+        value = round(float(total) / YI, 2) if math.isfinite(float(total)) else None
+        return code, value
+    except Exception as exc:  # noqa: BLE001 单板块失败不拖垮整份
+        logger.info("行业轮动：板块5日净额失败(%s)：%s", code, brief(exc, BRIEF_TIGHT))
+        return code, None
+
+
 def fetch_flow_5d(boards: list[dict[str, Any]]) -> dict[str, float | None]:
     """指定板块近 5 个交易日主力净额之和：`{ts_code: 亿元}`。
 
-    逐板块一次 `moneyflow_ind_dc(ts_code=...)`（实测单次返回约 730 行日频），
-    只给榜单上那 ≤10 个板块取，日更批量场景 10~20 秒可接受。
+    ★★★ 2026-09-27 第八轮：改 `ThreadPoolExecutor` 并发跑（限频3并发）。
+    原实现是同步串行 + `time.sleep(0.3)`，10 个板块要 6+ 秒；
+    改后 10 个板块通常 < 2 秒（约 −60%）。
+
+    每板块一次 `moneyflow_ind_dc(ts_code=...)`（实测单次返回约 730 行日频）。
     单板块失败只损失那一行（返回 None），不拖垮整份报告。
+
+    为什么用线程池而非裸 `asyncio.to_thread`+`gather`：
+    `service.generate()` 是 async 函数，但 Tushare HTTP 是**同步阻塞**——
+    在事件循环里并发跑会卡整服务。丢到 `ThreadPoolExecutor(max_workers=3)` 才是
+    真正并发（Tushare 限频 ~8 req/s，3 并发留余量）。
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     client = _tushare_client()
-    result: dict[str, float | None] = {}
+    codes: list[str] = []
     for board in boards:
         code = str(board.get("code") or "")
-        if not code:
-            continue
-        try:
-            frame = client.call("moneyflow_ind_dc", ts_code=code)
-            if frame is None or len(frame) == 0:
-                result[code] = None
-                continue
-            frame = frame.copy()
-            frame["trade_date"] = frame["trade_date"].astype(str)
-            tail = frame.sort_values("trade_date").tail(5)
-            total = pd.to_numeric(tail["net_amount"], errors="coerce").sum()
-            result[code] = round(float(total) / YI, 2) if math.isfinite(float(total)) else None
-        except Exception as exc:  # noqa: BLE001
-            logger.info("行业轮动：板块5日净额失败(%s)：%s", code, brief(exc, BRIEF_TIGHT))
-            result[code] = None
-        time.sleep(0.3)  # Tushare 限频友好：10 个板块也就多 3 秒
+        if code:
+            codes.append(code)
+    if not codes:
+        return {}
+
+    _MAX_PARALLEL = 3
+    result: dict[str, float | None] = {}
+    with ThreadPoolExecutor(max_workers=_MAX_PARALLEL,
+                            thread_name_prefix="flow5d") as pool:
+        # 提交全部，立即拿到 future 列表，按提交顺序收集
+        future_to_code = {
+            pool.submit(_fetch_flow_5d_one, client, code): code
+            for code in codes
+        }
+        for fut, code in future_to_code.items():
+            try:
+                _, value = fut.result(timeout=15.0)
+            except Exception as exc:  # noqa: BLE001 单板块失败不拖垮
+                logger.info("行业轮动：板块5日净额失败(%s)：%s",
+                            code, brief(exc, BRIEF_TIGHT))
+                value = None
+            result[code] = value
     return result
 
 
@@ -266,7 +298,8 @@ def assemble_boards(frame: pd.DataFrame) -> tuple[str, list[dict[str, Any]]]:
     return trade_date, boards
 
 
-def pick_heat(boards: list[dict[str, Any]], *, top: int = 10, bottom: int = 10) -> list[dict[str, Any]]:
+def pick_heat(boards: list[dict[str, Any]], *, top: int = 10,
+              bottom: int = 10) -> list[dict[str, Any]]:
     """热力图板块：涨幅前 top + 跌幅前 bottom（按涨跌幅排序的列表首尾取）。"""
     valid = [board for board in boards if board.get("pct") is not None]
     if len(valid) <= top + bottom:
@@ -430,12 +463,18 @@ def narrate(payload: dict[str, Any]) -> dict[str, Any]:
             return "5日数据暂缺"
         return "近5日同向，信号加强" if net5 > 0 else "近5日仍流出，按单日反弹对待"
 
+    def _top_names(boards: list[dict]) -> str:
+        # 3.10 兼容：f-string 内嵌套同引号 f-string 是 3.12 才有的语法，
+        # 先在外面 join 好（也顺带把超长行拆掉）。
+        return ", ".join(
+            f"{b['name']}{_fmt_yi(b.get('net_yi'))}" for b in boards[:3])
+
     views = [
         {
             "level": "in",
             "title": f"资金流入方向：{_names(inflow)}",
             "text": (
-                f"当日主力净流入居前（{', '.join(f'{b['name']}{_fmt_yi(b.get('net_yi'))}' for b in inflow[:3])}）。"
+                f"当日主力净流入居前（{_top_names(inflow)}）。"
                 f"{continuity(inflow[0]['name']) if inflow else ''}"
                 "单日流入不改变配置结论，需观察 2~3 日连续性。"),
         },
@@ -443,7 +482,7 @@ def narrate(payload: dict[str, Any]) -> dict[str, Any]:
             "level": "out",
             "title": f"资金流出方向：{_names(outflow)}",
             "text": (
-                f"当日主力净流出居前（{', '.join(f'{b['name']}{_fmt_yi(b.get('net_yi'))}' for b in outflow[:3])}）。"
+                f"当日主力净流出居前（{_top_names(outflow)}）。"
                 "流出居前 ≠ 基本面恶化，先分清是获利兑现还是趋势撤退——"
                 "看该方向近 5 日是否持续流出、以及板块内龙头是否同步走弱。"),
         },
@@ -467,14 +506,15 @@ def narrate(payload: dict[str, Any]) -> dict[str, Any]:
             "level": "watch",
             "title": f"量价齐升方向：{_names(strong) if strong else '—'}",
             "text": (
-                (f"{_names(strong)}上涨且主力净流入为正，量价配合良好，"
-                 "是当日最扎实的方向；仍建议以近 5 日资金连续性验证后再提升仓位优先级。"
-                 if strong else
-                 "当日无'涨幅>1%且主力净流入'的方向，市场缺乏量价共振主线，"
-                 "整体按存量博弈对待，控制追高动作。")),
+                f"{_names(strong)}上涨且主力净流入为正，量价配合良好，"
+                "是当日最扎实的方向；仍建议以近 5 日资金连续性验证后再提升仓位优先级。"
+                if strong else
+                "当日无'涨幅>1%且主力净流入'的方向，市场缺乏量价共振主线，"
+                "整体按存量博弈对待，控制追高动作。"),
         })
     return {"headline": headline, "body": body, "views": views,
-            "note": "规则生成（narrative_engine=rule-based-v1），结论完全由本页数据推导，非投资建议"}
+            "note": ("规则生成（narrative_engine=rule-based-v1），"
+                     "结论完全由本页数据推导，非投资建议")}
 
 
 # ==================== 编排 ====================
@@ -483,23 +523,62 @@ def narrate(payload: dict[str, Any]) -> dict[str, Any]:
 REGEN_TTL_SECONDS = 900.0
 
 
+def expected_trade_date() -> str:
+    """最近一个**行情已发布**的交易日（本地交易日历，零网络；判不了返回空串）。
+
+    复用量化链路的 `latest_complete_trade_date`：今天过了收盘发布时点 →
+    今天（若交易日）；否则 → 今天之前最近的交易日。节假日天然正确
+    （中秋 9-25 这种"是周五但休市"的情况，日历里根本没有这一天）。
+    """
+    try:
+        from src.quant.freshness import latest_complete_trade_date
+
+        return latest_complete_trade_date() or ""
+    except Exception as exc:  # noqa: BLE001 日历缺失不致命：降级为"判不了"
+        logger.info("行业轮动：交易日历不可用：%s", brief(exc, BRIEF_TIGHT))
+        return ""
+
+
+def is_stale() -> bool:
+    """落盘报告是否落后于"应该有的最近交易日"。
+
+    - 一份都没有 → 过期（触发首次生成）；
+    - 日历判不了 → 当作新鲜（宁可少刷，不为每次读取白付一轮网络取数）；
+    - 关机错过 15:40 调度的场景就靠它：开机后第一次读/补跑作业
+    都会发现 `cached < expected` 而重新生成。
+    """
+    cached = store.latest_date()
+    if not cached:
+        return True
+    expected = expected_trade_date()
+    if not expected:
+        return False
+    return cached < expected
+
+
 async def generate(*, force: bool = False) -> dict[str, Any]:
     """生成最近交易日报告：取数 → 装配 → 研判 → 落盘，返回报告 JSON。
 
     幂等策略：
-      - 已落盘且 `force=False` → 直接返回落盘那份；
+      - 已落盘**且不落伍**（交易日 == 应有交易日）且 `force=False`
+        → 直接返回落盘那份；
+      - 落盘日期落后于应有交易日（如主机关机错过调度）→ 重新生成；
       - 各数据源独立失败：某源挂掉只让对应板块为空（payload 里对应字段为
         None/空列表），整份报告仍然产出，meta.sources 标注口径。
     """
     cached_date = store.latest_date()
-    if cached_date and not force:
+    if cached_date and not force and not is_stale():
         cached = store.load(cached_date)
         if cached:
             return cached
 
-    indices, market_flow = await asyncio.gather(
-        fetch_index_quotes(), fetch_market_flow())
-    frame = await asyncio.to_thread(fetch_sector_frame)
+    # ★ 2026-09-27 性能修复：三路取数**全并行**。原先 Tushare 板块截面
+    # 串行排在"腾讯快照 + akshare 大盘资金流"之后，而它与其余两路**无数据
+    # 依赖**（frame 的消费点在 assemble_boards，此处只是取数）——
+    # 串行链 20~40 秒里它独占一段；并行后墙钟 ≈ 三路最慢者。
+    indices, market_flow, frame = await asyncio.gather(
+        fetch_index_quotes(), fetch_market_flow(),
+        asyncio.to_thread(fetch_sector_frame))
     trade_date, boards = assemble_boards(frame)
     if not trade_date:
         # Tushare 不可用：用大盘资金流的最新日期兜底，行业板块留空

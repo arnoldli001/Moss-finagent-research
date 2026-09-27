@@ -1,4 +1,3 @@
-import Disclaimer from "./Disclaimer";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   api, CharacterProfile, FactorMetaItem, IntradayFactorCatalog, IntradayLevels,
@@ -799,7 +798,6 @@ export default function WeightProfileEditor({
         </div>
 
         <div className="weight-editor-bar">
-      <Disclaimer compact />
           <nav className="help-tabs">
             <button className={tab === "intraday" ? "mode-btn active" : "mode-btn"}
                     onClick={() => setTab("intraday")}

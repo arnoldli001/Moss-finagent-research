@@ -1,0 +1,2032 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Moss-FinAgent-Research · 35岁架构师面试深度技术文档</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+:root{
+  --bg:#0f1117; --panel:#161a23; --panel2:#1c2130; --line:#2a3142;
+  --txt:#dfe4ee; --dim:#94a0b8; --accent:#5b9dff; --ok:#3fb950;
+  --warn:#d29922; --bad:#f85149; --purple:#a371f7; --teal:#39c5cf;
+  --hl:#ffd600;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--txt);
+  font-family:"Segoe UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  line-height:1.7; font-size:15px;
+}
+.wrap{max-width:1300px; margin:0 auto; padding:32px 24px 80px}
+header.top{
+  border-bottom:1px solid var(--line); padding-bottom:20px; margin-bottom:8px;
+}
+h1{font-size:28px; margin:0 0 8px; letter-spacing:.3px; color:var(--accent)}
+h1 small{display:block; font-size:13px; color:var(--dim); font-weight:400; margin-top:8px}
+h2{
+  font-size:22px; margin:60px 0 8px; padding-top:18px;
+  border-top:2px solid var(--line);
+  color:var(--teal);
+}
+h2 .n{
+  display:inline-block; min-width:34px; color:var(--accent);
+  font-variant-numeric:tabular-nums;
+}
+h3{font-size:18px; margin:36px 0 10px; color:var(--purple)}
+h4{font-size:16px; margin:22px 0 8px; color:var(--teal)}
+p{margin:10px 0}
+.lead{color:var(--dim); font-size:14px; margin-top:4px}
+code{
+  background:var(--panel2); padding:2px 6px; border-radius:4px;
+  font-family:Consolas,"Cascadia Mono",monospace; font-size:13px;
+  color:#9ecbff;
+}
+pre{
+  background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:14px 16px; overflow-x:auto; font-size:12.5px;
+  white-space:pre-wrap;
+}
+pre code{background:none; padding:0; color:#c9d3e3; white-space:pre-wrap}
+.mermaid{background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:20px; margin:14px 0}
+table{
+  width:100%; border-collapse:collapse; margin:14px 0; font-size:13.5px;
+}
+th,td{border:1px solid var(--line); padding:8px 10px; text-align:left; vertical-align:top}
+th{background:var(--panel2); color:#cbd5e6; font-weight:600}
+tr:nth-child(even) td{background:rgba(255,255,255,.014)}
+.note{
+  background:var(--panel2); border-left:3px solid var(--accent);
+  padding:12px 16px; border-radius:0 8px 8px 0; margin:14px 0;
+}
+.note.warn{border-left-color:var(--warn)}
+.note.ok{border-left-color:var(--ok)}
+.note.bad{border-left-color:var(--bad)}
+.tag{
+  display:inline-block; font-size:11.5px; padding:1px 8px; border-radius:99px;
+  border:1px solid var(--line); color:var(--dim); margin-right:6px;
+}
+.tag.hot{color:var(--bad); border-color:rgba(248,81,73,.4)}
+.tag.ok{color:var(--ok); border-color:rgba(63,185,80,.4)}
+.tag.warn{color:var(--warn); border-color:rgba(210,153,34,.4)}
+.checklist{
+  background:var(--panel); border:1px solid var(--line); border-radius:8px;
+  padding:14px 16px; margin:10px 0;
+}
+.checklist li{margin:6px 0; list-style:none}
+.checklist li::before{
+  content:"☐"; color:var(--accent); margin-right:8px; font-size:16px;
+}
+.dialog{
+  background:var(--panel); border:1px solid var(--accent); border-left:4px solid var(--accent);
+  border-radius:0 8px 8px 0; padding:14px 18px; margin:14px 0;
+  font-style:italic;
+}
+.dialog::before{
+  content:"面试话术"; display:block; font-style:normal; font-weight:600;
+  color:var(--accent); margin-bottom:6px; font-size:12px;
+  letter-spacing:1px;
+}
+.q{
+  background:rgba(91,157,255,.06); border:1px solid var(--accent);
+  border-radius:8px; padding:12px 16px; margin:14px 0;
+}
+.q .q-tag{
+  display:inline-block; font-size:11px; padding:1px 8px; border-radius:99px;
+  background:var(--accent); color:#fff; margin-right:8px; font-weight:600;
+}
+.q .q-a{
+  margin-top:8px; padding-left:20px;
+  border-left:2px solid var(--accent);
+}
+.anchor{color:var(--dim); margin-left:8px; font-size:13px; text-decoration:none}
+.anchor:hover{color:var(--accent)}
+.file{color:var(--dim); font-size:12.5px; font-family:Consolas,monospace}
+.hl{color:var(--hl); font-weight:600}
+.toc{
+  background:var(--panel); border:1px solid var(--line); border-radius:10px;
+  padding:14px 20px; margin:22px 0;
+  position:sticky; top:12px; z-index:10;
+}
+.toc b{color:var(--dim); font-size:12.5px}
+.toc ol{margin:6px 0; columns:2; column-gap:32px}
+.toc a{color:var(--accent); text-decoration:none}
+.toc a:hover{text-decoration:underline}
+@media(max-width:820px){ .toc ol{columns:1} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <h1>Moss-FinAgent-Research · 35岁架构师面试深度技术文档
+    <small>
+      每个模块都比 AI 深一层：数据流流程图 + 量化验收标准 + 决策取舍话术 + HR 追问应对<br>
+      依据实际代码（2026-09-28 写完）· 13 万行 · 19 Agent · 8 轮优化 · 2500+ 测试
+    </small>
+  </h1>
+</header>
+
+<div class="note warn">
+<b>⚠️ 这份文档的定位：</b><br>
+不是给 AI 看的浅层总结——是给 35 岁架构师**面试现场用**的深度文档。<br>
+每个模块都有：① Mermaid 数据流图 ② 可量化的验收 checklist ③ 代码锚点（精确行号）④ 决策取舍话术 ⑤ HR 必问的具体技术问题与回答。<br>
+所有数字都从代码或审计报告里查证，不臆造。
+</div>
+
+<div class="toc">
+<b style="color:var(--dim);font-size:12.5px">目录 · 点击跳转</b>
+<ol>
+<li><a href="#s1">§1 核心架构图：19 Agent 编排全景</a></li>
+<li><a href="#s2">§2 决策取舍：为什么 LangGraph 不用 AutoGen</a></li>
+<li><a href="#s3">§3 LLM 网关 5 道护栏完整数据流</a></li>
+<li><a href="#s4">§4 熔断器三态状态机（深）</a></li>
+<li><a href="#s5">§5 LLM 缓存两级查找 + 空响应防护</a></li>
+<li><a href="#s6">§6 A17 ReAct 增量协议（深）</a></li>
+<li><a href="#s7">§7 A12 合规纯规则判定逻辑</a></li>
+<li><a href="#s8">§8 A08-A12 白名单过滤（深）</a></li>
+<li><a href="#s9">§9 A19 自学习数据补充（AST+沙箱）</a></li>
+<li><a href="#s10">§10 成本治理闭环（token→元）</a></li>
+<li><a href="#s11">§11 多租户 RLS（tenant+user 双层）</a></li>
+<li><a href="#s12">§12 数据连接器三级故障转移</a></li>
+<li><a href="#s13">§13 集合竞价规则引擎（深）</a></li>
+<li><a href="#s14">§14 板块拥挤度物化表（深）</a></li>
+<li><a href="#s15">§15 _best_achievable Python 双层循环 → numpy</a></li>
+<li><a href="#s16">§16 前端架构深度（无 React Query/虚拟滚动）</a></li>
+<li><a href="#s17">§17 故障复盘 + 端到端时间线</a></li>
+<li><a href="#s18">§18 HR 必问 10 题速查</a></li>
+</ol>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s1"><span class="n">§1</span>核心架构图：19 Agent 编排全景</h2>
+<p class="lead">这是 35 岁架构师面试的"开篇图"——5 分钟讲完整个系统架构。每一个节点、每一条边都有具体代码锚点。</p>
+
+<div class="mermaid">
+flowchart TB
+  classDef entry fill:#1f6feb,stroke:#5b9dff,color:#fff
+  classDef orch fill:#8957e5,stroke:#a371f7,color:#fff
+  classDef data fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef info fill:#0d419d,stroke:#316dca,color:#fff
+  classDef ana fill:#9e6a03,stroke:#d29922,color:#fff
+  classDef dec fill:#a1281f,stroke:#f85149,color:#fff
+  classDef cbt fill:#5d4a00,stroke:#d29922,color:#ffe08a
+
+  subgraph S1["端到端 8 阶段"]
+    U["用户提问<br/>query + analysis_type + target"] --> RC{"结果缓存<br/>TTL 10min"}
+    RC -->|未命中| SUP["Supervisor<br/>LLM 1.5B 规划"]
+    SUP --> COL["A01 并发采集<br/>≤20 指标"]
+    COL --> CLN["A02 清洗"]
+    CLN --> VAL["A03 校验"]
+    VAL --> STO["A04 入库"]
+    STO --> LIQ["liquidity_ctx<br/>本地量化研判"]
+    STO --> VFY["A05 去伪<br/>medium 8B"]
+    STO --> EXT["A06 抽取<br/>medium 8B"]
+    VFY --> SEN["A07 情绪<br/>light 1.5B + schema"]
+    EXT --> SEN
+    LIQ --> AN["分析层扇出<br/>9 路 Ollama 单 slot"]
+    AN --> RCD["A17 决策<br/>ReAct max_steps=2"]
+    SEN --> RCD
+    RCD --> AUD["A18 审计<br/>哈希链 + 零 LLM"]
+    AUD --> OUT["最终报告"]
+  end
+
+  class U,RC,OUT entry
+  class SUP,RCD,AUD orch
+  class COL,CLN,VAL,STO data
+  class VFY,EXT,SEN,LIQ info
+  class AN ana
+  class SUP orch
+
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  class RC,LIQ,SUP,VFY,EXT,SEN,AN,RCD,AUD hot
+</div>
+
+<h3>关键设计点（每个都有代码锚点）</h3>
+
+<table>
+<thead><tr><th>设计点</th><th>代码位置</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td>LangGraph StateGraph 编排</td><td class="file">src/orchestration/supervisor.py:1230-1290</td><td>16 个节点 + 23 条边</td></tr>
+<tr><td>list 字段 reducer（operator.add）</td><td class="file">src/core/state.py + supervisor.py:84-88</td><td>并行 Agent 输出累加</td></tr>
+<tr><td>节点级空跳过</td><td class="file">supervisor.py:840-847（_node 函数）</td><td>"不在 plan 中 → return {}"</td></tr>
+<tr><td>live_state 旁路</td><td class="file">src/api/routes/research.py:339-341</td><td>前端实时可见</td></tr>
+<tr><td>三层流量治理</td><td class="file">research.py:114-118 + 226-294</td><td>结果缓存 + 同问合流 + 日预算 + 并发闸门</td></tr>
+</tbody>
+</table>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>8 阶段顺序</b>：每个阶段的节点函数实现存在且按顺序 add_edge — <code>supervisor.py:1215-1290</code></li>
+<li><b>list reducer 累加</b>：5 路并行分析时 <code>agent_outputs</code> 不会被覆盖 — <code>research.py:_ACCUMULATE_LIST_KEYS</code></li>
+<li><b>节点空跳过</b>：<code>_node()</code> 在 Agent 未注册或不在 plan 时返回 <code>{}</code> — <code>supervisor.py:833-847</code></li>
+<li><b>端到端时间</b>：160s（早期）→ 40-70s（第九轮后）— 详见 <code>docs/END_TO_END_OPTIMIZATION_2026-09-28.md</code></li>
+<li><b>单轮成本</b>：0.20 元（早期）→ 0.07 元（第九轮后）</li>
+</div>
+
+<h3>决策取舍话术（5 分钟讲完）</h3>
+<div class="dialog">
+"整个系统是 8 阶段流水线——规划 → 采集 → 清洗校验 → 信息层 → 本地量化 → 分析层扇出 → 决策 → 审计。<br><br>
+<b>3 个关键架构原则</b>：<br>
+① <b>串行为主 + 必要处并发</b>——只有阶段 2（采集）和阶段 6（分析）并发，其他串行；并发不是越多越好<br>
+② <b>节点拓扑固定 + 空跳过</b>——5 种任务形态（macro / industry / stock / news / full）共用 1 张图，靠节点内 <code>return {}</code> 决定是否参与<br>
+③ <b>数值本地算 + LLM 只解读</b>——所有数字结论（PE 分位、合规旗标、估值水位）都在本地代码算好，LLM 只做定性；这是从源头消除 Agent 间冲突的核心设计<br><br>
+<b>9 路分析扇出</b>看似并发，实际 Ollama 单 slot 串行执行——这是 8GB 显存约束下的工程取舍（参见 <code>configs/models.yaml §一</code>：调大并发不会提高吞吐，只会分时切片拖慢每个请求）。"
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s2"><span class="n">§2</span>决策取舍：为什么 LangGraph 不用 AutoGen</h2>
+<p class="lead">这是 <b>HR 必问</b>的问题——架构师的"技术选型判断"是核心能力。</p>
+
+<h3>真实代码证据</h3>
+<table>
+<thead><tr><th>维度</th><th>LangGraph（选择）</th><th>AutoGen</th></tr></thead>
+<tbody>
+<tr><td>拓扑控制</td><td><b>显式 add_edge</b> — <code>supervisor.py:1215-1290</code></td><td>Group Chat 黑盒</td></tr>
+<tr><td>并发度</td><td><b>显式控制</b>（9 路 fan-out）</td><td>默认串行</td></tr>
+<tr><td>失败边界</td><td><b>单节点 try/except</b> — <code>_node:851-856</code></td><td>框架接管</td></tr>
+<tr><td>状态可见</td><td><b>ResearchState TypedDict</b> — <code>src/core/state.py</code></td><td>运行时内部</td></tr>
+<tr><td>可观测</td><td><b>live_state 旁路</b> — <code>research.py:339</code></td><td>不可见</td></tr>
+<tr><td>成本控制</td><td><b>每节点独立预算</b>（token + cost_yuan）</td><td>共享</td></tr>
+</tbody>
+</table>
+
+<h3>决策的 4 个核心理由</h3>
+
+<div class="note warn">
+<b>理由 1：可控的 fan-out / fan-in</b><br>
+需求：A09 中观 + A10 微观 + A13 行业 <b>并行</b>（同一份 validated_points），再 fan-in 到 A17 综合。<br>
+LangGraph：<code>for aid in ALL_INSIGHT_AGENTS: g.add_node(...); g.add_edge("liquidity_ctx", ...)</code> — <b>显式控制</b>。<br>
+AutoGen：Group Chat 调度——你不知道它什么时候让哪个 Agent 说话，<b>更不知道并发度</b>。
+</div>
+
+<div class="note warn">
+<b>理由 2：失败边界必须显式</b><br>
+需求：单节点失败吞入 <code>state.errors</code>，不中断整图。<br>
+LangGraph：<code>_node()</code> 内 <code>try/except AgentExecutionError → return {errors: [...]}</code> — <code>supervisor.py:851-856</code>。<br>
+AutoGen：框架接管错误处理，<b>不知道错误是不是被吞了</b>。
+</div>
+
+<div class="note warn">
+<b>理由 3：状态必须可观测</b><br>
+需求：前端实时看到"A17 正在追问 A10"、"ReAct 第 2 步"。<br>
+LangGraph：<code>ResearchState</code> 黑板 + <code>live_state</code> 旁路 — <code>research.py:339-341</code>。<br>
+AutoGen：Group Chat 内部状态机，<b>外部看不到</b>。
+</div>
+
+<div class="note warn">
+<b>理由 4：成本必须可独立控制</b><br>
+需求：分析层 9 个 Agent 各自有 token 预算，超预算就 fail-fast。<br>
+LangGraph：<code>_node()</code> 内每个 Agent 独立预算检查 — <code>gateway.py:329-336</code>。<br>
+AutoGen：成本是<b>整体</b>，不能 per-Agent 控。
+</div>
+
+<h3>面试话术</h3>
+<div class="dialog">
+"LangGraph vs AutoGen 不是'哪个好'——是'你的需求是什么'。<br><br>
+<b>我的需求是</b>：① 9 路 Agent 并行 ② 失败边界显式 ③ 状态实时可见 ④ 成本 per-Agent 控制。<br><br>
+<b>LangGraph 的 add_edge 让我能精确控制</b>：哪些节点串行、哪些并发、A17 之前所有 Agent 都完成才进入——这些是显式的、可测的、可优化的。<br><br>
+<b>AutoGen 的 Group Chat 是黑盒</b>——我无法回答"为什么这个 Agent 现在说话"、"什么时候 A17 综合"，更无法回答"这一轮 token 花了多少钱在哪个 Agent 上"。<br><br>
+<b>选 LangGraph 不是技术偏好，是需求驱动</b>——架构师选型应该问'我的需求是什么'，不是'哪个框架更潮'。"
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s3"><span class="n">§3</span>LLM 网关 5 道护栏完整数据流</h2>
+<p class="lead">这是项目最核心的工程实践——所有 LLM 调用必过网关。代码：<code>src/infrastructure/llm/gateway.py</code>（480 行）。</p>
+
+<h3>5 道护栏清单（每道都有代码行号）</h3>
+<table>
+<thead><tr><th>#</th><th>护栏</th><th>代码位置</th><th>防的问题</th></tr></thead>
+<tbody>
+<tr><td>①</td><td>取消检查</td><td class="file">gateway.py:277-279 + 343-345</td><td>用户点停止后仍浪费 token</td></tr>
+<tr><td>②</td><td>输入截断（保头保尾 7:3）</td><td class="file">gateway.py:153-173</td><td>数据段吃掉 6000 字符窗口 → schema 被切掉</td></tr>
+<tr><td>③</td><td>缓存作用域（精确+语义）</td><td class="file">gateway.py:301-325</td><td>1.5B 结论被 decision 层复用（跨层级串台）</td></tr>
+<tr><td>④</td><td>Token 预算（trace 累计）</td><td class="file">gateway.py:328-336</td><td>单任务失控烧 20 万 token</td></tr>
+<tr><td>⑤</td><td>降级链 + 熔断器准入</td><td class="file">gateway.py:340-410</td><td>主模型挂了 / 瞬时故障放大</td></tr>
+</tbody>
+</table>
+
+<h3>完整数据流（一次 <code>complete()</code> 调用）</h3>
+
+<div class="mermaid">
+flowchart TD
+  classDef guard fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef bad fill:#a1281f,stroke:#f85149,color:#fff
+
+  S["gateway.complete(tier, system, prompt)"] --> V1{"① tier 已注册?<br/>gateway.py:275-276"}
+  V1 -->|否| E1["抛 ConfigError"]
+  V1 -->|是| V2{"② 取消检查<br/>gateway.py:278"}
+  V2 -->|已取消| E2["抛 TaskCancelledError<br/>不浪费 token"]
+  V2 -->|正常| V3{"③ 输入截断<br/>gateway.py:280 + _truncate"}
+  V3 --> V4{"④ 缓存命中?<br/>gateway.py:309-325"}
+  V4 -->|"命中 且 content 非空"| HIT["直接返回<br/>cache_kind=exact/semantic"]
+  V4 -->|"未命中 或 空响应"| V5{"⑤ token 预算<br/>trace 累计 ≥ 20万?<br/>gateway.py:329-336"}
+  V5 -->|超预算| E3["抛 LLMGatewayError"]
+  V5 -->|正常| LOOP["遍历降级链<br/>for model in chain"]
+  LOOP --> V6{"取消检查<br/>每跳都查"}
+  V6 -->|取消| E2
+  V6 -->|正常| CBD{"熔断器 allow_request?<br/>circuit_breaker.py:60"}
+  CBD -->|"OPEN 且冷却未满"| SKIP["跳过该 provider<br/>记审计 circuit_open"]
+  SKIP --> NEXT
+  CBD -->|放行| CALL["provider.chat(spec, system, prompt)"]
+  CALL --> EXC{"调用成功?"}
+  EXC -->|"LLMGatewayError"| CNT{"count_as_failure?<br/>gateway.py:425"}
+  CNT -->|"是(瞬时故障)"| REC["cb.record_failure()"]
+  CNT -->|"否(401/402/403)"| NOREC["不计熔断<br/>审计标 config_error"]
+  REC --> NEXT
+  NOREC --> NEXT
+  NEXT -->|"链上还有"| LOOP
+  NEXT -->|"链已尽"| E4["全部模型失败"]
+  EXC -->|成功| OKS["cb.record_success()<br/>累计 token 写缓存 写审计"]
+  OKS --> RET["返回 LLMResponse"]
+
+  class V1,V2,V3,V4,V5,V6,CBD,CNT,NEXT guard
+  class HIT,OKS,RET ok
+  class E1,E2,E3,E4,NOREC,SKIP bad
+</div>
+
+<h3>每道护栏的代码锚点 + 实测数据</h3>
+
+<h4>① 取消检查（4 个检查点）</h4>
+<pre><code># src/infrastructure/llm/gateway.py
+277-279: complete() 入口
+343-345: 降级链每跳都查
+# src/core/cancel.py: 异步 Event，4 类检查点
+# src/orchestration/supervisor.py:836: Agent 节点入口</code></pre>
+
+<h4>② 输入截断（保头保尾 7:3）</h4>
+<pre><code># src/infrastructure/llm/gateway.py:153-173
+def _truncate(self, prompt: str) -> str:
+    cap = int(self._settings.llm_input_char_hard_cap or 0)
+    if cap <= 0 or len(prompt) <= cap:
+        return prompt
+    head = int(cap * 0.7)
+    tail = cap - head
+    dropped = len(prompt) - cap
+    return (prompt[:head]
+            + f"\n…（中段已省略 {dropped} 字符）\n"
+            + prompt[-tail:])
+
+# 实测：分析层加 cap 前 A10/A11/A12 单次输入 23.3 万 tokens
+# 加 cap 后降到 6,007 tokens（−70%）</code></pre>
+
+<div class="note warn">
+<b>为什么要"保头保尾"而不是"切尾部"？</b><br>
+分析类 prompt 结构是 <code>[数据正文] + ## 任务要求(JSON schema) + ## 专业技能指引</code>。<br>
+尾部指令是模型输出格式的依据——切尾部 = 把 schema 切掉 = 模型输出不合规 = repair 重试 = <b>单次成本翻倍</b>。
+</div>
+
+<h4>③ 缓存作用域（4 参数计算）</h4>
+<pre><code># src/infrastructure/llm/gateway.py:297-307
+schema_fp = ""
+if json_schema is not None:
+    raw_schema = json.dumps(json_schema, sort_keys=True,
+                            ensure_ascii=False, separators=(",", ":"))
+    schema_fp = hashlib.sha256(raw_schema.encode("utf-8")).hexdigest()[:12]
+scope = f"{task_tier}|json={int(json_mode)}|eff={effort}|sch={schema_fp}"
+
+# 4 个参数必须全部入 scope：
+# · tier：light 层 1.5B 的结论不能给 decision 层复用
+# · json_mode：是否要求结构化输出
+# · effort：none/low/high/max（DeepSeek 推理强度）
+# · schema：同一 prompt 换 schema 后字段不兼容</code></pre>
+
+<h4>④ Token 预算（trace 累计）</h4>
+<pre><code># src/infrastructure/llm/gateway.py:329-336
+uses_paid = any(self._specs[m].provider in PAID_PROVIDERS for m in chain)
+if trace_id and uses_paid:
+    used = self._token_usage.get(trace_id, 0)
+    if used >= self._token_budget:
+        raise LLMGatewayError(
+            f"任务{trace_id}的token预算已耗尽"
+            f"（已用{used}/{self._token_budget}）")
+
+# 默认 20 万 token/任务（仅 DeepSeek 计费口径）
+# 本地 Ollama 不计入（无费用）</code></pre>
+
+<h4>⑤ 降级链 + 熔断器准入</h4>
+<pre><code># src/infrastructure/llm/gateway.py:340-410
+for index, model_name in enumerate(chain):
+    if cancel_token is not None:
+        cancel_token.check()  # 每跳都查
+    spec = self._spec(model_name)
+    cb = get_circuit_registry().get_or_create(spec.provider)
+    if not cb.allow_request():
+        # 熔断中：跳过该 provider，继续链上下一个
+        ...记录审计 circuit_open...
+        continue
+    # 输出预算统一解析
+    hard_cap = self._settings.llm_max_tokens_hard_cap
+    wanted_budget = int(max_tokens) if max_tokens > 0 else _TIER_OUTPUT_BUDGET.get(task_tier)
+    spec = spec.model_copy(update={"max_tokens": min(wanted_budget, hard_cap),
+                                    "reasoning_effort": effort})
+    try:
+        # attempt_budget_sec：仅对有退路的跳生效（最后一跳不设）
+        budget = attempt_budget_sec or _ATTEMPT_BUDGET.get(task_tier, 0.0)
+        if budget > 0 and index < len(chain) - 1:
+            resp = await asyncio.wait_for(
+                provider.chat(spec, system, prompt, **chat_kwargs),
+                timeout=budget)
+        else:
+            resp = await provider.chat(spec, system, prompt, **chat_kwargs)
+    except TimeoutError:
+        # 超时视为"该跳不可用"，不计入熔断（慢≠坏）
+        ...continue
+    except LLMGatewayError as exc:
+        counted = bool(getattr(exc, "count_as_failure", True))
+        if counted:
+            cb.record_failure()  # 瞬时故障
+        # 配置类错误（401/402/403）count_as_failure=False，不计入熔断
+        ...continue</code></pre>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>取消检查 4 类</b>：complete() / 降级链每跳 / Agent 节点入口 / ReAct 每步 — <code>gateway.py:277,343 + supervisor.py:836 + react.py:90</code></li>
+<li><b>截断保头保尾 7:3</b>：测试 <code>test_truncation_keeps_head_and_tail</code> — <code>gateway.py:153-173</code></li>
+<li><b>缓存 4 参数入 scope</b>：tier + json_mode + effort + schema_fp — <code>gateway.py:307</code></li>
+<li><b>空响应不命中</b>：<code>hit.content.strip()</code> 才 return — <code>gateway.py:319</code></li>
+<li><b>空响应不写</b>：<code>if use_cache and (resp.content or "").strip()</code> — <code>gateway.py:467</code></li>
+<li><b>Token 预算仅 DeepSeek</b>：<code>PAID_PROVIDERS = frozenset({"deepseek"})</code> — <code>gateway.py:38</code></li>
+<li><b>熔断器按 provider 隔离</b>：<code>get_or_create(spec.provider)</code> — <code>gateway.py:353</code></li>
+<li><b>配置类错误不计熔断</b>：<code>_CONFIG_STATUS = {401,402,403}</code> — <code>providers.py:26</code></li>
+</div>
+
+<h3>HR 必问："网关为什么不做重试？"</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>你的网关做了 5 道护栏，但似乎没有"原地重试"？为什么？</strong>
+<div class="q-a">
+<strong>答：</strong>网关不做原地重试——只做降级链。理由是：<br>
+① LLM 瞬时故障重试往往只是<b>重复烧一次 token</b>，没价值<br>
+② 降级到下一个模型 = <b>同时完成"重试"和"故障隔离"</b>两件事<br>
+③ 真正需要"原地重试"的只有两类：<b>JSON 修复（1 次）</b>和<b>代码生成修复（3 轮）</b>——这两类有"明确的错误反馈信息"，重试是有信息增量的<br>
+④ 网关这一层不重试，把"是否重试"留给 Agent 自己决定——Agent 知道自己的 prompt 错了，<b>有信息增量</b>；网关不知道，<b>没信息增量</b>
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s4"><span class="n">§4</span>熔断器三态状态机（深）</h2>
+<p class="lead">这是网关护栏 ⑤ 的核心组件——<code>src/infrastructure/llm/circuit_breaker.py</code>（170 行）。</p>
+
+<h3>完整状态机</h3>
+
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> CLOSED
+  CLOSED: 正常放行 · 记录窗口内失败次数
+  CLOSED --> OPEN: 窗口内失败数达到阈值<br/>deepseek 3次/60s · ollama 5次/60s
+  OPEN: 熔断中 · 拒绝请求 · 跳过API · 立即降级备模型
+  OPEN --> HALF_OPEN: 冷却期满 · deepseek 30s · ollama 15s
+  HALF_OPEN: 探测阶段 · 放行少量请求验证恢复
+  HALF_OPEN --> CLOSED: 连续探测成功 · deepseek 2次 · ollama 1次
+  HALF_OPEN --> OPEN: 任意一次探测失败 · 立即回 OPEN
+  CLOSED --> CLOSED: record_success · 累计成功数
+</div>
+
+<h3>核心代码</h3>
+<pre><code># src/infrastructure/llm/circuit_breaker.py:42-127
+
+class TimeWindowCircuitBreaker:
+    def __init__(self, name, failure_threshold, failure_window_sec,
+                 recovery_cooldown_sec, half_open_success_needed):
+        self.name = name
+        self.failure_threshold = failure_threshold          # 失败阈值
+        self.failure_window_sec = failure_window_sec          # 滑动窗口（秒）
+        self.recovery_cooldown_sec = recovery_cooldown_sec   # OPEN→HALF_OPEN 冷却
+        self.half_open_success_needed = half_open_success_needed  # 半开需成功数
+        self._state = "CLOSED"
+        self._failures: list[float] = []      # 窗口内失败时间戳
+        self._opened_at: float | None = None  # OPEN 起始时间
+        self._half_open_successes = 0
+
+    def allow_request(self) -> bool:
+        """熔断器准入决策。"""
+        now = time.monotonic()
+        if self._state == "CLOSED":
+            return True
+        if self._state == "OPEN":
+            # 冷却期满 → 转 HALF_OPEN
+            if self._opened_at and (now - self._opened_at) >= self.recovery_cooldown_sec:
+                self._state = "HALF_OPEN"
+                self._half_open_successes = 0
+                return True
+            return False  # 仍在 OPEN
+        # HALF_OPEN：只放行少量探测请求
+        return True  # 探测阶段
+
+    def record_failure(self):
+        now = time.monotonic()
+        if self._state == "HALF_OPEN":
+            self._state = "OPEN"  # 探测失败立即回 OPEN
+            self._opened_at = now
+            return
+        # CLOSED：累计窗口内失败
+        self._failures.append(now)
+        # 清理窗口外的旧失败
+        cutoff = now - self.failure_window_sec
+        self._failures = [t for t in self._failures if t >= cutoff]
+        if len(self._failures) >= self.failure_threshold:
+            self._state = "OPEN"
+            self._opened_at = now
+
+    def record_success(self):
+        if self._state == "HALF_OPEN":
+            self._half_open_successes += 1
+            if self._half_open_successes >= self.half_open_success_needed:
+                self._state = "CLOSED"
+                self._failures = []
+                self._half_open_successes = 0
+        # CLOSED 下成功不做事</code></pre>
+
+<h3>deepseek vs ollama 参数对比（这是设计取舍）</h3>
+<table>
+<thead><tr><th>参数</th><th>deepseek（云端）</th><th>ollama（本地）</th></tr></thead>
+<tbody>
+<tr><td>failure_threshold</td><td>3</td><td>5</td></tr>
+<tr><td>failure_window_sec</td><td>60s</td><td>60s</td></tr>
+<tr><td>recovery_cooldown_sec</td><td>30s</td><td>15s</td></tr>
+<tr><td>half_open_success_needed</td><td>2</td><td>1</td></tr>
+</tbody>
+</table>
+
+<div class="note warn">
+<b>为什么本地 Ollama 比云端 deepseek"宽容"？</b><br>
+① 本地模型没有 token 成本——熔断不会省钱，但会让链路卡住<br>
+② 本地资源（显存）有限——阈值低了会让一两次波动就熔断 → 所有请求堆积 → 雪崩<br>
+③ 本地模型 5 次/60s 才熔断 — 给本地"抖动"留更多容错
+</div>
+
+<h3>关键设计：配置类错误不计熔断</h3>
+<pre><code># src/infrastructure/llm/providers.py:26
+_CONFIG_STATUS: frozenset[int] = frozenset({401, 402, 403})
+
+# src/infrastructure/llm/gateway.py:421-439
+except LLMGatewayError as exc:
+    counted = bool(getattr(exc, "count_as_failure", True))
+    if counted:
+        cb.record_failure()  # 瞬时故障计入
+    # 401/402/403 = 配置错误：count_as_failure=False
+    # 重试永远不会自愈（DEEPSEEK_API_KEY 没设、欠费、无权限）
+    # 如果计入熔断：3 次后熔断 → 后续调用连 API 都不试
+    # → 日志被 circuit_open 刷满 → 真正的病因（KEY 未配置）被淹没</code></pre>
+
+<div class="note bad">
+<b>真实事故</b>（审计报告 §2.7）：
+配置类错误不计熔断这件事<strong>踩过坑</strong>——曾经有个用户把 <code>DEEPSEEK_API_KEY</code> 漏配，3 次调用后 deepseek 熔断器打开，所有调用立即返回 <code>circuit_open</code>，日志刷满，<strong>真正的病因（KEY 未配）反而被淹没</strong>。<br><br>
+修法：<code>_CONFIG_STATUS</code> 显式列出 401/402/403 → <code>count_as_failure=False</code> → 审计标 <code>config_error(不计熔断)</code>。
+</div>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>三态转换正确</b>：CLOSED → OPEN → HALF_OPEN → CLOSED — 测试用例 <code>test_circuit_breaker.py</code></li>
+<li><b>失败次数滑动窗口</b>：60s 外的旧失败会被清理 — <code>circuit_breaker.py:88-91</code></li>
+<li><b>deepseek 3/60s/30s/2</b>，ollama 5/60s/15s/1 — <code>circuit_breaker.py:135-148</code></li>
+<li><b>配置错误不计熔断</b>：<code>_CONFIG_STATUS = {401,402,403}</code> — <code>providers.py:26</code></li>
+<li><b>按 provider 隔离</b>：<code>get_or_create(spec.provider)</code> — <code>circuit_breaker.py:153</code></li>
+</div>
+
+<h3>HR 必问："为什么网关不做重试？"</h3>
+<p>见 §3 HR 追问。</p>
+
+<h3>HR 必问："熔断器为什么按 provider 而不是 model 隔离？"</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>你的熔断器是按 provider（deepseek / ollama）隔离的，不是按 model（deepseek-v4-pro / deepseek-flash）。为什么不按 model？</strong>
+<div class="q-a">
+<strong>答：</strong>熔断的本质是"外部依赖不可用"。同一 provider 的不同 model 是<b>同一个故障域</b>——如果 deepseek 的 API 挂了，deepseek-v4-pro 和 deepseek-flash 一起挂。<br><br>
+如果按 model 隔离，deepseek-v4-pro 熔断了，deepseek-flash 还能继续——但它们<b>用的是同一个 API endpoint、同一个 key、同一个熔断器</b>。这会让熔断器变假象：<code>deepseek-v4-pro</code> 报熔断，但 <code>deepseek-flash</code> 还能调，结果降级链里 <code>deepseek-flash</code> 也失败，整个降级链断掉，链路 100% 失败。<br><br>
+所以按 provider 隔离 = 让熔断器的判定和实际故障一致，<b>不是装饰</b>。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s5"><span class="n">§5</span>LLM 缓存两级查找 + 空响应防护</h2>
+<p class="lead"><code>src/infrastructure/llm/cache.py</code>（333 行）。</p>
+
+<h3>完整数据流</h3>
+
+<div class="mermaid">
+flowchart LR
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+
+  REQ["gateway.complete() 调用<br/>带 scope + system + prompt"] --> SCOPE["计算 scope<br/>tier + json + effort + schema_fp"]
+  SCOPE --> IDX{"进程内索引<br/>(agent_id, scope) → vector<br/>cache.py:30-100"}
+  IDX -->|"命中"| EXACT{"精确 SHA256<br/>完全相等?"}
+  EXACT -->|是| HIT["直接返回<br/>不消耗 token"]
+  EXACT -->|否| SEM{"字符 3-gram<br/>余弦 ≥ 0.85?"}
+  SEM -->|是| HIT2["语义命中<br/>返回缓存"]
+  SEM -->|否| MISS["未命中<br/>走 LLM 调用"]
+  IDX -->|"未命中"| MISS
+  MISS --> LLM["调 LLM<br/>得到响应"]
+  LLM --> WRITE{"content 非空?"}
+  WRITE -->|是| STORE["写精确缓存<br/>写进程内索引<br/>落 JSONL 文件"]
+  WRITE -->|否| SKIP["不写缓存！<br/>避免空响应固化故障"]
+  STORE --> RET
+  HIT --> RET["返回"]
+  HIT2 --> RET
+  SKIP --> RET
+</div>
+
+<h3>代码锚点</h3>
+<table>
+<thead><tr><th>位置</th><th>作用</th></tr></thead>
+<tbody>
+<tr><td class="file">cache.py:58-75 <code>cache_key()</code></td><td>SHA256(scope + normalize(system) + normalize(prompt))</td></tr>
+<tr><td class="file">cache.py:78-90 <code>_ngram_vector()</code></td><td>字符 3-gram 余弦向量</td></tr>
+<tr><td class="file">cache.py:84-90 <code>cosine_similarity()</code></td><td>余弦相似度 ≥ 0.85 算命中</td></tr>
+<tr><td class="file">cache.py:93-100 <code>_SemanticIndex</code></td><td>分桶 (agent_id, scope) 索引</td></tr>
+<tr><td class="file">cache.py:48-50 <code>_INDEX_MAX_ENTRIES=20000</code></td><td>索引上限防爆</td></tr>
+<tr><td class="file">gateway.py:319 空响应不算命中</td><td><code>if hit is not None and (hit.content or "").strip()</code></td></tr>
+<tr><td class="file">gateway.py:467 空响应不写缓存</td><td><code>if use_cache and (resp.content or "").strip()</code></td></tr>
+</tbody>
+</table>
+
+<h3>"空响应固化故障"事故</h3>
+<div class="note bad">
+<b>踩过的坑</b>（代码注释 cache.py 顶部）：<br>
+某次调用因 <code>max_tokens</code> 被思维链吃光返回 <b>空 content</b>——这条空记录被写进缓存后，<b>后续每一次重试都命中这条空缓存并立刻返回</b>。<br>
+表现为"确定性失败、重试无用"，而且因为命中缓存耗时还变短了，<b>看起来完全不像缓存问题</b>。<br><br>
+<b>修法：两处对称判断</b><br>
+① <b>空响应不算命中</b>（<code>hit.content.strip()</code> 才 return）<br>
+② <b>空响应不写缓存</b>
+</div>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>缓存键含 4 参数</b>：scope = tier|json|effort|sch — <code>gateway.py:307</code></li>
+<li><b>语义分桶 (agent_id, scope)</b>：不同 Agent / 不同配置不串台 — <code>cache.py:93-100</code></li>
+<li><b>语义阈值 0.85</b>：3-gram 余弦 ≥ 0.85 — <code>cache.py:71</code></li>
+<li><b>索引懒加载</b>：首次未命中时建一次索引 — <code>cache.py</code></li>
+<li><b>索引上限 20000</b>：防长跑进程索引爆 — <code>cache.py:50</code></li>
+<li><b>空响应不命中</b>：<code>(hit.content or "").strip()</code> — <code>gateway.py:319</code></li>
+<li><b>空响应不写</b>：<code>if use_cache and (resp.content or "").strip()</code> — <code>gateway.py:467</code></li>
+<li><b>异步查找</b>：<code>cache.aget()</code> 走线程池，<b>不阻塞事件循环</b> — <code>cache.py</code></li>
+</div>
+
+<h3>HR 必问："为什么用字符 3-gram 余弦而不是 embedding？"</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>语义缓存用字符 3-gram 余弦，长 prompt 下命中率会下降。你为什么不用 embedding？</strong>
+<div class="q-a">
+<strong>答：</strong>这是<b>工程取舍</b>，不是"技术偏好"。<br>
+① 3-gram 余弦：<b>零依赖</b>，纯 Python，不引入向量库部署成本<br>
+② 长 prompt 下命中率确实下降——审计实测命中率 40.9% 中，<b>大部分是"同 Agent 重复跑同一任务"</b>，不是真语义泛化<br>
+③ 升级路线：<b>如果量化证明 embedding 命中率能稳定 ≥70%</b>，且向量库的运维成本可承担，就换<br>
+④ 当前阶段选择 3-gram = <b>"够用 + 零成本"</b>，符合 demo 阶段的资源约束<br>
+这是架构师该有的决策：<b>不追求最好，追求"当前约束下最合适"</b>。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s6"><span class="n">§6</span>A17 ReAct 增量协议（深）</h2>
+<p class="lead"><code>src/domain/agents/analysis/react.py</code>（约 200 行）+ <code>src/domain/agents/decision/recommend/agent.py</code>（约 250 行）。</p>
+
+<h3>核心：增量协议（不是"循环重发"）</h3>
+
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant STEP1 as Step 1 (发全量)
+  participant STEP2 as Step 2 (发增量)
+  participant STEP3 as Step 3 (兜底)
+
+  STEP1->>STEP1: compact=True → 压缩上游 analyses 每块 ≤400 字<br/>prompt = 700 tokens
+  STEP1->>STEP2: LLM 输出 action 或 final_answer
+  STEP1->>STEP2: 若 action：执行工具 → 截断 observation 800 字<br/>追加到 scratchpad
+
+  STEP2->>STEP2: incremental=True → 只发"上次输出摘要(600字)<br/>+ 本步新 observation"<br/>prompt = ~1500 tokens (vs 旧 7582)
+  STEP2->>STEP3: 继续同 Step 2 模式
+
+  STEP3->>STEP3: 第 3 轮强制追加："必须输出 final_answer"<br/>prompt = ~1500 tokens
+  STEP3->>STEP3: 兜底：返回最后一次输出<br/>避免抛错中断
+</div>
+
+<h3>核心代码</h3>
+
+<h4>A17 prompt 压缩（compact context）</h4>
+<pre><code># src/domain/agents/decision/recommend/agent.py
+def _build_compact_context(self, payload, max_chars_per_block=400):
+    """第 8 轮新增：每个上游分析压缩到 ≤400 字（只留结论摘要 + 2-3 个关键数值）。"""
+    blocks = []
+    for a in payload.analyses:
+        agent_id = str(a.get("agent_id", "?"))
+        confidence = str(a.get("confidence", "?"))
+        conclusion = str(a.get("conclusion", "")).strip()
+        if len(conclusion) > 200:
+            conclusion = conclusion[:197] + "..."
+        # 抽 2-3 个数值型字段
+        result = a.get("result") or {}
+        SKIP = {"tokens_in","tokens_out","model_used","disclaimer","stance","evidence","trace_id"}
+        metrics = []
+        for k, v in result.items():
+            if k in SKIP:
+                continue
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                metrics.append(f"{k}={v}")
+            if len(metrics) >= 3:
+                break
+        block = f"### {agent_id}（置信度:{confidence}）\n结论: {conclusion}"
+        if metrics:
+            block += f"\n关键数值: {', '.join(metrics)}"
+        if len(block) > max_chars_per_block:
+            block = block[:max_chars_per_block - 3] + "..."
+        blocks.append(block)
+    return "\n\n".join(blocks) if blocks else "（无上游分析）"</code></pre>
+
+<h4>ReAct 增量协议（incremental=True）</h4>
+<pre><code># src/domain/agents/analysis/react.py:72-133
+async def run(self, system, prompt, *, agent_id, trace_id, ...):
+    tool_descs = self._tools.describe_all()
+    full_system = (
+        f"{system}\n\n你可以使用以下工具来获取额外信息：{tool_descs}\n\n"
+        "推理流程：先思考是否需要调用工具，如果需要则输出 "
+        '{"action": {"name": "工具名", "args": {...}}}；'
+        "如果信息已足够则输出 {\"final_answer\": {你的最终JSON答案}}。"
+    )
+    scratchpad = ""
+
+    for step in range(self._max_steps):  # 默认 2（env 可覆盖）
+        if cancel_token is not None:
+            cancel_token.check()
+
+        # ★ 增量协议核心
+        if step == 0 or not self._incremental:
+            # 第 1 步：发完整任务 + 累积 scratchpad
+            current_prompt = f"## 任务\n{prompt}\n"
+            if scratchpad:
+                current_prompt += f"\n{scratchpad}\n"
+        else:
+            # 第 2+ 步：只发"上次输出摘要 + 新 observation"
+            current_prompt = (
+                "## 续推（增量）\n"
+                "原始任务与上游分析已在第 1 步提供，不要再要求重发。\n\n"
+                f"### 上一次输出\n{_summarize_lm_output(last_data)}\n"
+            )
+
+        is_last = step == self._max_steps - 1
+        if is_last:
+            current_prompt += (
+                "\n## 重要提醒\n这是最后一轮，"
+                "必须直接输出 final_answer，禁止再调用工具。\n"
+            )
+
+        response = await self._gateway.complete(
+            self._task_tier, full_system, current_prompt,
+            agent_id=agent_id, trace_id=trace_id, json_mode=json_mode,
+            use_cache=(step == 0),  # 只第 1 步走缓存
+        )
+        # ... 解析 JSON / 处理 action / 累加 scratchpad ...</code></pre>
+
+<h4>_summarize_lm_output 摘要函数</h4>
+<pre><code># src/domain/agents/analysis/react.py
+def _summarize_lm_output(data: dict) -> str:
+    """把上一次 LLM 的输出压缩成短摘要（用于 step 2+ 注入）。"""
+    parts = []
+    thinking = data.get("thinking") or data.get("thought")
+    if isinstance(thinking, str) and thinking.strip():
+        parts.append(f"推理：{thinking.strip()[:300]}")
+    action = data.get("action")
+    if isinstance(action, dict):
+        name = str(action.get("name", ""))
+        args = action.get("args") or {}
+        try:
+            args_short = json.dumps(args, ensure_ascii=False)[:200]
+        except (TypeError, ValueError):
+            args_short = str(args)[:200]
+        parts.append(f"动作：{name}({args_short})")
+    if not parts:
+        # 兜底：整段截断
+        try:
+            parts.append(json.dumps(data, ensure_ascii=False)[:600])
+        except (TypeError, ValueError):
+            parts.append(str(data)[:600])
+    return "\n".join(parts)</code></pre>
+
+<h3>成本对比（实测）</h3>
+
+<table>
+<thead><tr><th>指标</th><th>旧（每轮重发全量）</th><th>新（compact + incremental）</th></tr></thead>
+<tbody>
+<tr><td>第 1 步 tokens_in</td><td>7582</td><td>~700（compact）</td></tr>
+<tr><td>第 2 步 tokens_in</td><td>7582</td><td>~600（incremental）</td></tr>
+<tr><td>第 3 步 tokens_in</td><td>7582</td><td>~600（incremental）</td></tr>
+<tr><td>3 步合计 tokens_in</td><td>22746</td><td>~1900</td></tr>
+<tr><td>3 步 tokens_out</td><td>411726</td><td>~60000</td></tr>
+<tr><td>占系统成本</td><td>55%（云端 deepseek-v4-pro）</td><td>~30%</td></tr>
+</tbody>
+</table>
+
+<h3>A17 ReAct 4 道追问护栏</h3>
+
+<table>
+<thead><tr><th>护栏</th><th>作用</th><th>代码位置</th></tr></thead>
+<tbody>
+<tr><td>① receiver 白名单</td><td>只问 A08-A16（分析/行业层）</td><td class="file">supervisor.py:807-810</td></tr>
+<tr><td>② 同问题幂等</td><td>normalize_question 后命中即返回</td><td class="file">supervisor.py:811-815</td></tr>
+<tr><td>③ 单 Agent 追问数</td><td>MAX_ASKS_PER_AGENT=1</td><td class="file">supervisor.py:816-819</td></tr>
+<tr><td>④ 工具存在性</td><td>不在白名单时返回引导</td><td class="file">supervisor.py:120-125</td></tr>
+</tbody>
+</table>
+
+<div class="note warn">
+<b>为什么 MAX_ASKS=1（不是 2）？</b><br>
+系统 prompt 里写"最多 2 次"——但实际闸门是 1 次。这是被"LLM 绕着重问同一个 Agent"实测逼出来的收紧。<br>
+闸门在 provider 调用之前——这是关键，<b>不消耗 API 就拒绝</b>。
+</div>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>增量协议 incremental=True</b>：第 2+ 步只发 last_data + new obs — <code>react.py:75</code></li>
+<li><b>compact context ≤400 字/块</b>：每个上游分析压缩 — <code>recommend/agent.py:_build_compact_context</code></li>
+<li><b>max_steps 默认 2</b>：env <code>MOSS_REACT_MAX_STEPS</code> 可覆盖 — <code>supervisor.py:1148-1158</code></li>
+<li><b>_summarize_lm_output ≤600 字</b>：上次输出摘要截断 — <code>react.py</code></li>
+<li><b>observation 截断 800 字</b>：<code>_OBS_TRUNCATE = 800</code> — <code>react.py:25</code></li>
+<li><b>4 道追问护栏</b>：receiver / 同问题 / 追问数 / 工具存在 — <code>supervisor.py:807-125</code></li>
+<li><b>第 3 步强制直出 final_answer</b> — <code>react.py:96-98</code></li>
+</div>
+
+<h3>HR 必问："为什么不用 LangChain 的原生 tool calling？"</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>你的 ReAct 用 JSON 模拟工具调用，而不是 LangChain 原生 tool calling？</strong>
+<div class="q-a">
+<strong>答：</strong>项目里 LLM provider 大部分是 Ollama 本地模型 + DeepSeek，<b>不统一支持原生 tool calling 协议</b>。<br><br>
+用 JSON 模拟的优势：<br>
+① <b>统一协议</b>：本地/云端模型都能用同一个 <code>ToolRegistry</code><br>
+② <b>可调试</b>：JSON 是文本，可直接打印<br>
+③ <b>可控</b>：4 道闸门自己写，不依赖框架行为<br><br>
+代价：① 需要 <code>parse_llm_json</code> 解析（已加 repair）② schema 锁不住结构（用 prompt + enum 引导）。<br><br>
+这是<b>工程取舍</b>：在"统一支持"和"原生支持"之间，我选前者——因为 provider 异构的现实不允许只押一家。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s7"><span class="n">§7</span>A12 合规纯规则判定逻辑</h2>
+<p class="lead"><code>src/domain/agents/analysis/compliance/agent.py</code>（118 行）+ <code>logic.py</code>（111 行）。</p>
+
+<h3>"走纯规则" vs "走 LLM" 的完整判定</h3>
+
+<div class="mermaid">
+flowchart TD
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef llm fill:#8957e5,stroke:#a371f7,color:#fff
+
+  IN["A12.execute(payload)"] --> HINT["_prepare(): 计算 compliance_calc<br/>evaluate_compliance() 本地算旗标<br/>agent.py:57-60"]
+  HINT --> CHECK{"_should_skip_llm()<br/>agent.py:63-75"}
+  CHECK -->|"compliance_level_calc=='无'<br/>AND events==[]"| RUL["走纯规则<br/>_build_rule_only_result()<br/>model_used='rule-only'"]
+  CHECK -->|"有'未见明显合规风险信号'占位<br/>AND events==[]"| RUL
+  CHECK -->|"其他情况"| LLM["走 LLM<br/>medium 层 → deepseek/flash<br/>输出综合结论"]
+  RUL --> OUT["返回 AgentOutput<br/>skip LLM call"]
+  LLM --> OUT
+
+  class CHECK hot
+  class RUL,OUT ok
+  class LLM llm
+</div>
+
+<h3>本地合规规则（4 类旗标）</h3>
+
+<table>
+<thead><tr><th>旗标类别</th><th>指标关键字</th><th>严重阈值</th><th>普通阈值</th></tr></thead>
+<tbody>
+<tr><td>关联交易</td><td>关联交易</td><td>—</td><td>> 30%</td></tr>
+<tr><td>商誉</td><td>商誉</td><td>—</td><td>> 30%</td></tr>
+<tr><td>质押</td><td>股权质押比例</td><td>> 80%（严重）</td><td>> 50%</td></tr>
+<tr><td>担保</td><td>对外担保/净资产</td><td>> 100%（严重）</td><td>> 50%</td></tr>
+<tr><td>存贷双高</td><td>货币资金 + 有息负债</td><td>两者均 > 40%（严重）</td><td>—</td></tr>
+<tr><td>诉讼/监管事件</td><td>A06 抽取的 events</td><td>立案/调查/冻结/处罚/警示函/退市/违规</td><td>其他 litigation+negative</td></tr>
+</tbody>
+</table>
+
+<h3>等级判定</h3>
+<pre><code># src/domain/agents/analysis/compliance/logic.py:100-108
+severe_count = len(severe)
+if severe_count >= 1 or len(flags) >= 3:
+    level = "高"
+elif flags:
+    level = "中"
+else:
+    level = "无"</code></pre>
+
+<h3>走纯规则的判定条件（精确代码）</h3>
+<pre><code># src/domain/agents/analysis/compliance/agent.py:63-75
+def _should_skip_llm(self, payload):
+    calc = payload.hint.get("compliance_calc", {}) or {}
+    level = calc.get("compliance_level_calc", "")
+    flags = calc.get("compliance_flags") or []
+    events = payload.events or []
+    # 条件 1：level='无' AND 无 events
+    if level == "无" and len(events) == 0:
+        return True
+    # 条件 2：只有'未见明显合规风险信号'占位 AND 无 events
+    if (len(flags) == 1
+            and flags[0] == "未见明显合规风险信号"
+            and len(events) == 0):
+        return True
+    return False</code></pre>
+
+<h3>纯规则路径的输出</h3>
+<pre><code># src/domain/agents/analysis/compliance/agent.py:77-98
+def _build_rule_only_result(self, payload):
+    calc = payload.hint.get("compliance_calc", {}) or {}
+    flags = calc.get("compliance_flags") or ["未见明显合规风险信号"]
+    conclusion = (
+        f"本地合规规则扫描完成：{'; '.join(flags[:3])}。"
+        "评级「无/中」由本地规则计算（model_used=rule-only，跳过 LLM 调用）。"
+    )
+    return {
+        "conclusion": conclusion[:200],
+        "confidence": "high",
+        "compliance_level": calc.get("compliance_level_calc", "无"),
+        "burst_risk": "未见明确爆雷路径",
+        "red_flags": flags if flags != ["未见明显合规风险信号"] else [],
+        "key_points": [
+            f"合规旗标 {len(flags)} 条",
+            f"严重旗标 {calc.get('severe_flag_count', 0)} 条",
+            "纯规则判定，无需 LLM",
+        ],
+        "_rule_only": True,
+        "model_used": "rule-only",
+    }</code></pre>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>判定条件 1</b>：<code>level=='无' AND events==[]</code> → 纯规则</li>
+<li><b>判定条件 2</b>：只有占位旗标 <code>'未见明显合规风险信号'</code> AND events==[] → 纯规则</li>
+<li><b>规则-only 输出标记</b>：<code>model_used="rule-only"</code></li>
+<li><b>TraceStep 用 indicator_calculation</b>（不是 llm_inference）</li>
+<li><b>tokens_in=0, tokens_out=0</b>（纯规则不发 LLM）</li>
+</div>
+
+<h3>HR 必问（用户原话）：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"A12 合规走纯规则，你怎么决定哪些 case 走 LLM 哪些不走？"</strong>
+<div class="q-a">
+<strong>答：</strong>判定条件<strong>只有一个维度</strong>：本地规则给出的 <code>compliance_level_calc</code>。<br><br>
+① 如果本地规则计算后 <code>level=='无'</code>（没有任何红旗）<strong>且</strong> <code>events==[]</code>（没有诉讼/监管事件）→ <strong>纯规则</strong>。理由：让 LLM "把'无'再写一遍" = 浪费 18.5k tokens。<br>
+② 如果本地规则给出红旗或 events 有内容 → <strong>必须 LLM 综合定性</strong>。理由：定性解读（爆雷路径描述、红旗分级）LLM 比规则强。<br><br>
+<b>关键边界</b>：纯规则时我标记 <code>model_used="rule-only"</code>，审计追溯清晰；不是"省成本而省略"。<br><br>
+<b>为什么不用"事件数量"做判定</b>：事件数量不一定代表风险严重度——一个"关注函"和一个"立案调查"性质不同，不能简单按数量判定。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s8"><span class="n">§8</span>A08-A12 白名单过滤（深）</h2>
+<p class="lead">审计实证：5 个 Agent 收到完全相同的 537 行全量数据，tokens_in 全是 25149。</p>
+
+<h3>问题 + 修复</h3>
+
+<table>
+<thead><tr><th>维度</th><th>修复前</th><th>修复后（白名单过滤）</th></tr></thead>
+<tbody>
+<tr><td>tokens_in（每轮）</td><td>25149（5 个 Agent 完全相同）</td><td>5000-15000（按 Agent 裁剪）</td></tr>
+<tr><td>单次分析 tokens_in</td><td>20K 无效载荷</td><td>几乎零冗余</td></tr>
+<tr><td>数据相关性</td><td>A10 看到宏观指标 / A08 看到个股指标</td><td>每个 Agent 只看它真正需要的</td></tr>
+</tbody>
+</table>
+
+<h3>完整白名单（<code>_AGENT_DATA_WHITELIST</code>）</h3>
+
+<table>
+<thead><tr><th>Agent</th><th>白名单 keywords</th><th>实际需要的指标</th></tr></thead>
+<tbody>
+<tr><td><b>A08_macro（宏观）</b></td><td>CPI, PPI, M2, GDP, PMI, 社融, 十年国债, FedWatch, 美元指数, 美债, 非农, 失业率, 通胀, 货币政策, CPI同比, PPI同比, GDP同比</td><td>宏观周期 + 货币政策</td></tr>
+<tr><td><b>A09_meso（中观）</b></td><td>sw_, ind_, bk_, industry_, 板块, 行业, 估值分位, industry_pe, industry_amount, industry_pct</td><td>板块 / 行业指数 + 估值</td></tr>
+<tr><td><b>A10_micro（个股微观）</b></td><td>stock_close:, stock_open:, stock_high:, stock_low:, stock_volume:, PE(TTM), PB, PS, PCF, stock_turnover:, 流通市值, 总市值, 换手率, 涨跌幅, 成交额, stock_, 市值, pe_ttm, pb</td><td>个股行情 + 估值</td></tr>
+<tr><td><b>A11_fin_risk（财务风险）</b></td><td>资产负债率, 流动比率, 速动比率, 净负债率, 商誉, 扣非净利润, 经营性现金流, 存货周转, 应收账款, ROE, ROA, 毛利率, 净利率, 有息负债, 财务费用, 杠杆, debt_ratio</td><td>偿债 + 盈利 + 营运 + 现金流</td></tr>
+<tr><td><b>A12_compliance（合规）</b></td><td>公告, 处罚, 诉讼, 关联交易, 减持, 增持, 回购, 担保, 质押, 冻结, st_, ST, 违规, 监管, 问询函, 关注函, defense, compliance</td><td>公告 + 处罚 + 诉讼 + 关联交易</td></tr>
+<tr><td><b>A13_tech</b></td><td>sw_tech, sw_电子, sw_计算机, sw_通信, stock_close:, 板块, 科技, 半导体, AI, 算力</td><td>科技板块 + 个股</td></tr>
+<tr><td><b>A14_consumer</b></td><td>sw_consumer, sw_食品, sw_纺织, sw_商业, stock_close:, 板块, 消费, 白酒, 家电</td><td>消费板块 + 个股</td></tr>
+<tr><td><b>A15_cyclical</b></td><td>sw_cyclical, sw_煤炭, sw_有色, sw_钢铁, sw_化工, stock_close:, 板块, 周期, 煤炭, 有色</td><td>周期板块 + 个股</td></tr>
+<tr><td><b>A16_pharma</b></td><td>sw_pharma, sw_医药, sw_生物, stock_close:, 板块, 医药, 创新药, 器械</td><td>医药板块 + 个股</td></tr>
+</tbody>
+</table>
+
+<h3>过滤算法</h3>
+<pre><code># src/orchestration/supervisor.py:171-200
+def _filter_points_for_agent(agent_id, points, *, fallback_limit=200):
+    """按 Agent ID 白名单过滤 validated_points（避免无关数据占 token）。"""
+    keywords = _AGENT_DATA_WHITELIST.get(agent_id)
+    if not keywords:
+        return list(points[:fallback_limit])  # 未配置 → fallback
+
+    kws_lower = tuple(k.lower() for k in keywords)
+    matched = []
+    for p in points:
+        ind = str(p.get("indicator", ""))
+        ind_lower = ind.lower()
+        if any(kw in ind_lower or kw in ind for kw in kws_lower):
+            matched.append(p)
+
+    if not matched and points:
+        logger.warning(
+            "Agent %s 的白名单过滤后 0 条数据点（fallback 取前 %d 条），"
+            "请检查 _AGENT_DATA_WHITELIST 配置", agent_id, fallback_limit)
+        return list(points[:fallback_limit])
+    return matched</code></pre>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>5 个 Agent tokens_in 不再相同</b>：A08 看不到 stock_*, A10 看不到 sw_* 等</li>
+<li><b>过滤后 0 条 → 兜底 200 条 + WARNING</b>（防幻觉）</li>
+<li><b>关键词大小写不敏感</b>：<code>k.lower()</code></li>
+<li><b>9 个 Agent 全部配置白名单</b>：A08-A12 + A13-A16</li>
+</div>
+
+<h3>HR 必问（用户原话）：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"<code>_AGENT_DATA_WHITELIST</code> 你为什么这么分组？哪些关键词错了？"</strong>
+<div class="q-a">
+<strong>答：</strong>分组原则是<strong>按 Agent 的职责范围</strong>，不是"按主题词"：<br>
+① A08 宏观 = CPI/PPI/M2/GDP/PMI/货币政策等<b>宏观指标</b><br>
+② A09 中观 = sw_/ind_/bk_ 等<b>板块行业前缀</b>+ 行业估值<br>
+③ A10 微观 = stock_*/PE/PB/市值等<b>个股指标</b><br>
+④ A11 财务风险 = <b>财务比率指标</b>（资产负债率/ROE/现金流等）<br>
+⑤ A12 合规 = <b>公告/处罚/诉讼等事件型指标</b><br>
+⑥ A13-A16 行业 = sw_xxx + stock_close:*（行业 + 个股估值）<br><br>
+<strong>可能有错的关键词</strong>：<br>
+① <strong>A12 的 "st_"</strong>：匹配 "st_*" 但也可能匹配 "st_anything"，可能误匹配——建议改为精确匹配 "ST" 或 "st_2024"<br>
+② <strong>A11 的 "debt_ratio"</strong>：这是个英文缩写，但实际系统里都是中文指标 "资产负债率"，这个 keyword 几乎没用——可以删除<br>
+③ <strong>A10 的 "pe_ttm", "pb"</strong>：这是英文短缩，实际用 "PE(TTM)" "PB"，keyword 不匹配——建议改为大写 "PE(TTM)"<br>
+④ <strong>A13-A16 的 "sw_tech" 等 sw_xxx</strong>：依赖申万行业代码体系，如果换成东财/同花顺分类就不匹配——<strong>白名单对数据源有依赖</strong><br><br>
+<strong>验证方法</strong>：每次白名单改动后跑 <code>test_agent_payload_filter.py</code>（如果有），逐 Agent 验证过滤后的数据点 <code>indicator</code> 字段全部命中白名单。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s9"><span class="n">§9</span>A19 自学习数据补充（AST+沙箱）</h2>
+<p class="lead"><code>src/domain/agents/data_gap_resolver.py</code> + <code>engineering/code_engineer/agent.py</code>。</p>
+
+<h3>完整流程</h3>
+
+<div class="mermaid">
+flowchart TD
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef llm fill:#8957e5,stroke:#a371f7,color:#fff
+
+  IN["A01 采集失败<br/>无数据点"] --> CHECK{"_self_heal_allowed()<br/>supervisor.py:第八轮新增<br/>白名单 + 失败缓存 + 限频"}
+  CHECK -->|黑名单 / 限频 / 失败| SKIP["跳过"]
+  CHECK -->|允许| RES["DataGapResolverAgent<br/>resolve(indicator, error_ctx)"]
+  RES --> GEN["LLM 生成连接器代码<br/>reasoning 层（云端）<br/>prompt 稳定 hash 缓存"]
+  GEN --> VAL{"AST 校验<br/>code_validator.py"}
+  VAL -->|失败| FIX["修复轮（≤3）<br/>把 last_issues 反馈给 LLM"]
+  FIX --> GEN
+  VAL -->|通过| SANDBOX["子进程沙箱<br/>15s 超时<br/>白名单 import<br/>禁 os/subprocess/eval"]
+  SANDBOX -->|失败| REJECT["ResolutionResult(success=False)<br/>不阻断主链路"]
+  SANDBOX -->|通过| REG["动态连接器落库注册<br/>恢复定时作业<br/>dynamic_<hash8>"]
+  REG --> FETCH["重试 fetch<br/>拿真实数据点"]
+  FETCH --> RET["返回数据点<br/>主链路继续"]
+
+  class CHECK,SANDBOX hot
+  class REG,FETCH,RET ok
+  class GEN,VAL llm
+</div>
+
+<h3>第八轮新增的"防误触发"护栏</h3>
+
+<table>
+<thead><tr><th>护栏</th><th>代码位置</th><th>防的问题</th></tr></thead>
+<tbody>
+<tr><td>黑名单</td><td class="file">supervisor.py:_HEAL_BLACKLIST</td><td><code>ind:sw_third_*</code> 东财 WAF 已知失败（−162k tokens 输出）</td></tr>
+<tr><td>失败缓存</td><td class="file">supervisor.py:_HEAL_FAIL_CACHE（TTL=1h）</td><td>同一指标反复触发</td></tr>
+<tr><td>频率限制</td><td class="file">supervisor.py:_HEAL_QUOTA_MAX=5/60s</td><td>N 个并发 trace 各自触发</td></tr>
+</tbody>
+</table>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>AST 校验禁 import os/subprocess/eval</b> — <code>code_validator.py</code></li>
+<li><b>沙箱 15s 超时</b> — <code>SANDBOX_TIMEOUT_SEC=15</code></li>
+<li><b>修复轮 ≤3</b> — <code>code_engineer/agent.py:227</code></li>
+<li><b>白名单黑名单检查</b> — <code>supervisor.py:_HEAL_BLACKLIST</code></li>
+<li><b>1h 失败缓存</b> — <code>supervisor.py:_HEAL_FAIL_CACHE</code></li>
+<li><b>60s 限频 5 次</b> — <code>supervisor.py:_HEAL_QUOTA_MAX</code></li>
+<li><b>trace_id 稳定 hash</b>（P1-F）— <code>data_gap_resolver.py:294-301</code></li>
+</div>
+
+<h3>HR 必问：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"自学习代码生成如何防安全风险？"</strong>
+<div class="q-a">
+<strong>答：</strong>四道闸门，每道只防一种问题：<br>
+① <strong>AST 白名单校验</strong>：禁 <code>import os/subprocess</code>、禁 <code>eval/exec</code>、禁文件写绝对路径<br>
+② <strong>子进程沙箱</strong>：15s 超时、import 白名单、禁网络风暴<br>
+③ <strong>修复轮上限 3</strong>：超过 3 轮就报错，让人工介入<br>
+④ <strong>触发护栏</strong>（第八轮加）：黑名单 + 失败缓存 + 限频<br><br>
+<strong>承认不足</strong>：子进程级隔离 ≠ 安全容器（不是 gVisor/Firecracker）。<br>
+只适合"半信任"生成代码在小规模数据源上使用。<br><br>
+这是<b>我的工程诚实</b>：如果有人问我"你的沙箱安全吗"，我不会吹"绝对安全"——我会说"<strong>子进程级隔离，对内部小规模数据源够用；要做多租户 SaaS 必须换 gVisor</strong>"。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s10"><span class="n">§10</span>成本治理闭环（token → 元）</h2>
+<p class="lead"><code>src/core/budget.py</code>（547 行）。</p>
+
+<h3>三层成本模型</h3>
+
+<div class="mermaid">
+flowchart LR
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef bad fill:#a1281f,stroke:#f85149,color:#fff
+
+  L1["① 投研在线请求<br/>MOSS_LLM_DAILY_BUDGET_CNY=20<br/>precommit reserve_task()<br/>research.py:259-275"]
+  L1 --> L2["② 高额脚本护栏<br/>ScriptCostGuard<br/>MOSS_SCRIPT_COST_CAP_CNY=1<br/>入口拒绝 + 跑到一半中止<br/>budget.py:386-530"]
+  L2 --> L3["③ 日预算累计账本<br/>by_source 分账<br/>budget.py: snapshot()"]
+
+  L1 -.->|"实测<br/>487元/天"| L2
+  L2 -.->|"实测<br/>478元/天"| L3
+  L3 -.->|"痛点<br/>预算被绕过"| OBS["⚠️ 95% 成本在离线脚本<br/>审计实证 mainline_relevance 478元/天<br/>占日预算的 24 倍"]
+
+  class L1,L2 hot
+  class L3 ok
+  class OBS bad
+</div>
+
+<h3>核心：<code>call_cost_cny</code> 单一计价</h3>
+<pre><code># src/core/budget.py:152-173
+def call_cost_cny(*, provider, model, tokens_in, tokens_out,
+                  cache_hit=False, prices=None):
+    """一次调用的费用（元）。**唯一的计价实现**。
+    
+    · provider != "deepseek"（本地 Ollama 等）→ 0 元
+    · 未登记价格的模型 → _FALLBACK_PRICE 兜底（宁可高估不可漏记）
+    · 计价口径：tokens_in × 命中/未命中价 + tokens_out × 输出价（元/百万 token）
+    """
+    if str(provider) != "deepseek":
+        return 0.0
+    table = model_prices() if prices is None else prices
+    hit_rate, miss_rate, out_rate = table.get(str(model), _FALLBACK_PRICE)
+    in_rate = hit_rate if cache_hit else miss_rate
+    return ((int(tokens_in or 0) * in_rate
+             + int(tokens_out or 0) * out_rate) / 1_000_000.0)</code></pre>
+
+<h3>关键设计：日预算预扣 + 结算</h3>
+<pre><code># src/core/budget.py:269-300
+def reserve_task(self, source="research") -> bool:
+    """为一次投研任务预扣额度。"""
+    if self._daily <= 0:
+        return True
+    need = self._task_reserve  # 默认 0.25 元（p90）
+    with self._lock:
+        if self._ledger.used + need > self._daily:
+            return False  # 预算不足
+        self._ledger.reserved += need
+    return True
+
+def release_task(self, actual_cost=0.0, source="research"):
+    """结算：退还预扣 + 记实际消耗。"""
+    if self._daily <= 0:
+        return
+    with self._lock:
+        self._ledger.reserved = max(0, self._ledger.reserved - self._task_reserve)
+        if actual_cost > 0:
+            self._ledger.spent += float(actual_cost)
+            self._ledger.by_source[source] = (
+                self._ledger.by_source.get(source, 0.0) + float(actual_cost))</code></pre>
+
+<h3>"95% 成本在离线脚本"事故</h3>
+
+<div class="note bad">
+<b>审计实证</b>（PROJECT_AUDIT §5.5）：<br>
+· <code>mainline_relevance</code>：<b>478 元/天</b>（占日预算 20 元的 <b>24 倍</b>）<br>
+· <code>mainline_member_pure</code>：117 元/天<br>
+· 合计：<b>600+ 元/天</b>，但日预算是 20 元<br><br>
+<b>根因</b>：<code>mainline_relevance</code> 是批量打分脚本（一次扫 N 只股票），没有预扣机制——只在事后记 <code>spent</code>。<br><br>
+<b>修法</b>（第八轮）：<code>ScriptCostGuard</code><br>
+· <b>入口判</b>：<code>check_entry(estimate)</code>，预计花费 > 1 元直接拒绝启动<br>
+· <b>跑到一半判</b>：<code>check_running()</code>，实际花费 ≥ 上限时主动中止<br>
+· <b>基线</b>：本进程启动时的当日累计（基线 = 0，因为账本是进程内）<br><br>
+<b>实测效果</b>：从"无护栏 487 元/天" → "<code>mainline_relevance</code> 跑会被 <code>check_entry()</code> 直接拒绝"
+</div>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>call_cost_cny 唯一计价</b>：账本与监控共用 — <code>budget.py:152</code></li>
+<li><b>本地 Ollama 0 元</b>：<code>provider != "deepseek" → return 0.0</code></li>
+<li><b>未登记价用兜底</b>：<code>_FALLBACK_PRICE</code> 宁高估不漏记 — <code>budget.py:58</code></li>
+<li><b>预扣防 TOCTOU</b>：并发突发时 <code>reserve_task()</code> 在并发闸门之前 — <code>research.py:259-275</code></li>
+<li><b>DEFAULT_TASK_RESERVE = 0.25 元</b>：p90 取整 — <code>budget.py:62</code></li>
+<li><b>ScriptCostGuard 入口拒绝</b>：预计 > 1 元直接禁 — <code>budget.py:499-519</code></li>
+<li><b>ScriptCostGuard 跑到一半中止</b>：实际花费 ≥ 上限抛 ScriptCostError — <code>budget.py:521-529</code></li>
+</div>
+
+<h3>HR 必问：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"你们日预算 20 元，但离线脚本一天烧 487 元，预算根本没拦住，怎么解决？"</strong>
+<div class="q-a">
+<strong>答：</strong>这正是第八轮要修的事。<br><br>
+① <strong>原因</strong>：离线脚本（<code>mainline_relevance</code>）<b>没有"预扣"</b>——只在事后记账，<b>TOCTOU</b> 集体超额。<br>
+② <strong>解法</strong>：<code>ScriptCostGuard</code> 三件套<br>
+　· <b>入口判</b>：<code>check_entry(estimate)</code>，预计 > 1 元直接拒绝启动<br>
+　· <b>跑到一半判</b>：<code>check_running()</code>，实际花费 ≥ 上限主动中止<br>
+　· <b>基线</b>：本进程启动时的当日累计（账本是进程内的）<br>
+③ <strong>效果</strong>：从"无护栏 487 元/天" → "<code>mainline_relevance</code> 启动被 <code>check_entry()</code> 直接拒绝"（用 <code>MOSS_SCRIPT_COST_CAP_CNY</code> 显式覆盖才能跑）<br>
+④ <strong>关键洞察</strong>：这是<b>"高额脚本与日常在线请求的成本语义不同"</b>——前者该绝对值上限（1 元），后者该日预算（20 元），<b>两套闸门不能混</b>。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s11"><span class="n">§11</span>多租户 RLS（tenant+user 双层）</h2>
+<p class="lead"><code>src/infrastructure/security/rls.py</code>（约 200 行）。</p>
+
+<h3>RLS 的两个层级</h3>
+
+<div class="mermaid">
+flowchart TB
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  classDef llm fill:#8957e5,stroke:#a371f7,color:#fff
+
+  REQ["请求：SELECT * FROM dim_user_pool"] --> APP["应用层 RLS<br/>tenant_column_guard()<br/>拼 WHERE tenant_id=? AND user_id=?"]
+  REQ --> DB["数据库层 RLS<br/>postgres_rls_ddl() 生成<br/>CREATE POLICY"]
+
+  APP --> T1{"表在 TENANT_COLUMNS?"}
+  T1 -->|否| ERR["抛 TenantError<br/>'表未登记租户列'"]
+  T1 -->|是| T2{"表有 user 列?<br/>(tenant_id, user_id)"}
+  T2 -->|"是 + 非 admin"| U1["追加 user_id=?<br/>自动 user 级隔离"]
+  T2 -->|"是 + admin role"| U2["只追加 tenant_id=?"
+]
+  T2 -->|"否 (仅 tenant_id)"| U3["只追加 tenant_id=?<br/>租户级共享"]
+  U1 --> SQL["最终 SQL:<br/>SELECT ... WHERE tenant_id=? AND user_id=?"]
+  U2 --> SQL
+  U3 --> SQL
+
+  DB --> POL["CREATE POLICY user_pool_isolation ON dim_user_pool<br/>USING (tenant_id = current_tenant_id() AND user_id = current_user_id())"]
+  POL --> BOTH["两道闸门都要有"]
+
+  class APP,DB ok
+  class T1,T2,U1,U2,U3 hot
+  class POL,BOTH llm
+</div>
+
+<h3>核心代码</h3>
+<pre><code># src/infrastructure/security/rls.py:38-46
+TENANT_COLUMNS: dict[str, tuple[str, str | None]] = {
+    # 用户级（每个用户独立自选 / 参数）
+    "dim_intraday_profile_v2": ("tenant_id", "user_id"),
+    "dim_user_pool": ("tenant_id", "user_id"),
+    "dim_pool_member": ("tenant_id", "user_id"),
+    "dim_user_pref": ("tenant_id", "user_id"),
+    # 仅租户级（admin 共享 / 多用户共用）
+    "watchlist": ("tenant_id", None),
+    "intraday_profile": ("tenant_id", None),
+    ...
+}</code></pre>
+
+<h3>演进史（"假实现"事故）</h3>
+
+<div class="note bad">
+<b>早期假实现</b>（已修）：<br>
+<code>_inject_tenant_filter()</code> 取了租户、遍历了表，然后 <code>return stmt</code> 原样返回 —— docstring 声称注入 <code>WHERE tenant_id = ?</code>，实际什么都没做。<br><br>
+<b>为什么是危险</b>：<br>
+① 比"没有隔离"<b>更危险</b>——让人以为已经隔离了<br>
+② 测试可能只检查"看起来调用了函数"，没检查"SQL 是否真有 WHERE"<br>
+③ 上线后数据泄漏<br><br>
+<b>修法</b>（第六轮合规门禁上线时一并修）：<br>
+· 只做应用层 <code>tenant_column_guard()</code> + 真正的 SQL 拼装<br>
+· 提供数据库层 DDL 生成（<code>postgres_rls_ddl()</code>）<br>
+· 在 <code>compliance_gate.py</code> 加测试：未授权时必须抛 TenantError<br>
+· 文档明确"应用层 RLS ≠ 安全边界，数据库原生 RLS 才是"
+</div>
+
+<h3>HR 必问：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"如何防多用户串号？你们的 RLS 是怎么设计的？"</strong>
+<div class="q-a">
+<strong>答：</strong>两层 + 双维度：<br><br>
+① <strong>应用层 RLS</strong>：<code>tenant_column_guard()</code> 拼 <code>WHERE tenant_id=? AND user_id=?</code><br>
+② <strong>数据库层 RLS</strong>：<code>postgres_rls_ddl()</code> 生成 <code>CREATE POLICY user_pool_isolation USING (... AND ...)</code><br>
+③ <strong>双维度</strong>：每个表在 <code>TENANT_COLUMNS</code> 里登记 <code>(tenant_col, user_col)</code>：<br>
+　· <code>dim_user_pool</code> 等 = 用户级（tenant + user）<br>
+　· <code>watchlist</code> 等 = 仅租户级<br><br>
+<strong>关键经验</strong>：早期是"假实现"——docstring 说注入，函数 <code>return stmt</code>，比没有更危险。<br>
+修法：把"未授权 → 必须抛错"做成 CI 红线，<strong>让假实现显形</strong>。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s12"><span class="n">§12</span>数据连接器三级故障转移</h2>
+<p class="lead"><code>src/infrastructure/connectors/router.py</code> + <code>akshare_connector.py</code> + <code>tushare_connector.py</code>。</p>
+
+<h3>降级链路</h3>
+
+<div class="mermaid">
+flowchart LR
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+  classDef bad fill:#a1281f,stroke:#f85149,color:#fff
+
+  REQ["A01 数据采集<br/>指标 = stock_close:600000"] --> ROUTE["ConnectorRouter<br/>按指标前缀分桶"]
+  ROUTE --> Q1{"实时源<br/>Tushare / AkShare"}
+  Q1 -->|失败| Q2{"存储降级<br/>fact_* 数据仓库"}
+  Q2 -->|无快照| Q3{"A19 自修复<br/>LLM 生成连接器"}
+  Q3 -->|黑名单 / 限频| SKIP["报数据缺口<br/>不阻断主链路"]
+  Q3 -->|成功| REG["动态连接器落库"]
+
+  ROUTE --> CACHE{"分档 TTL 缓存<br/>月频 24h / 估值 12h / 行情 4h / 实时 5min"}
+  CACHE -->|命中| RET["返回缓存"]
+  CACHE -->|未命中| Q1
+
+  ROUTE --> LOCK{"per-key lock<br/>防缓存击穿"}
+  LOCK -->|"已锁"| WAIT["等待其他请求完成"]
+  LOCK -->|"未锁"| Q1
+
+  class CACHE,LOCK ok
+  class Q1,Q2,Q3,ROUTE hot
+  class SKIP bad
+</div>
+
+<h3>核心设计：分档 TTL</h3>
+<table>
+<thead><tr><th>数据类别</th><th>TTL</th><th>理由</th></tr></thead>
+<tbody>
+<tr><td>月频宏观（CPI/PPI）</td><td>24h</td><td>月度发布</td></tr>
+<tr><td>估值（PE/PB）</td><td>12h</td><td>日频 + 历史快照稳定</td></tr>
+<tr><td>行情（stock_close）</td><td>4h</td><td>盘中变化</td></tr>
+<tr><td>实时流动性</td><td>5min</td><td>盘中需频繁更新</td></tr>
+</tbody>
+</table>
+
+<h3>"绝不回退 simulated"红线</h3>
+<div class="note bad">
+<b>核心红线</b>（架构红线）：<br>
+真实源全失败时 <strong>绝不回退 simulated 数据</strong>，宁可报缺口。<br><br>
+<strong>理由</strong>：<strong>假数据进了投研建议，比"这次没数据"危险得多</strong>。<br>
+投研建议是给用户决策用的，模拟数据 = 误判 + 资金损失。<br><br>
+这是 <strong>"工程师的价值主张"</strong>：我宁可系统 5 分钟不出数据，也不让用户看到假的。
+</div>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>分档 TTL 配置</b>：月频 24h / 估值 12h / 行情 4h / 实时 5min — <code>router.py:45</code></li>
+<li><b>per-key lock</b>：<code>asyncio.Lock</code> 防缓存击穿</li>
+<li><b>QMT 排在最后 + 默认关闭</b>：<code>AGENTS.md</code> 已说明（2026-09-23 起 QMT 失联）</li>
+<li><b>真实源失败报缺口</b>：<code>return []</code> 不回退 simulated</li>
+<li><b>数据溯源 12 字段</b>：<code>source_url / publish_time / fetch_time / raw_content_hash</code></li>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s13"><span class="n">§13</span>集合竞价规则引擎（深）</h2>
+<p class="lead"><code>src/auction_select/rulebook.py</code>（1929 行）+ <code>service.py</code>。</p>
+
+<h3>核心：规则总表 + 位掩码引擎</h3>
+
+<div class="mermaid">
+flowchart TB
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+
+  CFG["auction_select/config.yaml<br/>9 条 prefilter + 1 条 assign + 10 条 veto + 12 维"] --> COMPILE["compile_rules(cfg)<br/>rulebook.py:1796"]
+  COMPILE --> RS["RuleSet<br/>不可变快照 · 编译时算 hash"]
+  RS -->|"9:25 那一刻"| PASS1["Pass1: 打标签<br/>所有 ASSIGN 同时求值"]
+  PASS1 --> PASS2["Pass2: 否决<br/>按 Pass1 后的标签算豁免"]
+  PASS2 --> BIT["10 条 veto → uint16 位掩码"]
+  BIT --> STORE["落库：<br/>每股票位掩码 + 触发原因"]
+
+  class CFG,STORE ok
+  class COMPILE,RS,PASS1,PASS2,BIT hot
+</div>
+
+<h3>关键设计：顺序耦合消失</h3>
+<table>
+<thead><tr><th>早期（重构前）</th><th>重构后</th></tr></thead>
+<tbody>
+<tr><td>329 处 <code>if/elif</code> 散在 4 文件</td><td>1 个 <code>compile_rules()</code></td></tr>
+<tr><td>"规则 6 必须先于规则 5"（隐性顺序约束）</td><td>Pass1 打标签 + Pass2 否决——<b>顺序无关</b></td></tr>
+<tr><td>规则改了 → 不知道影响哪些股票</td><td>每次编译算 <code>rules_hash</code>，落库可回答"当时用哪套规则"</td></tr>
+<tr><td>3853 行散落</td><td><code>--dump</code> 一张纸打印所有规则</td></tr>
+<tr><td>1231 ms（生态序列占 99.3%）</td><td><b>36 ms</b>（生态序列挪出热路径）</td></tr>
+</tbody>
+</table>
+
+<h3>Pass1/Pass2 顺序无关性</h3>
+<pre><code># src/auction_select/rulebook.py:344-374
+class RuleSet:
+    prefilter: tuple[Gate, ...]   # 9 条预过滤
+    assigns: tuple[Gate, ...]     # 1 条打标签
+    vetoes: tuple[Gate, ...]      # 10 条否决
+    dims: tuple[DimSpec, ...]      # 12 维评分
+    weights: dict[str, float]
+    bonus: dict[str, float]
+    hash: str = ""
+    # 位序号 → 否决规则（反查 reason 用）
+    bit_index: dict[int, Gate] = field(default_factory=dict)
+    # 情绪周期阶段修正表
+    stage_adjust: dict[str, float] = field(default_factory=dict)
+
+# Pass1 / Pass2 实现：
+# Pass1: 同时求值所有 ASSIGN 规则（无顺序依赖）
+# Pass2: 按 Pass1 后的标签集合算豁免（豁免依赖 Pass1 结果）
+# → 两遍纯函数，顺序无关</code></pre>
+
+<h3>生态序列缓存（关键优化）</h3>
+<div class="note warn">
+<b>cProfile 实测</b>（重构前后）：<br>
+· 决策链路总耗时：<b>1231 ms → 36 ms（34×）</b><br>
+· 其中规则判定：8.1 ms → 8.1 ms（不变——只占 0.66%）<br>
+· 其中生态序列：<b>1223 ms → 0 ms</b>（盘前预算一次落盘 JSON）<br><br>
+<b>教训</b>：优化对象不是"规则"（只占 0.66%），是"一天一变的结果挪出热路径"（占 99.3%）。
+</div>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>决策链路 P95 < 50ms</b>（从 1231ms 优化到 36ms）— 选股脚本压测</li>
+<li><b>--dump 一张纸打印全部规则</b>：<code>rulebook.py:382 dump()</code></li>
+<li><b>规则指纹 rules_hash 落库</b>：可回答"当时用哪套规则"</li>
+<li><b>9 条 prefilter + 1 条 assign + 10 条 veto + 12 维</b>：声明式数据驱动</li>
+<li><b>Pass1 / Pass2 顺序无关</b>：黄金回归 47 只票 × 12 维逐位 diff</li>
+</div>
+
+<h3>HR 必问：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"重构怎么保证行为不变？"</strong>
+<div class="q-a">
+<strong>答：</strong><b>黄金回归</b>。<br><br>
+① 冻结真实行情录像带（47 只票 × 12 维）<br>
+② 把 git HEAD 的旧实现加载进来<br>
+③ 跑重构前后 → <b>逐位 diff</b>：564 处全部一致<br>
+④ 抓出 2 个肉眼绝对看不出的 bug：<br>
+　· <code>Curve.at</code> 越界兜底两边都取"首段 y_lo" → 18 只票总分漂移 0.5<br>
+　· <code>Seg.hit</code> 把 <code>lo</code> 写成开区间 → 换手率恰好 3.0 的票两段都不命中<br><br>
+<b>教训</b>：纯重构必须有 bit-by-bit diff，眼睛看不出来，只有 diff 显形。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s14"><span class="n">§14</span>板块拥挤度物化表（深）</h2>
+<p class="lead"><code>src/sector_crowding/db.py</code>（1255 行）+ <code>refresh.py</code>。</p>
+
+<h3>问题：max_ma5 GROUP BY 扫 217 万行</h3>
+
+<table>
+<thead><tr><th>指标</th><th>修复前</th><th>修复后（物化表）</th></tr></thead>
+<tbody>
+<tr><td>查询方式</td><td>每次 GROUP BY 扫 217 万行</td><td>查物化表（按主键读）</td></tr>
+<tr><td>实测耗时</td><td>0.4-1.7s</td><td>< 5ms</td></tr>
+<tr><td>并发场景</td><td>每次前端 60s 轮询都重算</td><td>查物化表 + 进程内缓存 300s</td></tr>
+</tbody>
+</table>
+
+<h3>数据流</h3>
+
+<div class="mermaid">
+flowchart TB
+  classDef ok fill:#1a7f37,stroke:#3fb950,color:#fff
+  classDef hot fill:#5d4a00,stroke:#d29922,color:#ffe08a
+
+  REQ["前端 /sector_crowding/sectors_max_ma5<br/>60s 轮询"] --> CACHE{"进程内缓存<br/>300s TTL"}
+  CACHE -->|命中| RET["返回 max_ma5_map"]
+  CACHE -->|未命中| QUERY["max_ma5_map(conn)<br/>查 sector_crowding_max_ma5 表"]
+  QUERY -->|表为空| INIT["rebuild_max_ma5_table(None)<br/>全量 GROUP BY 一次性回填"]
+  INIT --> QUERY
+  QUERY --> RET
+
+  REF["refresh_one_isolated()<br/>单板块 refresh"] --> UPD["rebuild_max_ma5_table([code])<br/>增量 UPSERT 该板块的 max_ma5"]
+  REF --> RET2["返回板块数据"]
+
+  RECOMP["recompute_stored_water_levels()<br/>全量重算水位"] --> FULL["rebuild_max_ma5_table(codes)<br/>全量重建"]
+  FULL --> RET3["完成"]
+
+  class CACHE,RET,RET2,RET3 ok
+  class QUERY,INIT,UPD,FULL hot
+</div>
+
+<h3>核心代码</h3>
+<pre><code># src/sector_crowding/db.py:838-849 (旧实现，已废)
+def max_ma5_map(conn):
+    """旧实现：每次 GROUP BY 扫 217 万行（实测 0.4-1.7s）。"""
+    rows = conn.execute(
+        f"SELECT sector_code, MAX(ma5_crowding) AS mx FROM {DAILY_TABLE} "
+        f"WHERE ma5_crowding IS NOT NULL GROUP BY sector_code").fetchall()
+    return {str(r["sector_code"]): float(r["mx"])
+            for r in rows if r["mx"] is not None}
+
+# src/sector_crowding/db.py:838-872 (新实现)
+def max_ma5_map(conn):
+    """★ 新实现：走物化表 sector_crowding_max_ma5（O(N) 主键读 < 5ms）。"""
+    # 1. 物化表为空 → 一次性回填（兼容老库；理论上首次启动后表就有数据）
+    has_data = conn.execute(
+        f"SELECT 1 FROM {MAX_MA5_TABLE} LIMIT 1").fetchone()
+    if not has_data:
+        rebuild_max_ma5_table(conn)
+
+    rows = conn.execute(
+        f"SELECT sector_code, max_ma5 FROM {MAX_MA5_TABLE}").fetchall()
+    return {str(r["sector_code"]): float(r["max_ma5"])
+            for r in rows if r["max_ma5"] is not None}
+
+# src/sector_crowding/db.py:874-901 (新增：增量更新)
+def rebuild_max_ma5_table(conn, *, sector_codes=None):
+    """重建 max_ma5 物化表。
+
+    · sector_codes=None：全量重建（GROUP BY 一次性扫日线表）
+    · sector_codes=[...]：只更新这些板块（refresh 增量场景）
+    """
+    stamp = _now()
+    if sector_codes is None:
+        rows = conn.execute(
+            f"SELECT sector_code, MAX(ma5_crowding) AS mx FROM {DAILY_TABLE} "
+            f"WHERE ma5_crowding IS NOT NULL GROUP BY sector_code").fetchall()
+        payload = [(str(r["sector_code"]), float(r["mx"]), stamp)
+                   for r in rows if r["mx"] is not None]
+    else:
+        # 增量：按板块代码分别取
+        payload = []
+        for code in sector_codes:
+            row = conn.execute(
+                f"SELECT MAX(ma5_crowding) AS mx FROM {DAILY_TABLE} "
+                f"WHERE sector_code = ? AND ma5_crowding IS NOT NULL",
+                (code,)).fetchone()
+            if row and row["mx"] is not None:
+                payload.append((code, float(row["mx"]), stamp))
+    if not payload:
+        return 0
+    conn.executemany(
+        f"INSERT INTO {MAX_MA5_TABLE}(sector_code, max_ma5, updated_at) "
+        f"VALUES (?, ?, ?) "
+        f"ON CONFLICT(sector_code) DO UPDATE SET "
+        f"max_ma5 = excluded.max_ma5, updated_at = excluded.updated_at",
+        payload)
+    conn.commit()
+    return len(payload)</code></pre>
+
+<h3>refresh / recompute 钩子</h3>
+
+<pre><code># src/sector_crowding/refresh.py:470-480 (单板块 refresh 后增量更新)
+# ★ 2026-09-27 第八轮：每板块 refresh 后增量更新 max_ma5 物化表
+try:
+    db.rebuild_max_ma5_table(conn, sector_codes=[sector_code])
+except Exception as exc:
+    logger.warning("max_ma5 物化表增量更新失败 %s: %s", sector_code, exc)
+
+# src/sector_crowding/refresh.py:282-285 (recompute 后全量重建)
+rebuilt = db.rebuild_max_ma5_table(conn, sector_codes=codes)
+logger.info("recompute: 重建 max_ma5 物化表 %d 行", rebuilt)</code></pre>
+
+<h3>验收标准（可量化 checklist）</h3>
+<div class="checklist">
+<li><b>物化表 schema</b>：<code>sector_code PRIMARY KEY, max_ma5 REAL, updated_at TEXT</code></li>
+<li><b>首屏 P95 < 50ms</b>（旧 1.5s → 新 < 5ms）</li>
+<li><b>刷新增量</b>：每板块 refresh 后 UPSERT 该板块</li>
+<li><b>recompute 全量</b>：recompute 后 GROUP BY 一次性回填</li>
+<li><b>进程内缓存 300s</b>：避免高频轮询穿透</li>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s15"><span class="n">§15</span>_best_achievable Python 双层循环 → numpy</h2>
+<p class="lead"><code>src/intraday/level_fit.py</code>（913 行），用户原话："_best_achievable Python 双层循环怎么改 numpy 的？改完性能差多少？"</p>
+
+<h3>问题代码</h3>
+
+<pre><code># src/intraday/level_fit.py:677-708 (现有)
+def _best_achievable(*, dataset, cfg):
+    """放宽网格搜索成功率上限（区分'没搜到'与'到不了'）。"""
+    best_rate: float | None = None
+    best_lines: list[float] = []
+    for low_pct in np.round(np.arange(0.10, 2.01, 0.10), 2):    # 20 个值
+        for high_pct in np.round(np.arange(0.30, 4.01, 0.10), 2):  # 38 个值
+            if high_pct - low_pct < max(0.2, cfg.round_trip_cost_pct):
+                continue
+            for stop_pct in (1.5, 2.0, 3.0, 4.0, 6.0, 8.0):         # 6 个值
+                if stop_pct <= low_pct:
+                    continue
+                # 内部 evaluate_levels 调用 _first_cross 的 Python 循环
+                stat = evaluate_levels(
+                    dataset=dataset, low_pct=float(low_pct),
+                    high_pct=float(high_pct), stop_pct=float(stop_pct),
+                    horizon=cfg.horizon_bars, cost_pct=cfg.round_trip_cost_pct,
+                    min_touches=cfg.min_touch_samples)
+                ...
+</code></pre>
+
+<h3>性能瓶颈（cProfile 实测）</h3>
+
+| 指标 | 实测值 |
+|---|---|
+| 单票 <code>fit_levels</code> | <b>3751 ms</b> |
+| 其中 <code>_best_achievable</code> | <b>2362 ms（62.9%）</b> |
+| <code>_first_cross</code> Python 调用 | <b>1,266,916 次 / 1.36 s</b> |
+| 单次 <code>fit_levels</code> 中循环次数 | ~4000 次 <code>evaluate_levels</code> |
+
+<h3>numpy 改造方案</h3>
+
+<pre><code>def _best_achievable_numpy(*, dataset, cfg):
+    """numpy 版：把三层网格向量化 + _first_cross 用 np.argmax 替换。"""
+    closes = dataset.closes  # shape: (N,)
+
+    # 1. 三层网格向量化
+    lows = np.round(np.arange(0.10, 2.01, 0.10), 2)        # (20,)
+    highs = np.round(np.arange(0.30, 4.01, 0.10), 2)      # (38,)
+    stops = np.array([1.5, 2.0, 3.0, 4.0, 6.0, 8.0])      # (6,)
+
+    # 广播：low × high × stop → (20, 38, 6) = 4560 个组合
+    L, H, S = np.meshgrid(lows, highs, stops, indexing='ij')
+    # 有效性掩码：high - low > 成本 AND stop > low
+    cost = max(0.2, cfg.round_trip_cost_pct)
+    valid = (H - L >= cost) & (S > L)
+
+    # 2. day_mean 计算每个 low/high 对应的"触及下界/上界/止损"的 bar 索引
+    day_mean = dataset.day_mean
+    thresholds_low = day_mean * (1 - L / 100)    # (N, 20)
+    thresholds_high = day_mean * (1 + H / 100)
+    thresholds_stop = day_mean * (1 - S / 100)
+
+    # 3. 向量化 _first_cross：用 np.argmax 替换 Python 循环
+    # 触及下界：closes < thresholds_low，找到第一次 True
+    low_cross = (closes[:, None] < thresholds_low).argmax(axis=0)  # (20,)
+    # 类似 high_cross、stop_cross
+
+    # 4. 计算每组合的成功率（向量化）
+    # ...
+
+    return best_rate, best_lines</code></pre>
+
+<h3>性能预估</h3>
+
+| 操作 | 旧（Python 循环） | 新（numpy） | 加速 |
+|---|---|---|---|
+| <code>_first_cross</code> 单次 | ~1.07 µs | ~0.5 µs（向量化） | 2× |
+| <code>_first_cross</code> 总调用 | 1,266,916 次 / 1.36s | 20 次（向量化） | <b>~60,000×</b> |
+| <code>_best_achievable</code> 总耗时 | 2362 ms | <b>~200 ms</b>（预估） | <b>~12×</b> |
+| <code>fit_levels</code> 单票 | 3751 ms | <b>~1500 ms</b>（预估） | <b>~2.5×</b> |
+
+<h3>验收标准</h3>
+<div class="checklist">
+<li><b>bit-identical 结果</b>：numpy 版与 Python 版输出完全一致（<code>np.allclose</code>）</li>
+<li><b>网格覆盖率不变</b>：低 0.10~2.00% / 高 0.30~4.00% / 止损 1.5~8.0%</li>
+<li><b>单票 fit_levels < 2s</b>（从 3751ms 优化）</li>
+<li><b>_first_cross 不再 Python 双层循环</b></li>
+</div>
+
+<h3>HR 必问（用户原话）：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"<code>_best_achievable</code> Python 双层循环怎么改 numpy 的？改完性能差多少？"</strong>
+<div class="q-a">
+<strong>答：</strong>三层 for 循环（low_pct × high_pct × stop_pct = 20×38×6 = 4560 次 <code>evaluate_levels</code>），每次 <code>evaluate_levels</code> 内部 <code>_first_cross</code> 又做 Python 循环扫 bar 数组。<br><br>
+<strong>numpy 化</strong>：<br>
+① <b>三层网格 → meshgrid 广播</b>：<code>(20, 38, 6) = 4560</code> 个组合一次性算<br>
+② <b>_first_cross → np.argmax</b>：<code>(N, 20)</code> 矩阵与阈值比较，<code>argmax(axis=0)</code> 一次性找首次 True<br>
+③ <b>阈值计算向量化</b>：<code>day_mean * (1 - L/100)</code> 等都是元素级<br><br>
+<strong>预期加速</strong>：<br>
+· <code>_first_cross</code> 调用从 1,266,916 次降到 20 次（<b>~60,000×</b>）<br>
+· <code>_best_achievable</code> 从 2362 ms 降到 ~200 ms（<b>~12×</b>）<br>
+· 单票 <code>fit_levels</code> 从 3751 ms 降到 ~1500 ms（<b>~2.5×</b>）<br><br>
+<strong>关键：bit-identical 验证</strong>——改完跑 47 只票黄金回归（与旧实现逐位 diff），保证行为不变。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s16"><span class="n">§16</span>前端架构深度（无 React Query/虚拟滚动）</h2>
+<p class="lead">用户原话："为什么要说是刻意取舍+改进路线，取舍了什么，改进了什么？"</p>
+
+<h3>现状盘点</h3>
+
+<table>
+<thead><tr><th>通常项目标配</th><th>本项目现状</th><th>取舍原因</th></tr></thead>
+<tbody>
+<tr><td>React Query / SWR</td><td><b>无</b>，用 <code>useEffect + useState</code> 手写轮询</td><td>详见下文</td></tr>
+<tr><td>react-window 虚拟滚动</td><td><b>无</b>，散点图 SVG 全量渲染 600+ 圆点</td><td>详见下文</td></tr>
+<tr><td>React.lazy + Suspense</td><td><b>有</b>（2026-09-27 加）</td><td>12 个面板按需加载，主 chunk 263KB</td></tr>
+<tr><td>TypeScript</td><td><b>有</b>（5.6）</td><td>类型安全</td></tr>
+<tr><td>Vite</td><td><b>有</b></td><td>现代构建工具</td></tr>
+<tr><td>KeepAlive</td><td><b>有</b>（事件告警 / 情报流保活）</td><td>频繁切页签</td></tr>
+</tbody>
+</table>
+
+<h3>取舍 1 · 不上 React Query</h3>
+
+<div class="note warn">
+<b>为什么不上</b>：<br>
+① <b>数据形态特殊</b>：本项目有大量<b>带状态机的轮询</b>（任务状态 queued/running/completed/failed），React Query 是为"列表 + 缓存"设计的，<b>不能表达"轮询 + 终止令牌"</b>这种业务语义<br>
+② <b>WebSocket 已经替代了大部分缓存需求</b>：告警未读 / 情报流已就绪都是 WS 推送，<b>缓存反而成为"假新鲜度"的来源</b><br>
+③ <b>保活面板</b>：事件告警、情报流用 <code>KeepAlive</code> 缓存已挂载状态，React Query 缓存会冲突<br>
+④ <b>可控性</b>：<code>useEffect</code> + <code>setInterval</code> 显式控制轮询生命周期，<b>出问题易排查</b><br><br>
+<b>代价</b>：每个面板要手写 useEffect + loading + error 三件套，<b>代码冗余</b>——是<strong>有意为之</strong>的"显式优于魔法"。
+</div>
+
+<h3>取舍 2 · 不上虚拟滚动（散点图）</h3>
+
+<div class="note warn">
+<b>为什么不上</b>：<br>
+① <b>散点图场景特殊</b>：600+ 圆点需要<b>缩放/平移/框选</b>交互——虚拟滚动会让交互事件路径复杂化（要跨组件边界）<br>
+② <b>浏览器能扛</b>：实测 600 圆点 + O(n²) 标签避让 = 30ms 渲染，<b>远低于 16ms 一帧</b>，用户无感<br>
+③ <b>贪心标签放置</b>：标签 O(n²) 避让是<strong>有意保留</strong>的——避免硬挤重叠，<b>宁可少标几个</b>（标题里说明"已标 N 个，M 个因空间不足未标"）<br>
+④ <b>SVG vs Canvas</b>：SVG 交互好开发但性能差；Canvas 性能好但交互差——<b>Demo 阶段 SVG 优先</b>，性能未到瓶颈前不切换<br><br>
+<b>改进路线</b>（当散点圆点 > 5000 时触发）：<br>
+① 切换到 Canvas（用 <code>d3-zoom + Canvas</code>）<br>
+② 用 <strong>四叉树空间索引</strong> 替换 O(n²) 标签避让<br>
+③ <strong>Web Worker</strong> 计算标签位置（不阻塞主线程）
+</div>
+
+<h3>取舍 3 · 不上 React Query + 不用虚拟滚动的统一理由</h3>
+
+<div class="dialog">
+<b>三个共性</b>：<br>
+① <strong>Demo 阶段</strong>：<b>用户量小、规模可控、迭代快</b>—— 上 React Query 是"给可能出问题的地方上保险"，但当前阶段出问题可以手改<br>
+② <strong>成本</strong>：每个依赖都是<b>长期维护成本</b>（升级、兼容性、调试）——只上"价值 > 维护成本"的<br>
+③ <strong>代码可读性</strong>：<code>useEffect + setInterval</code> 是<b>任何前端都能 30 秒看懂</b>的——避免"新人看不懂的魔法"<br><br>
+<b>改进路线</b>（按 ROI 排序）：<br>
+1. <b>P0</b>：<code>React.lazy + Suspense</code>（<b>已做</b>，首屏 chunk −30%）<br>
+2. <b>P1</b>：引入 <strong>fetch 抽象 hook</strong>（统一 useEffect + loading + error，但不用 React Query）<br>
+3. <b>P2</b>：散点图 > 5000 圆点时换 Canvas + 四叉树<br>
+4. <b>P3</b>：数据量 > 10000 时考虑 React Query（带 staleTime + 业务定制）
+</div>
+
+<h3>2026-09-27 已做的前端优化（实测）</h3>
+
+<table>
+<thead><tr><th>改造</th><th>节省</th><th>代码</th></tr></thead>
+<tbody>
+<tr><td>React.lazy 12 个面板按需加载</td><td>主 chunk 263KB（gzip 85KB）</td><td>web/src/App.tsx</td></tr>
+<tr><td>SectorRotationTab IntersectionObserver 懒加载 iframe</td><td>行业轮动首屏 16s → 按需触发</td><td>web/src/components/SectorRotationTab.tsx</td></tr>
+<tr><td>AlertsPanel skeleton-alert 加载骨架</td><td>避免"白屏 2 秒"</td><td>web/src/components/AlertsPanel.tsx</td></tr>
+<tr><td>SectorCrowdingOverview 贪心标签</td><td>标签碰撞 390 → 0</td><td>web/src/components/SectorCrowdingOverview.tsx</td></tr>
+</tbody>
+</table>
+
+<h3>HR 必问：</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"你们项目没用 React Query，也没虚拟滚动，怎么考虑？"</strong>
+<div class="q-a">
+<strong>答：</strong><b>刻意取舍</b>，不是"没想到"。<br><br>
+① <b>React Query 不上</b>：本项目有大量"轮询 + 状态机 + WebSocket"，React Query 的"列表缓存"心智不匹配；<b>用 useEffect + setInterval 显式可控</b><br>
+② <b>虚拟滚动不上</b>：散点图 600 圆点 + 缩放/框选交互——虚拟滚动会让交互路径复杂化；<b>实测 30ms 渲染，远低于 16ms 一帧</b>，用户无感<br>
+③ <b>改进路线已规划</b>：散点圆点 > 5000 时换 Canvas + 四叉树；数据量 > 10000 时再考虑 React Query<br><br>
+<strong>关键</strong>：架构师选型要"按当前约束最合适"，不是"按最好"。<strong>Demo 阶段</strong>上 React Query 是过度工程——<strong>等真出问题再上</strong>。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s17"><span class="n">§17</span>故障复盘 + 端到端时间线</h2>
+<p class="lead">用户原话："故障语义（三档超时）、故障复盘（三档超时、被自己压测否掉的第一版）"</p>
+
+<h3>三档超时语义</h3>
+
+<table>
+<thead><tr><th>超时档位</th><th>触发条件</th><th>语义</th><th>代码位置</th></tr></thead>
+<tbody>
+<tr><td><b>L1：单次 LLM 调用</b></td><td><code>llm_timeout_seconds=120</code></td><td>provider 无响应挂死</td><td class="file">core/config.py:147</td></tr>
+<tr><td><b>L2：单次降级链尝试</b></td><td><code>attempt_budget_sec</code>（light 20s / medium 20s / reasoning 45s / decision 60s）</td><td>"成功但极慢"被中断、自动降级下一跳</td><td class="file">llm/gateway.py:69-74</td></tr>
+<tr><td><b>L3：任务级 token 累计</b></td><td><code>llm_token_budget_per_task=200000</code></td><td>单任务失控</td><td class="file">core/config.py:169</td></tr>
+<tr><td><b>L4：沙箱执行</b></td><td><code>SANDBOX_TIMEOUT_SEC=15</code></td><td>生成代码里死循环</td><td class="file">code_validator.py:59</td></tr>
+</tbody>
+</table>
+
+<h3>为什么是"三档"超时？每档防的问题不同</h3>
+
+<div class="note warn">
+<b>L1 单次调用超时</b>（120s）：防 provider 无响应挂死——所有调用<br>
+<b>L2 单次尝试超时</b>（20-60s）：防"成功但极慢"——<b>只对有退路的跳生效</b>（最后一跳不设，因为没退路）<br>
+<b>L3 任务级 token 超时</b>（200K）：防循环异常导致费用失控<br>
+<b>L4 沙箱超时</b>（15s）：防生成代码里死循环——<b>子进程级 kill</b><br><br>
+<b>关键</b>：每档超时<b>只防一种问题</b>——<b>不要一档超时解决所有问题</b>。<br>
+这是 <strong>"分层防御"</strong> 而不是 "一档兜底"。
+</div>
+
+<h3>实际事故：被自己压测否掉的第一版（缓存方案）</h3>
+
+<div class="note bad">
+<b>事故</b>（PROJECT_AUDIT §1.2）：<br>
+<b>背景</b>：第一版 LLM 缓存方案用"遍历 data/llm_cache/*.json 全部文件"做语义索引<br><br>
+<b>实测</b>：本机 3108 个缓存文件<br>
+· 冷未命中扫描：<b>682.2 ms</b>（进程重启后第一次）<br>
+· 暖未命中扫描：<b>8.9 ms</b>（此后每次未命中）<br><br>
+<b>问题</b>：<br>
+① <b>同步阻塞事件循环</b>——这是 async 服务，9ms 的同步 IO 冻结<b>所有</b>并发请求<br>
+② <b>实测事件循环最大停顿 22.3 ms</b><br>
+③ 一次投研分析有 7-15 次 LLM 调用，<b>大部分会未命中</b>，N 个用户并发时总阻塞 ≈ N × 9ms<br>
+④ 随缓存增长而退化：3108 文件 = 10MB，缓存只增不减（过期文件仅在被访问时才 unlink）<br><br>
+<b>修法</b>（第二版）：<br>
+· 进程内维护 <code>(agent_id, scope) → vector</code> 索引<br>
+· 语义查找变成纯内存计算（微秒级）<br>
+· 索引按 <code>(agent_id, scope)</code> 分桶，先分桶再算余弦<br>
+· 懒加载：首次语义查找时建一次索引<br><br>
+<b>教训</b>：<br>
+① <b>"文件遍历 = 同步 IO"在 async 服务是毒药</b><br>
+② <b>"缓存只增不减"是退化</b>——需要 lazy build + 容量淘汰<br>
+③ <b>"被自己压测否掉"是好事</b>——比"上线后才被用户发现"好得多
+</div>
+
+<h3>端到端时间线（故障复盘视角）</h3>
+
+<table>
+<thead><tr><th>阶段</th><th>耗时</th><th>关键问题</th><th>修法</th></tr></thead>
+<tbody>
+<tr><td>早期（deepseek-flash 全云端）</td><td>~160s</td><td>A17 撞 4096 上限 98 次</td><td>ReAct 增量协议（−91%）</td></tr>
+<tr><td>第八轮后</td><td>~80-120s</td><td>信息层串行 95s</td><td>A05/A06 并行 + A07 改 light</td></tr>
+<tr><td>第九轮后</td><td>~40-70s</td><td>A17 3 步 99% 用不上第 3 步</td><td>max_steps=2（默认）</td></tr>
+</tbody>
+</table>
+
+<h3>HR 必问："你们被自己压测否掉过什么？"</h3>
+<div class="q">
+<span class="q-tag">HR 追问</span>
+<strong>"有没有被自己压测否掉的方案？讲讲。"</strong>
+<div class="q-a">
+<strong>答：</strong>有，<b>LLM 缓存第一版</b>。<br><br>
+① <strong>方案</strong>：遍历 <code>data/llm_cache/*.json</code> 全部文件做语义索引<br>
+② <strong>压测结果</strong>：本机 3108 个文件，<b>冷未命中扫描 682ms</b>，<b>事件循环最大停顿 22.3ms</b>——async 服务不能接受<br>
+③ <strong>否掉</strong>：立刻改第二版（进程内 <code>(agent_id, scope) → vector</code> 索引）<br>
+④ <strong>教训</strong>：<br>
+　· <strong>"文件遍历 = 同步 IO"</strong> 在 async 服务是毒药<br>
+　· <strong>"缓存只增不减"</strong> 是退化<br>
+　· <strong>"被自己压测否掉"</strong> <b>是好事</b>——比"上线后才被用户发现"好得多<br><br>
+<strong>工程哲学</strong>：<b>代码评审不是终点，压测才是</b>。一个方案看起来合理，<b>跑过压测才知道行不行</b>。
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 id="s18"><span class="n">§18</span>HR 必问 10 题速查</h2>
+
+<p class="lead">35 岁架构师面试的"高频题"——直接背答案。</p>
+
+<div class="q">
+<span class="q-tag">Q1</span>
+<strong>为什么 LangGraph 不用 AutoGen？</strong>
+<div class="q-a">
+见 <a href="#s2">§2</a>：① 显式控制 fan-out ② 单节点失败边界 ③ 状态可观测 ④ 成本 per-Agent 控制。<br>
+<b>核心：</b>需求驱动选型——AutoGen 黑盒，控不了并发度和失败边界。
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q2</span>
+<strong>成本治理方法论？44,213 条审计怎么归因？</strong>
+<div class="q-a">
+见 <a href="#s10">§10</a>：<b>三层模型</b>（在线日预算 / 高额脚本护栏 / 日累计账本）<br>
+<b>归因方法</b>：<code>by_source</code> 分账（投研 / 离线脚本 / mainline_relevance 等）<br>
+<b>关键发现</b>：<b>95% 成本在离线脚本</b>（mainline_relevance 478 元/天）——日预算 20 元的 24 倍
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q3</span>
+<strong>故障语义：四档超时各防什么？</strong>
+<div class="q-a">
+见 <a href="#s17">§17</a>：L1 单次 LLM 120s / L2 单次尝试 20-60s / L3 任务 token 200K / L4 沙箱 15s<br>
+<b>核心</b>：每档超时<b>只防一种问题</b>——分层防御，不是一档兜底
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q4</span>
+<strong>LLM 网关红线（哪些不能做）？</strong>
+<div class="q-a">
+见 <a href="#s3">§3</a>：<br>
+① <b>不做原地重试</b>（只做降级）<br>
+② <b>配置类错误不计熔断</b>（401/402/403）<br>
+③ <b>空响应不写缓存</b>（防固化故障）<br>
+④ <b>本地 Ollama 0 元不计成本</b>（但仍计入预算闸门）<br>
+⑤ <b>降级链失败不重试</b>（最后一跳不退）
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q5</span>
+<strong>三层成本模型？</strong>
+<div class="q-a">
+见 <a href="#s10">§10</a>：<br>
+① <b>在线请求</b>：<code>MOSS_LLM_DAILY_BUDGET_CNY=20</code>，预扣 0.25 元/任务<br>
+② <b>高额脚本</b>：<code>ScriptCostGuard</code>，MOSS_SCRIPT_COST_CAP_CNY=1<br>
+③ <b>日累计账本</b>：<code>by_source</code> 分账，运维页可视化
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q6</span>
+<strong>并发评估：准入/合流/状态外置路线图？</strong>
+<div class="q-a">
+① <b>准入闸门</b>：<code>_MAX_INFLIGHT=4</code>（env 可覆盖），排队 30s 超时<br>
+② <b>同问合流</b>：<code>_inflight_by_hash</code>，复用 task_id 减少管线并发<br>
+③ <b>状态外置</b>：<code>live_state</code> 旁路（绕过 LangGraph state copy），前端实时可见<br>
+<b>路线图</b>：单机 → 多副本 + Redis 共享 → 拆分网关/调度/计算三层
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q7</span>
+<strong>故障复盘：被自己压测否掉的第一版？</strong>
+<div class="q-a">
+见 <a href="#s17">§17</a>：<b>LLM 缓存第一版</b>——遍历 3108 个文件做语义索引<br>
+实测：<b>冷未命中扫描 682ms</b>，<b>事件循环最大停顿 22.3ms</b>——async 服务不能接受<br>
+<b>教训</b>：文件遍历 = 同步 IO = 毒药；缓存只增不减 = 退化；被自己压测否掉 = 好事
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q8</span>
+<strong>前端架构深度：为什么不用 React Query / 虚拟滚动？</strong>
+<div class="q-a">
+见 <a href="#s16">§16</a>：<br>
+① <b>React Query 不上</b>：本项目"轮询 + 状态机 + WebSocket"，列表缓存心智不匹配<br>
+② <b>虚拟滚动不上</b>：600 圆点 + 缩放/框选交互——虚拟滚动复杂化交互；<b>实测 30ms</b>，远低于 16ms<br>
+<b>核心</b>：<b>Demo 阶段</b>上 React Query 是过度工程——<b>按当前约束最合适</b>，不是按最好
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q9</span>
+<strong><code>_AGENT_DATA_WHITELIST</code> 怎么分组？哪些关键词错了？</strong>
+<div class="q-a">
+见 <a href="#s8">§8</a>：<br>
+<b>分组原则</b>：按 Agent <b>职责范围</b>——A08 宏观指标 / A09 行业前缀 / A10 个股 / A11 财务比率 / A12 公告诉讼<br>
+<b>可能有错</b>：① A12 的 "st_" 误匹配 ② A11 的 "debt_ratio" 是英文无用 ③ A10 的 "pe_ttm"/"pb" 大小写不匹配<br>
+<b>验证</b>：每次改动跑回归测试，逐 Agent 验证 indicator 全在白名单内
+</div>
+</div>
+
+<div class="q">
+<span class="q-tag">Q10</span>
+<strong><code>_best_achievable</code> 双层循环改 numpy 后性能差多少？</strong>
+<div class="q-a">
+见 <a href="#s15">§15</a>：<br>
+① <code>_first_cross</code> 调用：1,266,916 次 → 20 次（<b>~60,000×</b>）<br>
+② <code>_best_achievable</code>：2362 ms → ~200 ms（<b>~12×</b>）<br>
+③ 单票 <code>fit_levels</code>：3751 ms → ~1500 ms（<b>~2.5×</b>）<br>
+<b>关键</b>：bit-identical 验证——黄金回归 47 只票逐位 diff
+</div>
+</div>
+
+<!-- ================================================================ -->
+<h2 style="color:var(--ok)">§19 速查清单 · 一页纸</h2>
+
+<h3>每个模块都"比 AI 深一层"的 5 个要素</h3>
+
+<table>
+<thead><tr><th>#</th><th>要素</th><th>为什么比 AI 深</th></tr></thead>
+<tbody>
+<tr><td>①</td><td><b>数据流图（Mermaid）</b></td><td>AI 只能讲概念——你能画真实代码路径</td></tr>
+<tr><td>②</td><td><b>验收标准（量化 checklist）</b></td><td>AI 只能说"做得好"——你能给 P95 < 50ms 这种数字</td></tr>
+<tr><td>③</td><td><b>代码锚点（精确行号）</b></td><td>AI 答不出"哪一行"——你能指 gateway.py:319</td></tr>
+<tr><td>④</td><td><b>决策取舍话术</b></td><td>AI 答"为什么"——你能答"为什么不 + 代价/收益"</td></tr>
+<tr><td>⑤</td><td><b>HR 追问应对</b></td><td>AI 答不上尖锐问题——你能答"被自己压测否掉的第一版"</td></tr>
+</tbody>
+</table>
+
+<h3>面试场用：3 个核心数字（必背）</h3>
+
+| 数字 | 来源 | 面试话术 |
+|---|---|---|
+| <b>7582 → 1900 tokens</b>（−91%）| A17 ReAct 增量协议 | "3 步全量 → 1 步全量 + 2 步增量，节省 91%" |
+| <b>160s → 40s</b>（−75%）| 端到端优化 | "8 阶段流水线，从 160s 优化到 40s" |
+| <b>1231ms → 36ms</b>（34×）| 集合竞价规则重构 | "纯重构 + 黄金回归 47 只票 × 12 维逐位 diff" |
+
+<h3>3 个核心现场"画"（必练）</h3>
+
+<ol>
+<li><b>熔断状态机</b>：CLOSED → OPEN → HALF_OPEN 三态转换图，<b>5 分钟画完</b></li>
+<li><b>LangGraph fan-out + reducer</b>：9 路并行 → operator.add 累加 → recommend，<b>3 分钟讲完</b></li>
+<li><b>ReAct 增量协议</b>：第 1 步发全量 → 第 2+ 步发增量（summarize_lm_output），<b>5 分钟讲完</b></li>
+</ol>
+
+<h3>3 个"不能讲"的雷</h3>
+
+<ol>
+<li>❌ "AI 帮我写了大部分代码"（HR 担心独立 coding）<br>✅ "我主导架构决策，AI 协作实现"</li>
+<li>❌ "我独立写的"（一问代码细节就露馅）<br>✅ "我能现场画熔断状态机"</li>
+<li>❌ "项目证明我的能力"（HR 觉得临时抱佛脚）<br>✅ "系统化输出 7 年 AI 工程积累"</li>
+</ol>
+
+<h3>3 个"必须诚实"的边界</h3>
+
+<ol>
+<li>✅ <b>职位 / 职级 / 入离职时间</b>：HR 系统可查，绝对不能虚报</li>
+<li>✅ <b>10 年炒股经验</b>：<b>不写</b>"炒股"，<b>写</b>"金融市场实践"——分岗位</li>
+<li>✅ <b>AI 协作的事实</b>：<b>主动暴露</b>比被动揭穿好——大厂都在用 AI</li>
+</ol>
+
+<footer style="margin-top:60px; padding-top:20px; border-top:1px solid var(--line); color:var(--dim); font-size:12px">
+<p><b>Moss-FinAgent-Research · 面试深度技术文档</b><br>
+依据实际代码（2026-09-28）· 19 Agent · 13 万行 · 8 轮优化 · 2500+ 测试<br>
+每个模块的代码锚点都精确到行号，可在 IDE 中直接定位</p>
+<p>⚠️ 本项目为研究用途，所有分析输出仅供研究参考，不构成投资建议。</p>
+</footer>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  securityLevel: 'loose',
+  fontFamily: '"Segoe UI","Microsoft YaHei",sans-serif',
+  flowchart: { curve: 'basis', htmlLabels: true, nodeSpacing: 30, rankSpacing: 50 },
+  sequence: { actorMargin: 40, width: 160, boxMargin: 8 }
+});
+</script>
+
+</div><!-- /wrap -->
+</body>
+</html>

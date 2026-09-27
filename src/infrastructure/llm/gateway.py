@@ -74,8 +74,9 @@ _ATTEMPT_BUDGET: dict[str, float] = {
 }
 
 
-def _load_model_config(path: str) -> tuple[dict[str, ModelSpec], dict[str, list[str]]]:
-    """解析configs/models.yaml → (模型规格表, 层级降级链表)。"""
+def _load_model_config(path: str) -> tuple[
+        dict[str, ModelSpec], dict[str, list[str]], set[str]]:
+    """解析configs/models.yaml → (模型规格表, 层级降级链表, 钉死本地的层级)。"""
     try:
         with open(path, encoding="utf-8") as fh:
             raw: dict[str, Any] = yaml.safe_load(fh)
@@ -93,15 +94,24 @@ def _load_model_config(path: str) -> tuple[dict[str, ModelSpec], dict[str, list[
         })
 
     routing: dict[str, list[str]] = {}
+    tiers_local_only: set[str] = set()
     for tier, item in (raw.get("routing") or {}).items():
         chain = [item["primary"]]
         if item.get("fallback"):
             chain.append(item["fallback"])
         routing[tier] = chain
+        # ★ 层级级 `local_only`（结构修补，2026-09-26）：
+        #   `light` / `medium` 两层的 primary 是本地模型、**fallback 是付费的
+        #   deepseek-flash** —— 本地一抖动就"悄悄花钱"，实测踩过
+        #   （事件告警阶段一那 0.0196 元就是这么来的；探针脚本更隐蔽）。
+        #   在配置里给这两层钉上 `local_only: true`，比在每个调用点记得传
+        #   `local_only=True` 可靠：**新调用方默认就是安全的**。
+        if item.get("local_only"):
+            tiers_local_only.add(tier)
 
     if not specs or not routing:
         raise ConfigError(f"模型配置不完整: {path}")
-    return specs, routing
+    return specs, routing, tiers_local_only
 
 
 class LLMGateway:
@@ -118,7 +128,9 @@ class LLMGateway:
         audit: LLMAuditLog | None = None,
     ) -> None:
         self._settings = settings or get_settings()
-        self._specs, self._routing = _load_model_config(self._settings.model_config_path)
+        (self._specs, self._routing,
+         self._tiers_local_only) = _load_model_config(
+             self._settings.model_config_path)
         self._providers = providers if providers is not None else build_providers()
         self._cache = cache if cache is not None else (
             LLMCache(
@@ -192,7 +204,7 @@ class LLMGateway:
         cancel_token: CancellationToken | None = None,
         max_tokens: int | None = None,
         reasoning_effort: str | None = None,
-        local_only: bool = False,
+        local_only: bool | None = None,
         attempt_budget_sec: float | None = None,
     ) -> LLMResponse:
         """执行一次补全：缓存→主模型→备模型，全程审计。
@@ -245,6 +257,20 @@ class LLMGateway:
         `deepseek-flash`：本地 Ollama 一挂，它就会**真的去调云端**并计费。
         裁完为空（这一层根本没有本地模型）时**明确抛错**，而不是悄悄降级到
         云端 —— 调用方本来就按"模型不可用就走规则层"设计，报错比花钱好。
+
+        ## `local_only` 的三种取值（2026-09-26 改）
+
+        | 传值 | 含义 |
+        |---|---|
+        | `None`（默认） | **跟随层级配置**：该层写了 `local_only: true` 就钉死本地 |
+        | `True` | 强制只用本地（与以前一致） |
+        | `False` | 强制允许付费云端（显式退出，少数场景才用） |
+
+        为什么要有配置级的默认值：靠"每个调用点记得传 `local_only=True`"
+        是靠不住的 —— `light` / `medium` 两层的 fallback 都是**付费**的
+        deepseek-flash，任何一处忘传，本地一抖动就悄悄花钱（实测：
+        事件告警阶段一 0.0196 元、`_dbg_hot.py` 这类探针更隐蔽）。
+        现在这两层在配置里钉死本地，**新调用方默认就是安全的**。
         """
         if task_tier not in self._routing:
             raise ConfigError(f"未知任务层级: {task_tier}")
@@ -253,7 +279,10 @@ class LLMGateway:
             cancel_token.check()
         prompt = self._truncate(prompt)
         chain = self._routing[task_tier]
-        if local_only:
+        # `None` = 跟随层级配置（见 docstring 的三值表）。
+        pin_local = (task_tier in self._tiers_local_only
+                     if local_only is None else bool(local_only))
+        if pin_local:
             # 新列表，**不改配置里那份**（`self._routing` 是共享的，
             # 就地改会把"只这一次不花云端"变成"这一层以后都不花云端"，
             # 而调用方并没有这么要求）
@@ -261,7 +290,7 @@ class LLMGateway:
                            if self._specs[m].provider not in PAID_PROVIDERS]
             if not local_chain:
                 raise LLMGatewayError(
-                    f"{task_tier} 层没有本地模型可选（local_only=True）："
+                    f"{task_tier} 层没有本地模型可选（local_only）："
                     f"链={chain}，计费提供商={sorted(PAID_PROVIDERS)}")
             chain = local_chain
         effort = self._resolve_effort(task_tier, reasoning_effort)
@@ -412,6 +441,17 @@ class LLMGateway:
             resp.provider_chain = list(tried)
             resp.fallback_used = index > 0
             resp.trace_id = trace_id
+            # ★ 2026-09-27 第八轮：单次调用真实费用写入响应
+            #   让每条审计记录自带"花了多少钱"，让 token 优化**可被钱验证**
+            try:
+                from src.core.budget import call_cost_cny
+                resp.cost_yuan = call_cost_cny(
+                    provider=spec.provider, model=spec.model_name,
+                    tokens_in=resp.tokens_in, tokens_out=resp.tokens_out,
+                    cache_hit=False,
+                )
+            except Exception:  # noqa: BLE001 计价失败不影响调用结果
+                logger.debug("cost_yuan 计价失败（忽略）", exc_info=True)
             cb.record_success()  # 熔断器成功计数
             # 累计token预算（仅DeepSeek）
             if spec.provider == "deepseek" and trace_id:
