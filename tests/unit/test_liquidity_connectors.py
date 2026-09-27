@@ -259,8 +259,30 @@ def _fake_fed_module(prob_data: dict | None = None, raise_exc: Exception | None 
     return mod
 
 
+@pytest.fixture
+def _fed_probe_stubbed(monkeypatch):
+    """钉死 TCP 预检 + 清失败冷却，让 FedWatch 用例真正离线。
+
+    connector 在调 `cme_fedwatch` 之前会**真探** `www.cmegroup.com:443`
+    （2026-09-26 新增的快失败预检）。该主机可达性随网络环境漂移
+    （实测同一天时通时断），不放桩的话"离线解析"用例就成了网络敏感用例；
+    另外失败冷却是**进程级单例**，本文件或前序用例记下的失败会把
+    fetch 直接短路成空列表 —— 前后都要清。
+    """
+    from src.infrastructure.connectors import net_probe
+    from src.infrastructure.connectors.source_cooldown import get_cooldown
+
+    async def _reachable(host, port, timeout=net_probe.DEFAULT_PROBE_TIMEOUT):
+        return True
+
+    monkeypatch.setattr(net_probe, "probe_tcp", _reachable)
+    get_cooldown().clear()
+    yield
+    get_cooldown().clear()
+
+
 @pytest.mark.asyncio
-async def test_fedwatch_parses_probabilities(monkeypatch):
+async def test_fedwatch_parses_probabilities(_fed_probe_stubbed, monkeypatch):
     data = {
         "effr": 3.64, "current_target": "3.50%-3.75%",
         "meetings": [{
@@ -285,7 +307,7 @@ async def test_fedwatch_parses_probabilities(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_fedwatch_unreachable_returns_empty(monkeypatch):
+async def test_fedwatch_unreachable_returns_empty(_fed_probe_stubbed, monkeypatch):
     mod = _fake_fed_module(raise_exc=TimeoutError("connect timeout"))
     monkeypatch.setitem(sys.modules, "cme_fedwatch", mod)
     pts = await FedWatchConnector().fetch("fed:rate_prob:next")

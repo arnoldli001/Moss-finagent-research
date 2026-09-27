@@ -71,10 +71,6 @@ from src.mainline.config import (
     load_sector_blacklist,
     load_theme_exclusions,
 )
-# ★ 2026-09-27：主线池要与拥挤度共用同一份"最终要哪些板块"的事实来源。
-# `sector_crowding.config` 不反向依赖 mainline（它只在函数内惰性 import
-# `mainline.config.load_removed_concepts`），所以模块级导入不会成环。
-from src.sector_crowding.config import load_crowding_exclusions
 from src.mainline.models import (
     BoardBar,
     BoardFlow,
@@ -85,6 +81,11 @@ from src.mainline.models import (
     HolderRow,
     SeatRow,
 )
+
+# ★ 2026-09-27：主线池要与拥挤度共用同一份"最终要哪些板块"的事实来源。
+# `sector_crowding.config` 不反向依赖 mainline（它只在函数内惰性 import
+# `mainline.config.load_removed_concepts`），所以模块级导入不会成环。
+from src.sector_crowding.config import load_crowding_exclusions
 
 logger = logging.getLogger(__name__)
 

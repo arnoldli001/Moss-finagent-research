@@ -169,7 +169,7 @@ def bias_factor(bars: int, curve: dict[str, float] | None) -> float:
         return points[0][1]
     if bars >= points[-1][0]:
         return points[-1][1]
-    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+    for (x0, y0), (x1, y1) in zip(points, points[1:], strict=False):
         if x0 <= bars <= x1:
             if x1 == x0:
                 return y1

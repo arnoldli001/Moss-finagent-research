@@ -33,6 +33,12 @@ def test_in_range_month_boundaries():
 
 
 def test_series_to_points_m2_shape():
+    """AkShare 给的宏观序列是**新→旧**，连接器必须转成**升序**再交出。
+
+    这条以前断言的是 `[7.7, 8.0]`（即把 AkShare 的原生降序透出去）—— 等于把
+    "同一指标走网络是降序、命中本地 DB 短路却是升序"这个不一致**写进了测试**，
+    于是没人再发现它。统一数据层与其余连接器都是升序，这里跟随升序。
+    """
     df = pd.DataFrame({
         "月份": ["2026年07月份", "2026年06月份"],
         "货币和准货币(M2)-数量(亿元)": [3555077.0, 3567108.0],
@@ -42,8 +48,11 @@ def test_series_to_points_m2_shape():
         df, "M2", date_keywords=("月份",),
         value_keywords=("货币和准货币(M2)-同比增长",),
         start_date=None, end_date=None, confidence=0.8)
-    assert [p.value for p in points] == [7.7, 8.0]
-    assert points[0].period_date == "2026-07"
+    assert [p.value for p in points] == [8.0, 7.7]          # 06月 → 07月
+    periods = [p.period_date for p in points]
+    assert periods == sorted(periods)
+    assert points[0].period_date == "2026-06"
+    assert points[-1].period_date == "2026-07"
 
 
 def test_supports_new_indicators():
@@ -55,8 +64,9 @@ def test_supports_new_indicators():
     assert AkshareConnector.supports("流动比率:601088")
     assert AkshareConnector.supports("ind:社会消费品零售总额同比")
     assert AkshareConnector.supports("ind:动力煤价格(元/吨)")
-    # 其他模拟产业指标仍归Mock连接器
+    # 科技/消费/周期/医药行业PE 等已全部由真实产业连接器接管，AkShare 不管这些
     assert not AkshareConnector.supports("ind:科技行业PE(TTM)")
+    assert not AkshareConnector.supports("ind:消费行业PE(TTM)")
 
 
 class _FakeAk:

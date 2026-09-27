@@ -216,7 +216,7 @@ def compute_water_changes(conn: sqlite3.Connection, *,
                           month_days: int = 20,
                           long_days: int = 40,
                           min_base_water: float = 0.0,
-                          codes: "set[str] | None" = None
+                          codes: set[str] | None = None
                           ) -> tuple[dict[str, dict[str, Any]], str]:
     """批量算所有板块的水位变化（一次全表扫描 + 内存分板块，别按板块查库）。
 
@@ -456,7 +456,7 @@ def _register(task: MetricTask) -> None:
                 _TASKS.pop(stale.task_id, None)
 
 
-def compute_metrics_for_codes(codes: "list[str] | set[str]",
+def compute_metrics_for_codes(codes: list[str] | set[str],
                               *, config: SectorCrowdingConfig | None = None
                               ) -> dict[str, Any]:
     """**临时算**指定板块的周频 4 列（用户新增板块到前端时调用）。

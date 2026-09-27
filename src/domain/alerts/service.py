@@ -68,7 +68,10 @@ def in_trading_window(now: datetime | None = None) -> bool:
     不能指望那个函数 —— 第一版就是这么写的，结果是"盘后 5 分钟永远不弹"。
     """
     from src.core.trading_session import (
-        CALL_AUCTION_START, MORNING_OPEN, POST_CLOSE, minutes_of,
+        CALL_AUCTION_START,
+        MORNING_OPEN,
+        POST_CLOSE,
+        minutes_of,
         session_state,
     )
 

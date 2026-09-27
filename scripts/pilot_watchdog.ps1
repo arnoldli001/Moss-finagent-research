@@ -1,6 +1,6 @@
 ﻿# 对外实例（pilot @ 8110）运行期值守包装 —— **全项目唯一的值守入口**
 #
-# 由计划任务 `MossPilotWatchdog` 周期调用（每 5 分钟一次）。
+# 由计划任务 `MossPilotWatchdog` 周期调用（**每 1 分钟一次**，`PT1M`）。
 #
 # ## 它解决什么
 #
@@ -33,11 +33,36 @@
 # 3. **不注入 .env**：不需要 —— `src/core/config.py` 用 pydantic-settings 的
 #    `env_file=".env"`，只要 cwd 是项目根就会自己读到（实测无环境变量也能
 #    成功重启 pilot，SMTP 自检通过）。非交互会话下手工注入反而是编码/身份坑。
+# ## ★ 编辑本文件后**必须**重新补 BOM（2026-09-27 实测把生产值守弄坏）
+#
+# 事故经过：只改了两行**注释**（把"每 5 分钟"更正为"每 1 分钟"），
+# 用文本编辑工具落盘后 **UTF-8 BOM 被丢掉**，于是：
+#
+#     PowerShell 5.1 按 GBK 读 → 中文串吞掉引号 →
+#     行 56 解析失败并级联报 行 37/55/64 的
+#     "Missing closing '}'" / "Try statement is missing its Catch or Finally"
+#
+# 也就是说**脚本整体失效**，而症状是计划任务 `LastTaskResult=1` + **一行日志都不写**
+# —— 与"健康时的静默"完全无法区分（这正是 `tests/unit/test_ps1_encoding.py`
+# 存在的理由，它是唯一的自动拦截）。
+#
+# ⚠️ 教训：**改注释也会破坏脚本**。BOM 是文件的隐藏属性，diff 里看不出来，
+#    任何"读进来再写回去"的工具都可能丢掉它。
+#    所以每次编辑本文件后跑一次：
+#
+#         python scripts/fix_ps1_bom.py scripts/pilot_watchdog.ps1
+#         python -m pytest tests/unit/test_ps1_encoding.py -q
+#
 # 4. **绝不 `--replace`**：它按命令行枚举本项目**全部**后端进程，会把
 #    正在跑的另一个实例（dev 8100）一起停掉。`ensure` 内部已显式关掉它。
-# 5. **单实例锁**：上一轮还没跑完时下一轮直接退出。默认 5 分钟周期，
-#    而 `ensure` 走的是 `cmd_start`（含最多 ~10 秒就绪等待），正常不会重叠；
-#    但"不会重叠"要靠机制保证，不能靠时间差碰巧。
+# 5. **单实例锁**：上一轮还没跑完时下一轮直接退出。
+#
+#    ⚠️ 2026-09-27 更正：真实周期是 **1 分钟**（`PT1M`），不是本文档原先写的
+#    "默认 5 分钟周期"。这个数字错了会让下面这句论证失去前提 ——
+#    1 分钟的间隔**小于** `cmd_start` 的最坏耗时（`ensure` 含最多 ~10 秒
+#    就绪等待，加上环境自检可能更久），所以"正常不会重叠"是**不成立**的：
+#    靠的不是时间差宽裕，而完全是单实例锁 + 任务侧的 `IgnoreNew`。
+#    换句话说，这个锁不是"多一层保险"，而是**唯一**防止重叠的机制。
 $ErrorActionPreference = 'Continue'
 $proj = 'D:\code\Moss-finagent-research'
 $logDir = Join-Path $proj 'data\run'

@@ -139,7 +139,9 @@ class FedWatchConnector(BaseConnector):
                 timeout=_TIMEOUT_SEC,
             )
         except Exception as exc:  # noqa: BLE001 网络/超时统一降级为空结果
-            wait = cooldown.record_failure(_COOLDOWN_KEY, reason=str(exc)[:80])
+            from src.core.redaction import sanitize_error
+
+            wait = cooldown.record_failure(_COOLDOWN_KEY, reason=sanitize_error(exc))
             logger.warning(
                 "CME FedWatch不可达（降级为数据缺口，%.0fs 内不再重试）: %s",
                 wait, exc)

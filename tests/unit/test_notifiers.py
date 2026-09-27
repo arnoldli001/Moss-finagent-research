@@ -137,7 +137,7 @@ async def test_email_score_gate_boundaries(monkeypatch):
         "src.infrastructure.notifiers.email_notifier.smtplib.SMTP_SSL", _SMTP)
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="2693888583@qq.com"))
+        alert_email_to="your_qq_number@qq.com"))
     assert notifier.is_configured()
 
     # 风险类：69不发（严格大于），70发；与站内级别无关（medium也发）
@@ -159,7 +159,7 @@ async def test_email_score_gate_boundaries(monkeypatch):
         opportunity_score=85.0))
     assert sent_opp.status == "sent" and sent_calls
     # 收件人固定为需求邮箱
-    assert sent_calls[-1][1] == ["2693888583@qq.com"]
+    assert sent_calls[-1][1] == ["your_qq_number@qq.com"]
 
 
 @pytest.mark.asyncio
@@ -187,7 +187,7 @@ async def test_email_gate_thresholds_configurable(monkeypatch):
         "src.infrastructure.notifiers.email_notifier.smtplib.SMTP_SSL", _SMTP)
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="2693888583@qq.com",
+        alert_email_to="your_qq_number@qq.com",
         alert_email_risk_min_score=79.0, alert_email_opp_min_score=90.0))
     assert (await notifier.send(_alert(risk_score=75.0))).status == "suppressed"
     assert (await notifier.send(_alert(risk_score=80.0))).status == "sent"
@@ -210,7 +210,7 @@ async def test_email_failure_does_not_raise(monkeypatch):
         _BrokenSMTP)
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="2693888583@qq.com"))
+        alert_email_to="your_qq_number@qq.com"))
     result = await notifier.send(_alert())
     assert result.status == "failed" and "连接被拒绝" in result.detail
 
@@ -235,7 +235,7 @@ def test_email_body_has_disclaimer_and_html_escape():
     """TR-7.1/D12：邮件正文必带免责声明，外部字段HTML转义防注入。"""
     notifier = EmailNotifier(_settings(
         alert_smtp_user="sender@qq.com", alert_smtp_auth_code="code",
-        alert_email_to="2693888583@qq.com"))
+        alert_email_to="your_qq_number@qq.com"))
     alert = _alert()
     alert.title = '<script>alert("x")</script>固态电池政策'
     text = notifier._render_text(alert)

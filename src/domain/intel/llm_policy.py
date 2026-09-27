@@ -132,9 +132,8 @@ def needs_llm(decision: AnalysisDecision) -> bool:
 def _cloud_calls_today() -> int:
     """当日云端调用计数（从审计链读，不额外建状态）。"""
     try:
-        from pathlib import Path
-
         import json
+        from pathlib import Path
 
         p = Path("data/audit/llm_audit.jsonl")
         if not p.exists():

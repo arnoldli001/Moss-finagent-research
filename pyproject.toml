@@ -21,6 +21,14 @@ dependencies = [
     "pypinyin>=0.55.0",
     "eltdx>=3.2.2",
     "pypdf>=6.19.0",
+    # 数据处理基础（数据层/指标/因子广泛使用，运行期必需）
+    "numpy>=2.1",
+    "pandas>=2.2",
+    # HTTP 直连连接器（akshare/index_valuation 等连接器模块顶层使用）
+    "requests>=2.31",
+    # 登录人机校验验证码图片；资金流/板块缓存落盘读回（parquet）
+    "Pillow>=10.0",
+    "pyarrow>=15.0",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +45,14 @@ dev = [
     "pytest>=8.0,<8.4",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
+    # 测试套件离线运行所需（连接器测试对这些包打桩/读本地夹具，不访问外网）：
+    # openpyxl：pandas.read_excel 读取 .xls/.xlsx 夹具
+    # scikit-learn：manage 预检等用例预期其已安装
+    # akshare/tushare：连接器回归用例需要 import 包本体来打桩（网络仍为假）
+    "openpyxl>=3.1",
+    "scikit-learn>=1.4",
+    "akshare>=1.14",
+    "tushare>=1.4",
 ]
 
 [tool.uv]
@@ -69,3 +85,11 @@ select = ["E", "F", "I", "W", "UP", "B"]
 "src/fundflow/*" = ["E501"]
 # moss_selector 的 docstring 里是口径对照表与复用来源表，列宽同样无意义
 "moss_selector/*" = ["E501"]
+# jicai 集采数据字典：note 是带来源复核说明的中文文本，机械断行会肢解引用信息
+"src/infrastructure/connectors/jicai_price_source.py" = ["E501"]
+# 以下 docstring 是 markdown 对照/规则表格（日历主备链 / 命中规则 / 模型分层 / 到期提示），列宽无意义
+"scripts/scan_date_bombs.py" = ["E501"]
+"src/domain/intel/calendar.py" = ["E501"]
+"src/domain/intel/hot_scan.py" = ["E501"]
+"src/domain/intel/llm_policy.py" = ["E501"]
+"src/domain/intel/token_alerts.py" = ["E501"]

@@ -31,10 +31,9 @@ A 股有大量几乎没有成交的票（僵尸股、长期停牌边缘、退市
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
-import numpy as np
 import pandas as pd
 
 

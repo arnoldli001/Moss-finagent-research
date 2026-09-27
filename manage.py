@@ -1283,6 +1283,24 @@ def memory_snapshot() -> dict[str, object]:
         out["commit_pct"] = round(100 * committed / limit) if limit else 0
     except Exception:  # noqa: BLE001 拿不到就少记几个字段，不该影响值守
         out["mem_error"] = "无法读取内存快照"
+
+    # ── ★ 2026-09-27 修复：`job_membership()` 曾是**死代码** ──
+    #
+    # 实测（2026-09-27 后端静默终止取证）：`job_membership` 全文件只出现
+    # 2 次 —— 定义处 + 文档提及，**零调用**。于是 `backend_incidents.jsonl`
+    # 里 20 条事故记录**没有一条**带 job 字段，而它的 docstring 明确写着
+    # "每次事故现场都记一次"。这是最典型的静默失效：字段看着有实现，
+    # 实际上从来没被采集过。
+    #
+    # `KILL_ON_JOB_CLOSE` 的 Job 一关闭，成员进程被**内核**终止且不留日志 ——
+    # 与实测的静默终止表现完全一致，是本项目最需要排除的一条杀因。
+    # 记的是 `os.getpid()`（**值守进程自己**）而不是那个已经死掉的 pid：
+    # 死进程的 job 状态事后取不到，而"值守自己是否被 Job 兜着"同样重要 ——
+    # 若值守本身跑在一个 kill-on-close 的 Job 里，连它拉起的新实例也会一起陪葬。
+    try:
+        out["in_job"] = job_membership(os.getpid())
+    except Exception:  # noqa: BLE001 取不到就少记一个字段
+        out["in_job"] = "unknown"
     return out
 
 

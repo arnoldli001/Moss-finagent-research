@@ -10,7 +10,7 @@ import random
 
 import pandas as pd
 
-from src.quant.st_status import StStatus, is_st_name, _norm_code, _norm_day
+from src.quant.st_status import StStatus, _norm_code, _norm_day, is_st_name
 
 
 def _frame(rows: list[tuple]) -> pd.DataFrame:

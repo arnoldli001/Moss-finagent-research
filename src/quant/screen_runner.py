@@ -16,8 +16,9 @@ import json
 import os
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from src.core.errors import (
     BRIEF_DEFAULT,

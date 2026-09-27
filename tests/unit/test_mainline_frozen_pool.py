@@ -14,7 +14,6 @@
 """
 from __future__ import annotations
 
-import io
 from pathlib import Path
 
 import pytest
@@ -95,7 +94,6 @@ def test_shipped_frozen_pool_is_122_and_all_concept_prefixes() -> None:
 
 def test_pool_is_subset_of_frozen_list() -> None:
     """真库集成：`ml_board` 必须**恰好**等于冻结名单（不是子集就说明有别的规则在插手）。"""
-    import sqlite3
 
     from src.mainline.config import load_config
     from src.mainline.datastore import MainlineDataStore, load_frozen_pool

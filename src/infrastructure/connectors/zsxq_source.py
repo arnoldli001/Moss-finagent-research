@@ -40,7 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-from src.infrastructure.credentials import ZSXQ_FILE, load as load_cred
+from src.infrastructure.credentials import ZSXQ_FILE
+from src.infrastructure.credentials import load as load_cred
 
 logger = logging.getLogger(__name__)
 

@@ -241,6 +241,13 @@ def series_to_points(
 
     传入 exact_*_col 时要求列名精确相等，避免子串误中
     （如乐咕"等权滚动市盈率"包含"滚动市盈率"）。
+
+    ⚠️ 返回值**按 period_date 升序**，与统一数据层
+    （`DataPointRepository.query_points`："按period_date升序"）以及其余连接器一致。
+    AkShare 的宏观接口（如 `macro_china_consumer_goods_retail`）返回的是
+    **新→旧**，原样透出会得到一个"降序"的连接器：同一个指标走网络是降序、
+    命中本地 DB 短路却是升序 —— 任何依赖顺序的消费方都会时好时坏。
+    实测（2026-09-26）：`ind:社会消费品零售总额同比` 返回首=2026-08 / 尾=2008-01。
     """
     if df is None or len(df) == 0:
         return []
@@ -276,6 +283,8 @@ def series_to_points(
                 confidence=confidence, verified=False,
             )
         )
+    # 统一升序（见 docstring）：只按 period_date 排，None 期间排在最前不影响数值消费
+    points.sort(key=lambda p: p.period_date or "")
     return points
 
 

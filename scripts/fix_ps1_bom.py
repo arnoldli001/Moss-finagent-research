@@ -4,8 +4,29 @@
 
 Windows PowerShell 5.1 读脚本文件时，**没有 BOM 就按本地代码页解码**
 （中文系统 = GBK）。于是脚本里的中文字面量在**解析阶段**就已经是乱码 ——
-写进日志变成「绛夊緟 140 池重打分结束」这种。逻辑不受影响（路径和命令都是
-ASCII），但审计日志不可读。
+写进日志变成「绛夊緟 140 池重打分结束」这种。
+
+## ⚠️ 更正：不只是"日志不可读"，可能是**整段脚本解析失败**
+
+原文这里写的是"逻辑不受影响（路径和命令都是 ASCII）"。**2026-09-27 实测证伪**：
+
+同一个 `.ps1`（`scripts/tunnel_watchdog.ps1` 早期草稿，含
+`"$stamp 主用不通且本机后端 8110 也不通，跳过隧道处置（归 PilotWatchdog）"`）：
+
+| 版本 | `Parser::ParseFile` | 执行 |
+|---|---|---|
+| 无 BOM | **1 处语法错误** | 退出码 1，**`Add-Content` 抛 `PositionalParameterNotFound`，日志完全没写进去** |
+| 有 BOM | 0 错误 | 退出码 0，正确写入 |
+
+根因：按 GBK 解码后，某些中文串的字节边界会**吞掉引号或续行反引号**，
+使解析器把字符串与参数拆成多个 token → 位置参数绑定失败。
+**不是"乱码但能跑"，是"跑不起来且失败被吞"**（`$ErrorActionPreference` 为
+`Continue` 时只往 stderr 冒一行，很容易在日志里被忽略）。
+
+所以：**任何含非 ASCII 的 `.ps1` 落盘后必须过本脚本**，不是可选的整洁性步骤。
+`write` 工具写的是 UTF-8 无 BOM，每次写完都要补。
+（另注意：本脚本自身在中文控制台会因 emoji 抛 `UnicodeEncodeError`，
+需 `PYTHONIOENCODING=utf-8` 或 `PYTHONUTF8=1`。）
 
 本项目已多次记录 PowerShell + 非 ASCII 的坑（见 AGENTS 约定），这是又一例。
 `write` 工具写的是 UTF-8 **无 BOM**，所以落盘后必须过一遍本脚本。

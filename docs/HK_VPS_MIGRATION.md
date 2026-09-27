@@ -340,10 +340,43 @@ foreach ($u in @('https://moss.wujiaitool.cn','https://hk.wujiaitool.cn')) {
 
 | | CF 隧道 | 香港 frp |
 |---|---|---|
-| 进程 | `cloudflared` | `frpc.exe` |
-| 值守 | `MossTunnelWatchdog`（每 5 分钟） | 暂无（可照抄那套） |
+| 进程 | `cloudflared`（**SCM 服务**，非裸进程） | `frpc.exe` + `frp_ssh_tunnel.py` |
+| 值守 | `MossTunnelWatchdog`（每 5 分钟，**按需**，见下） | `MossFrpEnsure`（每 5 分钟，判据=公网入口 200） |
 | 入口 | `moss.wujiaitool.cn` | `hk.wujiaitool.cn` |
-| 状态 | **保留，不做任何改动** | 新增 |
+| 状态 | **降级为备用，不做常规值守** | **生产入口** |
 
 两条同时活着意味着**双倍入口**，但**不冲突**：它们各自连各自的
 服务端，最终都回到本机 8110。回滚成本为零。
+
+### 9.1 ★ 2026-09-27 修正：`MossTunnelWatchdog` 改成「按需值守」
+
+**上面那张表原来写的是"CF 隧道 = `MossTunnelWatchdog` 每 5 分钟值守 /
+香港 frp = 暂无值守"，正是这个错配造成了实测故障。**
+
+切换生产入口后，`MossTunnelWatchdog` 仍然每 5 分钟去探测**已降级的
+CF 备用**，连续失败就 `Restart-Service Cloudflared`。三个问题叠在一起：
+
+1. 它在**修一条没人用的路**，而真正在服务用户的 `hk` 入口**当时无人值守**。
+2. CF 这条路在本机宽带上**结构性劣化且修不好**（实测 3 次探测
+   `超时 / 200(5.1s) / 超时`；`cloudflared tunnel info` 连
+   `api.cloudflare.com` 都 `context deadline exceeded`；IPv6 建连 1296ms
+   vs IPv4 160~209ms，1400 字节包 100% 丢）。于是它**每 5 分钟就要重启一次**。
+3. 重启 cloudflared 会**中断所有在途请求** —— 净效果是自造抖动。
+
+**现行判据（顺序不能换，见 `scripts/tunnel_watchdog.ps1` 头部）：**
+
+| 条件 | 动作 |
+|---|---|
+| ① 主用 `hk` 入口 200 | **直接退出，零副作用**（绝大多数 tick） |
+| ② 主用不通 + 本机后端也不通 | 不碰隧道（归 `MossPilotWatchdog`） |
+| ③ 主用不通 + 备用能通 | 记一行，**不处置**（备用仍算可用，主用归 `MossFrpEnsure`） |
+| ④ 主用与备用**同时**不通 | 这时备用真的被需要 → `Restart-Service Cloudflared` |
+
+一句话：**只有"主用挂了、备用也挂了"才动手。**
+
+> ⚠️ 判据顺序换了就会退回旧故障：若把"备用是否健康"放到第一步，
+> 就会重新变成"每 5 分钟修一条没人用的路"。
+
+> ⚠️ **重启必须走 `Restart-Service`，绝不能自己 `taskkill` + `Start-Process`**：
+> cloudflared 由 SCM 托管且带 `FAILURE_ACTIONS = RESTART`，自己起进程会和
+> SCM 的自动恢复打架，造出**两个实例**互相抢同一个隧道（2026-09-26 实测事故）。

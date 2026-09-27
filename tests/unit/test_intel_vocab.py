@@ -803,7 +803,13 @@ def test_real_table_matches_the_documented_sources() -> None:
     vocab.reset_cache()
     try:
         st = vocab.stats()
-        assert st["kind_concept_board"] == 138, st
+        # 库文件在但**源数据为空**（CI/公开快照只有骨架库）也按缺库处理：
+        # 这条用例锁的是"真实规模不塌"，空库没有可锁的东西。
+        if st["kind_concept_board"] == 0 or st["kind_a_stock"] == 0:
+            pytest.skip(f"本地数据仓缺板块/A股名录数据：{st['gaps']}")
+        # 2026-09-27：主线概念池冻结后 `ml_board` 的 concept 目录 = 122
+        # （与 `configs/mainline_frozen_pool.yaml` 逐字相等）。原值是 138。
+        assert st["kind_concept_board"] == 122, st
         assert st["kind_a_stock"] == 5562, st
         assert st["kind_overseas"] == len(vocab.OVERSEAS_TERMS), st
         # `人工智能` 同时是概念板块与 AI 关键词 —— 一张表里按 `KINDS` 顺序
@@ -811,7 +817,7 @@ def test_real_table_matches_the_documented_sources() -> None:
         # 也是"一张表"这个设计的直接后果（分两张表就不会有这次去重）。
         assert st["kind_ai"] == len(vocab.AI_TERMS) - 1, st
         assert vocab.table().index["人工智能"].kind == vocab.KIND_BOARD
-        assert st["total"] == (138 + 5562 + len(vocab.OVERSEAS_TERMS)
+        assert st["total"] == (122 + 5562 + len(vocab.OVERSEAS_TERMS)
                               + len(vocab.AI_TERMS) - 1), st
         assert st["max_len"] >= 8, st            # "仿制药一致性评价"这类长名
         assert st["gaps"] == [], st              # 两类数据源都必须读到了

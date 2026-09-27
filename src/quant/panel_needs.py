@@ -39,8 +39,8 @@ from __future__ import annotations
 import ast
 import inspect
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 

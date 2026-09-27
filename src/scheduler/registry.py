@@ -511,7 +511,7 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         params={},
     ),
     # 数据源授权到期提醒（用户口径 2026-09-25）：
-    #   "5 天开始提醒，发邮件通知到 1027312283@qq.com"
+    #   "5 天开始提醒，发邮件通知到 your_qq_number@qq.com"
     #
     # 为什么必须提前提醒而不是失效后报警：token 是 opaque（无 exp 可读），
     # 实测有效期 7–14 天。失效后才发现 = 采集中断 —— 历史上就这样
@@ -525,7 +525,7 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         kind="intel_token_alert",
         description=(
             "数据源授权到期检查：满 5 天起邮件提醒管理员重新授权"
-            "（收件人 TOKEN_ALERT_EMAIL_TO，默认 1027312283@qq.com）；"
+            "（收件人 TOKEN_ALERT_EMAIL_TO，默认 your_qq_number@qq.com）；"
             "同一级别只发一次，重新授权后自动重置。"
             "只发管理员，用户侧无感"
         ),

@@ -405,7 +405,6 @@ def build_panels(
     flow_fields = set(needs.flow)
     bak_fields = set(needs.bak)
     limit_fields = set(needs.limits)
-    need_adj = bool(price_fields & {"open", "high", "low", "close"})
 
     def dataset_fields(dataset: str) -> tuple[str, ...]:
         if dataset == "daily":

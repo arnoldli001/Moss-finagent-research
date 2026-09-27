@@ -860,7 +860,7 @@ async def build_calendar(*, horizon_days: int = DEFAULT_HORIZON_DAYS
     kind_labels = {"earnings": "财报披露", "unlock": "限售解禁",
                    "macro": "宏观发布", "trade_day": "交易日"}
 
-    for kind, res in zip(jobs.keys(), results):
+    for kind, res in zip(jobs.keys(), results, strict=False):
         if isinstance(res, Exception):
             from src.core.redaction import sanitize_error
             logger.warning("日历 %s 拉取失败：%s", kind, sanitize_error(res))

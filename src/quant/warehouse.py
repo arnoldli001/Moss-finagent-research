@@ -1372,11 +1372,11 @@ def strategy_case_store(root: str | Path = DEFAULT_ROOT, *,
 # 单例化后只剩一次探测 + 一次连接。
 # 为什么不直接用 SQLAlchemy 连接池：现状后端是 SQLite（demo 阶段），连接池没收益；
 # 换 PostgreSQL 后 `engine.pool` 自带连接池，单例化是切换前置条件。
-_WAREHOUSE_CACHE: dict[tuple[str, str], "QuantWarehouse"] = {}
+_WAREHOUSE_CACHE: dict[tuple[str, str], QuantWarehouse] = {}
 _WAREHOUSE_LOCK = threading.Lock()
 
 
-def _get_warehouse_cached(root: str | Path, universe: str) -> "QuantWarehouse":
+def _get_warehouse_cached(root: str | Path, universe: str) -> QuantWarehouse:
     key = (str(root), str(universe))
     cached = _WAREHOUSE_CACHE.get(key)
     if cached is not None:

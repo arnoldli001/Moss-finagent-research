@@ -117,7 +117,7 @@ async def main() -> None:
         print("[E2E-INDUSTRY] 本地景气信号:",
               json.dumps(a15["result"].get("industry_signal_calc"), ensure_ascii=False))
 
-    # ---- 科技行业段（模拟产业数据打通：半导体→A09+A13，ind:模拟指标+真实CPI/PPI）----
+    # ---- 科技行业段（真实源打通：半导体→A09+A13，ind:真实指标+真实CPI/PPI）----
     tech_state = {
         "task_id": f"task_smoke_tech_{int(time.time())}",
         "tenant_id": "tenant_001",

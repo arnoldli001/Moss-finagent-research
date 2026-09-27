@@ -1,0 +1,1675 @@
+{
+ "routes_total": 215,
+ "calls_total": 152,
+ "routes_matched": 149,
+ "calls_matched": 141,
+ "orphan_routes": [
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select",
+   "file": "src/api/routes/auction_select.py",
+   "line": 135,
+   "refs": {
+    "README.md": [
+     "README.md"
+    ],
+    "auction_select": [
+     "auction_select/config.yaml"
+    ],
+    "docs": [
+     "docs/AUCTION_DATA_REDUNDANCY.md",
+     "docs/AUCTION_SELECT.md",
+     "docs/DATA_SOURCE_ROUTING.md",
+     "docs/DEMO_GUIDE.md",
+     "docs/DESIGN_HIGHLIGHTS.md",
+     "docs/DEV_EXPERIENCE_TABLE.md"
+    ],
+    "qmt": [
+     "qmt/auction_v3_qmt.py",
+     "qmt/signal_server.py",
+     "qmt/test_parity.py"
+    ],
+    "scripts": [
+     "scripts/_audit_routes.py",
+     "scripts/_count_lines.py",
+     "scripts/auction_data_audit.py",
+     "scripts/auction_replay.py",
+     "scripts/backtest_auction.py",
+     "scripts/backtest_auction_full.py"
+    ],
+    ".github": [
+     ".github/workflows/ci.yml"
+    ],
+    "skills": [
+     "skills/auction-selection/SKILL.md",
+     "skills/jianmen-shortterm/SKILL.md",
+     "skills/pipeline-redundancy-audit/SKILL.md"
+    ],
+    "src": [
+     "src/api/main.py",
+     "src/api/routes/__init__.py",
+     "src/auction_select/__init__.py",
+     "src/auction_select/config.py",
+     "src/auction_select/db.py",
+     "src/auction_select/ecology.py"
+    ],
+    "tests": [
+     "tests/unit/test_auction_golden.py",
+     "tests/unit/test_auction_jump_rush.py",
+     "tests/unit/test_auction_local_source.py",
+     "tests/unit/test_auction_rulebook.py",
+     "tests/unit/test_auction_select.py",
+     "tests/unit/test_auction_sentiment.py"
+    ],
+    "web": [
+     "web/src/auctionApi.ts",
+     "web/src/components/AuctionSelectPanel.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/detail/{code}",
+   "file": "src/api/routes/auction_select.py",
+   "line": 357,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select/detail",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/preheat",
+   "file": "src/api/routes/auction_select.py",
+   "line": 479,
+   "refs": {
+    "docs": [
+     "docs/INTERVIEW_FINAL.md",
+     "docs/INTERVIEW_PLAYBOOK.md",
+     "docs/INTERVIEW_SESSION_SUMMARY.md",
+     "docs/PLATFORM_MULTI_TENANCY_DESIGN.md",
+     "docs/PROJECT_AUDIT_2026-09-19.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "tests": [
+     "tests/unit/test_auction_golden.py"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts"
+   ],
+   "key": "auction_select/preheat",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/auction_select/run",
+   "file": "src/api/routes/auction_select.py",
+   "line": 425,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select/run",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/runs",
+   "file": "src/api/routes/auction_select.py",
+   "line": 414,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts"
+   ],
+   "key": "auction_select/runs",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/sentiment_cycle",
+   "file": "src/api/routes/auction_select.py",
+   "line": 114,
+   "refs": {
+    "docs": [
+     "docs/AUCTION_SELECT.md",
+     "docs/INTERVIEW_PREP_SESSION.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/components/AuctionSelectPanel.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts"
+   ],
+   "key": "auction_select/sentiment_cycle",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/stage_guide",
+   "file": "src/api/routes/auction_select.py",
+   "line": 388,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts"
+   ],
+   "key": "auction_select/stage_guide",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/state",
+   "file": "src/api/routes/auction_select.py",
+   "line": 493,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json",
+     "docs/interview/链路审计SKILL.md"
+    ],
+    "skills": [
+     "skills/pipeline-redundancy-audit/SKILL.md"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select/state",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/today",
+   "file": "src/api/routes/auction_select.py",
+   "line": 189,
+   "refs": {
+    "docs": [
+     "docs/DEMO_GUIDE.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_audit_routes.py"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select/today",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auction_select/watch",
+   "file": "src/api/routes/auction_select.py",
+   "line": 273,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select/watch",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/auction_select/watch",
+   "file": "src/api/routes/auction_select.py",
+   "line": 304,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select/watch",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "DELETE",
+   "path": "/api/v1/auction_select/watch/{code}",
+   "file": "src/api/routes/auction_select.py",
+   "line": 334,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "auction_select/watch",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/auth/_debug/whoami",
+   "file": "src/api/routes/auth.py",
+   "line": 304,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/PLATFORM_MULTI_TENANCY_DESIGN.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_verify_admin_e2e.py",
+     "scripts/_verify_auth_e2e.py"
+    ],
+    "src": [
+     "src/api/login_gate.py",
+     "src/core/config.py"
+    ],
+    "tests": [
+     "tests/unit/test_login_gate.py"
+    ]
+   },
+   "fe_refs": [],
+   "key": "_debug/whoami",
+   "verdict": "仅 docs / scripts / 后端其它模块 / 测试"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/code-engineer/connectors",
+   "file": "src/api/routes/code_engineer.py",
+   "line": 58,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "code-engineer/connectors",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/code-engineer/fix-gap",
+   "file": "src/api/routes/code_engineer.py",
+   "line": 22,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ],
+    "src": [
+     "src/domain/agents/engineering/code_engineer/agent.py"
+    ],
+    "tests": [
+     "tests/unit/test_code_engineer_agent.py"
+    ]
+   },
+   "fe_refs": [],
+   "key": "code-engineer/fix-gap",
+   "verdict": "仅 docs / 后端其它模块 / 测试"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/code-engineer/known-sources",
+   "file": "src/api/routes/code_engineer.py",
+   "line": 79,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "code-engineer/known-sources",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/code-engineer/reload",
+   "file": "src/api/routes/code_engineer.py",
+   "line": 68,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "code-engineer/reload",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/data/macro",
+   "file": "src/api/routes/data.py",
+   "line": 18,
+   "refs": {
+    "docs": [
+     "docs/API_REFERENCE.md",
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "tests": [
+     "tests/integration/test_api.py"
+    ]
+   },
+   "fe_refs": [],
+   "key": "data/macro",
+   "verdict": "仅 docs / 测试"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/debug/plan",
+   "file": "src/api/routes/research.py",
+   "line": 562,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/demo_tour.py"
+    ]
+   },
+   "fe_refs": [],
+   "key": "debug/plan",
+   "verdict": "仅 docs / scripts"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/fundflow/pick",
+   "file": "src/api/routes/fundflow.py",
+   "line": 192,
+   "refs": {
+    "docs": [
+     "docs/FUND_FLOW_MONITOR.md",
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "fundflow/pick",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/intel/alerts/{alert_id}/state",
+   "file": "src/api/routes/intel.py",
+   "line": 1092,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/intelApi.ts"
+   ],
+   "key": "alerts/state",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/intel/bootstrap",
+   "file": "src/api/routes/intel.py",
+   "line": 727,
+   "refs": {
+    "docs": [
+     "docs/OPS_GUIDE.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/components/intel/IntelPanel.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/App.tsx",
+    "web/src/components/intel/IntelPanel.tsx",
+    "web/src/hooks/useAuth.ts",
+    "web/src/intelApi.ts",
+    "web/src/panelPrefetch.ts"
+   ],
+   "key": "intel/bootstrap",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/intel/calendar",
+   "file": "src/api/routes/intel.py",
+   "line": 1007,
+   "refs": {
+    "docs": [
+     "docs/INVESTMENT_CALENDAR_DESIGN.md",
+     "docs/OPS_GUIDE.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_verify_intel_live.py",
+     "scripts/_verify_intel_privacy_vip.py"
+    ],
+    "tests": [
+     "tests/conftest.py",
+     "tests/unit/test_intel_prewarm.py",
+     "tests/unit/test_intel_slow_cache.py"
+    ],
+    "src": [
+     "src/core/config.py",
+     "src/domain/intel/prewarm.py"
+    ],
+    "web": [
+     "web/src/components/intel/IntelPanel.tsx",
+     "web/src/intelApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/intel/IntelPanel.tsx",
+    "web/src/intelApi.ts"
+   ],
+   "key": "intel/calendar",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/intel/feed",
+   "file": "src/api/routes/intel.py",
+   "line": 567,
+   "refs": {
+    "docs": [
+     "docs/OPS_GUIDE.md",
+     "docs/PANEL_LOAD_LATENCY.md",
+     "docs/PANEL_PREFETCH_KEEPALIVE.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_verify_intel_live.py",
+     "scripts/_verify_intel_perf_and_fulltext.py",
+     "scripts/_verify_intel_privacy_vip.py"
+    ],
+    "tests": [
+     "tests/conftest.py",
+     "tests/integration/test_intel_payload_size.py",
+     "tests/unit/test_admin_platform_api.py",
+     "tests/unit/test_intel_feed_nonblocking.py",
+     "tests/unit/test_llm_cost_accounting.py"
+    ],
+    "src": [
+     "src/api/routes/sector_rotation.py",
+     "src/core/config.py",
+     "src/domain/intel/prewarm.py",
+     "src/domain/intel/service.py",
+     "src/domain/intel/tone_store.py",
+     "src/scheduler/jobs.py"
+    ],
+    "web": [
+     "web/src/components/intel/IntelPanel.tsx",
+     "web/src/intelCache.ts",
+     "web/src/panelPrefetch.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/intel/IntelPanel.tsx",
+    "web/src/hooks/useAlertsWs.ts",
+    "web/src/intelApi.ts",
+    "web/src/intelCache.ts",
+    "web/src/panelPrefetch.ts"
+   ],
+   "key": "intel/feed",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/intel/feed/status",
+   "file": "src/api/routes/intel.py",
+   "line": 702,
+   "refs": {
+    "docs": [
+     "docs/OPS_GUIDE.md",
+     "docs/_link_audit_routes.json",
+     "docs/interview/01_模块数据流手册.html"
+    ],
+    "scripts": [
+     "scripts/_verify_intel_perf_and_fulltext.py"
+    ],
+    "src": [
+     "src/domain/intel/source_cache.py"
+    ],
+    "tests": [
+     "tests/unit/test_intel_feed_nonblocking.py"
+    ],
+    "web": [
+     "web/src/components/intel/IntelPanel.tsx",
+     "web/src/intelApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/intel/IntelPanel.tsx",
+    "web/src/intelApi.ts"
+   ],
+   "key": "feed/status",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/intel/heat",
+   "file": "src/api/routes/intel.py",
+   "line": 1146,
+   "refs": {
+    "docs": [
+     "docs/OPS_GUIDE.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "tests": [
+     "tests/conftest.py",
+     "tests/unit/test_intel_prewarm.py",
+     "tests/unit/test_intel_slow_cache.py"
+    ],
+    "src": [
+     "src/core/config.py"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/intel/IntelHeatBlock.tsx"
+   ],
+   "key": "intel/heat",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/intel/item/{content_hash}",
+   "file": "src/api/routes/intel.py",
+   "line": 809,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_probe_intel_rule_audit.py",
+     "scripts/_verify_intel_perf_and_fulltext.py",
+     "scripts/_verify_intel_round6.py"
+    ],
+    "src": [
+     "src/domain/intel/body_store.py"
+    ],
+    "tests": [
+     "tests/integration/test_intel_payload_size.py",
+     "tests/unit/test_intel_fulltext_guard.py",
+     "tests/unit/test_intel_label_and_fulltext.py"
+    ],
+    "web": [
+     "web/src/components/intel/IntelFeedTab.tsx",
+     "web/src/intelApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/intel/IntelFeedTab.tsx",
+    "web/src/intelApi.ts"
+   ],
+   "key": "intel/item",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/intel/sources/health",
+   "file": "src/api/routes/intel.py",
+   "line": 1040,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_verify_intel_privacy_vip.py"
+    ],
+    "web": [
+     "web/src/intelApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/intelApi.ts"
+   ],
+   "key": "sources/health",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/intraday/auto-select",
+   "file": "src/api/routes/intraday.py",
+   "line": 154,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "intraday/auto-select",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/alert-returns",
+   "file": "src/api/routes/mainline.py",
+   "line": 585,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/alert-returns",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/alerts",
+   "file": "src/api/routes/mainline.py",
+   "line": 448,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/App.tsx",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/alerts",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/backtest",
+   "file": "src/api/routes/mainline.py",
+   "line": 487,
+   "refs": {
+    "docs": [
+     "docs/INTERVIEW_FINAL.md",
+     "docs/MAINLINE_MINING.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/App.tsx",
+    "web/src/etfFlowApi.ts",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/backtest",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/backtest/list",
+   "file": "src/api/routes/mainline.py",
+   "line": 509,
+   "refs": {
+    "docs": [
+     "docs/ETF_FLOW_MONITOR.md",
+     "docs/MAINLINE_MINING.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/etfFlowApi.ts",
+     "web/src/mainlineApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/etfFlowApi.ts",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "backtest/list",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/board-win-rates",
+   "file": "src/api/routes/mainline.py",
+   "line": 638,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/components/MainlineAlertFlow.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/MainlineAlertFlow.tsx",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/board-win-rates",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/board/{code}",
+   "file": "src/api/routes/mainline.py",
+   "line": 412,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/components/MainlineAlertFlow.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/MainlineRadar.tsx",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/board",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/mainline/data/sync",
+   "file": "src/api/routes/mainline.py",
+   "line": 754,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/MAINLINE_MINING.md",
+     "docs/PLATFORM_MULTI_TENANCY_DESIGN.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "data/sync",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/etf-flow/backtest",
+   "file": "src/api/routes/mainline.py",
+   "line": 1052,
+   "refs": {
+    "docs": [
+     "docs/ETF_FLOW_MONITOR.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/App.tsx",
+    "web/src/etfFlowApi.ts",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "etf-flow/backtest",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/etf-flow/backtest/list",
+   "file": "src/api/routes/mainline.py",
+   "line": 1067,
+   "refs": {
+    "docs": [
+     "docs/ETF_FLOW_MONITOR.md",
+     "docs/MAINLINE_MINING.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/etfFlowApi.ts",
+     "web/src/mainlineApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/etfFlowApi.ts",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "backtest/list",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/mainline/etf-flow/save",
+   "file": "src/api/routes/mainline.py",
+   "line": 1038,
+   "refs": {
+    "docs": [
+     "docs/ETF_FLOW_MONITOR.md",
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/EtfFlowSignals.tsx",
+    "web/src/etfFlowApi.ts"
+   ],
+   "key": "etf-flow/save",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/etf-flow/signals",
+   "file": "src/api/routes/mainline.py",
+   "line": 1010,
+   "refs": {
+    "docs": [
+     "docs/ETF_FLOW_MONITOR.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/components/EtfFlowSignals.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/EtfFlowPanel.tsx",
+    "web/src/components/EtfFlowSignals.tsx",
+    "web/src/etfFlowApi.ts"
+   ],
+   "key": "etf-flow/signals",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/etf-flow/snapshot",
+   "file": "src/api/routes/mainline.py",
+   "line": 969,
+   "refs": {
+    "docs": [
+     "docs/ETF_FLOW_MONITOR.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_verify_etf_flow_gate.py"
+    ],
+    "web": [
+     "web/src/components/EtfFlowPanel.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/EtfFlowPanel.tsx",
+    "web/src/components/MainlinePanel.tsx",
+    "web/src/etfFlowApi.ts",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "etf-flow/snapshot",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/futures",
+   "file": "src/api/routes/mainline.py",
+   "line": 460,
+   "refs": {
+    "configs": [
+     "configs/mainline_futures_mapping.yaml"
+    ],
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/MainlinePanel.tsx",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/futures",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/mainline/futures/calibrate",
+   "file": "src/api/routes/mainline.py",
+   "line": 480,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/MAINLINE_MINING.md",
+     "docs/PLATFORM_MULTI_TENANCY_DESIGN.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "futures/calibrate",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/futures/mappings",
+   "file": "src/api/routes/mainline.py",
+   "line": 471,
+   "refs": {
+    "docs": [
+     "docs/MAINLINE_MINING.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/MainlineFutures.tsx",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "futures/mappings",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/refresh_status",
+   "file": "src/api/routes/mainline.py",
+   "line": 922,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/EtfFlowBacktest.tsx",
+    "web/src/components/MainlineBacktest.tsx",
+    "web/src/etfFlowApi.ts",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/refresh_status",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/relevance",
+   "file": "src/api/routes/mainline.py",
+   "line": 821,
+   "refs": {
+    "configs": [
+     "configs/mainline.yaml"
+    ],
+    "docs": [
+     "docs/DEV_EXPERIENCE_TABLE.md",
+     "docs/INTERVIEW_会话复盘_板块拥挤度与成分股提纯.md",
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/MAINLINE_MINING.md",
+     "docs/_link_audit_routes.json",
+     "docs/面试准备_竞价选股量化项目.archived.md"
+    ],
+    "scripts": [
+     "scripts/mainline_relevance.py"
+    ],
+    "src": [
+     "src/core/config.py",
+     "src/infrastructure/llm/gateway.py"
+    ]
+   },
+   "fe_refs": [],
+   "key": "mainline/relevance",
+   "verdict": "仅 configs / docs / scripts / 后端其它模块"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/saved",
+   "file": "src/api/routes/mainline.py",
+   "line": 395,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "mainline/saved",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/snapshot",
+   "file": "src/api/routes/mainline.py",
+   "line": 227,
+   "refs": {
+    "docs": [
+     "docs/INCIDENT_FIRST_SCREEN_LOOP_BLOCK_20260927.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/EtfFlowPanel.tsx",
+    "web/src/components/MainlinePanel.tsx",
+    "web/src/etfFlowApi.ts",
+    "web/src/mainlineApi.ts"
+   ],
+   "key": "mainline/snapshot",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/mainline/tasks",
+   "file": "src/api/routes/mainline.py",
+   "line": 939,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "mainline/tasks",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/me/profiles",
+   "file": "src/api/routes/my_profiles.py",
+   "line": 92,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "scripts": [
+     "scripts/_verify_multitenant_e2e.py"
+    ],
+    "src": [
+     "src/api/session_ctx.py"
+    ],
+    "tests": [
+     "tests/unit/test_login_gate.py",
+     "tests/unit/test_my_profiles_api.py"
+    ],
+    "web": [
+     "web/src/api.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/api.ts"
+   ],
+   "key": "me/profiles",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/quant/ic",
+   "file": "src/api/routes/quant.py",
+   "line": 732,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/QUANT_M2_FACTORS.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "quant/ic",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/quant/stocks/directory/rebuild",
+   "file": "src/api/routes/quant.py",
+   "line": 599,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/STOCK_DIRECTORY.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "directory/rebuild",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/research/{task_id}/agents",
+   "file": "src/api/routes/research.py",
+   "line": 552,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "research/agents",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/sector_crowding",
+   "file": "src/api/routes/sector_crowding.py",
+   "line": 878,
+   "refs": {
+    "README.md": [
+     "README.md"
+    ],
+    "configs": [
+     "configs/concept_removal_batches.yaml",
+     "configs/mainline.yaml",
+     "configs/sector_blacklist.yaml"
+    ],
+    "docs": [
+     "docs/CROWDING_METRIC_SCOPE_FACTCHECK.md",
+     "docs/DEV_EXPERIENCE_TABLE.md",
+     "docs/END_TO_END_OPTIMIZATION_2026-09-28.md",
+     "docs/INTERVIEW_DEEP_DIVE.html",
+     "docs/INTERVIEW_PLAYBOOK.md",
+     "docs/INTERVIEW_三岗位作战手册.md"
+    ],
+    "scripts": [
+     "scripts/_audit_llm_coverage.py",
+     "scripts/_audit_purification.py",
+     "scripts/_audit_routes.py",
+     "scripts/_count_lines.py",
+     "scripts/_crowding_population.py",
+     "scripts/_force_recompute.py"
+    ],
+    "sector_crowding": [
+     "sector_crowding/config.yaml"
+    ],
+    "skills": [
+     "skills/auction-selection/SKILL.md"
+    ],
+    "src": [
+     "src/api/routes/__init__.py",
+     "src/api/routes/mainline.py",
+     "src/api/routes/sector_rotation.py",
+     "src/auction_select/config.py",
+     "src/core/config.py",
+     "src/infrastructure/retention_passes.py"
+    ],
+    "tests": [
+     "tests/unit/test_mainline_daily_job.py",
+     "tests/unit/test_retention_passes.py",
+     "tests/unit/test_sector_crowding.py"
+    ],
+    "web": [
+     "web/src/components/SectorCrowdingAlertPanel.tsx",
+     "web/src/components/SectorCrowdingOverview.tsx",
+     "web/src/components/SectorCrowdingRefreshBar.tsx",
+     "web/src/components/SectorCrowdingTab.tsx",
+     "web/src/components/useCrowdingList.ts",
+     "web/src/sectorCrowdingApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/sectorCrowdingApi.ts"
+   ],
+   "key": "sector_crowding",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "POST",
+   "path": "/api/v1/sector_crowding/config_list/hidden/cleanup",
+   "file": "src/api/routes/sector_crowding.py",
+   "line": 570,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/SECTOR_CROWDING.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "hidden/cleanup",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/sector_crowding/metrics/status",
+   "file": "src/api/routes/sector_crowding.py",
+   "line": 193,
+   "refs": {
+    "docs": [
+     "docs/SECTOR_CROWDING.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/sectorCrowdingApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/sectorCrowdingApi.ts"
+   ],
+   "key": "metrics/status",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "DELETE",
+   "path": "/api/v1/sector_crowding/watchlist/{sector_code}",
+   "file": "src/api/routes/sector_crowding.py",
+   "line": 808,
+   "refs": {
+    "docs": [
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [
+    "web/src/sectorCrowdingApi.ts"
+   ],
+   "key": "sector_crowding/watchlist",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/sector_rotation",
+   "file": "src/api/routes/sector_rotation.py",
+   "line": 277,
+   "refs": {
+    "docs": [
+     "docs/DEV_EXPERIENCE_TABLE.md",
+     "docs/INCIDENT_FIRST_SCREEN_LOOP_BLOCK_20260927.md",
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/OPTIMIZATION_SUMMARY_2026-09-27.md",
+     "docs/PROJECT_AUDIT_2026-09-27.md",
+     "docs/SECTOR_ROTATION.md"
+    ],
+    "tests": [
+     "tests/test_sector_rotation.py"
+    ],
+    "src": [
+     "src/api/main.py",
+     "src/api/routes/__init__.py",
+     "src/scheduler/jobs.py",
+     "src/scheduler/registry.py",
+     "src/sector_rotation/__init__.py",
+     "src/sector_rotation/report.py"
+    ],
+    "web": [
+     "web/src/components/SectorRotationTab.tsx",
+     "web/src/sectorRotationApi.ts"
+    ]
+   },
+   "fe_refs": [
+    "web/src/components/SectorRotationTab.tsx",
+    "web/src/sectorRotationApi.ts"
+   ],
+   "key": "sector_rotation",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/sector_rotation/build_status",
+   "file": "src/api/routes/sector_rotation.py",
+   "line": 229,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ]
+   },
+   "fe_refs": [],
+   "key": "sector_rotation/build_status",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/sector_rotation/echarts.min.js",
+   "file": "src/api/routes/sector_rotation.py",
+   "line": 240,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "src": [
+     "src/sector_rotation/report.py"
+    ]
+   },
+   "fe_refs": [],
+   "key": "sector_rotation/echarts.min.js",
+   "verdict": "仅 docs / 后端其它模块"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/sector_rotation/report",
+   "file": "src/api/routes/sector_rotation.py",
+   "line": 177,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/SECTOR_ROTATION.md",
+     "docs/_link_audit_routes.json",
+     "docs/interview/01_模块数据流手册.html"
+    ],
+    "web": [
+     "web/src/components/SectorRotationTab.tsx"
+    ]
+   },
+   "fe_refs": [],
+   "key": "sector_rotation/report",
+   "verdict": "仅 docs"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/sector_rotation/report.html",
+   "file": "src/api/routes/sector_rotation.py",
+   "line": 192,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "web": [
+     "web/src/components/SectorRotationTab.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/sectorRotationApi.ts"
+   ],
+   "key": "sector_rotation/report.html",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/skills",
+   "file": "src/api/routes/skills.py",
+   "line": 35,
+   "refs": {
+    "AGENTS.md": [
+     "AGENTS.md"
+    ],
+    "README.md": [
+     "README.md"
+    ],
+    "auction_select": [
+     "auction_select/config.yaml"
+    ],
+    "docs": [
+     "docs/AGENT_COLLABORATION_ATLAS.html",
+     "docs/AUCTION_SELECT.md",
+     "docs/DEVELOPMENT_ROADMAP.md",
+     "docs/INTERVIEW_NOTES.md",
+     "docs/INTERVIEW_PLAYBOOK.md",
+     "docs/INTERVIEW_会话复盘_ETF回测统计口径与板块剔除.md"
+    ],
+    "scripts": [
+     "scripts/_audit_routes.py",
+     "scripts/_b1_consumers.py",
+     "scripts/_count_lines.py"
+    ],
+    ".trae": [
+     ".trae/skills/dev-standards/SKILL.md",
+     ".trae/skills/dev-standards/references/architecture-naming-spec.md",
+     ".trae/skills/dev-standards/references/project-structure.md"
+    ],
+    "skills": [
+     "skills/auction-selection/SKILL.md",
+     "skills/finagent-lessons/SKILL.md",
+     "skills/jianmen-shortterm/SKILL.md"
+    ],
+    "src": [
+     "src/api/routes/__init__.py",
+     "src/api/routes/auction_select.py",
+     "src/api/runtime.py",
+     "src/auction_select/__init__.py",
+     "src/auction_select/modes.py",
+     "src/auction_select/skill_guide.py"
+    ],
+    "tests": [
+     "tests/integration/test_skills_api.py",
+     "tests/unit/test_liquidity_cycle_skill.py",
+     "tests/unit/test_skill_integration.py",
+     "tests/unit/test_skill_library.py"
+    ],
+    "web": [
+     "web/src/auctionApi.ts",
+     "web/src/components/AuctionSelectPanel.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "skills",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/skills/quality",
+   "file": "src/api/routes/skills.py",
+   "line": 28,
+   "refs": {
+    "docs": [
+     "docs/LINK_AUDIT_REPORT_2026-09-27.md",
+     "docs/_link_audit_routes.json"
+    ],
+    "tests": [
+     "tests/integration/test_skills_api.py"
+    ]
+   },
+   "fe_refs": [],
+   "key": "skills/quality",
+   "verdict": "仅 docs / 测试"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/skills/{agent_id}",
+   "file": "src/api/routes/skills.py",
+   "line": 41,
+   "refs": {
+    "AGENTS.md": [
+     "AGENTS.md"
+    ],
+    "README.md": [
+     "README.md"
+    ],
+    "auction_select": [
+     "auction_select/config.yaml"
+    ],
+    "docs": [
+     "docs/AGENT_COLLABORATION_ATLAS.html",
+     "docs/AUCTION_SELECT.md",
+     "docs/DEVELOPMENT_ROADMAP.md",
+     "docs/INTERVIEW_NOTES.md",
+     "docs/INTERVIEW_PLAYBOOK.md",
+     "docs/INTERVIEW_会话复盘_ETF回测统计口径与板块剔除.md"
+    ],
+    "scripts": [
+     "scripts/_audit_routes.py",
+     "scripts/_b1_consumers.py",
+     "scripts/_count_lines.py"
+    ],
+    ".trae": [
+     ".trae/skills/dev-standards/SKILL.md",
+     ".trae/skills/dev-standards/references/architecture-naming-spec.md",
+     ".trae/skills/dev-standards/references/project-structure.md"
+    ],
+    "skills": [
+     "skills/auction-selection/SKILL.md",
+     "skills/finagent-lessons/SKILL.md",
+     "skills/jianmen-shortterm/SKILL.md"
+    ],
+    "src": [
+     "src/api/routes/__init__.py",
+     "src/api/routes/auction_select.py",
+     "src/api/runtime.py",
+     "src/auction_select/__init__.py",
+     "src/auction_select/modes.py",
+     "src/auction_select/skill_guide.py"
+    ],
+    "tests": [
+     "tests/integration/test_skills_api.py",
+     "tests/unit/test_liquidity_cycle_skill.py",
+     "tests/unit/test_skill_integration.py",
+     "tests/unit/test_skill_library.py"
+    ],
+    "web": [
+     "web/src/auctionApi.ts",
+     "web/src/components/AuctionSelectPanel.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "skills",
+   "verdict": "前端有（段边界命中）"
+  },
+  {
+   "method": "GET",
+   "path": "/api/v1/skills/{agent_id}/{skill_name}",
+   "file": "src/api/routes/skills.py",
+   "line": 50,
+   "refs": {
+    "AGENTS.md": [
+     "AGENTS.md"
+    ],
+    "README.md": [
+     "README.md"
+    ],
+    "auction_select": [
+     "auction_select/config.yaml"
+    ],
+    "docs": [
+     "docs/AGENT_COLLABORATION_ATLAS.html",
+     "docs/AUCTION_SELECT.md",
+     "docs/DEVELOPMENT_ROADMAP.md",
+     "docs/INTERVIEW_NOTES.md",
+     "docs/INTERVIEW_PLAYBOOK.md",
+     "docs/INTERVIEW_会话复盘_ETF回测统计口径与板块剔除.md"
+    ],
+    "scripts": [
+     "scripts/_audit_routes.py",
+     "scripts/_b1_consumers.py",
+     "scripts/_count_lines.py"
+    ],
+    ".trae": [
+     ".trae/skills/dev-standards/SKILL.md",
+     ".trae/skills/dev-standards/references/architecture-naming-spec.md",
+     ".trae/skills/dev-standards/references/project-structure.md"
+    ],
+    "skills": [
+     "skills/auction-selection/SKILL.md",
+     "skills/finagent-lessons/SKILL.md",
+     "skills/jianmen-shortterm/SKILL.md"
+    ],
+    "src": [
+     "src/api/routes/__init__.py",
+     "src/api/routes/auction_select.py",
+     "src/api/runtime.py",
+     "src/auction_select/__init__.py",
+     "src/auction_select/modes.py",
+     "src/auction_select/skill_guide.py"
+    ],
+    "tests": [
+     "tests/integration/test_skills_api.py",
+     "tests/unit/test_liquidity_cycle_skill.py",
+     "tests/unit/test_skill_integration.py",
+     "tests/unit/test_skill_library.py"
+    ],
+    "web": [
+     "web/src/auctionApi.ts",
+     "web/src/components/AuctionSelectPanel.tsx"
+    ]
+   },
+   "fe_refs": [
+    "web/src/auctionApi.ts",
+    "web/src/components/AuctionSelectPanel.tsx"
+   ],
+   "key": "skills",
+   "verdict": "前端有（段边界命中）"
+  }
+ ],
+ "orphan_calls": [
+  {
+   "raw": "/api/v1/me/profiles${mode ? ",
+   "path": "/api/v1/me/profiles${mode ",
+   "query": " ",
+   "file": "web/src/api.ts",
+   "line": 2045,
+   "via": "绝对"
+  },
+  {
+   "raw": "${PREFIX}/save${query({ trade_date: tradeDate })}",
+   "path": "/api/v1/mainline/etf-flow/save{p})}",
+   "query": "",
+   "file": "web/src/etfFlowApi.ts",
+   "line": 588,
+   "via": "绝对"
+  },
+  {
+   "raw": "${PREFIX}/backtest${query({ run_id: runId })}",
+   "path": "/api/v1/mainline/etf-flow/backtest{p})}",
+   "query": "",
+   "file": "web/src/etfFlowApi.ts",
+   "line": 593,
+   "via": "绝对"
+  },
+  {
+   "raw": "${PREFIX}/backtest/list${query({ limit })}",
+   "path": "/api/v1/mainline/etf-flow/backtest/list{p})}",
+   "query": "",
+   "file": "web/src/etfFlowApi.ts",
+   "line": 598,
+   "via": "绝对"
+  },
+  {
+   "raw": "${BASE}${path}",
+   "path": "/api/v1/intel{p}",
+   "query": "",
+   "file": "web/src/intelApi.ts",
+   "line": 610,
+   "via": "绝对"
+  },
+  {
+   "raw": "${BASE}${path}",
+   "path": "/api/v1/intel{p}",
+   "query": "",
+   "file": "web/src/intelApi.ts",
+   "line": 620,
+   "via": "绝对"
+  },
+  {
+   "raw": "${PREFIX}/backtest${query({ run_id: runId })}",
+   "path": "/api/v1/mainline/backtest{p})}",
+   "query": "",
+   "file": "web/src/mainlineApi.ts",
+   "line": 1013,
+   "via": "绝对"
+  },
+  {
+   "raw": "${PREFIX}/backtest/list${query({ limit })}",
+   "path": "/api/v1/mainline/backtest/list{p})}",
+   "query": "",
+   "file": "web/src/mainlineApi.ts",
+   "line": 1018,
+   "via": "绝对"
+  },
+  {
+   "raw": "${PREFIX}/refresh_status${query({ task_id: taskId })}",
+   "path": "/api/v1/mainline/refresh_status{p})}",
+   "query": "",
+   "file": "web/src/mainlineApi.ts",
+   "line": 1075,
+   "via": "绝对"
+  },
+  {
+   "raw": "${PREFIX}/report.html${date ? ",
+   "path": "/api/v1/sector_rotation/report.html${date ",
+   "query": " ",
+   "file": "web/src/sectorRotationApi.ts",
+   "line": 41,
+   "via": "绝对"
+  },
+  {
+   "raw": "/api/v1/auth/",
+   "path": "/api/v1/auth",
+   "query": "",
+   "file": "web/src/unauthorized.ts",
+   "line": 36,
+   "via": "绝对"
+  }
+ ]
+}

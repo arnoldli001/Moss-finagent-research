@@ -2,7 +2,7 @@
 
 ## 需求（用户口径 2026-09-25）
 
-> 周期提醒时……5 天开始提醒，发邮件通知到 1027312283@qq.com
+> 周期提醒时……5 天开始提醒，发邮件通知到 your_qq_number@qq.com
 
 ## 三层可见性（刻意的分层）
 
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 #: 提醒收件人。**与 `ALERT_EMAIL_TO` 分开** —— 那是行情/信号告警的收件人，
 #: 这是运维提醒的收件人，两者受众可能不同（一个给投研、一个给运维）。
-DEFAULT_ALERT_TO: Final = "1027312283@qq.com"
+DEFAULT_ALERT_TO: Final = "your_qq_number@qq.com"
 
 #: 提醒去重状态文件名
 _STATE_FILE: Final = "token_alert_state.json"

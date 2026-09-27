@@ -241,6 +241,18 @@ def test_sync_ingests_when_partition_is_ahead_of_warehouse(monkeypatch) -> None:
     monkeypatch.setattr(jobs_mod, "_partition_latest", lambda _dataset: "20260917")
     warehouse = _Warehouse(latest="20260915")
     _patch_warehouse(monkeypatch, warehouse)
+    # ⚠️ 2026-09-22 起补灌是问 `DatasetStore` 要**每档自己的分区键**（与
+    # test_sync_is_a_noop_when_already_current 同因）：不换掉分区目录的话，
+    # 无数据环境（CI/干净克隆）读到的是真实空分区 → 补灌恒为空，用例失败。
+    _patch_dataset_store(monkeypatch, {name: ["20260915", "20260916", "20260917"]
+                                       for name in ("daily", "daily_basic",
+                                                    "stk_limit", "moneyflow")})
+    # 日历缓存窗口给一个远期末日：`_refresh_calendar_horizon` 判"缓存已覆盖
+    # 今天"直接跳过 —— 用例不联网、不碰真实缓存（真实缓存末日落后时会发起
+    # 刷新，污染"没下载"断言）。不用 `date.today()`：本函数已有固定日期
+    # fixture，同函数再锚时钟会被 scan_date_bombs 判成定时炸弹。
+    monkeypatch.setattr(jobs_mod, "_calendar_cache_window",
+                        lambda: ("19901219", "29991231"))
     downloaded = _patch_download(monkeypatch, days=["20260916"])
 
     processed, detail = _run(jobs_mod._quant_data_sync(_Spec()))

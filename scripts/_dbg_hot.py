@@ -23,9 +23,13 @@ async def main() -> int:
     src = "\n".join(f"{c.get('title') or ''}\n{c.get('summary') or ''}"
                     for c in pool)
     gw = LLMGateway(settings=get_settings())
+    # ★ 探针不花钱：`light` 层的 fallback 是**付费的** deepseek-flash，
+    #   不钉住的话"本地输出不对→想看看原始输出"反而会去调云端（而这脚本
+    #   存在的意义正是**排查本地模型**，云端答案对它没有价值）。
     resp = await gw.complete("light", SYSTEM_PROMPT, build_prompt(pool),
                              agent_id="dbg", json_mode=True,
-                             json_schema=OUTPUT_SCHEMA, max_tokens=1200)
+                             json_schema=OUTPUT_SCHEMA, max_tokens=1200,
+                             use_cache=False, local_only=True)
     raw = str(getattr(resp, "content", "") or "")
     print("=== 模型:", getattr(resp, "model_used", "?"),
           "| 输出长度:", len(raw),

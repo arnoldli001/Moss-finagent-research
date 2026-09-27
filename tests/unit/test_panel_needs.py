@@ -27,7 +27,6 @@ from src.quant.panels import (
     PRICE_SOURCES,
 )
 
-
 # ============== 具体因子的字段 ==============
 
 def test_fundamental_factor_needs_only_fundamentals() -> None:
@@ -92,7 +91,7 @@ def test_no_factor_needs_bak_daily() -> None:
 
 
 def test_all_35_factors_are_covered() -> None:
-    needs = needs_for_factors()
+    assert needs_for_factors() is not None
     assert len(FACTORS) == 35
     # 每个因子都能推出点什么（要么字段，要么表级内容）
     for key in FACTORS:

@@ -20,7 +20,7 @@ Cloudflare 面板 → 右上头像 → **My Profile → API Tokens → Create To
 然后把 token 写进项目根目录 `.env`（**不要贴到聊天里**）：
 
     CLOUDFLARE_API_TOKEN=xxxxxxxx
-    CLOUDFLARE_ACCESS_EMAILS=2693888583@qq.com,另一位客户@example.com
+    CLOUDFLARE_ACCESS_EMAILS=your_qq_number@qq.com,另一位客户@example.com
 
 ## 用法
 

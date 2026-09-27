@@ -412,13 +412,28 @@ class Settings(BaseSettings):
     alert_scan_candidate_limit: int = 30       # 单次扫描进入LLM的候选事件上限
     alert_keywords: str = _env_field(
         "ALERT_KEYWORDS", "")                  # 逗号分隔自定义预筛词（空则仅内置）
-    alert_confidence_min: float = 0.70         # 置信度门槛，低于则不推送
-    alert_risk_high: int = 75                  # 风险分高/中/低阈值
-    alert_risk_medium: int = 60
-    alert_risk_low: int = 45
-    alert_opp_high: int = 80                   # 机会分高/中/低阈值
-    alert_opp_medium: int = 65
-    alert_opp_low: int = 50
+    # ── 事件告警阈值：**单一权威值就在本文件**（2026-09-24 标定）──────────────
+    # 依据：24 条真快讯实测打分分布（scripts/_probe_alert_scores.py →
+    #      data/run/alert_probe.txt）：把握度 p50=0.55 p75=0.60 p90=0.68 max=0.72。
+    #
+    # 原默认（risk 75/60/45、opp 80/65/50、conf 0.70）**全部高于实测最大值** →
+    # 判分再准也一条都不会成告警，`fact_alerts` 恒 0。那不是"宁漏勿滥"，是标尺没标定。
+    # 现行取值把"中档"压到实测 p75~p90 附近：既不恒 0，也不把噪声全推给客户。
+    #
+    # ⚠️ 为什么把标定值搬进代码默认、而不再只写 `.env`：
+    #   阈值"既能在代码里写默认、又能被环境变量覆盖"就必然漂移，而且不报错 ——
+    #   本项目的 `.env` 是 gitignore 的，CI 读不到它，于是同一份测试
+    #   本地红、CI 绿（或反之），红灯被当成噪音写进文档，漂移就没人管了。
+    #   收敛到本文件后：**有没有 `.env` 都是同一个值**，测试断言的是真实生效值。
+    #   要改就改这里，并同步 docs/ALERT_THRESHOLDS.md 与标定探针的输出。
+    # ⚠️ 改动提示词/换模型后必须重测重标（探针脚本会直接打印上面那三行分布）。
+    alert_confidence_min: float = 0.60         # 置信度门槛，低于则不推送
+    alert_risk_high: int = 70                  # 风险分高/中/低阈值
+    alert_risk_medium: int = 50
+    alert_risk_low: int = 35
+    alert_opp_high: int = 65                   # 机会分高/中/低阈值
+    alert_opp_medium: int = 50
+    alert_opp_low: int = 35
     # 告警有效期（天）。**到期先置 expired（列表隐藏），再被保留作业真正删除。**
     #
     # 用户口径（2026-09-26）："事件告警的信息最多保留三天，超过3天的信息
@@ -448,7 +463,7 @@ class Settings(BaseSettings):
     alert_smtp_port: int = 465
     alert_smtp_user: str = _env_field("ALERT_SMTP_USER", "")
     alert_smtp_auth_code: str = _env_field("ALERT_SMTP_AUTH_CODE", "")
-    alert_email_to: str = "2693888583@qq.com"
+    alert_email_to: str = "your_qq_number@qq.com"
     alert_email_from_name: str = "Moss投研事件告警"
 
     @property

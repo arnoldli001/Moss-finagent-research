@@ -12,9 +12,9 @@ from src.api.routes.backtest import router as backtest_router
 from src.api.routes.code_engineer import router as code_engineer_router
 from src.api.routes.data import router as data_router
 from src.api.routes.fundflow import router as fundflow_router
+from src.api.routes.intel import router as intel_router
 from src.api.routes.intraday import router as intraday_router
 from src.api.routes.intraday_weights import router as intraday_weights_router
-from src.api.routes.intel import router as intel_router
 from src.api.routes.mainline import router as mainline_router
 from src.api.routes.metrics import router as metrics_router
 from src.api.routes.my_features import router as my_features_router

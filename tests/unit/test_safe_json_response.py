@@ -33,7 +33,7 @@ def test_starlette_default_really_rejects_nan() -> None:
     让下面几条测试变成"测了个不存在的问题"还一路绿灯。
     """
     with pytest.raises(ValueError, match="Out of range float values"):
-        JSONResponse({"x": float("nan")}).body
+        _ = JSONResponse({"x": float("nan")}).body
 
 
 def test_safe_response_replaces_non_finite_with_null() -> None:

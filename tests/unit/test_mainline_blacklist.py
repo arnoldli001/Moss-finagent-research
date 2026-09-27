@@ -186,4 +186,9 @@ def test_pool_import_reports_selection_mode():
         pytest.skip(f"拥挤度库不可读：{type(exc).__name__}")
     if result.status == "skipped":
         pytest.skip("拥挤度库不存在")
+    # 实现内部把 sqlite 错误吞成了 status=failed（不走上面的 except）：
+    # 库文件在但没有 `sector_crowding_list` 表（CI/公开快照的骨架库）同属
+    # "无数据环境"，按 skip 处理，别让环境问题变成测试失败。
+    if result.status == "failed" and "no such table" in result.message:
+        pytest.skip(f"拥挤度库缺表（尚未导入）：{result.message}")
     assert "黑名单" in result.message or "回退" in result.message
