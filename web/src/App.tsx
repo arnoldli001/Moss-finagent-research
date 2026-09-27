@@ -547,6 +547,11 @@ const running = task !== null && (task.status === "queued" || task.status === "r
         {/* ★ 2026-09-27：Suspense 包裹 lazy 组件；fallback 给一个通用加载态。
            lazy 首次加载约 30-150ms（每 chunk），fallback 让用户感知到在加载。 */}
         <Suspense fallback={<PanelLoading label={view} />}>
+          {/* ⚠️ 这条三元链与 `view` 联合类型、`HASH_VIEWS` 是**三处一起改**的：
+              漏一处就会冒出「未知视图：xxx」红框（2026-09-26 报障：research 漏分支、
+              mypools 留在白名单里）。改这里前先读
+              `.trae/skills/frontend-change-guardrails/SKILL.md` 第四节，
+              改完跑 `pytest tests/unit/test_frontend_prefetch_structure.py`。 */}
           {view === "admin" && auth.user ? (
             <AdminPanel selfId={auth.user.user_id} />
           ) : view === "admin-monitor" ? (

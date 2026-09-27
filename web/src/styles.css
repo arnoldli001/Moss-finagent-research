@@ -4243,6 +4243,11 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 /* ==================================================================
    ★ 顶栏冻结（用户口径 2026-09-28）
 
+   ⚠️ 改这一节（或它上方的品牌区、页签那一排）之前，先读
+   `.trae/skills/frontend-change-guardrails/SKILL.md` —— 那里记着这一节
+   已经踩过的坑（渐隐带压住第一行内容、锁死一列把一级页签挤折行）与验收矩阵。
+   改完至少跑：`python scripts\_verify_header_css.py`（10 档宽度 × 2 种页签数）。
+
    「非手机移动端使用本网站时，header 可以冻结在顶部，方便用户选一级页签」
 
    所以桌面端把 `.header` 做成 `position: sticky; top: 0`：往下滚时
