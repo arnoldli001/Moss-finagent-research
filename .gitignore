@@ -34,6 +34,23 @@ node_modules/
 # TS构建缓存
 *.tsbuildinfo
 
+# dist-pilot 的历史备份目录（`dist-pilot-backup-<ts>/`，`ship-frontend` 每次发布留一份）。
+# ⚠️ 2026-09-27 实测：`/web/dist-pilot/` 挡不住 `web/dist-pilot-backup-*/`（名字不重叠），
+#    于是 7 个备份目录全是未跟踪状态，`git add .` 会把它们一并入库。
+#    公开线早就补了这条（它的 .gitignore 里记着"一次快照把 52 个备份构建文件带进了
+#    发布白名单"），私有线一直漏着 —— 这里补齐，两条线保持一致。
+/web/dist-pilot-backup-*/
+
+# ★ 私有实现的路由文件：**不进私有历史**，公开树用同路径的 stub 接管。
+#
+# ⚠️ 2026-09-27 事故：这两条规则在公开过滤器那次改写里被一并删掉了（公开线那侧
+#    是有意删的 —— 它要让 stub 版本随仓发布），但私有线也删了。后果是这两个文件
+#    从"被忽略"变成"未跟踪可见"，一次 `git add` 就把 425 行竞价引擎 / 277 行量化选股
+#    实现写进了私有提交。发现后已 `git rm --cached` + amend 清除。
+#    两条线的规则必须**分开看**：公开线删掉它们是对的，私有线必须留着。
+/src/api/routes/auction_select.py
+/src/api/routes/quant_select.py
+
 # 本地临时探针脚本与数据源勘察产物（根目录下划线开头的全部是临时物，勿提交：
 # _coal_*.py/txt/json、_ak_*.txt 等连接器调研现场，可随时重跑再生）
 /_*
