@@ -105,6 +105,44 @@ manage.py start --env pilot --port 8110 --daemon
 | `manage.py stop` | **全部**本项目后端（含对外服务） |
 | `Stop-Process -Id <PID>` / `taskkill /PID <PID> /T /F` | 只那一个（**但必须先确认那个 PID 是什么**） |
 
+> ### ★★ 2026-09-28 实测事故：`--port 8100` **不能**让 `stop` 只杀 8100
+>
+> ```powershell
+> python manage.py stop --port 8100     # ← 这一行杀掉了 pilot(8110)
+> ```
+>
+> 输出：
+>
+> ```
+> ✅ 已停止 backend (PID=12304)
+> ❌ 已停止 backend (PID=20836)     ← 我起的 dev(8100)
+> ✅ 已停止 backend (PID=22292)     ← ★ pilot(8110) 的 uvicorn，被一起杀了
+> ❌ 已停止 backend (PID=23136)     ← ★ pilot 的父进程
+> ```
+>
+> **为什么会这样**：`cmd_stop` 的枚举判据是"**命令行**里含 `src.api.main:app`
+> 且属于本项目"，`--port` 只是它自己收下的参数，**根本不参与筛选**。
+> 所以"我传了端口 = 只停那个端口"是一个**假的直觉** —— 它和 `--replace`
+> 是同一个陷阱，只是看起来更无辜。
+>
+> **代价**：客户入口中断约 25 秒。`frpc` 在这一段每 ~2 秒记一条
+> `connect to local service [127.0.0.1:8110] error: ... actively refused it`
+> （`data/run/frpc.log`），这就是事后确认"哪一段断了"的证据。
+> 数据库**没有**损坏（`stop` 是优雅停止，走 lifespan）。
+>
+> **恢复**（实测有效，约 30 秒）：
+>
+> ```powershell
+> python manage.py start --env pilot --port 8110 --daemon
+> # 然后必须验证两件事，不能只看端口在听：
+> Invoke-WebRequest http://127.0.0.1:8110/api/v1/health/live -UseBasicParsing   # 200
+> Invoke-WebRequest https://hk.wujiaitool.cn/api/v1/health/live -UseBasicParsing # 200
+> ```
+>
+> **纪律**：要单独停一个实例，只有两条路 —— ① 按 PID 杀（先确认那个 PID 是什么）；
+> ② 停 pilot 用 `scripts/pilot_autostart.ps1` 对应的流程（§2.4）。
+> **任何时候都不要用 `manage.py stop`**，哪怕带了 `--port`。
+
 ### 2.4 只重启 pilot 单实例的正确做法
 
 ```powershell

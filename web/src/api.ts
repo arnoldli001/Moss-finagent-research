@@ -80,7 +80,39 @@ export type Health = {
     health?: DataHealth;
   };
   model_gateway: Record<string, string>;
+  /**
+   * 免费档限流熔断状态（`src/infrastructure/llm/rate_limit_guard.py`）。
+   *
+   * 为什么单独一个字段而不是塞进 `model_gateway`：后者是
+   * `Record<string, string>`（值都是给人看的短状态词），而这里是**结构化**的
+   * 每模型计数 —— 混在一起会让下面的 `ollama === "connected"` 这类判据
+   * 在拿到对象时静默失效（字符串比较恒为 false，不报错，只是永远显示"异常"）。
+   *
+   * ⚠️ `available: false` 表示**读不到状态**（没量到），
+   * 与 `total_429: 0`（量到 0 次）是**两件事**，界面上必须分开表达。
+   */
+  rate_limit_guard?: RateLimitGuard;
   audit_chain: { valid: boolean; records: number };
+};
+
+/** 免费档限流熔断快照（与后端 `RateLimitGuard.snapshot()` 一一对应）。 */
+export type RateLimitGuard = {
+  available: boolean;
+  error?: string;
+  /** 状态文件路径 —— 运维要能直接去看它 */
+  path?: string;
+  /** 连续多少次 429 就锁定 */
+  threshold?: number;
+  lock_minutes?: number;
+  models?: Record<string, {
+    locked: boolean;
+    /** 未锁定时为 null（**不是 0** —— 0 会读成"刚好到期"） */
+    remaining_s: number | null;
+    consecutive_429: number;
+    total_429: number;
+    total_success: number;
+    last_reason: string;
+  }>;
 };
 
 // ---- 数据源健康度（能力矩阵 + 实测延迟 + Tushare 覆盖） ----

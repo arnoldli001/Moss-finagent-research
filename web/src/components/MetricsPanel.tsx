@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, Health, LlmMetrics } from "../api";
 import { agentLabel } from "../agentMeta";
+import { rateGuardView } from "../rateGuardView";
 import DataSourceHealth from "./DataSourceHealth";
 
 const pct = (v: number | null) => (v === null ? "—" : `${(v * 100).toFixed(1)}%`);
@@ -8,6 +9,9 @@ const ms = (v: number | null) => (v === null ? "—" : `${v}ms`);
 
 function HealthStrip({ health }: { health: Health }) {
   const chainOk = health.audit_chain.valid;
+  // 免费档限流熔断的展示口径抽在 `src/rateGuardView.ts`（纯函数，可独立验收）：
+  // 「没量到」不能显示成「量到 0」，锁定必须给"人话 + 剩余时间"。
+  const guard = rateGuardView(health.rate_limit_guard);
   return (
     <section className="panel">
       <h2>数据源与依赖健康</h2>
@@ -65,6 +69,20 @@ function HealthStrip({ health }: { health: Health }) {
               </span>
             </td>
             <td>云端降级链路</td>
+          </tr>
+          <tr>
+            <td className="agent-id">免费档限流</td>
+            <td>
+              <span className={`badge ${guard.tone}`}>{guard.text}</span>
+            </td>
+            <td>
+              {guard.detail}
+              {health.rate_limit_guard?.path && (
+                <span style={{ color: "var(--muted)" }}>
+                  {" "}· 状态文件 {health.rate_limit_guard.path}
+                </span>
+              )}
+            </td>
           </tr>
           <tr>
             <td className="agent-id">审计哈希链</td>
