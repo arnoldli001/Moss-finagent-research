@@ -1032,7 +1032,7 @@ uv run python scripts/prd_sync_check.py --ledger      # 交付前必须 0 ERROR
 > "当时为什么不敢动"的记录：那 31 处卡在"主实例算不算一个环境"上，
 > 而 §16.10 给出了不需要业务裁定就能解决的答案。
 
-### 16.10 收口到 0：registry 同时表达两套布局（`CHG-0071`）
+### 16.10 收口到 0：registry 同时表达两套布局（`CHG-0080`）
 
 §16.9 留下的 31 处全部是**主实例布局**（`data/audit` / `data/llm_cache` /
 `data/scheduler` / `data/moss_finagent.db` / `data/run/...`）。当时不敢动，
@@ -1365,6 +1365,67 @@ uv run python -m pytest tests/unit/test_local_think_switch.py -q   # 截断告�
 ```
 
 > 这三个探针是**未发布的本机脚本**（`scripts/` 默认不入库的政策）。
+
+### 17.8 逐跳时延与「第几跳成功」的累积代价（`CHG-0081`）
+
+> 用户提问：「3 跳和 4 跳发生时延多少？」。逐跳实测再按成功位置求和 ——
+> 因为各跳耗时**差异极大**，只看「打一次的总时长」会得出错误结论。
+
+**口径**：同一段 600 字级正文 + 真实抽取 prompt（`tone.build_prompt`），
+`think` 按现行默认（关）。**云端每跳只跑 3 次**（百炼是总量额度，实测跑道
+23.9 天），本地 3 次 —— 这 n=3 是**带配额成本的测量**，如实登记。
+
+| 跳（配置键） | provider | 实测 p50 | max | 明细 |
+|---|---|---|---|---|
+| `qwen-dashscope-flash` | dashscope | **0.16s** | 0.23s | 0.23/0.15/0.16 |
+| `deepseek-flash` | deepseek | **1.32s** | 4.96s | 4.96/1.05/1.32 |
+| `qwen-siliconflow-7b` | siliconflow | **7.23s** | 8.53s | 8.53/6.02/7.23 |
+| `local_light`（1.5B） | ollama | **1.06s** | 21.06s | 21.06/1.06/0.90 |
+| `local_medium`（**4B**） | ollama | **4.30s** | 4.57s | 4.57/4.30/4.30 |
+
+**累积时延（成功于第 k 跳 = 前 k 跳 p50 之和）**：
+
+| 层 | 跳数 | 第1跳 | 第2跳 | 第3跳 | **第4跳（本地地板）** | 全链失败 |
+|---|---|---|---|---|---|---|
+| planning | 3 | 0.16s | 1.48s | **2.54s** | — | 2.54s |
+| light | 3 | 7.23s | 7.39s | **8.45s** | — | 8.45s |
+| **medium** | **4** | 0.16s | 7.39s | 8.71s | **13.01s** | 13.01s |
+| **reasoning** | **4** | 1.32s | 1.48s | 8.71s | **13.01s** | 13.01s |
+| decision | 3 | 1.32s | 1.48s | **5.78s** | — | 5.78s |
+
+**三条读法**：
+
+1. **走本地地板的代价 = 前几跳 p50 之和 + 4.30s**。4 跳层最坏 **13.01s**，
+   而 `_ATTEMPT_BUDGET` 给的是 20s（reasoning 25s / decision 30s）——
+   实测远在预算内，所以「本地地板把整链拖到超时」这个担心**不成立**。
+2. **`light` 层反而最慢**（第 1 跳 siliconflow 就 7.23s）：它承载 82% 调用量，
+   而「快」的假设原本建立在 dashscope 上；现在首位换成更慢但**配额可再生**的
+   siliconflow（理由见 §14.3）。**这是刻意的取舍**，不是缺陷。
+3. **`local_light` 的 max=21.06s 是冷加载**（首次请求要 `load_tensors`），
+   p50 只有 1.06s —— 所以「1.5B 很快」只在**已驻留**时成立。
+
+**与本地 8B 时代的对照**（同一批审计用 `latency_ms` 现算）：
+
+| 调用点 | 8B p50 / p95 | **4B p50 / p95** | 变化 |
+|---|---|---|---|
+| `intel_extract`（券商作文多空抽取） | 13.22s / 55.72s（dev）<br>17.37s / 45.30s（pilot） | **3.88s / 10.76s**<br>**7.09s / 11.71s** | p50 −71%~−59%，p95 −81%~−74% |
+| `alert_analyzer`（事件告警打分） | 45.39s / 73.36s<br>40.93s / 65.21s | **8.38s / 18.14s**<br>（pilot 的 4B 样本尚少） | p50 **−82%** |
+
+> ⚠️ 8B 的 max 实测 **141.28s / 110.67s 已超过** `llm_timeout_seconds = 120s`
+> —— 那正是「掷硬币」在时延上的形态。换 4B 后 max 降到 18s 量级。
+
+### 17.9 两个「看着像问题、查了是历史」的现场（`CHG-0082`）
+
+排查「4B 是不是只做备用」时翻出的两个疑点，**都查实为历史，不是现行缺陷**：
+
+| 疑点 | 判据 | 结论 |
+|---|---|---|
+| `intel_extract` 有 120 次走 1.5B | 那些调用的 `provider_chain=[local_light]`，时间全在 **09-25** | 当时确实在走 light 层；现在是 `medium` + `local_medium`，且 `test_intel_vocab` 已钉住「地板不得被裁成 light 的 1.5B」 |
+| `alert_analyzer` 有 60 次走 `deepseek-flash`（付费） | **最后一次 09-26 11:09**（dev 是 09-25 16:02）；`chain=[deepseek-flash]` 单跳 | 当时开着 `MOSS_ALERT_ALLOW_CLOUD`；现在全仓库 / `.env` / 系统级环境变量**都没设它**，最近调用全是 4B（pilot 09-29 00:17） |
+
+**教训（可复用）**：两个疑点都是被**累计审计**骗的 —— `llm_audit.jsonl`
+**不轮转**，于是「历史占比」看起来像「现行行为」。**判据必须带时间窗**
+（最近 N 小时 / 最后一次是什么时候），否则会把早已修好的事重查一遍。
 
 ## 十八、多环境数据管理（dev / test / pilot / prod）（现行口径 · 2026-09-28 定型）
 
@@ -1706,6 +1767,24 @@ scripts/_probe_a12_whitelist_acceptance.py     # 白名单层
 `test_truncation_is_explicit_not_silent`、`test_numeric_strings_are_compared_as_numbers`
 （`"9.5"` vs `"10.2"` 必须按数值比，字典序会静默给错子集）。
 
+**真实产物验收**（`scripts/_probe_cross_section_real.py`：真取数 → 真过
+`_build_context()`，不是构造假数据）：
+
+```
+idx_val:snapshot:all                    47 点 → 渲染 12 行，**12 行全带标签**
+  ▦ 同日 5 个成员（按 index_name 区分），按值降序展示 5 条（全量）
+  - ✅idx_val:snapshot:all [科创50] 2026-09-29=103.22 c0.90 AKShare乐咕指数估值
+  - ✅idx_val:snapshot:all [中证1000] 2026-09-29=28.69 c0.90 …
+ind:sw_third_dividend_yield:all       1340 点 → 渲染 12 行，**12 行全带标签**
+  ▦ 同日 335 个成员（按 industry_name 区分），按值降序展示 12 条（**已截断**）
+  - ✅ind:sw_third_dividend_yield:all [防水材料] 2026-09-29=16.52 c0.90 …
+  - ✅… [纺织鞋类制造] 9.7 / [广告媒体] 7.7 / [定制家居] 6.78 …
+两者：**打乱输入顺序后输出逐字节相同 = True**
+```
+
+对照：修之前模型看到的是 12 行完全相同的 `... 2026-09-29=103.22`（不知道是哪个指数），
+而这 5 个指数的 PE 从 12.44 到 103.22 差 8 倍 —— **挑错一个就是把结论说反**。
+
 ### 19.11 指标登记面：**把手写豁免表换成派生断言**
 
 本轮 `configs/indicators.yaml` 78 → **97** 条，`INDICATOR_CATALOG` 70 → **81** 条。
@@ -1799,6 +1878,20 @@ scripts/_probe_a12_whitelist_acceptance.py     # 白名单层
    改 `compliance/logic.py` 时选中数由 **2** 纠正为 **26** 个测试文件）。
    它按 `git diff` 取改动面，**并发协作者的未提交改动会一起进来**（实测 211 条）——
    已改成超过 40 条就显式打印"挑选结果已不是本次改动的精确答案"。
+9. **★ 「量到 0」的第三种情形：源给了 0，但那个 0 在语义上不成立**
+   （`scripts/_probe_chanquan_zero.py` 实测）。`产权比率:600036` 与 `:000001`
+   各返回 **14 点、全为 0.0**，而 `:600519`（非金融）= 17.7969。
+   直连源帧判明：新浪财务分析指标模板里 `产权比率(%)` 列
+   **非空率 10/10、值就是 `[0, 0, 0]`** —— 即**列存在、值被源写成 0**，
+   连接器照实透出，**不是我们的解析 bug**。
+   **但它对用户是假绿**：问"这家公司杠杆高不高"，看到的是 0%。
+   前两种情形（「没量到」/「量到 0」）已有判据；**这第三种尚无判据**。
+   修法候选（**未实施，本轮只登记**）：银行类实体对这些列登记 `not_applicable`
+   （与 `local_data.NOT_APPLICABLE_FOR_ENTITY` 同一语义），
+   或按实体类型改用别的杠杆口径。
+   ⚠️ **明确不采用**"整列为 0 就当空值"这类启发式 —— 真有一批公司的某个比率
+   本来就是 0（如无有息负债），启发式会把它们连同银行一起吃掉，
+   把一个假绿换成一个假红。已在 `indicators.yaml` 的 `产权比率` 条目上写了 warn。
 
 ### 19.14 真值来源与验收命令
 
@@ -1830,6 +1923,9 @@ uv run python -m pytest tests/unit/test_cross_section_context.py -q
 uv run python scripts/_probe_acceptance_data.py          # 用户验收问题的 26 条数据
 uv run python scripts/_probe_compliance_families.py      # 6 个合规族在真实路由上的状态
 uv run python scripts/_probe_a12_whitelist_acceptance.py # A12 白名单那一跳
+uv run python scripts/_probe_cross_section_real.py       # 真实横截面的维度标签与可复现性
+uv run python scripts/_probe_chanquan_zero.py            # 「源给了 0 但语义不成立」的证据
+uv run python scripts/_e2e_query_acceptance.py           # 六子问题 23 口径（本地两跳 + 连接器）
 ```
 
 > ⑤ 的三个探针是**本机脚本**（`scripts/` 默认不入库的政策，见 §13 与
