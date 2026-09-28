@@ -710,6 +710,40 @@ function IntradayChart({
           </>
         )}
 
+        {/* 集合竞价开盘标记（09:25 撮合价）。
+            分时数据源（腾讯/新浪/东财）**首条都是 09:30 起的连续竞价**，9:15-9:25
+            这 10 根 call-auction bar 没有免费替代（`AGENTS.md` 已登记），
+            但 `quote.open` 在 9:25 撮合后即可用 —— 在图最左画一根短横线 + 「09:25 开盘」
+            标签，让"开盘定方向"这一帧有视觉锚点。
+            只在视窗还包含 9:30 时显示：用户放大到 10:00 之后它就该让位给分时。 */}
+        {(() => {
+          const openPrice = quote?.open ?? null;
+          const prevCloseVal = quote?.prev_close ?? null;
+          if (openPrice === null || !Number.isFinite(openPrice) || openPrice <= 0) return null;
+          if (prevCloseVal === null || prevCloseVal <= 0) return null;
+          if (view.start > 0) return null;
+          const yOpen = y(openPrice);
+          const gapPct = ((openPrice / prevCloseVal) - 1) * 100;
+          return (
+            <g className="premarket-marker">
+              <line x1={PAD.left} x2={PAD.left + 42}
+                    y1={yOpen} y2={yOpen}
+                    stroke="var(--low)" strokeWidth="1.2"
+                    strokeDasharray="4 2" opacity={0.85} />
+              <polygon
+                points={`${PAD.left - 6},${yOpen - 5} ${PAD.left},${yOpen} ${PAD.left - 6},${yOpen + 5}`}
+                fill="var(--low)" />
+              <text x={PAD.left + 5} y={yOpen - 6}
+                    fontSize="10" fontWeight="600" fill="var(--low)">
+                09:25 开盘
+              </text>
+              <title>
+                {`集合竞价撮合价 ${openPrice.toFixed(2)}（${gapPct >= 0 ? "+" : ""}${gapPct.toFixed(2)}% vs 昨收）`}
+              </title>
+            </g>
+          );
+        })()}
+
         {/* 做T三角标记 */}
         {markers.map((marker, index) => {
           const minute = sessionMinute(marker.ts);

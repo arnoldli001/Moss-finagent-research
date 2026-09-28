@@ -3005,7 +3005,19 @@ class IntradayService:
         while True:
             try:
                 allowed, reason = watchlist_refresh_window()
-                if allowed and not _is_trading_day_for_refresh():
+                # 9:15-9:30 集合竞价期间**不查** `is_trading_day()`：
+                # 行情时钟在 09:30 之前 tick 还没推进，`is_trading_day()` 会把真交易日
+                # 误判成"非交易日"，但 09:25 集合竞价一撮合、watchlist 就该立刻看到
+                # 开盘价 + 集合竞价涨幅 —— 否则 9:25-9:30 这 5 分钟面板上是 9/24 收盘价。
+                # 节假日误判方向见下方 in_call_auction 注释：最坏多烧一轮 CPU（48 × 3-5s），
+                # 比"集合竞价看不见开盘价"轻得多（用户口径 2026-09-28）。
+                now_moment = datetime.now()
+                in_call_auction = (
+                    now_moment.hour * 60 + now_moment.minute) < MORNING_OPEN
+                holiday_check = (
+                    allowed and not in_call_auction
+                    and not _is_trading_day_for_refresh())
+                if holiday_check:
                     # ---- 整表重算闸门：非交易日不做这轮重算（2026-09-25 中秋事故）----
                     # `watchlist_refresh_window()` 的行情时钟判据在 **09:15~09:30**
                     # 刻意失效（竞价期 tick 还没推进，怕误杀正常交易日），于是节假日
@@ -3016,7 +3028,7 @@ class IntradayService:
                     # 这里换成**完整交易日判定**（周末 + 市场时钟都查），非交易日直接
                     # 跳过整轮：既不发信，也不再空烧几十分钟 CPU。下一轮照常再判。
                     self._refresh_state.update(
-                        last_run_at=datetime.now().strftime("%H:%M:%S"),
+                        last_run_at=now_moment.strftime("%H:%M:%S"),
                         last_error="")
                     logger.debug("非交易日跳过自选池整表重算（%s）", reason)
                     await asyncio.sleep(_seconds_until_next_tick(interval))

@@ -231,13 +231,20 @@ def test_refresh_helper_fails_open(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_refresh_loop_skips_recompute_on_holiday(
-        monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch: pytest.MonkeyPatch,
+        freeze_at) -> None:
     """★ 核心回归：非交易日不得触发整表重算（那是信号的源头）。
 
     跑法：让循环的"睡到下一个整分"在第 2 次调用时抛异常终止循环，
     这样正好观察完第 1 轮 —— 它必须既不重算，也不碰数据源。
+
+    时间锚定 10:00：避开 09:15-09:30 的 in_call_auction 窗口
+    （2026-09-28 用户口径：集合竞价撮合后要立刻刷新；该窗口由放行路径处理，
+    本测试只盯节假日闸门）。
     """
     import asyncio
+
+    freeze_at(2026, 9, 28, 10, 0)          # 周一 10:00 — 已开盘+非竞价期
 
     computed: list[int] = []
     slept = 0
@@ -268,6 +275,53 @@ def test_refresh_loop_skips_recompute_on_holiday(
         asyncio.run(_Loop()._watchlist_refresh_loop())  # noqa: SLF001
 
     assert computed == [], "非交易日不该做整表重算"
+
+
+def test_refresh_loop_runs_during_call_auction_on_real_trading_day(
+        monkeypatch: pytest.MonkeyPatch,
+        freeze_at) -> None:
+    """★ 2026-09-28 用户口径：真交易日 09:25 集合竞价撮合后必须立刻刷新。
+
+    之前 `_is_trading_day_for_refresh()` 在 09:15-09:30 因市场时钟 tick 没推进
+    会判 False，导致整表重算跳过 —— watchlist 在 9:25-9:30 这 5 分钟面板上
+    仍显示 9/24 收盘价。新逻辑在集合竞价窗口里**不查**该闸门，让 watchlist
+    在 9:25 撮合后立刻看到开盘价 + 集合竞价涨幅。
+    """
+    import asyncio
+
+    freeze_at(2026, 9, 24, 9, 25)          # 周四 09:25 — 集合竞价撮合那一刻
+
+    computed: list[int] = []
+    slept = 0
+
+    async def _fake_sleep(seconds, *args, **kwargs):
+        nonlocal slept
+        slept += 1
+        if slept >= 2:
+            raise KeyboardInterrupt
+        return None
+
+    class _Loop(service_module.IntradayService):
+        def __init__(self) -> None:
+            super().__init__()
+            self._startup_grace_seconds = 0.0
+
+        async def watchlist(self, **kwargs):     # type: ignore[override]
+            computed.append(1)
+            return []
+
+    monkeypatch.setattr(service_module, "watchlist_refresh_window",
+                        lambda now=None: (True, "盘中自动刷新中"))
+    # 即便 `is_trading_day()` 仍判 False（市场时钟没推进），
+    # 集合竞价窗口里整表重算也必须**真跑** —— 这是这次修复的目的。
+    monkeypatch.setattr("src.intraday.auto_select.is_trading_day",
+                        lambda moment=None: False)
+    monkeypatch.setattr(service_module.asyncio, "sleep", _fake_sleep)
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(_Loop()._watchlist_refresh_loop())  # noqa: SLF001
+
+    assert computed, "集合竞价窗口里必须重算（9:25 撮合价要立刻可见）"
 
 
 def test_refresh_loop_recomputes_on_trading_day(
