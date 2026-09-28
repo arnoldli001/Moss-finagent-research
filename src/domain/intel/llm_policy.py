@@ -10,8 +10,15 @@
 | 层 | 用什么 | 成本 | 什么时候用 |
 |---|---|---|---|
 | **L0 规则** | 纯代码（关键词、正则、计数、排序） | **零** | **默认**。能在这一层解决的绝不往上走 |
-| **L1 本地模型** | Ollama（qwen3:8b / qwen2.5:1.5b） | **零**（只吃电） | L0 做不了的语义任务：情绪归类、要点抽取 |
+| **L1 本地模型** | Ollama（**具体是哪个模型见 `configs/models.yaml` 的 `local_light` / `local_medium`**） | **零**（只吃电） | L0 做不了的语义任务：情绪归类、要点抽取 |
 | **L2 云端模型** | DeepSeek 等 | **按 token 计费** | **仅**需要跨源综合推理，且过了下面的闸门 |
+
+> ⚠️ **本地模型的名字只写在 `configs/models.yaml` 一处。**
+> 本模块曾经有两个常量 `LOCAL_MODEL = "qwen3:8b"` / `LOCAL_MODEL_SMALL = "qwen2.5:1.5b"`
+> —— 它们**生产代码零引用**（只被测试与文档提到），却在本地模型从 8B 换成
+> `qwen3.5:4b` 之后变成**过期路标**：下一个人会照着它去找一个已经不在链上的模型。
+> 2026-09-28 已删除，并加了护栏
+> `tests/unit/test_local_model_single_source.py`（配置键必须存在 + 名字只能来自配置）。
 
 ## 闸门（防止"顺手调云端"变成习惯）
 
@@ -51,9 +58,19 @@ CLOUD_TOKEN_BUDGET_PER_TASK: Final = 8000
 #: 需要时由运维显式调高（`INTEL_CLOUD_CALLS_PER_DAY`）。
 CLOUD_CALLS_PER_DAY: Final = 20
 
-#: 本地模型（免费）。qwen3:8b 是项目既有的本地推理模型。
-LOCAL_MODEL: Final = "qwen3:8b"
-LOCAL_MODEL_SMALL: Final = "qwen2.5:1.5b"
+#: ★ 本地模型的名字**刻意不在这里定义**（2026-09-28 删除 `LOCAL_MODEL` /
+#: `LOCAL_MODEL_SMALL`）。理由有两条，缺一条都不足以删：
+#:
+#:   ① **它们是死的**：生产代码零引用（全仓库只有测试函数名与文档提过），
+#:      所以删掉不影响任何行为 —— 这一点必须先查清，否则删常量就是改功能。
+#:   ② **它们是过期路标**：值写的是 `qwen3:8b` / `qwen2.5:1.5b`，而
+#:      `configs/models.yaml` 里真实登记的是 `qwen3:8b-q4_K_M` /
+#:      `qwen2.5:1.5b-instruct-q4_K_M`，且本地地板已于同日换成 `qwen3.5:4b`。
+#:      留着它，下一个人会照着它去找一个**已经不在路由链上**的模型。
+#:
+#: 单一真值源 = `configs/models.yaml` 的 `models` / `routing` 两段。
+#: 护栏：`tests/unit/test_local_model_single_source.py`
+#: （配置键必须存在 + 名字只能来自配置 + 这两个常量不许长回来）。
 
 #: 本地模型单次送分析的条数上限（防卡死，见 zsxq_incremental 的同款理由）
 LOCAL_MAX_ITEMS: Final = 20
@@ -185,8 +202,6 @@ __all__ = [
     "CLOUD_CALLS_PER_DAY",
     "CLOUD_TOKEN_BUDGET_PER_TASK",
     "LOCAL_MAX_ITEMS",
-    "LOCAL_MODEL",
-    "LOCAL_MODEL_SMALL",
     "AnalysisDecision",
     "classify_by_rules",
     "needs_llm",

@@ -348,8 +348,11 @@ def test_long_text_still_calls_model(
         monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """★ 另一侧：长文本**必须**照旧走模型，而且要满足两条硬要求：
 
-      · **`medium` 层** —— 它的本地主模型是 `qwen3:8b`（`llm_policy.LOCAL_MODEL`）。
-        `light` 层的本地模型是 qwen2.5:1.5b，而本模块开头记着实测：
+      · **`medium` 层** —— 它的本地地板是 `configs/models.yaml` 的
+        `local_medium`（2026-09-28 起是 `qwen3.5:4b`；**名字只写在配置里**，
+        代码里不再有 `LOCAL_MODEL` 这类常量 —— 见
+        `tests/unit/test_local_model_single_source.py`）。
+        `light` 层的本地模型是 `local_light`（qwen2.5:1.5b 级），而本模块开头记着实测：
         1.5B 在这个任务上 5 条样本出 4 类错（模板抄回、标点改写、判定相反）。
         这条链路要读 ~600 字吐 9 个字段，小模型扛不住。
       · **`local_only=True`** —— `medium` 层的 fallback 是 `deepseek-flash`

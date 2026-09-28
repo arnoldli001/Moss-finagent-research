@@ -226,7 +226,9 @@ async def _ask_segment(gateway: Any, title: str, seg: str,
     try:
         resp = await gateway.complete(
             # ★ **medium** 层，不是 light（见 `EXTRACT_TIER` 的说明）：
-            #   这一层的本地主模型是 8B 规模，而 light 层本地是 1.5B ——
+            #   这一层的本地地板是 `configs/models.yaml` 的 `local_medium`
+            #   （4B 级；**具体是哪个模型只写在配置里**，代码里不写模型名），
+            #   而 light 层本地是 1.5B 级 ——
             #   1.5B 在"读 600 字吐 9 个字段"这个任务上实测 5 条出 4 类错。
             EXTRACT_TIER, _SYSTEM, build_prompt(title, seg),
             agent_id="intel_extract", json_mode=True, max_tokens=_MAX_TOKENS,
