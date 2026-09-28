@@ -260,6 +260,16 @@ async def test_health_aggregation(client):
         assert resp.status_code == 200
         assert body["agents"]["A08_macro"] == "healthy"
         assert "model_gateway" in body and "audit_chain" in body
+        # 免费档限流熔断（light 层首位是免费档，被限流时链会自动前进）：
+        # 这是它**唯一**的可见面 —— 没有它就只能从"延迟上升 + 下一跳配额
+        # 被多吃"上后知后觉。判据区分「未量到」与「量到 0」。
+        guard = body["model_gateway"]["rate_limit_guard"]
+        assert guard["available"] is True
+        assert guard["threshold"] >= 2
+        assert guard["path"], "状态文件路径要可见（运维要能直接去看它）"
+        for snap in guard["models"].values():
+            assert snap["remaining_s"] is None or snap["remaining_s"] > 0, (
+                "未锁定时 remaining_s 必须是 None，不能用 0 糊过去")
         sources = body["data_sources"]
         statuses = {c["name"]: c["status"] for c in sources["connectors"]}
         assert statuses["模拟源(测试替身)"] == "simulated"

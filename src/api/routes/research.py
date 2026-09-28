@@ -654,6 +654,24 @@ async def health(request: Request) -> dict:
             })
         return {"chain": chain, "connectors": connectors}
 
+    def _rate_limit_guard() -> dict:
+        """免费档限流熔断状态（**唯一能看见"siliconflow 被限流"的面**）。
+
+        为什么必须挂在这里：`light` 层（占 82% 调用量）首位是免费档，
+        它被限流时链会自动前进到下一跳 —— 而这个过程**原先没有任何可见面**，
+        只能从"延迟上升 + 下一跳配额被多吃"上后知后觉。
+        见 `src/infrastructure/llm/rate_limit_guard.py`。
+
+        ⚠️ 判据区分「未量到」与「量到 0」：读不到时给 `available: False`，
+        绝不用 `total_429: 0` 假装"没限流"（AGENTS.md 硬约束）。
+        """
+        try:
+            from src.infrastructure.llm.rate_limit_guard import get_guard
+
+            return {"available": True, **get_guard().snapshot()}
+        except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
+
     runtime = _runtime(request)
     settings = get_settings()
     agents = agent_health(runtime.agents)
@@ -715,6 +733,9 @@ async def health(request: Request) -> dict:
         "model_gateway": {
             "ollama": ollama_status,
             "deepseek": "configured" if settings.deepseek_api_key else "not_configured",
+            # 免费档限流熔断（siliconflow/dashscope）：锁定期内该跳被**跳过**。
+            # 判据区分「未量到」与「量到 0」——读不到时 available=False。
+            "rate_limit_guard": _rate_limit_guard(),
         },
         "audit_chain": {"valid": chain["valid"], "records": chain["count"]},
         # 并发容量与背压（详见 /research/capacity 的说明）：

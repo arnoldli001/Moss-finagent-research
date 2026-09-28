@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -33,27 +33,19 @@ node_modules/
 
 # TS构建缓存
 *.tsbuildinfo
+# 前端构建产物（web/dist 已被 dist/ 覆盖；dist-pilot 为试点构建目录）
+/web/dist-pilot/
 
 # dist-pilot 的历史备份目录（`dist-pilot-backup-<ts>/`，`ship-frontend` 每次发布留一份）。
-# ⚠️ 2026-09-27 实测：`/web/dist-pilot/` 挡不住 `web/dist-pilot-backup-*/`（名字不重叠），
-#    于是 7 个备份目录全是未跟踪状态，`git add .` 会把它们一并入库。
-#    公开线早就补了这条（它的 .gitignore 里记着"一次快照把 52 个备份构建文件带进了
-#    发布白名单"），私有线一直漏着 —— 这里补齐，两条线保持一致。
+# ⚠️ 2026-09-27 实测：这两个目录名**不重叠** —— `/web/dist-pilot/` 挡不住
+#    `web/dist-pilot-backup-*/`。公开线早就补了这条（它的 .gitignore 里记着
+#    "一次快照把 52 个备份构建文件带进了发布白名单"），私有线一直漏着：
+#    实测 7 个备份目录全是未跟踪状态，`git add .` 会把它们一并入库。
 /web/dist-pilot-backup-*/
 
-# ★ 私有实现的路由文件：**不进私有历史**，公开树用同路径的 stub 接管。
-#
-# ⚠️ 2026-09-27 事故：这两条规则在公开过滤器那次改写里被一并删掉了（公开线那侧
-#    是有意删的 —— 它要让 stub 版本随仓发布），但私有线也删了。后果是这两个文件
-#    从"被忽略"变成"未跟踪可见"，一次 `git add` 就把 425 行竞价引擎 / 277 行量化选股
-#    实现写进了私有提交。发现后已 `git rm --cached` + amend 清除。
-#    两条线的规则必须**分开看**：公开线删掉它们是对的，私有线必须留着。
-/src/api/routes/auction_select.py
-/src/api/routes/quant_select.py
-
-# 本地临时探针脚本与数据源勘察产物（根目录下划线开头的全部是临时物，勿提交：
-# _coal_*.py/txt/json、_ak_*.txt 等连接器调研现场，可随时重跑再生）
-/_*
+# 本地临时探针脚本与下载日志（根目录，勿提交）
+/_tmp_*.py
+/_*.log
 # 本地跑测试留下的日志（`pytest ... *> tests_full.log`），不是产物
 /*.log
 
@@ -62,10 +54,11 @@ node_modules/
 /downloads/
 
 # ==================== 私有核心资产（本地保留，不进入公开仓库） ====================
-# 竞价选股：逻辑/参数/情绪周期/综合打分（含根目录配置与API路由）
+# 竞价选股：逻辑/参数/情绪周期/综合打分私有引擎不发布。
+# 注意：其 API 路由（/src/api/routes/auction_select.py）由**自包含 stub** 接管并
+# 随仓发布，以保留接口契约与前端面板，因此这里不能再 ignore 该路由文件。
 /src/auction_select/
 /auction_select/
-/src/api/routes/auction_select.py
 # 私有核心skills（情绪周期/短线招式/卖点）
 /skills/auction-selection/
 /skills/jianmen-shortterm/
@@ -81,28 +74,51 @@ node_modules/
 /src/quant/model_backtest.py
 /src/quant/model_retrain_service.py
 /src/quant/stock_news.py
-/src/api/routes/quant_select.py
+# 量化选股 API 路由同理由自包含 stub 接管、随仓发布（不再 ignore 路由文件）。
 /src/backtest/shortterm.py
 /moss_selector/
 /config_label10_2bucket.yaml
-# 涨停/竞价统计与探针脚本（体现策略细节）
-/scripts/_probe_*.py
-/scripts/limit_up_*.py
-/scripts/bt_*.py
-# QMT侧竞价策略/信号服务器/模拟盘实现（79KB策略核心）
-/qmt/
-/scripts/auction_replay.py
-/scripts/auction_data_audit.py
-/scripts/shortterm_backtest.py
-/scripts/model_backtest_variants.py
-/scripts/run_model_backtest.py
-/scripts/train_label_variant.py
-/scripts/first_screen_probe.py
-# 前端私有面板（引用处以「商业版功能」提示组件替代）
-/web/src/components/AuctionSelectPanel.tsx
-/web/src/components/QuantSelectPanel.tsx
-/web/src/components/NiuLineChart.tsx
-/web/src/auctionApi.ts
+# QMT 侧竞价策略实现（79KB 策略核心）已从公开版删除；qmt/ 目录下仅保留
+# README.md 与 SIGNAL_CONTRACT.md（接口契约说明），故这里**不再整目录忽略 /qmt/**。
+# scripts 默认全部不发布，仅白名单以下公开脚本（研究/运维/验证脚本不入库）
+#
+# ⚠️ **进了白名单就必须入库**：白名单只表达"政策上允许发布"，git 不会替你
+# `git add`。`prd_sync_check.py` 曾经就是这样 —— 白名单里有、仓库里没有，
+# 于是 CI 的对账门禁在克隆/CI 环境里**每次都静默跳过**（只打一行
+# `::warning::`），而本机永远看不见。判据见
+# `tests/unit/test_shipped_deps.py::test_whitelisted_scripts_are_actually_tracked`
+# （它会把"白名单里的空头支票"直接报红）。
+/scripts/*
+!/scripts/.gitkeep
+!/scripts/_smoke_e2e.py
+!/scripts/backtest_demo.py
+!/scripts/backtest_sensitivity.py
+!/scripts/demo_tour.py
+!/scripts/download_industry_data.py
+!/scripts/download_qmt_data.py
+!/scripts/intraday_failover_check.py
+!/scripts/intraday_latency_probe.py
+# 需求—PRD 对账（2026-09-28）：AGENTS.md 硬约束要求"每轮对话跑一条命令"，
+# 脚本不发布则克隆环境下那条命令指向不存在的文件（tests/unit/test_shipped_deps.py 判据 3）
+!/scripts/prd_sync_check.py
+# 开工前置检查（AGENTS.md《需求闭环与影响半径》点名"开工前跑一条命令"）：
+# 同类现场 / 贯通点逐项状态 / 影响半径。缺了它，那条硬约束在克隆里无法执行。
+!/scripts/preflight_check.py
+# 测试经济性（AGENTS.md《测试运行经济性》点名"日常只跑本次改动相关的测试"）：
+# 没有它，克隆环境只能靠跑全量兜底 —— 而这条规则正是为取消"全量当默认"而立的。
+!/scripts/affected_tests.py
+!/scripts/quant_cases.py
+!/scripts/quant_stocks.py
+!/scripts/quant_strategy_scan.py
+!/scripts/quant_sync.py
+!/scripts/quant_warehouse.py
+!/scripts/scan_same_name_conflicts.py
+!/scripts/scan_date_bombs.py
+!/scripts/seed_demo_data.py
+!/scripts/verify_cleanup.py
+# 前端面板 UI **随开源版发布**（保证全部子界面可见）：面板只做渲染、不含后端
+# 打分公式/阈值；配合脱敏版 stub 路由显示「结构空壳+脱敏提示」。
+# （因此这里不再 ignore AuctionSelectPanel / QuantSelectPanel / NiuLineChart / auctionApi）
 # 暴露私有逻辑/公式的文档与决策明细
 /docs/AUCTION_SELECT.md
 /docs/AUCTION_DATA_REDUNDANCY.md
@@ -112,6 +128,25 @@ node_modules/
 /docs/SELECTOR_DAILY_K.md
 /docs/NIULINE_DAILY_CHART.md
 /docs/竞价选股_*
+# 内部 Agent/规格工作目录（不发布，含本地 file:// 链接与内部规划）
+/.trae/
+# ⚠️ 例外（2026-09-28，CHG-0047）：需求—PRD 对账 skill **要发布** —— 否则 AGENTS.md 的
+# `@` 引用在克隆环境里指向不存在的文件（正是「交付完整性硬约束」要防的那类缺陷）。
+# gitignore 不能直接反选"被忽略目录下的子文件"，必须先逐级放开、再逐级忽略；
+# `/.trae/*` 保证**其余 skill 依旧不发布**，只放行这一条链路。
+!/.trae/
+/.trae/*
+!/.trae/skills/
+/.trae/skills/*
+!/.trae/skills/requirement-prd-sync/
+!/.trae/skills/requirement-prd-sync/**
+# 研究/面试/复盘流水账：已被 docs/INTERVIEW_FINAL.md 取代，含策略明细与个人域名
+/docs/INTERVIEW_*.md
+/docs/面试准备_*
+/docs/MAINLINE_*
+/docs/ETF_*.md
+/docs/PLATFORM_MULTI_TENANCY_DESIGN.md
+/docs/mainline_iterations/
 # 暴露私有公式/skill的测试用例
 /tests/unit/test_auction_golden.py
 /tests/unit/test_auction_rulebook.py
@@ -132,10 +167,19 @@ node_modules/
 /tests/unit/test_moss_selector.py
 /tests/unit/test_selector_labels_and_buckets.py
 /tests/unit/test_preheat_cache.py
-
-# ---- 香港 VPS + frp（2026-09-26）----
-# frpc.toml 里有隧道 auth.token：泄露 = 别人能把你 VPS 的端口暴露到公网。
-# 入库的只有占位符版本 scripts/frpc.toml.example。
-/frpc.toml
-# frp 客户端二进制（体积大、平台特定，不入库）
-/bin/frpc.exe
+# 绑定未发布私有脚本的研究测试（目标脚本已被 scripts 白名单排除）
+/tests/unit/test_daily_auction_tick.py
+/tests/unit/test_mainline_layer_scale.py
+/tests/unit/test_mainline_rank_key.py
+/tests/unit/test_rescore_purge.py
+/tests/unit/test_mainline_layer_compose.py
+/tests/unit/test_intel_alert_copy_trial.py
+/tests/unit/test_script_cost_guard.py
+/tests/unit/test_sector_crowding.py
+# alert 阈值/门控策略重构中：这 3 个测试随重构完成后的下一版一起发布，
+# 先行发布会对不上中间态（断言旧阈值 0.70 vs 代码 0.60 等），CI 必红
+/tests/unit/test_alert_thresholds.py
+/tests/unit/test_alert_models.py
+/tests/unit/test_notifiers.py
+# 文档目录下的一次性勘察输出（数据源/zsxq/合规探测现场，勿发布）
+/docs/_*.txt

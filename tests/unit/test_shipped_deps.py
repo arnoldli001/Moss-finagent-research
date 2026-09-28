@@ -281,6 +281,82 @@ def test_documented_script_commands_exist() -> None:
         "修法：改名对齐真实脚本，或加进 _KNOWN_DANGLING_CALLS 并写清原因")
 
 
+#: `.gitignore` 里 `/scripts/*` 的白名单行（`!/scripts/x.py`）。
+#: ⚠️ 必须 `re.MULTILINE` —— 不加时 `^`/`$` 只认**整份文本**的首尾，
+#: `findall` 会返回空集，于是判据恒绿（本文件自己踩过一次：空集触发了
+#: 下面那条"解析出 0 条"的自证断言，两分钟就抓住了）。
+_WHITELIST_RE = re.compile(r"^!/scripts/([A-Za-z_]\w*)\.py\s*$", re.MULTILINE)
+
+
+def _whitelisted_scripts() -> set[str]:
+    """`.gitignore` 明确放行的脚本名（= **政策上承诺要发布**的那些）。"""
+    text = (ROOT / ".gitignore").read_text(encoding="utf-8-sig", errors="replace")
+    return set(_WHITELIST_RE.findall(text))
+
+
+def _broken_whitelist_promises() -> dict[str, str]:
+    """白名单里承诺发布、却**没有真的入库**的脚本。
+
+    为什么单独立一条判据（2026-09-28 实测，这正是一个**假绿**）：
+
+    `prd_sync_check.py` 被写进 `.gitignore` 白名单（台账 CHG-0047 声称
+    "加入发布白名单，这样换开发工具也生效"），但**从来没有 `git add` 过**。
+    后果分两层，第二层更贵：
+
+      ① 克隆/CI 里这个文件不存在 → `AGENTS.md` 教的"每轮对账一条命令"跑不了；
+      ② CI 的对账门禁因此**每次都静默跳过**（只打一行 `::warning::`）——
+         门禁看起来接上了，实际一次都没跑。**绿灯是假的。**
+
+    为什么原有三条判据全都漏掉它：它们报错的**前提**是
+    `_tracked(path) is False`（= "这个脚本不发布"）。而白名单里的文件
+    恰恰是"**打算发布但目前没入库**" —— 三条判据都把它当成"合法的未发布脚本"
+    静默放过。**"政策上要发布"与"技术上已发布"之间的缝，就是这个假绿的来源。**
+
+    判据本身可执行：白名单 = 承诺，`git ls-files` = 事实，两者不一致就报。
+    """
+    out: dict[str, str] = {}
+    for name in sorted(_whitelisted_scripts()):
+        path = f"scripts/{name}.py"
+        if not (ROOT / path).exists():
+            out[name] = "白名单里有、磁盘上都没有（改名/打错字的现场）"
+            continue
+        if _tracked(path) is False:
+            out[name] = "白名单承诺发布，但从未 git add（克隆/CI 里不存在）"
+    return out
+
+
+@pytest.mark.skipif(not _is_git_repo(), reason="不在 git 仓库内")
+def test_whitelisted_scripts_are_actually_tracked() -> None:
+    """★ 判据 4：`.gitignore` 的白名单不是"免死金牌"，是**必须兑现的承诺**。
+
+    没有这一条时，谁都可以把脚本写进白名单、然后在台账里宣布"已发布"，
+    而 CI 门禁因为文件不存在**静默跳过** —— 界面全绿、事实为空。
+    """
+    broken = _broken_whitelist_promises()
+    assert not broken, (
+        "以下脚本在 `.gitignore` 白名单里承诺发布，但没有真的入库 —— "
+        f"克隆/CI 环境里它们不存在：{broken}\n"
+        "修法二选一：① `git add <脚本>` 兑现承诺；"
+        "② 从 `.gitignore` 白名单删掉（= 承认它不发布），"
+        "并确保引用它的测试有 skip 守卫、文档不再把它当命令教。")
+    assert _whitelisted_scripts(), (
+        "白名单解析出 0 条 —— 正则或 .gitignore 结构变了，判据 4 会变成假绿")
+
+
+def test_whitelist_promise_check_is_not_vacuous() -> None:
+    """★ 自证：判据 4 必须能报出"承诺未兑现"，不能恒绿。"""
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(sys.modules[__name__], "_whitelisted_scripts",
+                            lambda: {"ghost_whitelisted_zzz"})
+        monkeypatch.setattr(sys.modules[__name__], "_tracked", lambda _p: False)
+        monkeypatch.setattr(Path, "exists", lambda self: True)
+        assert "ghost_whitelisted_zzz" in _broken_whitelist_promises(), (
+            "白名单里的空头支票必须被报出来 —— 否则判据 4 是假绿")
+    finally:
+        monkeypatch.undo()
+
+
 def test_placeholder_names_are_not_treated_as_commands() -> None:
     """★ 自证：文档里的占位符不该被当成真命令。
 
