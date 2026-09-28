@@ -26,6 +26,13 @@ class ModelSpec(BaseModel):
     vram_mb: int = 0
     # DeepSeek 原生思维链强度（none/low/high/max）；空串=不下发，用服务端默认。
     reasoning_effort: str = ""
+    #: 本地（Ollama）思维链开关。`None` = 按 `MOSS_LOCAL_THINK` 解析，
+    #: **默认关**（`OllamaProvider._resolve_think` 有实测依据：
+    #: 思考 token 计入 `num_predict`，开思考会让 4B 100% 空返回、
+    #: 让 8B 白花一倍延迟而能力不变）。
+    #: 云端模型忽略此字段（DeepSeek 用 `reasoning_effort`，OpenAI 兼容端点
+    #: 不支持该参数）。
+    think: bool | None = None
 
 
 class LLMResponse(BaseModel):

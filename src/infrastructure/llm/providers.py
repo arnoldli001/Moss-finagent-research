@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
 from typing import Any, Protocol
@@ -17,9 +18,58 @@ from src.core.config import get_settings
 from src.core.exceptions import LLMGatewayError
 from src.infrastructure.llm.models import LLMResponse, ModelSpec
 
+logger = logging.getLogger(__name__)
+
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+#: 本地（Ollama）思维链开关的环境变量。**默认关**（理由见 `_resolve_local_think`）。
+ENV_THINK = "MOSS_LOCAL_THINK"
+
+
+def _resolve_local_think(*, spec: ModelSpec) -> bool:
+    """该不该给这次**本地**调用下 `think`，下什么值。
+
+    ## 为什么默认**关**思维链（2026-09-28 实测：这就是"掷硬币"的根因）
+
+    `qwen3` / `qwen3.5` 是**思考型**模型，思考 token **计入** `num_predict`
+    （Ollama 把它单独放在响应的 `thinking` 字段里，但预算是一起算的）。
+    实测（真实 prompt = `tone.build_prompt` + `tone.extraction_schema()`，
+    `num_predict=2048`，各 3 次）：
+
+    | 模型 | 默认（开思考） | `think=false` |
+    |---|---|---|
+    | `qwen3:8b` | p50 **18.3s** · 输出 729 tok · 键齐全 100% | p50 **9.1s** · 321 tok · 键齐全 100% |
+    | `qwen3.5:4b` | p50 31.4s · **空正文 100%**（2048 全被思考吃掉） | p50 **4.8s** · 184 tok · 键齐全 100% |
+
+    - 对 8B，关思考是**纯收益**：延迟减半、输出 token 减 57%、抽取能力不变；
+    - 对 4B，开思考是**必然空返回**（不是偶发）—— 上层看到"模型返回空内容"，
+      与随机故障长得一模一样。这正是被长期登记为"**8GB 显存不足导致掷硬币**"
+      的那个现象。
+
+    **显存不是这个病**：4B 权重只占 ~3.4GB（比 8B 的 5.6GB 宽裕得多），
+    却比 8B 更容易空返回。病在**输出预算被思维链吃光**。
+
+    ## 判据
+
+    - `spec.think` 显式给了 → 听调用方的（供 A/B 与个别任务回退）
+    - 否则读 `MOSS_LOCAL_THINK`：`1/true/on/yes` → True；
+      `0/false/off/no` → False；**未设 → False（默认关）**
+    - 设了别的值 → 打 warning 并按默认关（**不静默**）
+    """
+    if spec.think is not None:
+        return bool(spec.think)
+    raw = (os.environ.get(ENV_THINK) or "").strip().lower()
+    if not raw:
+        return False
+    if raw in {"1", "true", "on", "yes"}:
+        return True
+    if raw in {"0", "false", "off", "no"}:
+        return False
+    logger.warning("%s=%r 无法识别（用 1/0），按默认「关思考」处理", ENV_THINK, raw)
+    return False
 
 
 #: 这些状态码属于**配置类**故障，重试不会自愈，因此不计入熔断器
@@ -138,6 +188,9 @@ class OllamaProvider:
             payload["format"] = json_schema
         elif json_mode:
             payload["format"] = "json"
+        # ★ 思维链开关（顶层字段，**不在 options 里**）。见 `_resolve_local_think`
+        # 的实测表：开思考会让 4B 100% 空返回、8B 白花一倍延迟而能力不变。
+        payload["think"] = _resolve_local_think(spec=spec)
         # ★ 应用侧并发闸（见 `local_gate` 的模块说明）：Ollama 只有**一个**
         #   计算槽位，并发请求会在它内部排队；把等待挪到这里，超时就只计
         #   生成时间，而不是"排队排到 120 秒"被记成调用失败。

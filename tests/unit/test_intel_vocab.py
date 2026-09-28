@@ -375,21 +375,32 @@ def test_long_text_still_calls_model(
     assert hit is not None and hit["source"] == "rules+llm"
 
 
-def test_extraction_tier_resolves_to_the_8b_local_model() -> None:
-    """★★ 真配置下把这条链路**实际会用的模型**钉死：`medium` → 有本地 8B 兜底。
+def test_extraction_tier_resolves_to_a_capable_local_model() -> None:
+    """★★ 真配置下把这条链路**实际会用的模型**钉死：`medium` → 有**够用的**本地兜底。
 
     这条用例直接读 `configs/models.yaml`（与运行期同一个文件）——
-    "哪一层 = 哪个模型"是配置决定的，光断言常量名证明不了 8B 真的会被调用。
+    "哪一层 = 哪个模型"是配置决定的，光断言常量名证明不了它真的会被调用。
     只读配置、不建网关（不联网）。
 
-    ⚠️ 2026-09-28 两处修正：
+    ⚠️ 2026-09-28 三处修正：
     ① 改为读**解析后的完整链**（`_load_model_config`）：原实现手工拼
        `primary` + 单数 `fallback`，遇到三跳链（`fallbacks` 列表）会**漏掉
        后续跳** → 误报"medium 层没有本地模型"。
     ② "本地"判据改用 `provider == "ollama"`，**不用** `not in PAID_PROVIDERS`：
        后者是"**不花钱**"语义，而 `zhipu`（glm，免费）不在 PAID_PROVIDERS 里
-       → 会被误判成本地模型。本例要的是**本机**（8B ollama），不是"免费"。
-       两个概念混用会让判据在最需要它的时候（新接免费云端）静默失效。
+       → 会被误判成本地模型。本例要的是**本机**，不是"免费"。
+    ③ **第二十三轮：判据从"必须是 8B 这个名字"改成"能力类别够用"**。
+
+       原因：本地地板从 `qwen3:8b-q4_K_M` 换成了 `qwen3.5:4b`（带标注的
+        9 条语料 × 2 轮实测：两者**完全正确率同为 89%**，而 4B 的
+        `p95 5.58s` 远好于 8B 的 `22.49s`、显存 2983MB 远小于 5578MB，
+        且能与 1.5B 同时常驻不换出）。
+
+       原判据 `"8b" in model_name` 把"**这条链路需要多大的本地模型**"这个
+       真问题，写成了"当时正好选了哪个模型名"—— 换模型时会误报，而它想防的
+       （被裁到 1.5B）却不一定拦得住。现在改成两条**与模型名无关**的判据：
+        · 不能是 light 层那个 1.5B（1.5B 在本任务"5 条样本出 4 类错"）
+        · 显存档位必须 ≥ 3000MB（= 4B 级），1.5B 级（<1500MB）不算数
     """
     from src.infrastructure.llm.gateway import _load_model_config
 
@@ -398,10 +409,59 @@ def test_extraction_tier_resolves_to_the_8b_local_model() -> None:
     chain = chains[tier]
     local = [m for m in chain if specs[m].provider == "ollama"]
     assert local, f"{tier} 层没有**本机**模型兜底（链={chain}）"
-    # 本机模型必须是 8B 规模（`llm_policy.LOCAL_MODEL = "qwen3:8b"`），
-    # 不能是 1.5B —— 1.5B 在本任务上的实测错误见模块 docstring
-    assert "8b" in specs[local[0]].model_name.lower(), specs[local[0]]
-    assert specs[local[0]].model_name == "qwen3:8b-q4_K_M"
+
+    spec = specs[local[0]]
+    light_specs = [specs[m] for m in chains.get("light", [])
+                   if specs[m].provider == "ollama"]
+    _assert_capable_local_floor(spec, light_specs)
+
+
+def _assert_capable_local_floor(spec, light_specs) -> None:
+    """抽取层本地地板的**能力判据**（抽成函数是为了能自证它真的会报错）。
+
+    两条都与"模型叫什么名字"无关 —— 因为名字会变，能力要求不会：
+      ① 不能与 light 层那个轻量模型是同一个（它在"读 600 字吐 9 个字段"上
+         实测 5 条样本出 4 类错），名字里也不能出现 `1.5b`
+      ② 显存档位 ≥ 3000MB（`vram_mb` 是网关判"拉不拉得起来"用的**实测值**，
+         4B 实测 2983MB）—— 1.5B 级（<1500MB）不算数
+    """
+    name = spec.model_name.lower()
+    for ls in light_specs:
+        assert spec.model_name != ls.model_name, (
+            f"抽取层的地板被裁成了 light 的轻量模型 {ls.model_name} —— "
+            f"那条实测过 5 条样本出 4 类错")
+    assert "1.5b" not in name, f"抽取层地板是 1.5B 级模型：{spec.model_name}"
+    assert spec.vram_mb >= 3000, (
+        f"抽取层地板的显存档位只有 {spec.vram_mb}MB（4B 级实测 2983MB）—— "
+        f"疑似被裁到更小的模型：{spec.model_name}")
+
+
+def test_capable_floor_criterion_actually_rejects_a_downgrade() -> None:
+    """★ 自证：把地板裁成 1.5B / 更小模型时，上面那条判据**必须报错**。
+
+    没有这条自证，`_assert_capable_local_floor` 就只是一个"看起来在守"的
+    断言 —— 它恒真与它有效在测试结果上长得一模一样（AGENTS.md：
+    「自己的检查脚本必须先自证」/「护栏保真」）。
+    """
+    from src.infrastructure.llm.models import ModelSpec
+
+    def spec(name: str, vram: int) -> ModelSpec:
+        return ModelSpec(name="local_medium", provider="ollama",
+                         model_name=name, base_url="http://localhost:11434",
+                         vram_mb=vram)
+
+    light = [spec("qwen2.5:1.5b-instruct-q4_K_M", 1000)]
+    # 合法：4B（现状）与 8B（回退路径）都要放行
+    _assert_capable_local_floor(spec("qwen3.5:4b", 3000), light)
+    _assert_capable_local_floor(spec("qwen3:8b-q4_K_M", 5400), light)
+
+    # 非法三种：同 light 模型 / 名字带 1.5b / 显存档位不足
+    with pytest.raises(AssertionError, match="裁成了 light"):
+        _assert_capable_local_floor(spec("qwen2.5:1.5b-instruct-q4_K_M", 1000), light)
+    with pytest.raises(AssertionError, match="1.5B 级"):
+        _assert_capable_local_floor(spec("qwen2.5:1.5b", 1400), [])
+    with pytest.raises(AssertionError, match="显存档位"):
+        _assert_capable_local_floor(spec("qwen3:1b-q4_K_M", 900), [])
 
 
 def test_rule_entities_only_on_short_text() -> None:

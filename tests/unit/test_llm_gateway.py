@@ -1,5 +1,7 @@
 """LLM网关测试（FakeProvider注入，不联网）。"""
 
+from pathlib import Path
+
 import pytest
 
 from src.core.config import Settings
@@ -249,26 +251,100 @@ async def test_medium_force_local_env_restores_old_behavior(gateway_env, monkeyp
     这条守着"延迟 vs 成本"取舍的**可回退性** —— 改配置换来 −75s 的同时，
     必须留一条不改代码就能退回"零云端花费"的路（AGENTS.md：
     「默认值即护栏」+「同一判断只允许一份实现」）。
+
+    ## ★ 2026-09-28 第二十二轮修订：原判据**一直在红**（不是被本轮改红的）
+
+    两个原因叠在一起，原断言描述的是一个**已经不存在的形态**：
+
+    1. 原写法只注册 `{"ollama", "deepseek"}`，而 `medium` 现在的链是
+       `qwen-dashscope-flash → qwen-siliconflow-7b → deepseek-flash → local_medium`
+       —— 后三跳的 provider 没注册 → 报 `提供商未注册` → 与
+       `match="全部模型调用失败"` 对不上 → **DID NOT RAISE**。
+    2. 更要紧的是：现在的 `pin_local` 里有**显存可行性检查**
+       （`_filter_local_by_vram`）。本地拉不起来时它**故意**摘掉本地、
+       改走云端备源并记一条 `vram_reroute` 审计 —— 于是
+       "强制本地 ⇒ 零云端" 这条不变量**已不再成立**（这是刻意的：
+       拿一个真结果回来，好过干等超时）。
+
+    ⚠️ 所以修法是**按真实语义拆成两条**，不是把断言放宽：
+      · 本条：钉死显存可用（注入假探针）→ 单独验"强制本地"这条**回退路**
+      · 下一条：钉死显存**不可用** → 单独验"改道云端 + 出声"这条新行为
+    两条合起来仍然覆盖"零云端"这个承诺，只是把它放在了正确的条件下。
     """
     settings, _ = gateway_env
     monkeypatch.setenv("MOSS_MEDIUM_FORCE_LOCAL", "1")
 
-    providers = {"ollama": FakeProvider(error=LLMGatewayError("本地模型挂了")),
-                 "deepseek": FakeProvider()}
-    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+    from src.infrastructure.llm.gateway import (
+        LOCAL_PROVIDERS,
+        _load_model_config,
+    )
 
-    # 本地挂了 + 强制本地 → 必须失败，且**一次都没碰云端**
+    specs, chains, _lo = _load_model_config("configs/models.yaml")
+    chain = chains["medium"]
+    chain_providers = {specs[m].provider for m in chain}
+    cloud_providers = sorted(chain_providers - LOCAL_PROVIDERS)
+
+    def _providers(local_error: Exception | None) -> dict[str, FakeProvider]:
+        """按**链上真实 provider** 建表（缺一个就会得到"未注册"而不是本地失败）。"""
+        return {prov: (FakeProvider(error=local_error)
+                       if prov in LOCAL_PROVIDERS else FakeProvider())
+                for prov in chain_providers}
+
+    providers = _providers(LLMGatewayError("本地模型挂了"))
+    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+    _pin_vram(gw)          # ★ 钉住"显存够" → 隔离出 force_local 这一条分支
+
+    # 本地挂了 + 强制本地 + 显存够 → 失败，且**一个云端都没碰**
     with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
-        await gw.complete("medium", "系统", "信息层任务")
-    assert providers["deepseek"].calls == [], \
-        "MOSS_MEDIUM_FORCE_LOCAL=1 时 medium 仍然调了云端"
+        await gw.complete("medium", "系统", "信息层任务", use_cache=False)
+    for prov in cloud_providers:
+        assert providers[prov].calls == [], (
+            f"MOSS_MEDIUM_FORCE_LOCAL=1 且本地可用时仍然调了云端 {prov}")
+    assert providers["ollama"].calls, "本地一跳该被尝试过（否则这条用例没跑到判定路径）"
 
     # 关掉开关 → 恢复云端 primary（对照组，证明开关真的在起作用）
     monkeypatch.delenv("MOSS_MEDIUM_FORCE_LOCAL", raising=False)
-    providers2 = {"ollama": FakeProvider(), "deepseek": FakeProvider()}
+    providers2 = _providers(None)
     gw2 = LLMGateway(settings=settings, providers=providers2, cache=None)
-    resp = await gw2.complete("medium", "系统", "信息层任务")
-    assert resp.model_used == "deepseek-flash"
+    _pin_vram(gw2)
+    resp = await gw2.complete("medium", "系统", "信息层任务", use_cache=False)
+    assert resp.model_used == specs[chain[0]].model_name, (
+        "关掉开关后应恢复链首（云端）模型")
+    assert resp.provider == specs[chain[0]].provider
+
+
+async def test_local_not_usable_reroutes_to_cloud_and_says_so(gateway_env, monkeypatch):
+    """★ 显存不足时**改道云端备源**，但必须**出声**（不许静默花钱）。
+
+    为什么单独立一条：这个分支是"拿一个真结果回来，而不是干等到 120s 超时"
+    的兜底，而它**会花钱**。原实现静默改道 —— 静默花钱正是本仓库反复踩过的
+    那类缺陷（"本地一抖动就悄悄花钱"，实测 0.0196 元）。
+    所以判据有两条，缺一不可：
+      ① 真的走了云端（不是失败）
+      ② 审计里留下了 `vram_reroute` 痕迹（运维查得到"哪次改道了、为什么"）
+    """
+    settings, tmp_dir = gateway_env
+    from src.infrastructure.llm.gateway import LOCAL_PROVIDERS, _load_model_config
+
+    specs, chains, _lo = _load_model_config("configs/models.yaml")
+    chain = chains["medium"]
+    chain_providers = {specs[m].provider for m in chain}
+    providers = {prov: FakeProvider() for prov in chain_providers}
+    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+    _pin_vram(gw, free_mb=0, resident=frozenset())   # ★ 显存不够、也没驻留
+
+    monkeypatch.setenv("MOSS_MEDIUM_FORCE_LOCAL", "1")   # 连"强制本地"也压不住它
+    resp = await gw.complete("medium", "系统", "信息层任务", use_cache=False)
+
+    first_cloud = next(m for m in chain
+                       if specs[m].provider not in LOCAL_PROVIDERS)
+    assert resp.provider == specs[first_cloud].provider, "显存不足时应改走云端备源"
+    assert not providers["ollama"].calls, (
+        "本地拉不起来却仍然调了它 —— 那正是 120s 挂死的形态")
+    audit_file = Path(tmp_dir) / "llm_audit.jsonl"
+    text = audit_file.read_text(encoding="utf-8") if audit_file.exists() else ""
+    assert "vram_reroute" in text, (
+        "改道云端会花钱，必须留审计痕迹（静默改道 = 偷偷花钱）")
 
 
 async def test_local_only_never_spends_cloud_tokens(gateway_env, routing):
