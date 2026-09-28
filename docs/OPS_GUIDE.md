@@ -143,6 +143,38 @@ manage.py start --env pilot --port 8110 --daemon
 > ② 停 pilot 用 `scripts/pilot_autostart.ps1` 对应的流程（§2.4）。
 > **任何时候都不要用 `manage.py stop`**，哪怕带了 `--port`。
 
+### 2.3b ★★ 改 `configs/models.yaml` **必须重启**，而且只重启那一个实例才有用
+
+**实测（2026-09-28 23:19 改配置 → 00:13 才发现）**：
+`LLMGateway` 在**构造时**把 `configs/models.yaml` 读进内存
+（`_load_model_config`），之后**再也不重读**。于是：
+
+| 实例 | 启动时间 | 配置改动 | 实际在用的模型 |
+|---|---|---|---|
+| dev 8100 | 23:19（改配置之后） | — | ✅ `qwen3.5:4b` |
+| **pilot 8110** | **22:06（改配置之前）** | 23:19 换地板 | ❌ **仍是 `qwen3:8b-q4_K_M`** |
+
+审计日志是唯一能看出这件事的地方（`agent_id=intel_extract` 那几条的 `model=` 字段）：
+配置解析出来是 4B，**进程里跑的却是 8B** —— 两边都不报错。
+
+**纪律**：改了 `configs/models.yaml` / `configs/*.yaml` 里任何**影响路由**的键之后，
+**必须逐个重启实例**（dev 与 pilot 是两份进程，重启一个不影响另一个）。
+判据不是"配置里写着 4B"，而是**审计里那一行 `model=`**：
+
+```powershell
+# 按 PID 重启 pilot（见 §2.4，绝不用 manage.py stop）
+# 重启后核对：配置解析 vs 审计实证
+uv run python -c "import sys;sys.path.insert(0,'.');from src.infrastructure.llm.gateway import _load_model_config; s,c,_=_load_model_config('configs/models.yaml'); print([m for m in c['medium'] if s[m].provider=='ollama'])"
+# 然后等下一次 intel_tone_extract / 告警扫描，看 data/pilot/audit/llm_audit.jsonl 的 model= 字段
+```
+
+> ⚠️ **附带修好的一件事**：本次重启前 `data/run/backend.pid` 指向一个**已不存在**的
+> 进程（12108），而真实在跑的是 22:06 启动的另一个 PID —— 值守因此每次 tick 都记
+> 「端口被其他程序占用（值守拒绝启动）」并用 `exit 2` 退出，**等于长期没有值守**。
+> 重启（走 `manage.py start --daemon`）后 pid 文件重新指向存活的启动器 PID，
+> 值守恢复认领。**所以「pilot 20~30 秒消失」这类现象，先查 pid 文件指向谁** ——
+> 它比"进程真的被杀了"更常见。
+
 ### 2.4 只重启 pilot 单实例的正确做法
 
 ```powershell
