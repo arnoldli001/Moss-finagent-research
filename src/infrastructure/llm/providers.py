@@ -29,6 +29,48 @@ def _sha256(text: str) -> str:
 ENV_THINK = "MOSS_LOCAL_THINK"
 
 
+def _warn_if_prompt_truncated(spec: ModelSpec, system: str, prompt: str,
+                              prompt_eval_count: int) -> None:
+    """★ 提示词被后端**静默截断**时出声（Ollama 实测行为，2026-09-28）。
+
+    ## 为什么需要它
+
+    Ollama 在 prompt 超过它的上下文上限时**不报错**，而是处理"装得下的那部分"，
+    并把**实际处理的 token 数**放在响应的 `prompt_eval_count` 里 ——
+    生产链路上**没有任何地方读这个字段**，所以截断是完全不可见的：
+    表现只是"这条怎么没抽全"。
+
+    实测（`qwen3.5:4b`，`num_ctx=4096`）：
+
+    | 提交的正文 | 实际 prompt | `prompt_eval_count` |
+    |---|---|---|
+    | 600 字（生产单段上限） | 1379 字符 | **795**（未截断） |
+    | 6000 字 | 6761 字符 | 3027（未截断） |
+    | 12000 字 | 12761 字符 | **2050 ← 封顶** |
+    | 20000 字 | 20761 字符 | **2050 ← 封顶** |
+
+    注意封顶值**不是常量**：换一个 `num_ctx=16384` 的临时模型后是 8194~9152。
+
+    ## 判据
+
+    中文正文的实测密度约 **0.64 token/字**（600 字 → 795 token，含 404 token 骨架）。
+    取 0.3 作**保守下限**（按英文字符更密的情况留足余量）：若
+    `prompt_eval_count < 0.3 × (system+prompt 字符数)`，说明后端只处理了一部分。
+    只**告警**不改行为 —— 这一层不该替调用方决定"截断了要不要重试"。
+    """
+    total_chars = len(system or "") + len(prompt or "")
+    if total_chars <= 0 or prompt_eval_count <= 0:
+        return
+    # 骨架本身也要算：它再短也有几十 token，所以只在"比例明显偏低"时告警。
+    if prompt_eval_count < 0.3 * total_chars:
+        logger.warning(
+            "Ollama 可能截断了提示词：提交 %d 字符，后端只处理了 %d token"
+            "（模型 %s）。截断是**静默**的 —— 表现只是'没抽全'。"
+            "若这是抽取链路，请检查单段字数上限（tone.MAX_TEXT_CHARS）"
+            "与 num_ctx 的关系。",
+            total_chars, prompt_eval_count, spec.model_name)
+
+
 def _resolve_local_think(*, spec: ModelSpec) -> bool:
     """该不该给这次**本地**调用下 `think`，下什么值。
 
@@ -204,12 +246,14 @@ class OllamaProvider:
                 data = resp.json()
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             raise _gateway_error("Ollama", spec.model_name, exc) from exc
+        tokens_in = int(data.get("prompt_eval_count") or 0)
+        _warn_if_prompt_truncated(spec, system, prompt, tokens_in)
         return _wrap_response(
             spec,
             system,
             prompt,
             data["message"]["content"],
-            int(data.get("prompt_eval_count") or 0),
+            tokens_in,
             int(data.get("eval_count") or 0),
             started,
             # Ollama 不区分思维链 token（qwen3 的 thinking 混在 eval_count 里，

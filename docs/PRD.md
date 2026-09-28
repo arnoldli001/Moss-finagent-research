@@ -1028,6 +1028,57 @@ uv run python scripts/prd_sync_check.py --ledger      # 交付前必须 0 ERROR
 | 路由与健康检查里的展示路径 | 7 | 与 `settings` 同源，改动等于改展示口径，收益低风险高 |
 | 其余 | 7 | 待下一轮按同一模式迁移 |
 
+> **本表已随 §16.10 失效** —— 上面这 31 处**全部清零**。留在这里是为了保留
+> "当时为什么不敢动"的记录：那 31 处卡在"主实例算不算一个环境"上，
+> 而 §16.10 给出了不需要业务裁定就能解决的答案。
+
+### 16.10 收口到 0：registry 同时表达两套布局（`CHG-0071`）
+
+§16.9 留下的 31 处全部是**主实例布局**（`data/audit` / `data/llm_cache` /
+`data/scheduler` / `data/moss_finagent.db` / `data/run/...`）。当时不敢动，
+是因为把默认值改成 registry 的 `{env_root}` 派生会**把主实例的审计哈希链搬走**
+（`data/audit` → `data/dev/audit`），链校验会断。
+
+**关键认识：这不是"该改成哪一套"的问题，而是"registry 少了一种表达能力"。**
+项目里**同时存在两套布局**，是既成事实：
+
+| 谁 | 应用库 | 审计 | 缓存/调度 |
+|---|---|---|---|
+| 三档隔离实例（`--env dev/test/pilot`） | `data/<env>/moss_<env>.db` | `data/<env>/audit` | `data/<env>/…` |
+| **主实例 / 离线脚本**（不注入 `MOSS_SQLITE_PATH`） | `data/moss_finagent.db` | `data/audit` | `data/…` |
+
+所以给 registry 加一个 **`main_path`** 字段 + 一个 **`is_main_instance()`** 谓词：
+**隔离档走 `path`、主实例走 `main_path`**。代码里一处字面量都不用写，
+两套布局都由唯一事实源表达。
+
+**收敛轨迹**：77 → 67（判据修正）→ 49（仓储默认值）→ 36（共享只读存储）→ 31
+（情报缓存 + 周期表）→ 25（缓存/审计/运行目录）→ **0**。
+
+| 动作 | 内容 |
+|---|---|
+| registry 新增 | `main_path` 字段（`Store`）+ `is_main_instance()` + `store_rel()` + `default_app_db()`；登记 24 条存储（新增 `quant_strategies` / `gap_queue`） |
+| `core/config.py` | 5 个路径默认值改用 `_env_field_factory`（`default_factory` 求值，**不能在类体求值** —— 否则 `--env` 注入永远不生效） |
+| 其余 26 处 | 审计链/审计追加器/缓存/访问审计/限流状态/网络兜底状态/做T热缓存/竞价缓存/策略目录/缺口队列/选股诊断与结果/健康度缓存/路由展示/目录周期兜底表 |
+| **等价性证据** | 主实例 **17/17 逐字相同**（含 `data/audit/audit_chain.jsonl`）、pilot **10/10 落在 `data/pilot/`**、两套布局 **13/13**、`Settings` **11/11**；合计 **51 条断言，0 异常** |
+
+**本轮新增的两条纪律（都是实测换来的）**：
+
+1. **★ 改了引用就要实测"名字可用"，编译抓不到。** `assets.py` 的
+   `DIR_FREQUENCY_BY_PATH` 用了 `_rel()`，而 helper 被插在**它下面** ——
+   `py_compile` **通过**（编译不解析名字），模块导入直接
+   `NameError: name '_rel' is not defined`，`assets.py` 整条链都起不来。
+   `routes/quant.py` 同款（`store_rel` 没补 import）。
+   判据：**改完必须真导入一次**，不能只看编译。
+2. **判据本身要自证。** `test_no_store_path_literals_in_src` 断言"`== []`"，
+   如果判据太严（把该检出的都判成不是路径），它会**永远绿** ——
+   那是最隐蔽的假绿。所以补了 `test_store_path_literal_judge_recognises_real_paths`：
+   喂已知正例/反例各 5 条，确认认得出、且不误伤。
+   这条自证当场抓出我自己写错的一个用例（`sqlite:///data/…` 里**确实**内嵌了
+   硬编码路径，判据**应该**抓它 —— 是我把用例写错了，不是判据错）。
+
+**棘轮到期**：基线常量 `_LITERAL_BASELINE` 与"降到 0 后删掉它"的过期断言
+**已按约定删除**，只留永久栅栏 `test_no_store_path_literals_in_src`。
+
 ---
 
 ## 十七、本地模型兜底：能力档位与思维链口径（现行口径 · 2026-09-28 定型）
@@ -1242,6 +1293,79 @@ uv run python scripts/_probe_coexist.py
 "谁对"（`#9` 一条是 AI 智能爆炸的评论，4B 判偏空、8B 判中性，两者都能自圆其说）。
 要更强的结论需要更大样本 + 人工标注，**本轮不做**。
 
+### 17.7 上下文预算：600 字正文占多少，以及**静默截断**的真实现场
+
+> 起因：用户提问「券商作文的输入长度最大 600 个中文字，如果超过了 4b 模型
+> 允许的大小，会发生什么？」。本节把这件事量到底（`CHG-0076`）。
+
+#### 一、600 字正文的真实占用（实测，非估算）
+
+口径：`tone.build_prompt` 的真实 prompt、`qwen3.5:4b`、`num_ctx=4096`、
+`think=false`，读 Ollama 返回的 `prompt_eval_count`：
+
+| 输入 | prompt 长度 | `prompt_eval_count` |
+|---|---|---|
+| 纯骨架（JSON schema + 指令，无正文） | 779 字符 | **404 token** |
+| 300 字正文 | 1082 字符 | **603 token**（3 次一致） |
+| **600 字正文（生产单段上限）** | 1379 字符 | **795 token**（3 次一致） |
+
+**结论：600 字只占 4096 的 19%，余 3301 token 给输出**（输出预算是
+`max_tokens=2048`）⇒ **装得下，余量充足**。
+
+⚠️ 两个容易混淆的口径，别搞反：
+`models.yaml` 里的 `max_tokens` 是**输出**预算；`num_ctx` 是**上下文窗口**
+（由 Ollama 的 `PARAMETER num_ctx` 决定，当前 4096）。
+另注：本机实测中文正文密度 ≈ **0.64 token/字**（骨架固定 404）。
+
+#### 二、**为什么"超过"在生产路径上到不了模型**（两道硬闸）
+
+1. `tone_job._extract_one` 先 `tone.segment_text(text)` 切段，段长上限
+   `tone.MAX_TEXT_CHARS = 600`；
+2. `tone.build_prompt` 里还有一次兜底：`body = (text or "")[:MAX_TEXT_CHARS]`。
+
+即 **"600 字"不是期望，是上限**；单段最长就是 600 字，而 600 字 = 795 token。
+
+#### 三、★ 真去撞上限会发生什么：**静默截断，不报错**
+
+把正文一路加长（绕过 `build_prompt` 的兜底，直接拼骨架+长正文）：
+
+| 提交的正文 | prompt | 实际处理的 `prompt_eval_count` | done_reason |
+|---|---|---|---|
+| 6000 字 | 6761 字符 | 3027 | `length` |
+| **12000 字** | 12761 字符 | **2050 ← 封顶** | `length` |
+| **20000 字** | 20761 字符 | **2050 ← 封顶** | `length` |
+
+**行为**：Ollama **不报错**，只处理"装得下的那部分"，把实际处理的 token 数放在
+`prompt_eval_count` 里。**而生产链路上原先没有任何地方读这个字段** ——
+所以截断完全不可见，表现只是"这条怎么没抽全"。
+
+⚠️ **封顶值不是常量**：换一个 `num_ctx=16384` 的临时模型（`ollama create` 建、
+跑完删）后是 **8194~9152**。所以"到底能装多少"**不能当成一个固定数字**去写死判据。
+
+#### 四、本轮的动作（只加观测，不改行为）
+
+`providers._warn_if_prompt_truncated`：当
+`prompt_eval_count < 0.3 × (system+prompt 字符数)` 时打一条 WARNING，
+说明"后端可能只处理了一部分 + 去检查 `MAX_TEXT_CHARS` 与 `num_ctx` 的关系"。
+
+- 为什么取 0.3：实测中文密度 0.64、骨架再压一点，0.3 是**保守下限**
+  （英文/数字更密时也不会误报）。
+- 为什么**只告警不重试**：这一层不该替调用方决定"截断了要不要重试"；
+  而且当前生产路径（600 字上限）永远不会触发它 —— 它是给"将来有人放宽上限"
+  准备的安全网。
+- 护栏（3 条）：封顶时必报 / 生产上限的正常 prompt **不许**报（否则变噪音）/
+  读数缺失时**不报**（「没量到」≠「量到 0」）。
+
+#### 五、验收命令
+
+```bash
+uv run python scripts/_probe_ctx_budget.py     # 600 字的真实占用 + 逐档压 num_ctx
+uv run python scripts/_probe_truncation.py     # 针尖测试：超长时丢哪一头
+uv run python -m pytest tests/unit/test_local_think_switch.py -q   # 截断告警 3 条
+```
+
+> 这三个探针是**未发布的本机脚本**（`scripts/` 默认不入库的政策）。
+
 ## 十八、多环境数据管理（dev / test / pilot / prod）（现行口径 · 2026-09-28 定型）
 
 > 本节由 **CHG-0066** 引入。触发它的是用户提供的一份《数据库管理》经验规则，
@@ -1262,7 +1386,7 @@ uv run python scripts/_probe_coexist.py
 | **A3** | §1 日志分环境 | dev 只重定向 `LLM_AUDIT_DIR`，**漏了 `MOSS_AUDIT_DIR`**（默认同为 `data/audit`）→ 访问审计写在共用目录 | ✅ **本轮已修** |
 | **A4** | §4 Agent 不直连库、走统一网关 | **全线直连**：`src/` 里 77 处 `data/` 路径字面量、51 个文件；无网关层 | ⏳ **L1/L2 范围** |
 | **A5** | §2 元数据加 `env` 字段 + 版本化发布 | `indicator_catalog` / `data_asset_catalog` **per-env 各一份且内容不同**（pilot 722 指标 vs 回填后 1,029），无 `env` / `version` / `is_shared` / `sync_from` 列，无"dev 验证→发布"流程 | ⏳ **待排期** |
-| **A6** | §4 空结果诊断区分环境 | 规则给了 5 个码（`ENV_NOT_COVERED` / `PROD_ONLY` / `DEV_ONLY` / `DEV_SYNC_DELAY` / `PROD_PERMISSION_DENIED`），本项目 `local_data.py::DiagCode` 里**一个都没有** —— 于是"dev 没同步"会被误报成"库里没有" | ⏳ **依赖 A4 的 registry**（见 §18.3） |
+| **A6** | §4 空结果诊断区分环境 | 规则给了 5 个码（`ENV_NOT_COVERED` / `PROD_ONLY` / `DEV_ONLY` / `DEV_SYNC_DELAY` / `PROD_PERMISSION_DENIED`），本项目 `local_data.py::DiagCode` 里**一个都没有** —— 于是"dev 没同步"会被误报成"库里没有" | ✅ **本轮已修（CHG-0075）**：5 个码全部定义（`DiagCode` 12→**17**），且**显式排除在联网兜底的触发表之外**（环境差异不是数据缺口）。见 §19.5、§18.3 的废止痕迹 |
 | **A7** | §3 单向同步（prod → dev）、§1 prod 只读 | 本项目**没有 prod**；dev 与 pilot **各自采集且都写共享行情仓**（pilot 调度台账 `quant_data_sync` 成功 **41** 次，`manage.py:774-789` 自认两实例曾同写）。"谁写谁读"没有裁决 | ⏳ **需用户裁定** |
 
 ### 18.2 本轮已修的判据（机器判据，不靠记得）
@@ -1288,11 +1412,23 @@ uv run python -m pytest tests/unit/test_env_guard.py -q
 
 ### 18.3 纪律：不假装完成
 
-A6 的 5 个环境诊断码**本轮刻意不定义**。理由是本项目已为同类做法付过代价
+> ⚠️ **已废止（CHG-0075，2026-09-29）**：本节原文说 A6 的 5 个环境诊断码
+> **本轮刻意不定义**。该判断**已被推翻并修正** —— 5 个码现已全部定义
+> （`local_data.py::DiagCode` 由 12 个扩到 **17** 个），理由与判据见
+> **§19.5**。原文保留在下方（**不删**），因为"为什么当初不定义"与
+> "后来为什么又能定义了"合起来才是完整口径。
+
+~~A6 的 5 个环境诊断码**本轮刻意不定义**。理由是本项目已为同类做法付过代价
 （`MOSS_SCHEDULER_ENABLED` 设了但全仓库零处读取 → 伪造安全感，
 见 `dev_isolation_env` 里那段注释）。**没有判据能产生它的错误码，
 就是"设了但不生效的开关"** —— 所以 A6 必须等 A4 的跨环境库清单（L1 registry）
-落地后再一起做。（这条纪律与 §17.4 同源。）
+落地后再一起做。（这条纪律与 §17.4 同源。）~~
+
+**修正后的口径（现行）**：当时的顾虑是"设了不生效的开关"，而**顾虑本身是对的** ——
+所以补这 5 个码时必须同时补"谁会产出它"。L1 registry（`configs/data_stores.yaml`
++ `catalog/data_stores.py`，CHG-0067/0070）落地后，判定"这个存储在当前环境里
+可不可见"有了**单一事实源**，5 个码各自都有判据能产生它，且**这 5 个码被显式
+排除在联网兜底的触发表之外**（环境差异不是数据缺口，联网也拿不到）。
 
 ### 18.4 待用户裁定
 
@@ -1316,6 +1452,389 @@ A6 的 5 个环境诊断码**本轮刻意不定义**。理由是本项目已为�
 > 三档**互不相同**由 `test_all_three_isolation_envs_isolate_cache_and_audit` 断言。
 > 唯一仍共用的是 `data/quant/warehouse.db` 与 `data/mainline_cache.db`
 > （共享只读市场数据，**有意共用**，见 §16.2），以及 `data/run/`（见 **A7**）。
+
+
+## 十九、本地数据确定性流水线（现行口径 · 2026-09-29 定型）
+
+> 本节由 **CHG-0072**（流水线 L1–L6 + A12 溯源）、**CHG-0073**（合规「未量到」
+> + 生产者落地 + 白名单那一层）、**CHG-0074**（横截面维度还原）、
+> **CHG-0075**（§18 A6 环境诊断码补定义）引入。
+
+### 19.1 报障原文与结论：不要靠提示词，也不要让采集 Agent 自由写 SQL
+
+用户原话（2026-09-28）：
+
+> 「不要指望靠提示词让 Agent『优先查本地库』，也不要让采集 Agent 直接连数据库
+> 自由写 SQL。要把『找数据』做成一条**确定性流水线**：元数据目录 → 语义解析 →
+> 实体/指标链接 → 查询计划 → 统一网关执行 → **空结果诊断** → 反馈治理。」
+
+工具优先级**由编排层固定**（不是写进 prompt 请求模型配合）：
+
+```
+local_catalog_search → local_query → local_doc_rag → external_search → LLM知识
+```
+
+同轮追加要求（原话）：
+
+> 「要全面补充常见金融和股票财务指标词汇，加入到连接器，对接到数据库，
+> 同时也可以遍历数据库所有表和字段参数，加入到连接器，构建**精准哈希索引**。
+> 避免数据库有的却连接不到。指标等级 `indicators.yaml` 要支持**模糊匹配**。
+> 连接器找不到、指标等级里无 id、`INDICATOR_CATALOG` 目录里没有，
+> 都要**自动去联网获取数据，做最差的兜底，一定要找到数据**。」
+
+**结论（也是本轮最贵的一条教训）**：`_filter_points_for_agent` 的实测是
+「A08 白名单 22 词 → 719 种指标里只放行 **4** 种」，而库里数据齐全
+（`fed:policy_range` 3 条、`us_nonfarm`/`us_unemployment` 各 107 条）。
+**数据到了、Agent 看不见** —— 这类缺陷不报错，只表现为"结论里没有这一维"。
+所以"找数据"必须是**代码里的确定性链路**，每一段都要有机器判据。
+
+### 19.2 L1 元数据目录：反向索引（`catalog/column_index.py`）
+
+| 能力 | 实现 | 判据 |
+|---|---|---|
+| 全库表/字段枚举 | 递归扫 `data/**/*.db`（跳过 archive/backup/rollback），`PREFERRED_DB_NAMES` 定序 + `DB_AUTHORITY` 定权威 | `TableColumns(row_count/columns/numeric/time/entity/investable)` |
+| 字段 → 数据集 | `dataset_registry()` + `best_for_column()`：**有数据 → 最新时间 → 权威 → 行数** | 排序规则在代码里，不在注释里 |
+| 已消费字段 | `consumed_columns()`：单次读源码 + `\w+` token 集合 | **16,007 ms → 60 ms**（同输入同输出） |
+| 未消费的可投字段 | `unconsumed_investable_columns()` | 供"库里有、没人用"审计 |
+| 单例与预热 | `get_column_index(rebuild=False)`；API lifespan 起 `column-index-warm` 任务（延迟 8 s） | 冷建 **~1.7 s**；反向查 **0.029 ms** |
+
+> ⚠️ **"避免数据库有的却连接不到"的反面同样要防**：本轮实测
+> `data/quant/warehouse.db::quant_daily_basic` **rows=15,426,153、
+> trade_date 20060104..20260928（当天）**，而旧注释写着「该表停在 2023-11-10」。
+> 那条注释让 6 个已实现的行情仓指标长期挂着"僵尸表"的豁免 ——
+> **错误的理由比没有理由更危险**，因为它会让人停止追查。
+
+### 19.3 L2 语义解析 / 实体链接（`catalog/synonym_dict.py`）
+
+| 对象 | 规模（实测） | 关键判据 |
+|---|---|---|
+| 指标别名 | **154** 条 | `resolve_metric()` |
+| 实体别名 | **260** 条 / 76 个代码 + 生成式 5,568 条 | `resolve_entity()` |
+| 匹配规则 | **最长匹配跨度**（`_alias_match_span`） | `股息率TTM` 必须落到 `dv_ttm`、**不许**落到 `dv_ratio` |
+| 英文边界 | ASCII 别名必须是**整词** | 否则 `pe` ⊂ `fedtargetupper` 这类子串会误命中 |
+
+> ★ 这里推翻过一次自己的判断：第一版修法是"按长度降序排别名"，**方向错了** ——
+> 正确的是**最长匹配跨度**。别名表的排序不是语义，跨度才是。
+
+### 19.4 L3 查询计划与统一网关执行（`catalog/local_data.py`）
+
+- `LocalDataExecutor.metric_series(metric, entity, start, end, limit)`：指标 + 实体 → **一条只读 SQL**。
+- `_alias_candidates()` 先问 `synonym_dict.resolve_metric`，再追加原文（模糊匹配的兜底）。
+- `_norm_entity()` 吃 `600036` / `600036.SH` / `SH600036` / 中文简称；个股走 `resolve_stock_sync`。
+- `resolve()` 走 `best_for_column` 选存储，**不写死库名**。
+- 索引失效自愈：`_refresh_index()`（陈旧引用 → 重建一次）。
+- 跨库只读查询面：`query_across(stores, sql, params)`（§16.7.5）。
+
+> ★ **取"最新"必须 `ORDER BY time DESC LIMIT n` 再反转**：旧实现
+> `ORDER BY time ASC LIMIT 400` 把 **2007 年**的数据当成"最新"返回，
+> 数值偏差 8 倍，且**一路无异常**。
+
+### 19.5 L4 空结果诊断：17 个码（不是 12 个）
+
+| 维度 | 码 | 语义 |
+|---|---|---|
+| 数据 | `NO_DATA` | 表在、列在、该实体/区间没有行（**可入队补采**） |
+| 数据 | `NO_TABLE` | 表不存在（**可入队补采**） |
+| 数据 | `NO_COLUMN` / `ENTITY_UNMAPPED` / `TIME_OUT_OF_RANGE` / `FREQ_MISMATCH` / `UNIT_MISMATCH` / `DIM_MISMATCH` / `NO_PERMISSION` | 逐条给出下一步（`DIAG_NEXT_STEP`） |
+| 数据 | `CONN_FAIL` | 连接层失败 |
+| 数据 | **`NOT_APPLICABLE_FOR_ENTITY`** | **不是数据缺失，是这个实体没有这个概念**（给银行要"流动比率"）→ **不触发联网** |
+| 环境 | `ENV_NOT_COVERED` / `PROD_ONLY` / `DEV_ONLY` / `DEV_SYNC_DELAY` / `PROD_PERMISSION_DENIED` | 环境差异 → **不触发联网**（本节推翻 §18.3 原判断，见那里的废止痕迹） |
+
+`ENQUEUEABLE_CODES = {NO_DATA, NO_TABLE}` —— 只有这两个码值得进补采队列；
+其余要么是环境问题、要么是语义问题，入队只会制造噪音。
+
+> 每个码都必须有 `DIAG_NEXT_STEP` 文案，且由测试断言"**码集 = 文案键集**"。
+> 理由：没有下一步的码，等于把"排查方向"留给下一个人重新想一遍。
+> 判据：`tests/unit/test_local_data_executor.py::test_all_diag_codes_defined_and_documented`
+> —— 它断言**两个维度集**（数据 12 + 环境 5），**不写死 17 这个数**。
+
+### 19.6 L5 联网兜底：三护栏 + **默认 fail-closed**（`catalog/network_fallback.py`）
+
+| 护栏 | 默认值 | 作用 |
+|---|---|---|
+| 来源白名单 | **`()`（空 = 全禁）** | 安全的一侧做默认；要开必须显式配 |
+| 每日预算 | **¥2.0/天**（单次按 ¥0.02 计） | 成本上限写进代码 |
+| 每小时调用上限 | **30 次/小时** | 防重试风暴 |
+| 失败冷却 | **600 s** | |
+| 限流冷却 | **1800 s** | |
+| 熔断 | 连续 **3** 次失败 | |
+| 陈旧触发 | `STALE_TRIGGER_DAYS = 30` | 数据比这更旧才允许联网 |
+| 状态落盘 | 按环境隔离（`data/dev/llm_audit/network_fallback.json`） | 冷却跨重启有效 |
+
+**触发面与不触发面是两张表，且必须互斥并覆盖全集**：
+`FALLBACK_TRIGGER_CODES ∪ _NO_FALLBACK_REASONS == DiagCode 全集`，交集为空
+（由 `test_trigger_codes_cover_every_diag_code_without_silent_gaps` 断言）。
+
+> ★ **不写死码数**。第一版这条测试写的是 `assert len(real) == 12`，
+> 与本文件自己的 docstring（"并集 == 全集"）**自相矛盾**：补上 5 个环境码后，
+> 并集判据立刻报"有码未归类"（**这是对的**），而魔数那行只会说"不再是 12 个"，
+> 把真信息盖掉。**判据要表达意图，不要表达某个时刻的数量。**
+
+### 19.7 L6 反馈治理
+
+- 空结果诊断 → 补采队列（仅 `ENQUEUEABLE_CODES`）。
+- **假缺口清理**：`scripts/clean_gap_queue.py` 把"其实不是缺口"的条目标 `skipped`。
+- 判据：`tests/unit/test_gap_queue_false_positive.py`。
+
+### 19.8 三跳（+兜底）取数：`supervisor._query_data`
+
+```
+① 本次已采集的 validated_points（内存，最便宜）
+② LocalDataExecutor（本地库 + 17 码诊断）
+③ _query_data_via_connectors（A01 的 ConnectorRouter）
+④ 联网兜底（仅在诊断码属于 FALLBACK_TRIGGER_CODES 且护栏放行时）
+```
+
+`_AGENT_DATA_WHITELIST` 同步补齐 **en_id / 族前缀**（`us_*` / `fed:` / `cal:` /
+`ind:` / `mkt:` / `idx_val:` / 行情仓列族等）—— 实测 A08 由 **4 种**指标提升到
+**87~99 个数据点**。判据在 `tests/unit/test_whitelist_coverage.py`（**三向**：
+登记 ↔ 白名单 ↔ Agent 域）。
+
+### 19.9 ★ A12 合规：「没量到」不许伪装成「没风险」（`CHG-0073`）
+
+**症状**：A12 对任何个股都输出 `compliance_level = "无"`、旗标
+`["未见明显合规风险信号"]`、`confidence = "high"`，且因 `level == "无"` 会走
+纯规则路径**跳过 LLM**（省 18,500 tokens/轮）—— **整条链路没有任何环节报错**。
+
+**根因**：`compliance/logic.py::evaluate_compliance` 的最后三行把两种**语义相反**
+的处境收进同一个 `else`：
+
+| 处境 | 事实 | 旧输出 |
+|---|---|---|
+| 6 个族都量到了、值都没超阈值 | 真的没发现风险 | 「无」+「未见明显合规风险信号」 |
+| **6 个族一条都没量到** | **什么都不知道** | **同上，一字不差** |
+
+**实测证据**（`scripts/_probe_compliance_families.py`，走 `build_runtime()` 里
+A01 真实持有的 `ConnectorRouter`；⚠️ 该探针第一版按 `supports()`/同步 `fetch()`
+写，10 条全报"没有该属性"—— **`ConnectorRouter` 没有 `supports()`，`fetch()` 是
+async**，那 10 条"取不到"是**探针自己错了**）：
+
+```
+修前：6 个族全部 "★ 无连接器支持"
+      资产负债率:600036  命中 ['AkshareConnector'] 26 点 最新 2026-06-30 = 90.183
+      ROE:600036        命中 ['AkshareConnector'] 25 点 最新 2026-06-30 = 5.68
+```
+
+即：**6 个族零生产者**，线上一直走的是第二行 —— 一张**伪造的体检合格证**。
+
+**修法（分四层，缺一层就白修）**：
+
+1. **规则层**：`_RULE_FAMILIES` 显式列出 6 个族，**逐族**记录有没有拿到值
+   （`None` = 没量到；`0.0` = 量到了、读数是 0）；无输入 → 等级
+   `LEVEL_UNMEASURED`（**「未量到」**），占位旗标 `FLAG_UNMEASURED`
+   （明写"此结果不等于「无风险」"）。
+2. **Agent 层**：`_build_rule_only_result()` 两条分支文案**完全不同**，
+   各带一个机器可读的 `_rule_only_reason`（`measured_clean` / `no_input`）
+   —— 没有它，"走了纯规则"与"压根没跑"在审计里长得一模一样。
+   `_requirements()` 补禁令：规则未量到时**不得**输出「未见合规风险」，
+   `compliance_level` 枚举加 `未量到`。
+3. **采集层**：新建 `ComplianceFinConnector`（`商誉占净资产比` /
+   `货币资金占总资产比` / `有息负债占总资产比` / `大股东质押比例` /
+   `对外担保占净资产比`），并注册进 `src/api/runtime.py` 路由表。
+   **`关联交易占营收比` 刻意不支持**：免费源只有公告标题/日期/网址、没有金额字段，
+   且**不许退化成计数口径**（规则按子串取值，`关联交易公告数:{code}` 会被当成
+   百分数去比 `> 30`）。
+4. **★ 白名单层（最容易漏的一层）**：`_AGENT_DATA_WHITELIST["A12_compliance"]`
+   原先只有 `担保`/`质押`/`关联交易` 三个词能**巧合**匹配到新指标名，
+   `商誉`/`货币资金`/`有息负债` **全部被挡** → 商誉档与存贷双高
+   （需两个输入同时到手）**恒不触发**。
+   **这与"数据在库里 Agent 看不见"完全同类，只是换了一层。**
+
+**验收（端到端，两层都打到）**：
+
+```
+scripts/_probe_compliance_acceptance.py        # 路由层
+  600036  商誉占净资产比       1 点 2026-06-30=0.7401
+  600036  有息负债占总资产比   1 点 2026-06-30=0.9868
+  600036  大股东质押比例       1 点 2026-09-24=0.35
+  → evaluate_compliance: 等级「无」、compliance_measured=True、
+    已量到族 ['商誉','有息负债','质押']
+
+scripts/_probe_a12_whitelist_acceptance.py     # 白名单层
+  路由层合计 3 点 → **白名单过滤后仍是 3 点**
+  A12 实际拿到：商誉占净资产比:600036 / 大股东质押比例:600036 / 有息负债占总资产比:600036
+```
+
+**现在这个「无」是挣来的**（3 个族真量到了、都没超阈值），而不是以前那种
+"6 个族一条没量到还报无风险"。仍然缺的 3 族各有**不同原因**，必须分开看：
+`关联交易`（免费源无比率口径）、`担保`（窗口内无公告 = 真结论）、
+`货币资金`（**银行模板无此科目 → 口径不适用**，不是缺陷）。
+
+**护栏**：`tests/unit/test_compliance_input_provenance.py`（23 条）。关键几条：
+`test_no_input_is_unmeasured_not_none`（用户报障那一行的机器复现）、
+`test_zero_is_a_measurement_not_a_gap`（6 个族逐个参数化）、
+`test_measured_low_value_still_reports_none`（**反向**：别把假绿换成假红）、
+`test_rule_families_cover_every_consumed_keyword`（与
+`test_contract_consistency.py` 的 **AST 派生**清单对齐 —— 单一事实源）。
+
+### 19.10 ★ 横截面指标：把「这个数是谁的」补回去（`CHG-0074`）
+
+`ind:sw_third_pe_ttm:all` / `ind:sw_third_dividend_yield:all` 是**横截面**：
+实测 **335 条**，`period_date` **全部等于 2026-09-29**，每条属于一个不同的申万三级行业。
+而 `_build_context()` 的渲染是 `- {指标} {期}={值} c{置信} {来源}`，**不带 `extra`**：
+
+```
+旧：- ✅ind:sw_third_pe_ttm:all 2026-09-29=80.53 c0.95 AKShare申万行业估值
+    - ✅ind:sw_third_pe_ttm:all 2026-09-29=25.34 c0.95 AKShare申万行业估值   ← 谁的？
+```
+
+模型收到 60 行无主数字，只能随手挑一个当"该行业 PE"。第二个更隐蔽的问题：
+`context_max_periods = 60` 把它当"最近 60 **期**"截断，而这里**没有"期"** ——
+同一日期上 335 个成员被**任意**留下 60 个，SQL 返回顺序不稳定 ⇒
+**同一个问题两次答案不一样，且无法复现**。
+
+**修法**（只加信息，不减信息）：判据是**行为判据**，不猜字段名 ——
+① 同一 `period_date` ≥ 3 条；② 这些条目的 `extra` 里存在一个键，其取值 ≥ 2 个
+不同非空值（**能被区分**才算横截面）。然后：
+
+- 排序改成**完全确定**的 `(期 desc, 值 desc, 维度标签)`；
+- 每行前缀 `[银行业]`；头部明写 `同日 335 个成员（按 industry_name 区分），
+  按值降序展示 60 条（**已截断**）`（全量时写「（全量）」）。
+
+**为什么下限是 3 而不是 2**：`fed:policy_range` 的事故正是**同一天 2~3 条**
+（上限/下限/有效利率）而**没有任何字段能区分** —— 那不是横截面，是
+"一个 indicator 多值语义"的缺陷，正确修法是**拆成单值序列**（已拆为
+`fed:target_upper` / `fed:target_lower` / `fed:effr`）。拿"同一天多条"当横截面判据，
+会把那个缺陷**掩盖**掉。护栏里专门有一条
+`test_multi_value_without_distinguishing_field_is_still_a_defect` 盯住这个反面。
+
+**顺带修掉**：`value is None` 原先渲染成字面量 `None`（`dict.get(k, 默认)` 只在
+**键不存在**时给默认值），模型会读成 0 或忽略 —— 现在渲染成 `缺失`。
+
+**护栏**：`tests/unit/test_cross_section_context.py`（10 条），含
+`test_output_is_reproducible_under_input_shuffle`（打乱输入 → 输出逐字节相同）、
+`test_truncation_is_explicit_not_silent`、`test_numeric_strings_are_compared_as_numbers`
+（`"9.5"` vs `"10.2"` 必须按数值比，字典序会静默给错子集）。
+
+### 19.11 指标登记面：**把手写豁免表换成派生断言**
+
+本轮 `configs/indicators.yaml` 78 → **97** 条，`INDICATOR_CATALOG` 70 → **81** 条。
+补登记的对象与"为什么它们此前没登记"分三类：
+
+| 类别 | 对象 | 为什么此前是缺口 |
+|---|---|---|
+| 行情仓列族 | `股息率TTM:` / `总市值:` / `流通市值:` / `换手率:` / `量比:` / `市销率:` | 连接器早就实现（`_QUANT_COLUMN_INDICATORS`），登记表没有；**旧注释还错说该表停在 2023-11-10** |
+| 截面入口 | `idx_val:pe_ttm:{指数名}` / `idx_val:pb:{指数名}` / 申万二级 PE / 三级股息率 / 4 条渗透率赛道 | 连接器 `capabilities` 明确声明、`supports()` 认，登记表只登记了同族的一部分 |
+| 宏观 | `M2` / `社融`（只缺目录）/ `PMI` / `PMI:制造业` / `PMI:非制造业` / `GDP` / `GDP:同比` | `PMI`/`GDP` 采集侧原本**无人实现**（19 个连接器 `supports()` 全 False）；`MacroExtraConnector` 落地后由"真缺口"变成"遗漏登记" |
+
+> ★★ **本轮唯一的防复发改动**：把"白名单声称了、连接器也取得到、就是没人登记"
+> 这张**手写豁免表**退役，换成**派生断言**
+> `test_whitelist_keywords_a_connector_accepts_are_registered`
+> —— 遍历 `_AGENT_DATA_WHITELIST` 的每个关键词，被 `supports()` 认的就必须能在
+> `indicators.yaml` 里匹配到条目。**零清单、零豁免**（断言里明写"不要给它加豁免"）。
+> 理由：手写表**不会自己长大** —— 下一个 `PMI`/`GDP` 式缺口它一个字都不会说。
+
+**过期检查逼出的删除（全部由测试自己点名）**：
+`_UNREGISTERED_CONNECTOR_PREFIXES` 删 8 条、`_CATALOG_NOT_REGISTERED` 整表退役、
+`_KNOWN_UNPRODUCED_RULE_FAMILIES` 6 条删 5 条、`_ALLOWED_PHANTOM_PREFIXES` 删 5 条
+（含 `A11_fin_risk:商誉` / `:有息负债` / `A12_compliance:担保` / `:质押` /
+`A08_macro:GDP同比`）。
+
+> ★ **`A08_macro:GDP同比` 那条值得单说**：白名单写 `"GDP同比"`（无冒号），
+> 登记的 id 是 `GDP:同比`（有冒号）→ 子串匹配不到 ⇒ **一条都放不过去**。
+> 修法是**改白名单**，不是留着豁免 —— 留着等于把"我放行了 GDP 同比"这句假话
+> 登记成合法状态。**同一指标两种写法 = 幻影关键词，肉眼看不出来**，
+> 只有"关键词必须能在 `indicators.yaml` 里匹配到"这条判据能抓。
+
+### 19.12 验收：用户那条问题的数据可得性实测
+
+问题原话：
+
+> 「当前宏观环境如何，预测下一年美国的加息节奏，对A股的影响，以及 AI 应用加速
+> 失业率增加对消费的影响节奏时间节点分析，未来半年能否持有高股息的招商银行？」
+> 要求：「要确保数据都能找到，不存在数据缺少问题。」
+
+**口径**：`scripts/_probe_acceptance_data.py` 逐条走 `build_runtime()` 的
+真实 `ConnectorRouter`（判据用 `_matched()`，**不是**反射/目录猜测）。
+
+**结果：26 条需求里 25 条取到、0 条空结果、1 条取数失败。**
+
+| 子问题 | 代表指标 | 最新值（实测） |
+|---|---|---|
+| ① 宏观-中国 | `CPI` / `PPI` / `M2` / `社融` / `ind:社会消费品零售总额同比` | 2026-09=0.8 / 2026-09=3.8 / 2026-08=7.5 / **2026-04**=6245.0 / 2026-08=0.4 |
+| ② 美国加息 | `fed:effr` / `fed:target_upper` / `fed:target_lower` / `us_cpi_yoy` | 2026-09-24=3.88 / 2026-09-28=4.0 / 2026-09-28=3.75 / 2026-08=3.4 |
+| ③ A股影响 | `mkt:turnover:total` / `mkt:margin_balance` / `idx_val:snapshot:all` | 2026-09-29=17027.99 / 2026-09-24=26289.42 / 5 行 |
+| ④ AI→消费传导 | `ind:penetration:AI大模型应用` / `人形机器人` | 2026-09-29=8.5 / 0.3 |
+| ⑤ 高股息招行 | **`股息率TTM:600036`** | **2026-09-28 = 4.9606%（4,915 点）** |
+| ⑤ | `PE(TTM):600036` / `PB:600036` / `ROE:600036` / `资产负债率:600036` | 6.76 / 0.9 / 5.68 / 90.183 |
+
+**唯一失败**：`股息率:600036` → `ConnectionError: RemoteDisconnected`
+（AkShare `stock_history_dividend_detail` 间歇性断连；同源的 `股息率TTM` 走行情仓，**成功**）。
+
+### 19.13 已知缺口（不省略）
+
+1. **美国宏观 5 条序列停在 2025-07/08（约 13 个月）**：`us_core_cpi`（2025-08-12）、
+   `us_nonfarm`（2025-08-01）、`us_unemployment`（2025-08-01）、
+   `us_pce`（2025-08-29）、`us_fed_rate`（2025-07-31）。而 `us_cpi_yoy` 是新的
+   （2026-08）。→ **"预测下一年美国加息节奏"这一问的输入里有一半是旧数据**，
+   必须靠新鲜度标注（`_STALE_DAYS = 45`）让 Agent 说出来，不能当作当期事实。
+2. **`社融` 最新只到 2026-04**（`macro_china_shrzgm`），比 CPI/PPI 落后 5 个月。
+3. **`大股东质押比例` 的阈值未标定**：连接器给的是源里的**全股东口径**
+   （质押股数 ÷ 总股本），而 `compliance/logic.py` 的 50%/80% 两档是按
+   **大股东持股口径**写的 ⇒ 该规则当前**偏保守、几乎不触发**。
+   不替用户拍一个新阈值（没有数据支撑的阈值就是假精度）——
+   **登记为已知缺口**：要么补大股东口径数据源，要么按数据重新标定。
+4. **`对外担保占净资产比` 在 600036/600519/000001 上都是 0 点**：
+   按连接器语义这是"窗口内没有担保公告"的**真结论**（取数失败一律抛错、不吞成空），
+   但**未用"已知有担保公告的标的"反证过**该接口真的能取到非空结果 ——
+   这一条仍是**待证**（不是"已证为空"）。
+5. **`关联交易占营收比` 无生产者**：免费源没有比率口径，且不许退化成计数口径。
+   该族在 A12 里会一直是「未量到」。
+6. **13 条"连接器声明且 `supports()` 认、登记表没有"仍未登记**
+   （`ind:sw_first_pb:all`、`ind:sw_second_pb:all`、2 条渗透率赛道、
+   `mkt:turnover:sh|sz|cyb|kcb`、`mkt:turnover_rate:hist`、
+   `mkt:north_flow:hist`、`mkt:margin_net_buy`）。已写进 `indicators.yaml`
+   的「已知缺口」节；**求差时必须先过滤 `supports()` 为假的条目**
+   （`StarChinextConnector` 的 `turnover:all` 是**相对键**，算进来全是假告警）。
+7. `index_close:` / `etf_close:` **不登记是有意的**，不是缺口：
+   `passers == []`（没有分析层白名单放行它们），登记即"僵尸登记"。
+   它们的消费者在**分析层之外**（`src.intraday.sources.close_indicator()`、
+   `src.api.routes.backtest._ASSET_QUOTE_PREFIX`、
+   `src.core.data_freshness._FREQ_BY_PREFIX`），由
+   `_OUT_OF_ANALYSIS_LAYER_PREFIXES` + 一条**行为判据**过期断言守住。
+   ⚠️ 更正痕迹：本节初稿曾举 `src/mainline/sources.py::index_closes()` 为消费者 ——
+   **错的**，它直接读 `quant_index_daily` **表**，从不构造 `index_close:` 这个 id。
+8. `scripts/affected_tests.py` 本轮修掉两处**静默少选/崩溃**
+   （GBK 解码崩溃；`__init__.py` 被算成 `X.__init__` 导致传递闭包断链 ——
+   改 `compliance/logic.py` 时选中数由 **2** 纠正为 **26** 个测试文件）。
+   它按 `git diff` 取改动面，**并发协作者的未提交改动会一起进来**（实测 211 条）——
+   已改成超过 40 条就显式打印"挑选结果已不是本次改动的精确答案"。
+
+### 19.14 真值来源与验收命令
+
+| 对象 | 单一真值源 |
+|---|---|
+| 反向索引与存储选择 | `catalog/column_index.py::get_column_index` / `best_for_column` |
+| 指标/实体别名 | `catalog/synonym_dict.py::resolve_metric` / `resolve_entity` |
+| 诊断码与下一步 | `catalog/local_data.py::DiagCode` / `DIAG_NEXT_STEP` |
+| 联网兜底三护栏 | `catalog/network_fallback.py`（触发/不触发两张表） |
+| 合规规则与等级 | `analysis/compliance/logic.py::evaluate_compliance`（权威值，LLM 不得修改） |
+| 规则族清单 | `analysis/compliance/logic.py::_RULE_FAMILIES` |
+| 分析层可见性 | `orchestration/supervisor.py::_AGENT_DATA_WHITELIST`（**单一事实源**） |
+| 指标登记 | `configs/indicators.yaml` |
+| planner 可选目录 | `orchestration/planner.py::INDICATOR_CATALOG` |
+
+```bash
+# ① 本地数据流水线四件套（索引 / 执行器 / 别名 / 兜底）
+uv run python -m pytest tests/unit/test_column_index.py tests/unit/test_local_data_executor.py \
+    tests/unit/test_synonym_dict.py tests/unit/test_network_fallback.py -q
+# ② 契约四面一致性 + 白名单三向（高扇出，改指标/白名单必跑）
+uv run python -m pytest tests/unit/test_contract_consistency.py \
+    tests/unit/test_whitelist_coverage.py tests/unit/test_indicator_prefix_wiring.py -q
+# ③ 合规「未量到」与 A12 端到端
+uv run python -m pytest tests/unit/test_compliance_agent.py \
+    tests/unit/test_compliance_input_provenance.py -q
+# ④ 横截面维度还原与可复现截断
+uv run python -m pytest tests/unit/test_cross_section_context.py -q
+# ⑤ 真值探针（**都需要网络**，判据是"取到没取到"，不是"看着像不像"）
+uv run python scripts/_probe_acceptance_data.py          # 用户验收问题的 26 条数据
+uv run python scripts/_probe_compliance_families.py      # 6 个合规族在真实路由上的状态
+uv run python scripts/_probe_a12_whitelist_acceptance.py # A12 白名单那一跳
+```
+
+> ⑤ 的三个探针是**本机脚本**（`scripts/` 默认不入库的政策，见 §13 与
+> `tests/unit/test_shipped_deps.py`）；它们的输出已留档进本节与本节引用的
+> 证据目录 `docs/_evidence_20260928_model_routing/`。
 
 
 ---
