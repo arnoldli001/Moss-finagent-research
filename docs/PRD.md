@@ -880,6 +880,115 @@ uv run python scripts/prd_sync_check.py --ledger
 4. **回滚清单落盘**（`data/backups/pilot_backfill_ids_*.txt`，含全部 `data_id`），
    回滚 = 按清单 `DELETE`，或从 `VACUUM INTO` 快照恢复。
 
+### 16.7 L1 交付：单一事实源与三份清单归一（`CHG-0067`）
+
+#### 16.7.1 新增的单一事实源
+
+| 对象 | 位置 | 说明 |
+|---|---|---|
+| 存储清单 | `configs/data_stores.yaml` | 20 条登记（5 sqlite + 15 dir）。字段：`kind` / `isolation(shared\|per_env)` / `writer(main\|own\|none)` / `writable` / **`protected`** / `role` / `time_column` / `note` |
+| 解析器 | `src/infrastructure/catalog/data_stores.py` | `resolve_store()` / `store_path()` / `open_readonly()` / `writable_here()` / `unregistered_databases()` / `describe()` |
+
+**三条硬约束**（都写进代码注释与护栏）：
+
+1. **不许再按名字或体积跳过存储。** 行情仓被 `SKIP_DB_PATTERNS`（名字）
+   与 `max_db_bytes=8GiB`（体积）**双重跳过**，这是"看不见权威库"的直接元凶。
+   要不要扫由登记的 `kind` 决定。
+2. **`protected: true` 不得被任何清理口径覆盖**（`warehouse` 与 `legacy_main`）。
+3. **写者归属是声明式的、可见的**，且 `writable_here()` 返回**决定 + 人话理由**；
+   对 A7 未裁定的共享库，它如实标 `decided=false`（**只报告不阻断** ——
+   把事实印出来比假装已经管住更安全）。
+
+#### 16.7.2 三份清单改为读它（实测效果）
+
+| 清单 | 改前 | 改后 |
+|---|---|---|
+| `assets.DataAssetCatalog` | 只扫 `settings.sqlite_path` **一个库** + 手写 4 个目录 | **149 条资产 / 133 张表 / 5 个库 + 16 个目录**；11 个 sqlite 存储逐个扫、目录角色取自 registry |
+| `column_index.ColumnIndex` | 递归 `data/**.db`，**按名字 + 体积双重跳过行情仓** | 扫描范围由 registry 决定；`find_column("dv_ratio")` 命中 **`warehouse.db / quant_daily_basic`（row≈15,426,153、authority=99）** |
+| `TABLE_FREQUENCY` / `DIR_FREQUENCY` | **手写**路径清单 | 目录的"在哪里"由 registry 定、"多久更新一次"由 `DIR_FREQUENCY` 定 —— **职责分开，不再各存一份路径清单** |
+
+> **判据措辞的教训**：`assets.py` 原 docstring 写「扫描**主库**的全部表」——
+> 而"主库"实际是**一个文件**。这句话让"一个库"看起来像"全部本地数据"，
+> 于是"本地到底有哪些数据"的答案永远是 dev/pilot 那一份应用库。
+
+#### 16.7.3 顺带修掉的一个**测试隔离泄漏**（既有缺陷，本轮现形）
+
+`local_data.LocalDataExecutor._refresh_index()` 原先**无条件**把索引换成全局单例
+`get_column_index(rebuild=True)` —— 而全局单例扫的是**真实仓库**。
+调用方给了 `project_root=<tmp>` 的假库树时，一次"自愈"就把**作用域悄悄扩大**，
+于是**单测读到真实行情仓**，用例的通过与否取决于本机数据。
+
+反证：`test_local_data_executor.py` 的两个用例（"列在但实体无值应判
+`NOT_APPLICABLE`"、"诊断要带候选列"）在本轮之前是**靠巧合通过**的 ——
+全局单例当时也看不见行情仓，所以两边都查不到；行情仓一进扫描范围，它们立刻变红。
+
+**修法**：给了显式索引就**就地重建它自己**，绝不换成全局单例。
+**判据同步改写**：原断言 `calls == [True]`（要求调用全局单例）**把泄漏当成了契约**，
+现改为"就地重建发生过 **且** 不得调用全局单例"（`calls == []`）——
+这条反向断言正是防止泄漏回潮的那一半。
+
+#### 16.7.4 验收判据现状（写成次数 / 布尔）
+
+| 判据 | 目标 | 现状 |
+|---|---|---|
+| ① `src/` 内存储路径字面量（AST 口径、非 docstring） | 77 → **0** | **67（棘轮锁定，只许减）** ⏳ |
+| ② registry 覆盖 == `data/**/*.db` 实扫库数 | 相等 | **✅ 未登记库 = 0**（并借此抓到并清掉一个游离空库 `data/warehouse.db`） |
+| ③ pilot **与** dev 上 `_quant_column_points(600036, turnover_rate)` 最新日期 | == 最新交易日 | **✅ 两个环境都 664 点 / 2026-09-28 / staleness_days=0** |
+| ④ `src/` 内行数常量 | 6 → **0** | **✅ 0** |
+
+护栏 `tests/unit/test_store_registry.py`（8 条，含棘轮的**过期检查**）：
+① 库清单覆盖实扫结果 · ② 受保护存储已声明且完好 · ③ 行数常量 = 0 ·
+④ 路径字面量棘轮（**精确相等**，每次变化都要显式确认）+ ⑤ 棘轮降到 0 后必须删掉自身。
+
+```bash
+uv run python -m pytest tests/unit/test_store_registry.py \
+    tests/unit/test_column_index.py tests/unit/test_local_data_executor.py \
+    tests/unit/test_data_index_audit.py -q     # 65 passed
+```
+
+#### 16.7.5 L2 交付：跨库只读查询面（`CHG-0068`）
+
+读统一、写归属的**读那一半**落到取数执行器上：
+
+| 入口 | 作用 |
+|---|---|
+| `LocalDataExecutor.query_across(stores, sql, params)` | **一份只读连接**跨多个存储查询，库名直接写进 SQL（`warehouse.quant_daily_basic` / `main.map_quant_sector_stock`）；`mode=ro` + `PRAGMA query_only=1` |
+| `LocalDataExecutor.available_stores()` | 存储清单 + **写权限报告**（与 registry 同源，不再长第二份清单） |
+
+**为什么写路径不从这里走**：SQLite **没有跨库事务** —— 一次写两个库只能半提交；
+而数据溯源规范要求每个数据点可归属到来源与操作者。所以写必须恰好落到一个库
+（判据在 `data_stores.writable_here`）。
+
+护栏 `tests/unit/test_store_registry.py::test_cross_store_readonly_query_works_and_rejects_writes`
+**两个方向都钉**：只钉"能查"会漏掉写保护，只钉"写不进"会在查询坏掉时照样绿。
+
+### 16.8 台账形状判据：字段数不符必须 ERROR（`CHG-0068`）
+
+> 这一节记的是**工具链的完整性**，不是业务口径。放在这里是因为它与
+> §16.6 / §16.7 同源：**都是"判据认不出坏掉的形状，而人以为已经查过了"**。
+
+**现场**：同一天里 `docs/REQUIREMENT_CHANGELOG.md` 被改坏三次 ——
+把 `CHG-0061` 的行首整个替换掉、毁掉 `CHG-0065` 的结尾、
+把 `CHG-0067` 与 `CHG-0066` 粘成一行（字段数 9 → 14）——
+而 `prd_sync_check.py --ledger` **每次都报"通过"**。
+
+**根因**：`_table_rows()` 对**短行静默补空单元格**
+（`cells += [""] * (len(header) - len(cells))`），
+而**长行**被 `dict(zip(header, cells, strict=False))` **静默截断**。
+两种都不报错 —— 于是**所有下游判据都建立在被静默改过的行上**。
+
+**判据**：`_table_shape_issues()` —— 任何表格行的字段数必须与表头**严格相等**；
+只认**未转义**的 `|`（markdown 里 `\|` 是单元格内的字面竖线）；
+并且在 `validate_ledger()` **解析之前**先跑（顺序不能反）。
+
+**自证**：`--self-test` 补第六条 —— 喂一个"两行粘成一行"的已知坏输入，
+必须报出"字段数"。没有这条自证，新判据本身也可能是假绿。
+
+```bash
+uv run python scripts/prd_sync_check.py --self-test   # 六类坏输入
+uv run python scripts/prd_sync_check.py --ledger      # 交付前必须 0 ERROR
+```
+
 ---
 
 ## 十七、本地模型兜底：能力档位与思维链口径（现行口径 · 2026-09-28 定型）
@@ -960,38 +1069,46 @@ uv run python scripts/prd_sync_check.py --ledger
 
 ### 17.4 已知缺口（不省略）
 
-1. **★ 换 4B 的真实代价：摘要更短 → 更容易被摘要闸门拦掉（2026-09-28 端到端实测）**
+1. **★ 摘要为空与模型无关：真因是语义缓存串答案（2026-09-28 实测，已定位到层）**
 
-   端到端跑 `tone_job.run_once`（5 条 >100 字正文、`local_only=True`、清空 LLM 缓存
-   与结果文件）得到：`calls=5`、`extracted=5`、`written=5`，模型**每次都吐了合法 JSON**
-   （`out≈158~255 tok`，3~9 秒/条），字段也抽对了（`codes` / `brokers` / `tone` 全部到位）。
-   但落库后 **5 条里只有 1 条有 `summary`**，另外 4 条 `summary` 为空。
+   > **本条第 1 版把这件事归因成"4B 惜字撞 `no_number`"—— 那个归因是错的，已作废。**
+   > 留这段更正痕迹，是因为**归因错一次就会改错一个地方**：当时差点去动摘要 prompt。
 
-   **根因不在模型、也不在缓存**（两者都已单独排除）：
+   **现象**：端到端跑 `tone_job.run_once`（5 条 >100 字正文、`local_only=True`），
+   `calls=5 / written=5`，模型每次吐合法 JSON，但落库后只有 1 条有 `summary`。
 
-   | 排除项 | 判据 |
-   |---|---|
-   | 不是模型没吐 | 直接打网关：`cache_hit=False`，正文 383 字符，含完整 `summary` |
-   | 不是 LLM 缓存 | 同一 prompt 用 `use_cache=False` 与 `True` 各跑一次，两次都有正文 |
-   | 审计 | 5 次调用 `out=158~255`、`err=None` |
+   **逐层二分（每一步都是可复跑判据）**：
 
-   真正的闸门在落库前：`src/domain/intel/summarize.py::validate_summary`，其中两条判据：
-
-   | 摘要样例 | 长度 | 判定 |
+   | 层 | 判据 | 结果 |
    |---|---|---|
-   | 含"净利润同比增长38%"那类数字的摘要 | — | ✅ 通过 |
-   | `宁德时代遭问询函及大股东拟减持，分析师看好长期竞争力。` | 27 | ❌ **`no_number`**（原文有数字而摘要一个都没有 → 判"把关键信息压没了"） |
-   | `宁德时代遭问询函及大股东拟减持，分析师维持增持评级。` | 26 | ❌ **`banned`**（含"增持"=评级词，合规红线） |
+   | 模型本身 | 直连 Ollama `/api/chat`，两条不同正文 | ✅ 输出各不相同 |
+   | 网关关缓存 | `gw.complete(..., use_cache=False)` | ✅ 输出各不相同 |
+   | 网关开缓存 | 同一对正文再跑一次 | ❌ **`cache_hit=True kind=semantic`：第 2 条起拿到第 1 条的答案** |
+   | `_ask_segment` 层 | 置 `gw._cache = None` 后同跑 5 条 | ✅ **5/5 摘要可落库，各条针对自己的正文** |
 
-   4B 的摘要风格**更短、更概括**（8B 更贴原文照抄，天然带数字与原文片段），
-   所以撞这两条的频率更高。**表现形态**：条目有方向、有代码，却读不到摘要 ——
-   看起来像"模型什么都没干"。
+   **根因（数字可复算）**：语义相似度是拿**整个 prompt** 算的，而抽取 prompt 的
+   固定骨架（JSON schema + 指令 ≈ 700 字）占绝大部分：
 
-   **未修（诚实登记）**：放宽判据会削弱防编造与合规红线，属于必须单独裁定的口径变更
-   （`banned` 那条是合规红线，**不该为模型风格让路**）。候选方向（都需 A/B 与落账）：
-   ① 摘要 prompt 显式要求"保留原文关键数字"；② 首段失败时**逐段重试**而不是直接留空；
-   ③ 保留 4B 的 `tone`/`codes` 的同时用原文首句兜底摘要。
-   **在那之前，"有方向无摘要"是本条链路的已知形态。**
+   | 两条不同资讯 | 整 prompt 相似度 | 仅正文相似度 | 阈值 0.85 |
+   |---|---|---|---|
+   | 光模块 vs 减持 | **0.9328** | 0.0393 | ★ 命中 |
+   | 光模块 vs 降准 | **0.9348** | 0.0535 | ★ 命中 |
+   | 减持 vs 降准 | **0.9371** | 0.0280 | ★ 命中 |
+
+   **即任意两条不同资讯的 prompt 都 ≈0.93 相似 → 必然复用第一条的答案。**
+
+   **影响面（与模型无关 ⇒ 8B 时代同样存在，是长期潜伏、不是本轮引入）**：
+   `tone_job._ask_segment` 走默认缓存路径（未传 `use_cache=False`）。同一模型、
+   同一批文本：关缓存三条各不相同，开缓存**三条全同**。
+
+   **未修（诚实登记）**：这是**缓存键口径**缺陷，修法要单独裁定 + A/B：
+   ① 语义复用只在**正文**相近时发生（骨架不进相似度）；
+   ② 命中必须同时满足"整 prompt 相似"与"正文相似"；
+   ③ 抽取类调用显式 `use_cache=False`。
+   三条各有代价（②③ 降低命中率，① 要改缓存接口），**不在本轮范围**。
+
+   **本轮的有效结论**：绕开缓存后 4B 的摘要 **5/5 全部可落库**、每条针对自己的正文、
+   中位 **27 字**（8B 对照 20 字）—— **"4B 惜字导致摘要丢失"不成立**。
 
 2. **`bear_stocks` 两个模型都填不出来**（0%）：它们把标的放进 `bull_stocks`
    （与 `tone` 一致）。这是 **prompt 措辞歧义**（"利空股票" vs "这条消息看空的股票"），
