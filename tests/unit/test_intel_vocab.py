@@ -376,30 +376,32 @@ def test_long_text_still_calls_model(
 
 
 def test_extraction_tier_resolves_to_the_8b_local_model() -> None:
-    """★★ 真配置下把这条链路**实际会用的模型**钉死：`medium` → 本地 8B。
+    """★★ 真配置下把这条链路**实际会用的模型**钉死：`medium` → 有本地 8B 兜底。
 
     这条用例直接读 `configs/models.yaml`（与运行期同一个文件）——
     "哪一层 = 哪个模型"是配置决定的，光断言常量名证明不了 8B 真的会被调用。
     只读配置、不建网关（不联网）。
+
+    ⚠️ 2026-09-28 两处修正：
+    ① 改为读**解析后的完整链**（`_load_model_config`）：原实现手工拼
+       `primary` + 单数 `fallback`，遇到三跳链（`fallbacks` 列表）会**漏掉
+       后续跳** → 误报"medium 层没有本地模型"。
+    ② "本地"判据改用 `provider == "ollama"`，**不用** `not in PAID_PROVIDERS`：
+       后者是"**不花钱**"语义，而 `zhipu`（glm，免费）不在 PAID_PROVIDERS 里
+       → 会被误判成本地模型。本例要的是**本机**（8B ollama），不是"免费"。
+       两个概念混用会让判据在最需要它的时候（新接免费云端）静默失效。
     """
-    import yaml
+    from src.infrastructure.llm.gateway import _load_model_config
 
-    from src.infrastructure.llm.gateway import PAID_PROVIDERS
-
-    raw = yaml.safe_load(
-        open("configs/models.yaml", encoding="utf-8").read()) or {}
     tier = tone_job.EXTRACT_TIER
-    chain = [raw["routing"][tier]["primary"]]
-    if raw["routing"][tier].get("fallback"):
-        chain.append(raw["routing"][tier]["fallback"])
-    specs = raw["models"]
-    local = [m for m in chain if specs[m]["provider"] not in PAID_PROVIDERS]
-    assert local, f"{tier} 层没有本地模型"
-    assert specs[local[0]]["provider"] == "ollama", specs[local[0]]
-    # 本地主模型必须是 8B 规模（`llm_policy.LOCAL_MODEL = "qwen3:8b"`），
+    specs, chains, _lo = _load_model_config("configs/models.yaml")
+    chain = chains[tier]
+    local = [m for m in chain if specs[m].provider == "ollama"]
+    assert local, f"{tier} 层没有**本机**模型兜底（链={chain}）"
+    # 本机模型必须是 8B 规模（`llm_policy.LOCAL_MODEL = "qwen3:8b"`），
     # 不能是 1.5B —— 1.5B 在本任务上的实测错误见模块 docstring
-    assert "8b" in specs[local[0]]["model_name"].lower(), specs[local[0]]
-    assert specs[local[0]]["model_name"] == "qwen3:8b-q4_K_M"
+    assert "8b" in specs[local[0]].model_name.lower(), specs[local[0]]
+    assert specs[local[0]].model_name == "qwen3:8b-q4_K_M"
 
 
 def test_rule_entities_only_on_short_text() -> None:

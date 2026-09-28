@@ -56,26 +56,188 @@
 # 0.0196 元就是这么来的）。钉在配置里，**新调用方默认就是安全的**；
 # 真要花云端的少数场景，显式传 `local_only=False`。
 routing:
-  light:              # 数据清洗、格式化等基础任务
-    primary: local_light
-    fallback: deepseek-flash
-    local_only: true
-  medium:             # 信息层处理（A05去伪/A06提取）：本地模型为主，云端兜底
-    primary: local_medium
-    fallback: deepseek-flash
-    local_only: true
+  planning:           # ★ Supervisor 规划层（2026-09-28 用户裁定）
+    # 用户原话：「规划层 优先glm-4.7-flash，其次备选deepseek-flash」
+    #
+    # 【为什么规划层可以和 medium 用不同的次序】
+    #   规划是**低频**（每次请求 1 次）+ **延迟敏感**（在关键路径最前端，
+    #   它不返回后面 19 个节点一个都动不了）+ **任务简单**（从目录挑子集）。
+    #   而 `medium` 还挂着**高频**的信息层（A05 去伪 / A06 提取）。
+    #
+    #   → 同样是 17% 429 的 glm：
+    #      放 `medium` 会按调用量放大成常态失败；
+    #      放规划层则暴露面小，且换来的收益是 **p50 1106ms（比 deepseek 快）
+    #      且免费**。失败那一跳由 deepseek 接住，用户几乎无感。
+    #
+    # 【2026-09-28 第十九轮修订】glm 出局 → 换 `qwen-dashscope-flash`
+    #   实测：glm 在此处 **429×2**，且 A11 上跑过 **74.2 秒**；
+    #         dashscope 轻任务 p50 **407ms**、并发 5 时 **0/30 限流**。
+    #   次序：① dashscope（免费+快）② deepseek（可靠兜底 —— 规划失败会让
+    #   整条链退化成规则式，代价是整轮分析质量）③ local_light（地板）
+    primary: qwen-dashscope-flash
+    fallbacks:
+      - deepseek-flash
+      - local_light
+  light:              # 数据清洗、格式化等基础任务（**最高频：82% 的调用量**）
+    # 【2026-09-28 第十九轮】次序：免费提速 → 本地地板 → 第二云端备源
+    #
+    # 为什么这么排（步骤 1 的实测数据支撑）：
+    #   · `light` 占全部调用量的 **82%**（1220/1485），日均 114,621 token
+    #   · 百炼免费额度是 **100 万 token / 90 天 / 一次性** → light 单独
+    #     就能在 **8.7 天**耗尽它 → **不能把它当常态主力**
+    #   · `local_light`（qwen2.5:1.5b）**不消耗任何配额**，是唯一可持续的地板
+    #
+    # 形态：前 ~9 天享受 **407ms vs 本地 1774ms（快 4×）** 的红利，
+    # 额度耗尽后**自动回落本地** —— 降级链本来就会前进，
+    # **不需要人工切换，行为也不突变**。
+    #
+    # ⚠️ 必须配「连续 N 次 429 → 锁回本地 T 分钟」的**落盘**护栏：
+    # 限流是 429，会让每次调用先白撞一次再落本地。
+    #
+    # ⚠️ 原 `local_only: true` 已移除：本层现在允许云端。
+    # 它原本防的是"本地一抖动就悄悄花钱"，而免费档不花钱 ——
+    # 风险从"悄悄花钱"变成"悄悄限流"，由上面那条 429 护栏接管。
+    # 【2026-09-28 第二十轮】首位改为 `siliconflow`（用户裁定 + 配额分散）
+    #
+    # 为什么从 dashscope 换成 siliconflow：
+    #   · **配额集中问题**：`light`(114,621/天) + `medium`(39,901) + `planning`(1,938)
+    #     三层共用百炼同一个 `qwen-flash` 池 → 合计 156,460/天
+    #     → **6.4 天耗尽**。把最大的消费者（light 占 73%）挪到另一个池后，
+    #     百炼只承载 medium+planning（41,839/天）→ **23.9 天**（3.7×）。
+    #   · **限制性质不同**：百炼是**总量额度**（一次性，用完即止）；
+    #     siliconflow 是**速率限制**（RPM/TPM，超了 429 但**随时间恢复、
+    #     可再生**）。高频层需要的是"能持续跑"，不是"有一大桶但会用完"。
+    #   · 实测过关：并发 5（30/30）、并发 10（40/40）**零限流**，
+    #     p50 578ms / max 990ms。
+    #
+    # 已知代价（诚实登记）：siliconflow 的输出更"惜字" ——
+    #   A08 86 字 vs dashscope 116 字；A11 **69 字** vs 135 字。
+    #   但 `light` 干的是**清洗/格式化**，是三个层里对信息量最不敏感的 →
+    #   质量差距在这里的代价最小。
+    #
+    # ⚠️ 若判断错了（它其实也有总量额度）→ 降级链会自动前进到 dashscope，
+    #    行为不突变。**但必须配落盘观测**，否则"静默限流→每次落 dashscope"
+    #    这个过程看不见（见下方 TODO）。
+    primary: qwen-siliconflow-7b
+    fallbacks:
+      - qwen-dashscope-flash
+      - local_light
+  medium:             # 信息层处理（A05去伪/A06提取）
+    # ★★★ 2026-09-28 第十二轮：primary 从 local_medium 改为 deepseek-flash
+    #
+    # 【为什么改】审计实证（`scripts/llm_latency_attribution.py`，21 次采样）：
+    #     A05_verifier   lat_p50 = 38.1s  有效速率 36 tok/s（本地 qwen3:8b）
+    #     A06_extractor  lat_p50 = 52.9s  有效速率 40 tok/s（本地 qwen3:8b）
+    #     ─────────────────────────────────────────────────────
+    #     两者看图上是并行（store → A05 ∥ A06），但 **Ollama 只有 1 个计算槽位**
+    #     → 实际串行 = 38.1 + 52.9 ≈ **91s**，比 A17 的 33.7s 还多 57s。
+    #
+    #   同环境对照：deepseek-flash 实测 **172 tok/s**（mainline 批处理 31,895 次采样）
+    #     → A05/A06 换云端约 **16s**（−75s，−82%）
+    #
+    # 【代价】按实测 token 量（A05 in1499/out1381，A06 in1453/out2122）：
+    #     单次分析增加 **¥0.017（1.7 分钱）**
+    #     —— 日预算 20 元，等于每天可跑约 1100 次分析才触顶
+    #
+    # 【与旧护栏的关系】原 `local_only: true` 是防"本地一抖动就悄悄花钱"的
+    #   结构护栏（见上方 2026-09-26 的说明）。这里**不是取消护栏**，而是
+    #   把它从"层"下移到"调用点语义"：
+    #     · primary 是付费模型 → 花钱是**显式配置的结果**，不是抖动导致的意外
+    #     · 仍保留 fallback=local_medium（云端挂了退本地，不会整链失败）
+    #     · 要完全退回"只用本地"：设 MOSS_MEDIUM_FORCE_LOCAL=1
+    #       （gateway 会把本层降级链裁回本地，行为与旧配置一致）
+    #
+    # 【回退】质量或成本不满意 → `MOSS_MEDIUM_FORCE_LOCAL=1` 一行回退，
+    #   无需改代码、无需改 yaml。
+    #
+    # ★★★ 2026-09-28 第十七轮：**改成三跳，glm 插在本地之前**
+    # 用户裁定原话：「跨厂商 不应该是两个云端模型吗  deepseek-flash、glm,
+    #   本地ollama最后备用」
+    #
+    # 【原配置的问题】`fallback: local_medium` 把**会挂死的本地**放在
+    #   第一备源位 —— deepseek 一抖动就掉到整条链里**最不可靠**的那一跳
+    #   （本地显存换入挂死实测 120294ms）。次序错了。
+    #
+    # 【新次序的含义】
+    #   ① deepseek-flash  可靠主模型
+    #   ② glm-4.7-flash   **另一个云端厂商**：deepseek 熔断/故障时接得住。
+    #                     免费，但实测 429 频繁 → **只做备源、不做主模型**
+    #                     （语义由 test_glm_concurrency_cap_in_config 钉住）
+    #   ③ local_medium    最后兜底：云端**全挂**时还能跑，比整链失败强
+    #
+    # 【2026-09-28 第十九轮】次序：免费 → 免费(另一厂商) → 付费 → 本地地板
+    #   步骤 1 实测：medium 日均 39,901 token，百炼额度可撑 25 天。
+    #   与 light 合计则是 5.1 天 —— 所以 medium 的第二跳用**独立额度池**的
+    #   siliconflow，避免与 light 抢同一份额度。
+    primary: qwen-dashscope-flash
+    fallbacks:
+      - qwen-siliconflow-7b
+      - deepseek-flash
+      # ★ 2026-09-28 第二十一轮：链尾放回 `local_medium`（8B），**不是** local_light。
+      #   原因：`src/domain/intel/tone_job.py`（EXTRACT_TIER=medium + local_only=True）
+      #   与 `src/domain/alerts/analyzer.py`（local_only=not allow_cloud()，默认 True）
+      #   这两个调用点**依赖 8B** —— 前者的 docstring 记录 1.5B 在该任务上
+      #   「5 条样本出 4 类错」；后者实测基于 qwen3:8b。
+      #   把它们裁到 1.5B 是**静默的能力降级**，由
+      #   `test_intel_vocab.py::test_extraction_tier_resolves_to_the_8b_local_model` 哨兵抓住。
+      # ⚠️ 8B 只做地板（云端全挂时才用），**不做主力** —— 不影响配额分散，
+      #   也避开了它做主力时的显存争抢（那才是挂死 120s 的成因）。
+      - local_medium
   reasoning:          # 宏观/中观/微观/财务风险等核心分析
+    # 【2026-09-28 第十九轮】**付费第一，保住常态质量**。
+    #   实测（A08/A11 各 3 模型，见 docs 与探针输出）：
+    #     deepseek-flash  输出 1303/905 tok · 结论 164/270 字
+    #     dashscope       输出  300/243 tok · 结论 116/135 字（约 70%）
+    #     siliconflow     输出  227/180 tok · 结论  86/ 69 字（约 35%）
+    #   **输出量差 4 倍** —— 这是报告骨架，不能用未验证的档赌。
+    #   后两跳是免费云端：它替代的原先那一跳是 `local_medium`（11.8~19.9s），
+    #   **快 4~8 倍 → 纯收益，不是妥协**。
+    #   形态：常态花 deepseek 的钱，抖动时花免费档的时间。
     primary: deepseek-flash
-    fallback: local_medium
+    fallbacks:
+      - qwen-dashscope-flash
+      - qwen-siliconflow-7b
+      # 链尾 8B（理由同 medium：8B 只做地板，恢复依赖它的调用点的能力）
+      - local_medium
   decision:           # 投研建议综合（A17）
-    # fallback 必须是**另一个 provider**：原来写的是 deepseek-flash，而
-    # deepseek-v4-pro 与 deepseek-flash 同属 provider=deepseek（同一端点、
-    # 同一份 key、同一个熔断器），于是 DeepSeek 一熔断主备一起被拒、
-    # 整条链必然失败 —— 等于没兜底，而本机 Ollama 明明是好的却没人用。
-    # 实测踩过：deepseek 熔断后投研分析直接报
-    # 「全部模型调用失败（链: deepseek-v4-pro→deepseek-flash）」。见 docs/LLM_ROUTING.md
-    primary: deepseek-v4-pro
-    fallback: local_medium
+    # ★ 2026-09-28 第十轮：primary 从 v4-pro 改为 flash
+    # 审计实证：A17 step 1 用 v4-pro 实测 32.7s / 3168 tokens（占端到端最大单点）；
+    # flash 同等输出约 11s（−66% 延迟，−3.3× 成本）。
+    # 合成类任务（"冲突仲裁""三档情景"）在 flash 下结论质量仍可接受；
+    # 质量回归明显时用 MOSS_DECISION_USE_PRO=1 临时切回。
+    #
+    # 原设计（fallback 必须是另一个 provider）仍然成立：fallback 是 local_medium
+    # （Ollama，不同 provider/不同熔断器）。DeepSeek 熔断 → 主备不会被一起拒。
+    # 历史兜底链路：`deepseek-v4-pro→deepseek-flash` 同 provider 已废（见下面"★"注释）。
+    #
+    # 若用户执意要 v4-pro（高冲突仲裁质量）：设 MOSS_DECISION_USE_PRO=1
+    #（A17 recommend_node 会显式覆盖 task_tier 行为）。
+    #
+    # ★★★ 2026-09-28 第十八轮：改成三跳，glm 插在本地之前
+    # 用户裁定原话：「A17决策层 优先deepseek-flash，其次才是glm-4.7.」
+    #
+    # 【原配置的问题】`fallback: local_medium` 把**会挂死的本地**放在第一备源位
+    #   —— DeepSeek 一熔断就掉到整条链里**最不可靠**的那一跳
+    #   （本地显存换入挂死实测 120294ms）。A17 在链尾，它挂掉等于整轮分析白做。
+    #
+    # 【新次序】
+    #   ① deepseek-flash  质量与延迟的平衡点（实测 v4-pro 32.7s → flash 约 11s）
+    #   ② glm-4.7-flash   **另一个云端厂商**：DeepSeek 熔断时接得住。
+    #                     免费，但 429 频繁 → 只做备源、不做主模型
+    #   ③ local_medium    最后兜底：云端全挂时还能出结论
+    #
+    # 【2026-09-28 第十九轮修订】glm 出局 → 换成 `qwen-dashscope-flash`
+    #   理由：glm 在 A11 上跑过 **74.2 秒**，而 A17 在**链尾** ——
+    #   它挂掉等于整轮分析白做。dashscope 轻任务 p50 407ms、并发 10 零限流。
+    #
+    #   **刻意不加 siliconflow**：A17 的输出是最终结论，需要最强判断力；
+    #   siliconflow 是实测里最"惜字"的（A11 上只写 69 字）——
+    #   **宁可少一跳冗余，也不要一个会漏项的备源**。
+    primary: deepseek-flash
+    fallbacks:
+      - qwen-dashscope-flash
+      # 链尾 8B（理由同 medium/reasoning：8B 只做地板）
+      - local_medium
 
 models:
   local_light:
@@ -84,6 +246,9 @@ models:
     base_url: "http://localhost:11434"
     max_tokens: 2048
     temperature: 0.1
+    # 显存需求（MB，权重）：网关据此判断"拉不拉得起来"。
+    # 实测本机 RTX 4060 **只有 8GB**，两个模型同时驻留后仅剩 176MB 空闲。
+    vram_mb: 1000
 
   local_medium:
     provider: "ollama"
@@ -91,6 +256,7 @@ models:
     base_url: "http://localhost:11434"
     max_tokens: 4096
     temperature: 0.1
+    vram_mb: 5400
 
   # 本地推理候选（**默认不接线**）：deepseek-r1:7b 已拉取（4.36 GB）。
   # 要用它请把 `reasoning` 或某个调用方的层级指到这里，并且**同时**把
@@ -102,6 +268,7 @@ models:
     base_url: "http://localhost:11434"
     max_tokens: 4096
     temperature: 0.1
+    vram_mb: 4600
 
   deepseek-flash:
     provider: "deepseek"
@@ -129,6 +296,91 @@ models:
       input_cache_hit: 0.02
       input_cache_miss: 1.0
       output: 4.0
+
+  # ★ 2026-09-28 第十三/十四轮：智谱 GLM（**影子跑专用，不参与主路由**）
+  #
+  # 为什么登记：调研（docs/LLM_MODEL_SELECTION_RESEARCH_20260928.md）显示
+  # `glm-4.7-flash` **免费**（官方定价页标 ¥0/¥0），30B 级、200K 上下文、
+  # 官方明确支持结构化输出 —— 看起来匹配 A17 的硬需求。
+  #
+  # ══════════════════════════════════════════════════════════════════
+  # ★★ 实测结论（`scripts/probe_glm_concurrency.py`，2026-09-28）：
+  #    **免费档不可用于生产**。实测数据：
+  #
+  #      并发 1 ：OK=5/6，429=1（**17% 失败率**），p50=1106ms，0.87 rps
+  #      并发 2 ：OK=0/6，429=6（**100% 失败**），脚本触发止损停止
+  #
+  #    ⚠️ 这不是"上限低"，是**连单并发都不稳定**。
+  #    ⚠️ 诚实边界：本次实测紧跟在几次探针调用之后，无法完全排除
+  #       "配额已被前述调用消耗"这一解释。要用于生产，需在**冷却 24h 后
+  #       重跑** `scripts/probe_glm_concurrency.py --levels 1,2 --n 20` 确认。
+  #
+  #    **上限写进代码（AGENTS.md 硬约束）**：
+  #       即使将来实测转好，本模型的可用并发**不得超过 1**，
+  #       且必须有 429 退避重试。超过 1 已验证会 100% 失败。
+  # ══════════════════════════════════════════════════════════════════
+  #
+  # 因此：**不放进 routing**。当前仅用于影子跑对比与实验。
+  glm-4.7-flash:
+    provider: "zhipu"
+    model_name: "glm-4.7-flash"
+    base_url: "https://open.bigmodel.cn/api/paas/v4"
+    max_tokens: 8192
+    temperature: 0.1
+    #: 实测并发上限：1（超过即 100% 429）
+    max_concurrency: 1
+    cost:
+      # 官方定价页标"免费"；这里按 0 记账，避免污染成本归因。
+      # ⚠️ 若将来收费，必须同步改这里 + docs 的调研报告。
+      input_cache_hit: 0.0
+      input_cache_miss: 0.0
+      output: 0.0
+
+  # ══════════════════════════════════════════════════════════════════
+  # ★ 2026-09-28 第十八轮：高频层（light/medium）的免费替代候选
+  #
+  # **已登记、未接线**。为什么盯高频层（用户裁定）：
+  #   `light`（数据清洗/格式化）与 `medium`（信息层 A05/A06）是**每次请求
+  #   都会走**的层；而 A08/A11 单次成本仅约 ¥0.02。省高频层的钱收益是
+  #   分析层的几十倍，且质量风险面小得多。
+  #
+  # 为什么只登记不进 routing：本项目铁律 —— **未实测的模型不进路由**。
+  #   `glm-4.7-flash` 就是活证据：官方定价页写"免费"，实测 **429×3 次**
+  #   + 一次 **74.2 秒**（见上方记录）。
+  #
+  # 接线前必须做（缺一不可）：
+  #   ① 配 key（`.env`，必须用 pydantic-settings 读，不能 os.environ）
+  #   ② 实测：`uv run python scripts/probe_analysis_models.py --models <名字>`
+  #      判据：成功率高、延迟可接受、**结论信息量（字数）**不缩水。
+  #      ⚠️ 不要只看"数字有据"——它会因"少说少错"虚高（glm 在 A11 上拿了
+  #      1.00 却只写了 79 字）。
+  #   ③ 拿到数据后再改 routing，并同步更新 `_ATTEMPT_BUDGET`
+  # ══════════════════════════════════════════════════════════════════
+  qwen-dashscope-flash:
+    provider: "dashscope"          # 阿里云百炼（OpenAI 兼容端点）
+    model_name: "qwen-flash"
+    base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    max_tokens: 4096
+    temperature: 0.1
+    cost:
+      # 每模型独立 100 万 Token 免费额度（90 天，**仅华北2北京**
+      # 地域有额度；未实名认证用户额度用完后强制"用完即停"）。
+      # 免费额度用尽后按下述官方价计费（按 2026-09-28 调研文档）。
+      input_cache_hit: 0.0
+      input_cache_miss: 0.0
+      output: 0.0
+
+  qwen-siliconflow-7b:
+    provider: "siliconflow"        # 硅基流动（部分小模型免费）
+    model_name: "Qwen/Qwen2.5-7B-Instruct"
+    base_url: "https://api.siliconflow.cn/v1"
+    max_tokens: 4096
+    temperature: 0.1
+    cost:
+      # ⚠️ 免费档限流通常很严 —— 必须实测 429 率再考虑接线。
+      input_cache_hit: 0.0
+      input_cache_miss: 0.0
+      output: 0.0
 
   deepseek-v4-pro:
     provider: "deepseek"

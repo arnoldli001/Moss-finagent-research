@@ -5,7 +5,11 @@ import pytest
 from src.core.config import Settings
 from src.core.exceptions import ConfigError, LLMGatewayError
 from src.infrastructure.llm.audit import LLMAuditLog
-from src.infrastructure.llm.gateway import LLMGateway
+from src.infrastructure.llm.gateway import (
+    LOCAL_PROVIDERS,
+    PAID_PROVIDERS,
+    LLMGateway,
+)
 from src.infrastructure.llm.models import LLMResponse
 
 
@@ -42,6 +46,41 @@ def gateway_env(tmp_dir):
     return settings, tmp_dir
 
 
+@pytest.fixture
+def routing():
+    """`configs/models.yaml` **现读**的 `(模型规格表, 层降级链表)`。
+
+    为什么现读而不是硬编码模型名（2026-09-28 第二十轮的真实代价）：
+    路由一改，写死模型名与跳数的断言就集体变红 —— 而它们想证明的是
+    **「网关照配置执行」**，不是「配置此刻长这样」（后者由
+    `tests/unit/test_llm_routing_contract.py` 专门守）。
+    """
+    from src.infrastructure.llm.gateway import _load_model_config
+
+    specs, chains, _lo = _load_model_config("configs/models.yaml")
+    return specs, chains
+
+
+def _pin_vram(gw: LLMGateway, *, free_mb: int | None = 99999,
+              resident: frozenset[str] = frozenset()) -> None:
+    """注入假显存探针，让「钉死本地」的用例与本机显卡状态解耦。
+
+    必须注入：显式 `local_only=True` 会走 `_filter_local_by_vram`
+    （真起 `nvidia-smi` 子进程 + 问 Ollama，约 2s），而且结果随本机显存
+    占用变化 —— 不注入的用例会「在我这台机器上绿、换一台就红」。
+    """
+    from src.infrastructure.llm.vram import LocalCapacity
+
+    gw._local_capacity = LocalCapacity(  # noqa: SLF001
+        free_probe=lambda: free_mb, resident_probe=lambda _u: resident,
+        ttl_sec=0.0)
+
+
+def _local_hops(chain: list[str], specs) -> list[str]:
+    """链上的**本机**跳（判据用 `LOCAL_PROVIDERS` 而不是 `PAID_PROVIDERS`）。"""
+    return [m for m in chain if specs[m].provider in LOCAL_PROVIDERS]
+
+
 @pytest.fixture(autouse=True)
 def _fresh_circuit_breakers(monkeypatch):
     """每个用例一套**干净的熔断器**。
@@ -56,79 +95,210 @@ def _fresh_circuit_breakers(monkeypatch):
     yield
 
 
-async def test_routes_light_to_ollama_primary(gateway_env):
+@pytest.fixture(autouse=True)
+def _fresh_rate_limit_guard():
+    """每个用例一套**干净的限流熔断器**（理由同上，且更隐蔽）。
+
+    `gateway` 现在取的是进程级单例（这样 `/health` 展示的就是**生效中**那一个
+    的计数）。若不复位，某个用例锁定的模型会跟着流到后面的用例，
+    表现是"某个无辜用例里这一跳被跳过" —— 与熔断器那次踩坑同型。
+    """
+    from src.infrastructure.llm.rate_limit_guard import reset_guard
+
+    reset_guard()
+    yield
+    reset_guard()
+
+
+async def test_routes_light_to_ollama_primary(gateway_env, routing):
+    """`light` 层**钉死本地**时，调用落在 ollama 的本机模型上，且是单跳。
+
+    ## ★ 2026-09-28 第二十轮：触发条件从「层级配置」改为「调用点显式声明」
+
+    原判据：**不传任何参数** → 路由到 `local_light`
+      （那时 `light` 在 `configs/models.yaml` 里钉着 `local_only: true`，
+      运行时链被裁成 1 跳）。
+
+    为什么变：第二十轮把 `light` 首位改成**免费**的 `qwen-siliconflow-7b`
+      并移除了 `local_only: true`（配额分散；免费档不花钱 —— 依据见
+      `configs/models.yaml` 第 97~99 行）→ 默认调用的主模型变成**云端**，
+      `resp.model_used == qwen2.5:1.5b` 不再成立。
+      **机制没坏，是载体变了**：要验「路由到本机主模型 + 响应字段填对」，
+      就得在调用处显式声明 `local_only=True`。
+
+    ⚠️ 显式钉死本地会走 `_filter_local_by_vram`（真起子进程、结果随本机显存
+      变化）→ 注入假探针（`_pin_vram`），与本机显卡状态解耦。
+    """
     settings, _ = gateway_env
+    specs, chains = routing
+    hops = _local_hops(chains["light"], specs)
+    assert hops, f"light 链上没有本机模型（{chains['light']}）—— 用例前提不成立"
+
     providers = {"ollama": FakeProvider(), "deepseek": FakeProvider()}
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
+    _pin_vram(gw)
 
-    resp = await gw.complete("light", "系统提示", "清洗这批数据")
-    assert resp.model_used == "qwen2.5:1.5b-instruct-q4_K_M"
-    assert resp.provider_chain == ["local_light"]
+    resp = await gw.complete("light", "系统提示", "清洗这批数据", local_only=True)
+    assert resp.model_used == specs[hops[0]].model_name
+    assert resp.provider_chain == hops[:1]
     assert not resp.fallback_used
-    assert resp.content == "answer::qwen2.5:1.5b-instruct-q4_K_M"
+    assert resp.content == f"answer::{specs[hops[0]].model_name}"
     assert resp.tokens_out == 20
 
 
-async def test_fallback_chain_works_on_reasoning_tier(gateway_env):
-    """降级链本身照常工作（用 `reasoning` 层验证：云端主 → 本地备）。
+async def test_fallback_chain_works_on_reasoning_tier(gateway_env, routing):
+    """降级链本身照常工作：主模型失败 → 前进到**下一跳**并返回它的结果。
 
-    ⚠️ 不再用 `light` 验证"云端兜底"：那一层自 2026-09-26 起在
-    `configs/models.yaml` 里钉了 `local_only: true`（见下一个用例）。
+    ⚠️ 载体选择（2026-09-28 第二十轮更新）：原写「不再用 `light` 验证云端兜底，
+    因为那层钉了 `local_only: true`」—— 该钉死已移除（见下一个用例），但
+    `light` 仍不适合本条：它的链**三跳全免费**，验不出"主模型挂掉 → 备源接管"
+    的语义。改用链**最长**的 `reasoning`：既验"前进一跳即停"，
+    也验"没有跳过中间跳"。
+
+    ## ★ 2026-09-28 第二十轮：期望值改为**从配置推导**
+
+    原判据把 `reasoning` 的链写死成 `deepseek-flash → local_medium`
+    （"云端主 → 本地备"两跳），断言 `model_used == qwen3:8b-q4_K_M`。
+    第二十轮 `reasoning` 改为四跳（`deepseek-flash → qwen-dashscope-flash
+    → qwen-siliconflow-7b → local_light`），且 `local_medium` **退出所有链**
+    —— 硬编码的模型名与跳数**同时**过期。
+    现在按链现读：跳数、配置键名、真实模型名三处都不会再漂移。
     """
     settings, _ = gateway_env
-    providers = {"ollama": FakeProvider(),
-                 "deepseek": FakeProvider(error=LLMGatewayError("云端挂了"))}
+    specs, chains = routing
+    chain = chains["reasoning"]
+    assert len(chain) >= 2, f"reasoning 链只有一跳（{chain}），没有备源可测"
+    # 相邻两跳必须换厂商（由 test_routing_fallbacks_are_cross_provider 守），
+    # 所以"按 provider 建替身"不会让主备共用同一个失败替身。
+    primary_provider = specs[chain[0]].provider
+    providers: dict[str, FakeProvider] = {}
+    for name in chain:
+        provider = specs[name].provider
+        providers.setdefault(provider, FakeProvider(
+            error=(LLMGatewayError(f"{provider} 挂了")
+                   if provider == primary_provider else None)))
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
 
     resp = await gw.complete("reasoning", "系统", "任务")
-    assert resp.model_used == "qwen3:8b-q4_K_M"   # reasoning 层 fallback
+    assert resp.model_used == specs[chain[1]].model_name
     assert resp.fallback_used
     # ⚠️ `provider_chain` 记的是**配置里的名字**，`model_used` 才是真模型名
-    assert resp.provider_chain == ["deepseek-flash", "local_medium"]
+    assert resp.provider_chain == chain[:2]
+    assert providers[primary_provider].calls == [specs[chain[0]].model_name], (
+        "主模型没有被尝试 —— 那这条用例证明不了降级")
 
 
-async def test_light_and_medium_never_fall_back_to_paid(gateway_env):
-    """★★ 结构修补：`light` / `medium` 两层**默认就不许**降级到付费云端。
+async def test_light_never_falls_back_to_paid(gateway_env, routing):
+    """★★ `light` 层**默认就不许**产生付费调用。
 
-    这两层的 primary 是本地模型、fallback 却是付费的 deepseek-flash ——
-    实测踩过：本地一抖动就悄悄花钱（事件告警阶段一 0.0196 元；
-    `_dbg_hot.py` 这类探针更隐蔽）。靠"每个调用点记得传 local_only=True"
-    靠不住，所以在配置里给这两层钉死，**新调用方默认就是安全的**。
+    ## ★ 2026-09-28 第二十轮：保证来源变了（不是放宽断言，是前提变了）
 
-    要花云端必须**显式** `local_only=False`（少数场景），链本身没被改掉。
+    原判据：`light` 在 `configs/models.yaml` 里钉 `local_only: true`
+      → `complete()` 的 `pin_local` 把运行时链裁到只剩 `local_light`
+      → 本地一挂即整链失败，**绝不落到付费的 deepseek-flash**。
+      实测背景：本地一抖动就悄悄花钱（事件告警阶段一 0.0196 元；
+      `_dbg_hot.py` 这类探针更隐蔽）。
+
+    为什么变：第二十轮把 `light` 首位改成**免费**的 `qwen-siliconflow-7b`
+      （配额分散：light+medium+planning 共用百炼同一份额度会在 6.4 天耗尽），
+      并移除了 `local_only: true` —— **全仓现在没有任何层是 local_only**
+      （`_load_model_config` 的 `tiers_local_only` 是空集）。
+
+    新判据（**意图不变，载体变了**）：`light` 的链**不含付费 provider**
+      ⇒「默认不花钱」改由**链的组成**保证，而不是运行时钉死保证。
+      所以这里把付费 provider 注册成**可用替身**再断言它**一次都没被调用**
+      —— 若哪天有人把 deepseek 接回 light 的链，这条立刻红。
+      运行期的钉死机制仍在，但改为**显式** `local_only=True` 才生效（见下）。
     """
     settings, _ = gateway_env
-    providers = {"ollama": FakeProvider(error=LLMGatewayError("本地模型挂了")),
-                 "deepseek": FakeProvider()}
-    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+    specs, chains = routing
+    chain = chains["light"]
+    paid = [m for m in chain if specs[m].provider in PAID_PROVIDERS]
+    assert not paid, (
+        f"light 链上出现付费档 {paid}（链={chain}）—— 本层占 82% 调用量，"
+        "静默落到付费档会按调用量放大账单")
 
-    for tier in ("light", "medium"):
-        with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
-            await gw.complete(tier, "系统", f"任务-{tier}")
-    assert providers["deepseek"].calls == [], \
-        "light/medium 默认仍然调了云端（会花钱）"
-
-    # 显式退出才允许付费：配置里那条链本身没被改掉
-    resp = await gw.complete("light", "系统", "任务2", local_only=False)
-    assert resp.model_used == "deepseek-flash"
-    assert providers["deepseek"].calls == ["deepseek-flash"]
-
-
-async def test_local_only_never_spends_cloud_tokens(gateway_env):
-    """★ `local_only=True` 时**绝不**降级到计费提供商。
-
-    用途：情报抽取那条链路每 2 小时跑几十条，而 `light` 层的 fallback 配的是
-    `deepseek-flash`（云端、按 token 计费）。用户口径："本地模型推理不费钱，
-    浪费就浪费……只要不用云端tokens就行" —— 本地挂了**宁可失败**（调用方退回
-    规则层），也不能悄悄花钱。
-    """
-    settings, _ = gateway_env
-    providers = {"ollama": FakeProvider(error=LLMGatewayError("本地模型挂了")),
-                 "deepseek": FakeProvider()}
+    # ① 默认（不传 local_only）：免费链**全挂**也不许落到付费档
+    chain_providers = sorted({specs[m].provider for m in chain})
+    providers: dict[str, FakeProvider] = {
+        p: FakeProvider(error=LLMGatewayError("免费链挂了"))
+        for p in chain_providers}
+    providers["deepseek"] = FakeProvider()      # 可用但**不在链上**的付费诱饵
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
 
     with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
-        await gw.complete("light", "系统", "任务", local_only=True)
+        await gw.complete("light", "系统", "任务-light")
+    assert providers["deepseek"].calls == [], \
+        "light 默认仍然调了云端（会花钱）"
+
+    # ② 显式钉死本地：连**免费**云端也不许碰（运行期护栏仍在，只是默认不打开）
+    pinned = {p: FakeProvider() for p in chain_providers if p != "ollama"}
+    gw2 = LLMGateway(settings=settings,
+                     providers={**pinned, "ollama": FakeProvider()}, cache=None)
+    _pin_vram(gw2)
+    resp = await gw2.complete("light", "系统", "任务2", local_only=True)
+    assert resp.provider_chain == _local_hops(chain, specs)[:1], (
+        "local_only=True 没有把链裁到只剩本机模型")
+    for provider, fake in pinned.items():
+        assert fake.calls == [], f"local_only=True 仍然调了 {provider}（云端）"
+
+
+async def test_medium_force_local_env_restores_old_behavior(gateway_env, monkeypatch):
+    """★★ `MOSS_MEDIUM_FORCE_LOCAL=1` 必须把 `medium` 退回"只用本地"。
+
+    这条守着"延迟 vs 成本"取舍的**可回退性** —— 改配置换来 −75s 的同时，
+    必须留一条不改代码就能退回"零云端花费"的路（AGENTS.md：
+    「默认值即护栏」+「同一判断只允许一份实现」）。
+    """
+    settings, _ = gateway_env
+    monkeypatch.setenv("MOSS_MEDIUM_FORCE_LOCAL", "1")
+
+    providers = {"ollama": FakeProvider(error=LLMGatewayError("本地模型挂了")),
+                 "deepseek": FakeProvider()}
+    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+
+    # 本地挂了 + 强制本地 → 必须失败，且**一次都没碰云端**
+    with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
+        await gw.complete("medium", "系统", "信息层任务")
+    assert providers["deepseek"].calls == [], \
+        "MOSS_MEDIUM_FORCE_LOCAL=1 时 medium 仍然调了云端"
+
+    # 关掉开关 → 恢复云端 primary（对照组，证明开关真的在起作用）
+    monkeypatch.delenv("MOSS_MEDIUM_FORCE_LOCAL", raising=False)
+    providers2 = {"ollama": FakeProvider(), "deepseek": FakeProvider()}
+    gw2 = LLMGateway(settings=settings, providers=providers2, cache=None)
+    resp = await gw2.complete("medium", "系统", "信息层任务")
+    assert resp.model_used == "deepseek-flash"
+
+
+async def test_local_only_never_spends_cloud_tokens(gateway_env, routing):
+    """★ `local_only=True` 时**绝不**降级到计费提供商。
+
+    用途：情报抽取那条链路每 2 小时跑几十条（`local_only=True`），绝不能悄悄
+    花云端 token。用户口径："本地模型推理不费钱，浪费就浪费……只要不用云端
+    tokens就行" —— 本地挂了**宁可失败**（调用方退回规则层），也不能悄悄花钱。
+
+    ## ★ 2026-09-28 第二十轮：换载体层（原判据**空转**了）
+
+    原实现用 `light` 层 + `local_only=True` 断言 `deepseek.calls == []`。
+    第二十轮之后 `light` 的链是 `qwen-siliconflow-7b → qwen-dashscope-flash
+    → local_light` —— **一个付费跳都没有**：那条断言会**空转**
+    （哪怕 `local_only` 完全失效，deepseek 也永远不会被调用）。
+    改用**链上确实挂着付费档**的层，并先断言这一点（防再次空转）。
+    """
+    settings, _ = gateway_env
+    specs, chains = routing
+    tier = "decision"
+    assert any(specs[m].provider in PAID_PROVIDERS for m in chains[tier]), (
+        f"{tier} 链上没有付费档（{chains[tier]}）—— 本用例会空转，换个层")
+
+    providers = {"ollama": FakeProvider(error=LLMGatewayError("本地模型挂了")),
+                 "deepseek": FakeProvider()}
+    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+    _pin_vram(gw)
+
+    with pytest.raises(LLMGatewayError, match="全部模型调用失败"):
+        await gw.complete(tier, "系统", "任务", local_only=True)
     assert providers["deepseek"].calls == [], "local_only 仍然调了云端（会花钱）"
 
 
@@ -216,23 +386,43 @@ async def test_audit_records_all_calls(gateway_env):
     assert entries[0]["prompt_hash"] and entries[0]["agent_id"] == "A08_macro"
 
 
-async def test_failure_is_audited(gateway_env):
+async def test_failure_is_audited(gateway_env, routing):
     """失败的每一跳都要留审计（含模型名）。
 
-    用 `reasoning` 层（云端主→本地备）：light/medium 现在默认钉死本地，
-    整条链上只有一个模型，验不出"两跳都留痕"。
+    用 `reasoning` 层：这条链上的模型最多，能验出"**每一跳**都留痕"。
+
+    ## ★ 2026-09-28 第二十轮：期望值改为**从配置推导**
+
+    原判据写死了两跳：`errors == ["boom2", "boom"]`、
+    `models == ["deepseek-flash", "qwen3:8b-q4_K_M"]`（当时是"云端主 →
+    本地备"）。第二十轮 `reasoning` 变成四跳
+    （`deepseek-flash → qwen-dashscope-flash → qwen-siliconflow-7b →
+    local_light`），`local_medium` 退出所有链 —— 写死的跳数与模型名同时过期。
+    现在链、配置键名、真实模型名、每跳的错误文案全部**按链现读**，
+    改 routing 不再让这条红（它要证明的是"每跳都留痕"，不是"链长这样"）。
+
+    ⚠️ 必须给链上**每个 provider** 都注入替身：`provider` 未注册时
+    `complete()` 只记 `last_error` 并 `continue`，**不写审计**
+    （见 `gateway.py` 的 `KeyError` 分支）—— 那样断言会漏跳而看不出来。
     """
     settings, tmp = gateway_env
-    providers = {"ollama": FakeProvider(error=LLMGatewayError("boom")),
-                 "deepseek": FakeProvider(error=LLMGatewayError("boom2"))}
+    specs, chains = routing
+    chain = chains["reasoning"]
+    assert len(chain) >= 2, f"reasoning 链只有一跳（{chain}），验不出多跳留痕"
+
+    providers: dict[str, FakeProvider] = {}
+    for name in chain:
+        provider = specs[name].provider
+        providers.setdefault(provider, FakeProvider(
+            error=LLMGatewayError(f"boom::{provider}")))
     gw = LLMGateway(settings=settings, providers=providers, cache=None)
     with pytest.raises(LLMGatewayError):
         await gw.complete("reasoning", "系统", "任务T")
 
     entries = LLMAuditLog(tmp).read_all()
-    assert [e["error"] for e in entries] == ["boom2", "boom"]
-    assert entries[0]["model"] == "deepseek-flash"
-    assert entries[1]["model"] == "qwen3:8b-q4_K_M"
+    assert [e["model"] for e in entries] == [specs[m].model_name for m in chain]
+    assert [e["error"] for e in entries] == [
+        f"boom::{specs[m].provider}" for m in chain]
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +495,118 @@ def test_provider_classifies_http_status():
     assert _gateway_error("DeepSeek", "m", httpx.ConnectError("c")).count_as_failure is True
 
 
+# ---------------------------------------------------------------------------
+# ★ 2026-09-28 第二十二轮：**免费档限流熔断**（`rate_limit_guard`）的两条
+# 接线判据。为什么必须有：
+#
+#   ① 判据只用**文案**匹配 "429" 是不够的 —— 那句话是 `httpx` 的实现细节，
+#      它一改写法，护栏就**静默失效**（`total_429` 永远是 0，没人会收到报错）。
+#      所以状态码必须从协议层传上来，且**状态码优先于文案**。
+#   ② 状态文件路径写死 `data/run/free_tier_429.json` 是**跨实例污染源**：
+#      `data/run/` 是 dev / pilot / 生产**共用**的目录，
+#      dev 里调试出的 3 次 429 会把线上这一跳锁 10 分钟（按模型名判断，
+#      不看库、不看实例）。故障方向反过来 —— 不报错，只是"线上突然不用免费档了"。
+# ---------------------------------------------------------------------------
+
+
+def test_gateway_error_carries_structured_http_status():
+    """`_gateway_error` 必须把状态码**结构化**带上去，不能只留在文案里。"""
+    import httpx
+
+    from src.infrastructure.llm.providers import _gateway_error
+
+    req = httpx.Request("POST", "https://api.siliconflow.cn/v1/chat/completions")
+    err = httpx.HTTPStatusError(
+        "x", request=req, response=httpx.Response(429, request=req))
+    gw_err = _gateway_error("siliconflow", "Qwen/Qwen2.5-7B-Instruct", err)
+    assert gw_err.http_status == 429, "状态码没传上去 —— 限流判据只能靠文案"
+
+    # 无 response 的异常（超时/连接失败）要如实为 None，不能瞎编一个。
+    assert _gateway_error("x", "m", httpx.ConnectTimeout("t")).http_status is None
+
+
+async def test_rate_limited_locks_the_hop_even_without_429_in_the_text(
+        gateway_env, monkeypatch, tmp_path):
+    """★ 状态码就能触发锁定 —— 文案里**没有** "429" 也必须锁。
+
+    这一条在修复前是红的：错误消息刻意写成
+    `HTTPStatusError: 服务器返回了错误状态`（不含任何限流字样），
+    旧判据（只在文案里找 "429"）会**判为不是限流** → 每次调用都白撞一次、
+    永远不锁。这正是"护栏装了但从来没生效"的机器复现。
+    """
+    import httpx
+
+    from src.infrastructure.llm import circuit_breaker as cbmod
+    from src.infrastructure.llm.providers import _gateway_error
+    from src.infrastructure.llm.rate_limit_guard import LOCK_THRESHOLD
+
+    monkeypatch.setattr(cbmod, "_registry", cbmod.CircuitBreakerRegistry())
+    monkeypatch.setenv("MOSS_RATE_GUARD_PATH", str(tmp_path / "guard.json"))
+
+    settings, _ = gateway_env
+    req = httpx.Request("POST", "https://api.deepseek.com/chat/completions")
+    # ⚠️ 文案里**故意没有** 429 / rate limit 字样
+    boom = _gateway_error(
+        "DeepSeek", "deepseek-flash",
+        httpx.HTTPStatusError(
+            "服务器返回了错误状态", request=req,
+            response=httpx.Response(429, request=req)))
+    providers = {"deepseek": FakeProvider(error=boom)}
+    gw = LLMGateway(settings=settings, providers=providers, cache=None)
+    assert gw._rate_guard.path.endswith("guard.json"), (
+        "护栏路径没跟着 MOSS_RATE_GUARD_PATH 走 —— 又回到跨实例共用了")
+    fake = providers["deepseek"]
+
+    # 打够阈值次数（每次换 prompt，避免缓存/去重把调用吃掉）
+    for i in range(LOCK_THRESHOLD):
+        with pytest.raises(LLMGatewayError):
+            await gw.complete("decision", "s", f"p{i}")
+    assert fake.calls, "provider 一次都没被调用，用例本身没跑到判定路径"
+    assert gw._rate_guard.is_locked("deepseek-flash"), (
+        "连续 429 之后没有锁定 —— 判据没认出来（文案里没有 '429'）")
+    snap = gw._rate_guard.snapshot()["models"]["deepseek-flash"]
+    assert snap["total_429"] == LOCK_THRESHOLD, "429 计数没落到状态文件里"
+    assert snap["remaining_s"] and snap["remaining_s"] > 0
+    calls_before = len(fake.calls)
+
+    # 锁定期内：这一跳必须被**跳过**（不再白撞一次）
+    with pytest.raises(LLMGatewayError):
+        await gw.complete("decision", "s", "after-lock")
+    assert len(fake.calls) == calls_before, (
+        f"锁定期内仍在调它（{calls_before} → {len(fake.calls)}）—— 没跳过，"
+        "等于每次调用都先白撞一次 429")
+
+
+def test_rate_guard_state_path_is_isolated_per_instance(monkeypatch, tmp_path):
+    """★ dev / pilot / 生产**不能共用**同一个护栏状态文件。"""
+    import importlib
+
+    from src.infrastructure.llm import rate_limit_guard as mod
+
+    mod = importlib.reload(mod)          # 保证读到的是当前实现
+
+    monkeypatch.delenv("MOSS_RATE_GUARD_PATH", raising=False)
+    monkeypatch.delenv("LLM_AUDIT_DIR", raising=False)
+    assert mod.resolve_state_path() == mod.DEFAULT_STATE_PATH
+
+    # dev / pilot 的隔离本来就在设 LLM_AUDIT_DIR —— 护栏跟着它走，
+    # 于是 manage.py 里**不需要**再加一处 key（少一个 key 就少一处漏改）
+    monkeypatch.setenv("LLM_AUDIT_DIR", str(tmp_path / "dev" / "audit"))
+    isolated = mod.resolve_state_path()
+    assert isolated != mod.DEFAULT_STATE_PATH
+    assert isolated.endswith("/free_tier_429.json")
+    assert "\\" not in isolated, "路径分隔符要归一化（否则 Windows 上跨平台判据会脆）"
+
+    monkeypatch.setenv("MOSS_RATE_GUARD_PATH", str(tmp_path / "explicit.json"))
+    assert mod.resolve_state_path().endswith("explicit.json"), "显式指定必须最高优先"
+
+    # 单例语义：`get_guard()` 不接受 path 参数，避免"传了 path 就换实例"
+    # 从而把内存里已累计的"连续 429"计数丢掉
+    mod.reset_guard()
+    assert mod.get_guard() is mod.get_guard()
+    mod.reset_guard()
+
+
 async def test_missing_api_key_is_config_error():
     """缺 key 必须标记为不计熔断，否则 3 次就把熔断器打开。"""
     from src.infrastructure.llm.models import ModelSpec
@@ -323,24 +625,28 @@ async def test_missing_api_key_is_config_error():
 
 
 def test_routing_fallbacks_are_cross_provider():
-    """每一层的 fallback 必须换 provider，否则等于没兜底。
+    """降级链**相邻两跳必须换 provider**，否则等于没兜底。
 
     2026-09-20 实测：decision 层是 deepseek-v4-pro → deepseek-flash，
     两者同属 provider=deepseek，DeepSeek 一熔断主备一起被拒，
     整条链必然失败（报"全部模型调用失败"），而本机 Ollama 是好的却没用上。
-    """
-    import yaml
 
-    with open("configs/models.yaml", encoding="utf-8") as fh:
-        cfg = yaml.safe_load(fh)
-    models = cfg["models"]
-    for tier, route in cfg["routing"].items():
-        primary = models[route["primary"]]
-        fallback = models[route["fallback"]]
-        assert primary["provider"] != fallback["provider"], (
-            f"{tier} 层的主备同属 provider={primary['provider']}，"
-            "该 provider 整体不可用时没有兜底"
-        )
+    ⚠️ 2026-09-28 改为按**解析后的完整链**检查，支持三跳（`fallbacks` 列表）。
+    原实现读单数 `route["fallback"]`，遇到 `fallbacks` 会取到 `None` ——
+    判据会**静默失效**而不是报错。链变长后"相邻不得同厂商"才是正确的不变量
+    （厂商级故障不该连杀两跳）。
+    """
+    from src.infrastructure.llm.gateway import _load_model_config
+
+    specs, chains, _lo = _load_model_config("configs/models.yaml")
+    assert chains, "没有解析出任何路由链"
+    for tier, chain in chains.items():
+        provs = [specs[m].provider for m in chain]
+        for i in range(len(provs) - 1):
+            assert provs[i] != provs[i + 1], (
+                f"{tier} 层第 {i} 跳与第 {i + 1} 跳同属 provider="
+                f"{provs[i]}（链={chain}）—— 该 provider 整体不可用时没有兜底"
+            )
 
 
 # ==================================================================

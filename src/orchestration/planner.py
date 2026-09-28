@@ -7,10 +7,59 @@ PRD要求"Supervisor通过LLM动态决策任务执行顺序"。本模块用LLM�
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from src.domain.agents.analysis.base import parse_llm_json
 from src.infrastructure.llm import LLMGateway
+from src.infrastructure.llm.gateway import _ATTEMPT_BUDGET
+
+logger = logging.getLogger(__name__)
+
+#: 规划层单次调用的墙钟预算（秒）。**取 light 层的既有权威默认值**，
+#: 不另造数字 —— `_ATTEMPT_BUDGET["light"]` 的 20s 是 2026-09-26 实测定的
+#: （比云端 p90 18.3s 略宽、又远小于本地模型的 45s）。
+#:
+#: **为什么必须显式给**（2026-09-28 实测）：`light` 层钉了 `local_only: true`
+#: （防静默降级到付费云端），`complete()` 在 `pin_local` 时把降级链**裁到 1 跳**
+#: —— 而延迟预算的启发式写着"最后一跳不设预算"（怕把"慢但正确"变成"必然失败"）。
+#: 两者交叉出的结果：本地模型挂死时，规划层**裸调到 HTTP 120s 超时**。
+#:
+#:     实测（`scripts/_e2e_timing_probe.py`，astream 逐节点计时）：
+#:       supervisor_planner  in=0 out=0  120294ms
+#:       端到端 123.45s，其中这一个节点吃掉 120.31s，后面 19 个节点共 3.1s
+#:
+#: 显式传入后，超时被 `asyncio.wait_for` 在预算处中断 → 落到下面的规则式规划兜底。
+#: 实测端到端 **123.45s → 12.22s**（10 倍）。
+#:
+#: ⚠️ 预算值必须覆盖**冷路径**，否则会把"能成功"变成"必然失败"：
+#:     冷加载 qwen2.5:1.5b（显存驱逐后重新载入）   9.5s   ← 实测
+#:     规划生成（1102 tokens 输入 → 结构化 plan）  4.73s  ← 实测
+#:     ────────────────────────────────────────────────
+#:     冷路径合计                                  ≈14.2s
+#: 我第一版拍了个 12s（理由是"本地正常 2~5s"—— 那是代码注释里的旧数字，
+#: 不是实测），结果冷启动下规划层**必然失败**。20s 覆盖冷路径并留 40% 余量。
+#: **待办**：启动时预热该模型可让用户请求不再付这 9.5s（见 main.py 的
+#: `_warm_llm_cache_index` 同类做法），届时候选下调本值。
+_PLANNER_BUDGET_SEC = _ATTEMPT_BUDGET["planning"]
+
+#: 规划层的**输出**预算（tokens）。
+#:
+#: 为什么必须显式给（2026-09-28 实测）：`light` 层的层级输出预算是
+#: `_TIER_OUTPUT_BUDGET["light"] = 1024`，而规划要输出的是
+#: 「analysis_type + 参与 Agent 清单 + 采集指标清单」的结构化 JSON ——
+#: **1024 不够**。审计日志抓到的现场：
+#:
+#:     supervisor_planner | in=2280 out=1024 | 6654ms   ← out 正好 1024
+#:     → AgentExecutionError: LLM输出非合法JSON:
+#:           Expecting value: line 5 column 2327
+#:
+#: 即 **JSON 被从中间截断**，报错却长得像"模型不会写 JSON"。
+#: 在没有预算的那几轮里，这个截断被 120s 超时盖住，根本看不到。
+#:
+#: 取 2048（与 medium 层同档）：规划 JSON 实测在 1024~2048 之间，
+#: 给一倍余量；这是**上限**，未用满不计费、不拖慢。
+_PLANNER_MAX_TOKENS = 2048
 
 # 可用指标目录（与supervisor._PLANNING/INDUSTRY_INDICATORS对齐），
 # LLM规划时据此选择需要采集的指标，避免凭空编造不存在的indicator id。
@@ -118,6 +167,34 @@ _PLAN_SCHEMA = (
     '- "reasoning": 规划理由（50字内）'
 )
 
+#: `_PLAN_SCHEMA` 的**语法级**版本（`json_schema` 受约束解码）。
+#:
+#: 为什么两者都要（2026-09-28 实测）：上面那段只是**文字描述**，
+#: `json_mode=True` 只保证"是 JSON"，不保证"是你要的 JSON"。规划 prompt
+#: 有 2280 tokens（能力目录 + 指标目录），本地 qwen2.5:1.5b 在其上**输出会失控**：
+#:
+#:     同一 prompt 的三次实测：
+#:       out=163   1535ms  ✅ 合法 JSON，规划成功
+#:       out=1024  6566ms  ❌ 截断（撞 light 层默认输出上限）
+#:       out=2048 12892ms  ❌ 截断（撞我们调大后的上限）
+#:
+#: 调大上限治不了 —— 它只决定"截在哪"。受约束解码从**语法**上禁止
+#: 失控输出（枚举锁死 analysis_type、字符串不许逃逸），既治截断也治解析失败。
+_PLAN_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "analysis_type": {
+            "type": "string",
+            "enum": ["macro", "industry", "stock", "news", "full"],
+        },
+        "target": {"type": "string"},
+        "agents": {"type": "array", "items": {"type": "string"}},
+        "indicators": {"type": "array", "items": {"type": "string"}},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["analysis_type", "agents"],
+}
+
 
 class LLMSupervisorPlanner:
     """用LLM把用户问题分解为Agent执行计划。"""
@@ -160,11 +237,46 @@ class LLMSupervisorPlanner:
             # 规划是从指标目录+Agent目录里挑子集的简单任务，light层(qwen2.5:1.5b)足够，
             # 本地 2-5s vs deepseek-flash 18s，省大头
             response = await self._gateway.complete(
-                "light", SYSTEM_PROMPT, prompt,
+                # ★ `planning` 层（2026-09-28 用户裁定）：
+                # 「规划层 优先glm-4.7-flash，其次备选deepseek-flash」
+                #
+                # 为什么独立成层而**不复用 `medium`**：`medium` 还挂着**高频**的
+                # 信息层（A05/A06），而规划是**低频 + 延迟敏感 + 任务简单**。
+                # 复用会让"规划走 glm（免费/更快但 17% 429）"这个决定
+                # **顺带改掉信息层的次序** —— 用户没要求的连带改动。
+                #
+                # 为什么规划层可以 glm 优先：暴露面小（1 次/请求），
+                # 且失败一跳由 deepseek 接住，换到的是 p50 1106ms + 免费。
+                # 本地模型只做第三跳兜底 —— 它显存换入会挂死 120s，绝不能靠前。
+                "planning", SYSTEM_PROMPT, prompt,
                 agent_id="supervisor_planner", trace_id="planner", json_mode=True,
+                # 预算仍显式给：免费档实测 17% 429，备源要在预算内接得住
+                attempt_budget_sec=_PLANNER_BUDGET_SEC,
+                max_tokens=_PLANNER_MAX_TOKENS,
+                # ★ 关闭思维链（2026-09-28 实测）：
+                # `deepseek-flash` 是**推理模型**，思维链**计入输出预算**
+                # （models.yaml 自己那条注释：3072推理+1024输出）。
+                # 于是 2048 的输出上限被 CoT 吃光 → 正文截断成空串，
+                # 报错却是 `LLM输出非合法JSON: Expecting value: line 1
+                # column 1 (char 0)` —— 看起来像"模型不会输出"。
+                #     实测：`out=2048 / 8348ms` → 解析失败
+                #
+                # 规划是"从能力目录+指标目录里挑子集"，**不需要多步推演**；
+                # 且 A17 的同类实测显示 effort=none 更快且不丢质量
+                # （5451ms vs 9987ms，正文反而更长）。
+                reasoning_effort="none",
+                # 语法级约束：治长 prompt 上的输出失控
+                json_schema=_PLAN_JSON_SCHEMA,
             )
             data = parse_llm_json("supervisor_planner", response.content)
-        except Exception:  # noqa: BLE001 LLM规划失败不阻断，回退规则
+        except Exception as exc:  # noqa: BLE001 LLM规划失败不阻断，回退规则
+            # ⚠️ 必须**出声**：这里静默回退过一次 120s 挂死，导致
+            # "链路正常但慢了 40 倍"被当成"采集慢"排查了三轮。
+            # 判据：回退是允许的，**无声回退**不允许。
+            logger.warning(
+                "LLM 规划失败，回退规则式规划（agent=supervisor_planner, "
+                "预算=%.1fs）：%s: %s",
+                _PLANNER_BUDGET_SEC, type(exc).__name__, exc)
             return None
         agents_plan = data.get("agents") or []
         if not isinstance(agents_plan, list) or not agents_plan:

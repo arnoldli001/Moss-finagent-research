@@ -143,6 +143,39 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str = _env_field("DEEPSEEK_API_KEY", "")  # 仅经环境变量注入
+    # ★ 2026-09-28 第十三轮：智谱 GLM（A17 影子跑用，见
+    #   `docs/LLM_MODEL_SELECTION_RESEARCH_20260928.md`）。
+    # ⚠️ 必须用 `_env_field`（走 pydantic-settings）而**不是**
+    #   `os.environ.get` —— 后者读不到 `.env`（pydantic 只把它读进 Settings，
+    #   不注入进程环境）。本项目已在 `eastmoney_direct.py` 踩过同一个坑：
+    #   「`.env` 里明明写着，`install()` 却报未启用」。
+    zhipu_api_key: str = _env_field("MOSS_ZHIPU_API_KEY", "")
+    zhipu_base_url: str = _env_field(
+        "MOSS_ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+
+    # ★ 2026-09-28 第十八轮：**高频层（light/medium）的免费替代候选**。
+    #
+    # 为什么盯高频层而不是分析层：用户裁定「把免费模型的收益点放到真正高频的
+    # 地方去」。`light`（数据清洗/格式化）与 `medium`（信息层 A05/A06）是每次
+    # 请求都会走的层；而 A08/A11 那两个分析 Agent 单次成本仅约 ¥0.02。
+    # **省高频层的钱，收益是分析层的几十倍，且质量风险面小得多。**
+    #
+    # 为什么只加字段**不动 routing**：先接代码（零风险），
+    # 实测（`scripts/probe_analysis_models.py`）拿到数据后再决定是否改路由。
+    # 本项目铁律：**未实测的模型不进 routing** —— `glm-4.7-flash` 就是活证据
+    # （定价页写免费，实测 429×3 次 + 一次 74 秒）。
+    #
+    # 阿里云百炼：每模型独立 100 万 Token 免费额度（90 天，**仅华北2北京**）。
+    dashscope_api_key: str = _env_field("MOSS_DASHSCOPE_API_KEY", "")
+    dashscope_base_url: str = _env_field(
+        "MOSS_DASHSCOPE_BASE_URL",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1")
+
+    # 硅基流动：部分小模型免费，但免费档限流通常很严（需实测）。
+    siliconflow_api_key: str = _env_field("MOSS_SILICONFLOW_API_KEY", "")
+    siliconflow_base_url: str = _env_field(
+        "MOSS_SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+
     model_config_path: str = "configs/models.yaml"
     llm_timeout_seconds: float = 120.0
     llm_cache_enabled: bool = True
