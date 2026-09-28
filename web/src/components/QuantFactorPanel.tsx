@@ -5,6 +5,7 @@ import {
   QuantFactorList,
   QuantScreenResult,
 } from "../api";
+import { readQuantFactors, writeQuantFactors } from "../quantCache";
 import { QuantHelpModal } from "./QuantHelpModal";
 import { StrategyCasesPanel } from "./StrategyCasesPanel";
 
@@ -144,9 +145,22 @@ export default function QuantFactorPanel({
     //
     // 绑在一起等 = 因子库被数据条拖住，用户盯着「多因子库（0 个）」二十秒。
     // 两件事**互不依赖**，各自落地即可：因子库先出，数据条后到。
+    //
+    // ★ 2026-09-28：因子库**先读缓存**（stale-while-revalidate）。
+    // panelPrefetch 的保活续期已经在后台把 `/quant/factors` 放进 localStorage，
+    // 挂载即有内容，不必等网络往返。
+    const cached = readQuantFactors();
+    if (cached) setLibrary(cached.library);
     void api.quantFactors()
-      .then(setLibrary)
-      .catch((exc) => setError(`因子库加载失败：${String(exc)}`));
+      .then((data) => {
+        setLibrary(data);
+        writeQuantFactors(data);
+      })
+      .catch((exc) => {
+        // 缓存有内容时不画红字（stale 数据胜过错误提示）；
+        // 只有"完全没数据"时才报错，避免误判。
+        if (!cached) setError(`因子库加载失败：${String(exc)}`);
+      });
     void api.quantDataStatus()
       .then(setStatus)
       .catch(() => {
@@ -262,7 +276,7 @@ export default function QuantFactorPanel({
 
       <section className="panel">
         <div className="panel-head">
-          <h2>多因子库（{library?.count ?? 0} 个）</h2>
+          <h2>多因子库（{library === null ? "加载中…" : `${library.count} 个`}）</h2>
           <span className="muted-text">
             七大类 · 全部按公告日对齐（PIT）· 无未来函数
           </span>

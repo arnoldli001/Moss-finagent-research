@@ -564,19 +564,20 @@ const running = task !== null && (task.status === "queued" || task.status === "r
             <SchedulerPanel />
           ) : view === "metrics" ? (
             <MetricsPanel />
-          ) : view === "backtest" ? (
-            <BacktestPanel />
           ) : view === "intraday" ? (
             <QuantTabContainer onEditProfile={setProfileCode} />
           ) : view === "mainline" ? (
             <MainlinePanel />
           ) : view === "fundflow" || view === "intel-hot"
-              || view === "intel-calendar" || view === "alerts" ? (
-            // 这四个视图由下面**常驻的 `<KeepAlive>`** 承载（见那里的说明）。
+              || view === "intel-calendar" || view === "alerts"
+              || view === "backtest" ? (
+            // 这五个视图由下面**常驻的 `<KeepAlive>`** 承载（见那里的说明）。
             // 这里返回 null：三元链的语义是"只渲染命中的那一个"，切走即卸载，
             // 而这些面板是用户反复来回切的，需要保活（fundflow 2026-09-27
             // 加入：板块拥挤度/行业轮动日报两个子页签切换卸载重挂是
-            // "打开加载慢"报障的根因之一）。
+            // "打开加载慢"报障的根因之一；backtest 2026-09-28 加入：
+            // 多因子库面板的两次取数（quantFactors + quantDataStatus）
+            // 在切回时会让用户再等 1~2 秒）。
             null
           ) : view === "research" ? (
           /* ★ 「投研分析」= 默认业务面板。它原来**漏在三元链之外**（内容单独挂在
@@ -713,6 +714,18 @@ const running = task !== null && (task.status === "queued" || task.status === "r
         <KeepAlive active={view === "fundflow"}>
           <Suspense fallback={<PanelLoading label="资金流监控" />}>
             <FundFlowPanel />
+          </Suspense>
+        </KeepAlive>
+      </ErrorBoundary>
+      {/* ★ 策略回测保活（2026-09-28）：用户报障"多因子库（35 个）首次加载
+          要等几秒才出现"。在按 `[fundflow][intel][alerts]` 同款 KeepAlive 之前，
+          切回「策略回测」会卸载重挂 QuantFactorPanel，触发两次冷请求
+          （quantFactors + quantDataStatus），在 ~51 KB/s 隧道上每次 1~2 秒。
+          BacktestPanel 是 lazy 组件，自带 Suspense（与 FundFlowPanel 同款）。 */}
+      <ErrorBoundary resetKey="backtest" label="策略回测">
+        <KeepAlive active={view === "backtest"}>
+          <Suspense fallback={<PanelLoading label="策略回测" />}>
+            <BacktestPanel />
           </Suspense>
         </KeepAlive>
       </ErrorBoundary>

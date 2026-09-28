@@ -42,6 +42,7 @@ import { Alert, AlertSettings, api } from "./api";
 import { preloadAlerts } from "./alertsCache";
 import { feedCacheKeyOf, readIntelFeed, writeIntelFeed } from "./intelCache";
 import { fetchIntelFeed } from "./intelApi";
+import { readQuantFactors, writeQuantFactors } from "./quantCache";
 
 /** 保活续期间隔。要**小于**两个缓存的 TTL（告警 5 分钟 / 情报 10 分钟），
  *  否则续期之间会出现"缓存刚好过期"的窗口 —— 那就白做了。
@@ -87,21 +88,42 @@ async function prefetchIntel(force: boolean): Promise<void> {
   writeIntelFeed(key, feed);
 }
 
+/** 预取多因子库（`/quant/factors`），2026-09-28 新增。
+ *
+ * 与 alertsCache 同款的 force 语义：登录/刷新时 force=false 受新鲜度保护，
+ * 保活续期 force=true 必须真的重新拉（因子库是静态 spec，但 `quantDataStatus`
+ * 也会被这个组件一起触发，所以保活续期要跑；这里只预取 quantFactors）。
+ *
+ * 因子库本身**毫秒级**（静态拼 dict，不碰库不碰盘，见
+ * `src/api/routes/quant.py` 的 `/factors` 路由），但首次冷握手 ≈0.9s；
+ * 预取的目的是让保活续期把这个握手提前到后台。 */
+async function prefetchQuantFactors(force: boolean): Promise<void> {
+  if (!force) {
+    const existing = readQuantFactors();
+    if (existing && Date.now() - existing.at < KEEPALIVE_MS) return;
+  }
+  const library = await api.quantFactors();
+  writeQuantFactors(library);
+}
+
 /**
- * 预取两个面板的数据。**绝不抛** —— 预取失败只等于"回到优化前的行为"。
+ * 预取三个面板的数据。**绝不抛** —— 预取失败只等于"回到优化前的行为"。
  *
  * @param force 绕过新鲜度去重，用于保活续期
  */
 export async function prefetchPanels(force = false): Promise<void> {
   if (inFlight) return inFlight;
   inFlight = (async () => {
-    // 两个目标互相独立：一个失败不该拖累另一个（各自 catch）。
+    // 三个目标互相独立：一个失败不该拖累另一个（各自 catch）。
     await Promise.allSettled([
       prefetchAlerts(force).then(
         () => { lastDone.alerts = Date.now(); },
         () => { /* 预取失败静默：面板自己会取 */ }),
       prefetchIntel(force).then(
         () => { lastDone.intel = Date.now(); },
+        () => { /* 同上 */ }),
+      prefetchQuantFactors(force).then(
+        () => { lastDone.quant = Date.now(); },
         () => { /* 同上 */ }),
     ]);
   })();
@@ -238,6 +260,7 @@ export function startPanelKeepAlive(): () => void {
 export function resetPrefetchState(): void {
   lastDone.alerts = 0;
   lastDone.intel = 0;
+  lastDone.quant = 0;
   inFlight = null;
 }
 
