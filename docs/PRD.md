@@ -1471,7 +1471,42 @@ uv run python -m pytest tests/unit/test_local_think_switch.py -q   # 截断告�
 **两次唯一的 FAIL 完全相同、且与 LLM 无关**：嵌入模型 `nomic-embed-text` 的
 「同主题跨语言 > 无关主题同语言」项 —— 它自己的文档里已有换 `bge-m3` 的建议。
 
-#### 四、结论与诚实边界
+#### 四、补测 C：claim-level 引用忠实度（`eval_faithfulness.py --from-db --llm`）
+
+**顺序不能换**：`--fresh` 会删掉整个 `data/e2e` ⇒ 必须"跑完端到端**立刻**核查同一份
+产物库"，再换模型重跑。（第一次就是这么把 4B 那份产物库丢掉的。）
+
+| 判定 | `qwen3.5:4b` | `qwen3:8b` |
+|---|---|---|
+| 带引用的论断 | 52 | 43 |
+| 引用覆盖面 | **53%** | 36% |
+| `weakly_supported`（靠数字/缩写等**语言无关信号**核对通过） | **22** | 16 |
+| `unsupported` | 14 | 14 |
+| **`contradicted`（方向被说反）** | **6** | **5** |
+| `unverifiable`（跨语言且**无任何**共同信号 → 弃权） | **7** | **0** |
+
+**怎么读（关键，否则会被当成"4B 更好/更差"的结论）**：
+
+1. **`unverifiable` 是"格式可核查性"的代理指标**：它=「跨语言引用、且**连数字/缩写
+   都对不上**」。8B 是 **0**、4B 是 **7** ⇒ **4B 写进的缩写与数字比 8B 少** ——
+   这是 4B 在这条链路上**唯一可观测的劣势**，也是本轮新增的一条观察。
+2. **两边都有一批 `contradicted`（6 / 5）**，而中文综述引英文文献本来就是该评测
+   Tier 0 的**已知盲区**（它自己的 `docs/EVALUATION.md` 写了，建议那种场景开 Tier 1）；
+   **不能直接归因于模型**。
+3. **裁判模型就是被评的那个模型本身**（按 config 取）⇒ 4B 当裁判时的判断力也未经验证。
+   所以**这一层分不出胜负**：它提供的是**观察**，不是结论。
+
+**结论（更新后）**：4B 在本项目的任务上**工程与写作层面未掉质量**
+（产物更长 +28%、引用更多 19 vs 11 且都合法、墙钟 −36%、引用覆盖面 53% vs 36%），
+**但跨语言引用的可核查性略差**（`unverifiable` 7 vs 0）。
+若该项目将来以"引用可自动核验"为硬指标，**优先级应是换嵌入模型 `bge-m3` +
+把 Tier 1 换成更强的裁判模型**，而不是回退到 8B。
+
+**这一层不能证明什么**：n=1；`e2e.py` 的判据全是工程正确性、不判内容对错；
+裁判不可靠（就是被评模型本身）；**没有"人写 / 更强模型写"的基线** ——
+所以 6 条 `contradicted` 算多算少，这份数据回答不了。
+
+#### 五、结论与诚实边界
 
 **结论：4B 在它自己的任务上未掉质量。** 依据是"产物更长、引用更多、
 引用校验都通过、墙钟 −36%"这组**一致方向**的可观测值。
@@ -1486,7 +1521,7 @@ uv run python -m pytest tests/unit/test_local_think_switch.py -q   # 截断告�
    （4B 那份已被 8B 覆盖 —— 我的操作失误），且 Tier 1 会把综述连同
    **每一条论断**交给裁判模型，成本较高（已告知用户）。
 
-#### 五、同批修正我自己引入的一个错误（重要）
+#### 六、同批修正我自己引入的一个错误（重要）
 
 我把 `num_ctx` 从 8192 压到了 4096（想省显存）。**这在那个项目里是错的**：
 
@@ -1527,7 +1562,7 @@ uv run python -m pytest tests/unit/test_local_think_switch.py -q   # 截断告�
 | **A4** | §4 Agent 不直连库、走统一网关 | **全线直连**：`src/` 里 77 处 `data/` 路径字面量、51 个文件；无网关层 | ⏳ **L1/L2 范围** |
 | **A5** | §2 元数据加 `env` 字段 + 版本化发布 | `indicator_catalog` / `data_asset_catalog` **per-env 各一份且内容不同**（pilot 722 指标 vs 回填后 1,029），无 `env` / `version` / `is_shared` / `sync_from` 列，无"dev 验证→发布"流程 | ⏳ **待排期** |
 | **A6** | §4 空结果诊断区分环境 | 规则给了 5 个码（`ENV_NOT_COVERED` / `PROD_ONLY` / `DEV_ONLY` / `DEV_SYNC_DELAY` / `PROD_PERMISSION_DENIED`），本项目 `local_data.py::DiagCode` 里**一个都没有** —— 于是"dev 没同步"会被误报成"库里没有" | ✅ **本轮已修（CHG-0075）**：5 个码全部定义（`DiagCode` 12→**17**），且**显式排除在联网兜底的触发表之外**（环境差异不是数据缺口）。见 §19.5、§18.3 的废止痕迹 |
-| **A7** | §3 单向同步（prod → dev）、§1 prod 只读 | 本项目**没有 prod**；dev 与 pilot **各自采集且都写共享行情仓**（pilot 调度台账 `quant_data_sync` 成功 **41** 次，`manage.py:774-789` 自认两实例曾同写）。"谁写谁读"没有裁决 | ⏳ **需用户裁定** |
+| **A7** | §3 单向同步（prod → dev）、§1 prod 只读 | 本项目**没有 prod**；dev 与 pilot **各自采集且都写共享行情仓**。"谁写谁读"没有裁决 | ✅ **已裁定（CHG-0087）**：用户裁定「共享行情仓，**dev 读，pilot 写和读**；谁负责更新数据谁有写权限」→ `warehouse.writer: pilot`，写闸门 fail-closed，更新作业在非写者实例上不触发。见 §18.6 |
 
 ### 18.2 本轮已修的判据（机器判据，不靠记得）
 
@@ -1572,10 +1607,18 @@ uv run python -m pytest tests/unit/test_env_guard.py -q
 
 ### 18.4 待用户裁定
 
-- **A7 谁写谁读**：共享行情仓 `data/quant/warehouse.db` 目前被 dev 与 pilot **同时写**。
-  候选口径：(a) 主实例唯一写、pilot/dev 只读（需给 pilot 裁掉 `quant_data_sync`）；
-  (b) 维持现状并接受行级竞争；(c) 拆成"采写实例 + 只读副本"。
-  **这是运维口径决策，不由 AI 单方面拍板。**
+> ⚠️ **A7 已由用户裁定（`CHG-0087`，2026-09-29），原文保留在下方**（不删）——
+> 「为什么当初判它必须由用户拍板」与「用户最后怎么拍的」合起来才是完整口径。
+> 现行口径见 **§18.6**。
+>
+> ~~- **A7 谁写谁读**：共享行情仓 `data/quant/warehouse.db` 目前被 dev 与 pilot
+> **同时写**。候选口径：(a) 主实例唯一写、pilot/dev 只读（需给 pilot 裁掉
+> `quant_data_sync`）；(b) 维持现状并接受行级竞争；(c) 拆成"采写实例 + 只读副本"。
+> **这是运维口径决策，不由 AI 单方面拍板。**~~
+>
+> 用户裁定选的是 **(a) 的变体**：不是"主实例唯一写"，而是**pilot 唯一写**
+> （"谁负责更新数据谁有写权限"）。主实例因此**也**变成只读 —— 见 §18.6 的后果说明。
+
 - **A5 元数据版本化**：是否引入 `env` 列与"dev 验证→发布"流程（会影响
   `data_asset_catalog` / `indicator_catalog` 的 schema 与既有登记数据）。
 
@@ -1591,7 +1634,149 @@ uv run python -m pytest tests/unit/test_env_guard.py -q
 
 > 三档**互不相同**由 `test_all_three_isolation_envs_isolate_cache_and_audit` 断言。
 > 唯一仍共用的是 `data/quant/warehouse.db` 与 `data/mainline_cache.db`
-> （共享只读市场数据，**有意共用**，见 §16.2），以及 `data/run/`（见 **A7**）。
+> （共享只读市场数据，**有意共用**，见 §16.2），以及 `data/run/`。
+>
+> ⚠️ 措辞更正（`CHG-0087`）：上句原文写的是"共享**只读**市场数据"——
+> 那是把"读的意图"当成了"写的约束"。行情仓从来不是只读：**dev 与 pilot
+> 一直在同时写它**（2026-09-29 实测最后一班落在同一分钟）。现在"只读"
+> 才第一次成为**强制事实**：写者=pilot，其余实例连接级 `query_only=1`。见 §18.6。
+
+### 18.6 写权限归属：谁更新数据谁写（`CHG-0087`，2026-09-29 落定）
+
+> **用户原话**：「共享行情仓，dev 读，pilot 写和读。同时看下更新数据是谁负责的，
+> 谁负责更新数据谁有写权限。」
+
+**裁定**：`configs/data_stores.yaml` 的 `warehouse.writer` 由 `main` 改为
+**`pilot`**；dev / test / main 三个实例对 `data/quant/warehouse.db` **只读**。
+
+#### 18.6.1 为什么必须改（实测证据，不是推测）
+
+| 实例 | `quant_data_sync` 记录数 | 最后一班 |
+|---|---|---|
+| `data/scheduler`（主实例） | 7（6 成功） | 2026-09-28 19:00 |
+| `data/dev/scheduler` | 33（32 成功） | 2026-09-28 **23:30:03** |
+| `data/pilot/scheduler` | 43（43 成功） | 2026-09-28 **23:30:02** |
+
+**dev 与 pilot 在同一分钟往同一个 14.36 GiB 的 SQLite 文件里 upsert**，
+而且各自以为自己是唯一写者。SQLite 是单写者模型，这不是"性能问题"，
+是**数据正确性问题**。
+
+#### 18.6.2 为什么"关掉一个开关"没有解决它
+
+同一件事此前**已经被判断过一次**，而且判断是对的 —— `manage.py` 里写着：
+
+> ~~「定时任务同样关闭……两个调度器同时写同一个仓库会造成重复下载与行级竞争。
+>   所以试点的定位是『只读行情 + 独立账号库』。这条限制写在启动输出里。」~~
+
+它靠 `MOSS_SCHEDULER_ENABLED=0` 表达，而这个环境变量**全仓库零处读取**
+（`src/api/main.py` 里 `CronScheduler(...).start()` 是无条件的）。后果是**反向的**：
+横幅印着"定时任务已关闭"，于是没人会想到两个实例正在同写行情仓。
+（这与 §18.3 记的"设了但不生效的开关"是同一个失败模式，只是这次代价落在数据上。）
+
+#### 18.6.3 现行机制：一处声明 → 三层派生（都**强制**，不只是提示）
+
+| 层 | 位置 | 判据 |
+|---|---|---|
+| ① 归属声明 | `configs/data_stores.yaml` → `warehouse.writer: pilot` | **只此一处**；改归属只改这一个字段 |
+| ② 写闸门 | `QuantWarehouse.assert_writable()` + `engine()` 的 `PRAGMA query_only=1` | 非写者 `upsert()` 抛 `WarehouseError`（理由含"谁是写者 + 怎么改"）；**绕过 `upsert()` 直接写也被 SQLite 拒** |
+| ③ 调度裁剪 | `JobSpec.updates` × `writable_here()` → `schedulable_jobs()` | 更新作业在非写者实例上**根本不被触发**（否则每班撞闸门，台账刷成一片红 —— 而那不是故障） |
+
+三条**同源**：③ 不是手写黑名单，而是读 `JobSpec.updates`（作业声明它会写哪些存储）
+再问 registry"本实例能不能写"。所以"谁写什么"只有一处需要维护。
+`MOSS_SCHEDULER_DENY`（逗号分隔的作业名）作为**临时**开关保留，
+拼错的名字会被单独 warning —— 否则"写错一个字母"与"本来就不需要禁"在日志里长得一样。
+
+**待裁定项不参与裁剪**：`writable_here()` 的 `decided=False`（口径未拍板，
+如 `writer: main` 那批共享存储）**只报告、不阻断**，也不拿来关作业 ——
+让没人拍过板的口径静默停掉生产任务，与"设了但不生效的开关"是同一个错误的两个方向。
+
+#### 18.6.4 实测判据（四档 × 三层，机器可判）
+
+| 环境 | 裁决 | `upsert()` | `query_only` | 读取 | `quant_data_sync` |
+|---|---|---|---|---|---|
+| main（未注入 `MOSS_ENV`） | 拒（已裁定） | 抛 `WarehouseError` | 1 | 15,426,322 行 | **被裁** |
+| dev | 拒（已裁定） | 抛 `WarehouseError` | 1 | 15,426,322 行 | **被裁** |
+| test | 拒（已裁定） | 抛 `WarehouseError` | 1 | 15,426,322 行 | **被裁** |
+| pilot | 允许 | 通过 | 0 | 15,426,322 行 | **照跑** |
+
+护栏：`tests/unit/test_warehouse_write_ownership.py`（14 条，含"写者写得进去"
+与"只读实例读得到"两个**反向**判据 —— 只钉"拦住"会在写侧坏掉时照样绿）；
+`tests/unit/test_store_registry.py` 的写者归属判据改成**跟着登记表推**，
+不再写死 `writer == "main"`（写死的那版在本次改口径时立刻红了）。
+
+#### 18.6.5 ⚠️ 后果（必须说清楚，不许省略）
+
+1. **主实例也变成只读**（它没注入 `MOSS_ENV`，`current_env()` 判为 `dev`）。
+   `data/scheduler` 里那 7 条 `quant_data_sync` 记录**不会再增长**。
+   这是有意的（一个共享文件一个写者），改回来只需改 `writer` 一个字段。
+2. **手工补数/离线脚本要声明身份**：`scripts/quant_warehouse.py ingest` 这类
+   在主实例上跑的脚本会被拒（错误消息里给出可照抄的命令）：
+   ```bash
+   MOSS_ENV=pilot uv run python scripts/quant_warehouse.py ingest --dataset daily
+   ```
+3. **`/health` 新增 `data_sources.local_stores` 与 `data_sources.schedule`**：
+   写权限归属与调度作用域第一次**可见**（此前 `describe()` 零个生产调用方）。
+   只接摘要 —— 实测 `/health` 15,650 → **19,357 字节（+23.7%）**，
+   而全量（含 `note`）要 +75%，见 §18.6.6。
+4. **MySQL/PG 仓库不受 `query_only` 约束**：那边的写权限由账号表达
+   （本项目行情仓是 SQLite，已在代码注释里如实标注这个边界）。
+
+#### 18.6.6 本次改动的体积/时延预算（判据写成 KB 与次数）
+
+| 项 | 数字 |
+|---|---|
+| `describe(want_sizes=False)` | 11.0 ms |
+| `describe(want_sizes=True)`（对照） | 3,288.9 ms（递归 3.5 万个分区文件）= **306×** |
+| `/health` 接入前（实测**活实例**） | 15,650 字节 |
+| 接**全量**（含 `note`）的代价 | +11.46 KB（+75%）→ **不接** |
+| 接**摘要**（sqlite 写权限为主）的代价 | +1.58 KB（+10%） |
+| 再加文件/目录类清单（19 条，只给名字/路径/存在性） | 约 +0.9 KB |
+| 再加 `data_sources.schedule`（44 个作业的作用域） | 约 +1.1 KB |
+| **`/health` 接入后（实测活实例）** | **19,357 字节（+3,707 字节，+23.7%）** |
+| 新增串行往返 | **0**（并进 `_sync_probes()` 已有那趟线程池调用） |
+| 未量到的体积 | `size_mb: null`（**不是 0** —— 0 会被读成"空库"） |
+| 未量到的作业数 | **不给 `total`**（不是 0 —— 0 会被读成"这台机器没有作业"） |
+
+> ⚠️ 预算从 +1.58 KB 改成 **+3.71 KB** 是**实测修正**，不是估算口径变了：
+> 起草时只算了 sqlite 摘要，漏了目录类清单与新增的调度作用域两段。
+> 复核方式可复跑 —— `scripts/_probe_health_payload_budget.py`（分项）与
+> `scripts/_probe_health_live.py`（活实例总字节数）。
+> 这 23.7% 加在一个**已有**的 20 秒轮询响应上：**没有新增请求次数** ——
+> 而那正是本项目「要减少的是**次数**，不是字节」这条约束所要求的取舍。
+
+#### 18.6.7 同轮自查：一次"写了但没人看得到"
+
+裁剪理由最初写在 `SchedulerService.start()` 的 `logger.info` 里，措辞是
+"被裁掉的逐条给人话理由"。**实测那句话谁也看不到**：
+
+| 检查 | 结果 |
+|---|---|
+| 全仓库 `logging.basicConfig()` / `dictConfig()` | **0 处** |
+| root logger 的 handler | 无（Python last-resort handler **只兜 WARNING 及以上**） |
+| 逐字节搜 `data/run/*.log` 里的「调度器已启动」 | **0 处** |
+| 对照：同文件里 WARNING 级的「作业…上一轮未结束，跳过本轮」 | **在** |
+
+（第一次用 PowerShell `Select-String` 搜同一批文件报了 **6 处** —— 那是编码造成的
+**假阳性**；改成 `read_bytes().count(...)` 才是 0。判据要能自证。）
+
+也就是说：**只写日志的话，"作业为什么没跑"在运行中的实例上完全不可见** ——
+正是本项目记过的那道门（"我改了" → "有没有人看到"）。所以补齐两个可见面：
+
+1. `manage.py` 启动横幅的 `_scheduler_scope_line()`（stderr，**给人看**；
+   实测输出 `定时任务：37/38 个会触发；因**写权限归属**被裁：quant_data_sync`）；
+2. `/health` → `data_sources.schedule`（**给机器/前端看**；实测 dev 活实例
+   `43/44 会触发`，被裁那条带完整人话理由）。
+
+`logger.info` 保留（测试与前台运行有人配了 logging 时可见），但**不许**再把它
+当成"运维能看到"的依据。
+
+> 注：静态 `JOB_REGISTRY` 是 **38** 个，运行中的 dev 实例是 **44** 个 ——
+> 差额来自 `load_dynamic_jobs()` 从 `data/<env>/scheduler` 装回来的动态采集作业。
+> 两个数字**都对**，但口径不同；`schedulable_jobs()` 覆盖两者。
+>
+> 另：pilot 的 `/health` 被登录门槛拦成 **401**（除登录/注册/存活探针外都要会话），
+> 所以那台实例上的新可见面**只对有会话的人可见** —— 实测 `/health/live` 与
+> 公网 `hk.wujiaitool.cn/api/v1/health/live` 都是 200。
 
 
 ## 十九、本地数据确定性流水线（现行口径 · 2026-09-29 定型）
@@ -1789,6 +1974,24 @@ async**，那 10 条"取不到"是**探针自己错了**）：
    `商誉`/`货币资金`/`有息负债` **全部被挡** → 商誉档与存贷双高
    （需两个输入同时到手）**恒不触发**。
    **这与"数据在库里 Agent 看不见"完全同类，只是换了一层。**
+5. **★ 计划层（最容易被当成"数据源的问题"的一层）**：把上面 5 族写进
+   `_SIGNAL_AGENT_INDICATORS["stock"]` **且**同步进 `_CODE_SUFFIX_INDICATORS`
+   —— 否则计划里根本没有这几族，**一次请求都不会发**，而 A12 只能报
+   「一条都没量到」。**"没去取"与"取不到"在结论里长得一模一样**，
+   这是本缺陷最危险的地方（详见 §19.15）。
+6. **★ 覆盖率必须随结论下发（第三层"残缺的合格证"）**：只量到 2/6 族时，
+   结论文本原本只写「未见明显合规风险信号」—— 覆盖率藏在 `key_points` 里，
+   而**结论才是用户看的那一行**。六族全空时报「无」是伪造（第 1 层已修）；
+   **两族量到就报「无」而不说清另外四族**，仍是一张**残缺的**合格证：
+   数字没错，但用户会读成"查过了、没问题"。
+   现行口径：`conclusion` 必须写「已量到 N/6 族（…），未量到 …（**不等于**
+   这几种风险为零）」；`key_points` 必须点明四种「没量到」的原因**各不相同**
+   （口径不适用 / 该票不在专题表内 / 无免费源 / **本次未取**），
+   且只要存在未量到族，`confidence` 由 `high` 降为 `medium`。
+   判据：`test_measured_clean_conclusion_discloses_coverage`。
+   实测输出（招商银行、量到 2/6 族）：
+   > 本地合规规则扫描完成：未见明显合规风险信号。已量到 2/6 族（商誉/有息负债），
+   > 未量到 关联交易/担保/货币资金/质押 —— 未量到**不等于**这几种风险为零。
 
 **验收（端到端，两层都打到）**：
 
@@ -2150,6 +2353,203 @@ uv run python scripts/_e2e_real_llm.py
 uv run python -m pytest tests/unit/test_planned_indicators_channel.py \
     tests/unit/test_stock_signal_contract.py tests/unit/test_query_signal_routing.py -q
 ```
+
+### 19.16 ★ 平台自有数据的接入口径 —— 附**三次"我说没有、其实有"的更正**（`CHG-0086`）
+
+> 用户原话：「连接器或行业agent，个股agent，要考虑连接器接入如下本平台的
+> **板块拥挤度、主线挖掘、个股行情估值打分、投资日历个股解禁**情况的后端数据…」
+> 以及一句关键的纠正：「**前端有个股估值打分啊**」（附量化面板截图：
+> 永鼎股份=「估值透支」、**招商银行=「估值合理偏贵」**）。
+
+#### 19.16.1 先纠正我自己的三次错误结论（**本文的价值一半在这里**）
+
+我在侦察阶段连续三次把「我没找到」说成了「平台没有」。三次都已被实测推翻，
+**记在这里是为了让下一个人不要重犯同一个方法论错误**：
+
+| 我说过 | 真相（实测） | 我漏查的那一层 |
+|---|---|---|
+| 「平台**没有**个股级解禁数据」（我搜遍所有库的表名/列名，`unlock/解禁/lift` 零命中） | **有**：`fact_data_points.extra_json.top_stocks` = `{code, name, market_cap, pct_of_float, share_type}`（实测 2026-11-13 那条含 7 个明细：中邮科技 18.56 亿/占流通 95.6%、隆平高科 12.85 亿/11.6%…） | **JSON 列**（列名叫 `extra_json`，按业务词搜列名**永远**搜不到）+ **接口层** `domain/intel/calendar.py::fetch_unlock_schedule()`（主源东财 `stock_restricted_release_detail_em`，**按个股**给） |
+| 「个股→概念**相关度排序不可靠**」（我只查了 `ml_member_pure`：600036 仅 1 条且 `relevant=0`） | **可靠**：`ml_stock_theme` 覆盖 **4,996 只**（600036：货币金融服务 `final_score=99.2`、商业银行 98.31、银行 98.31，且带 `reason='主营即货币金融服务'`）；`ml_member_corr` 覆盖 **5,215 只**（带 `corr/samples/日期区间`） | **选错了表**：`ml_member_pure` 是**以板块为键的候选池**，不是全市场逐票映射 |
+| 「估值水位要自己按分位定档（阈值写进常量）」 | **平台已有权威实现** `src/intraday/valuation.py`（`ValuationProvider` / `compute_headroom_score` / `headroom_bucket` / `HEADROOM_LABELS`）—— 前端那个标签就是它给的 | **代码层**：只搜了数据表，没搜"这个判断是不是已经有人实现了" |
+
+**由此确立的判据（已进 `AGENTS.md`）**：下结论"平台没有"之前必须过完四层 ——
+①表/列（`PRAGMA table_info`，但列名可能不含业务词）→ ②**JSON 列**（`*_json`/`extra*`/`payload` 抽样看值）
+→ ③**接口/服务层**（`grep` 业务词在 `src/**` 的函数名与路由里：数据可能是**实时取的**而非落库的）
+→ ④**已有实现**（`grep` 那个**结论词**：有现成实现就必须**复用**，否则同一判断两份实现会让
+界面与 Agent 给出不同答案）。
+
+#### 19.16.2 「估值水位」的现行口径：**复用 `ValuationProvider`，不另定阈值**
+
+实测（`scripts/_probe_valuation_provider.py`，只读）：
+
+| | 复用平台实现得到的 | 用户前端截图 |
+|---|---|---|
+| 600036 招商银行 | `pe_ttm=6.76` `pb=0.90`，PE 近三年 **63.5%** 分位 / PB **43.5%** 分位，`score=-0.0703`，`headroom=stretched` → **「估值合理偏贵」** | **「估值合理偏贵」** ✅ |
+| 600105 永鼎股份 | `pe_ttm=133.71` `pb=15.38`，PE 60.4% / PB 85.8% 分位，`score=-0.4617`，`headroom=expensive` → **「估值透支」** | **「估值透支」** ✅ |
+
+**逐字一致 ⇒ 单一事实源成立。** 口径细节（必须随数据下发，否则会与界面产生分歧）：
+`pe_series_days=1110`（**近三年**日频，不是全历史）；`source_name=项目采集链(百度估值)`；
+`peer_pe_median`/`industry_pe_median` 来自 `configs/intraday.yaml` 的 watchlist 条目
+（实测 600036/600105 的 `peers: []` 且无 `industry` ⇒ 分数**只含分位分量**，
+这正是两边能对上的原因）。装配路径照 `src/intraday/service.py:348-351`：
+`load_intraday_config` → `IntradayDataProvider` → `ValuationProvider(cfg, data, backend)`。
+
+#### 19.16.3 「概念拥挤度 + 相关度」的现行口径：**先相关、再看拥挤**
+
+用户原话的语序就是判据：「个股**相关度最大**的所属概念板块，**其拥挤度水平**」。
+所以不是"把所有概念按拥挤度排"，而是**每条都成对给出（相关度 + 拥挤度）**：
+
+| 口径 | 来源 | 实测覆盖 |
+|---|---|---|
+| 走势相关 `corr` | `mainline_cache.db::ml_member_corr`（board_code/code/corr/samples/日期区间） | **5,215 只**；600036 有 16 个板块，`corr` 0.700~0.869 |
+| 主营相关 `final_score` | 同库 `ml_stock_theme`（code/theme/business_score/corr/final_score/reason） | **4,996 只**，`final_score` 全非空 |
+| 拥挤度 | `moss_finagent.db::sector_crowding_daily`（raw_crowding/ma5_crowding/**water_level**） | **2,181,780 行**，最新 20260924 |
+
+**★ join 实测 16/16 命中（同一套 `.TI` 编码）**：`700334.TI 银行(A股)`、`700402.TI 商业银行(A股)`、
+`700547.TI 综合性银行(A股)`、`700714.TI 货币金融服务指数`、`881155.TI 银行`、`884250.TI 股份制银行`…
+（按名 join 也通：`ml_stock_theme.theme` → `sector_crowding_daily.sector_name` 命中 3/4）。
+⚠️ `map_stock_concept` 只覆盖 **105 只**个股 —— 它**不是**全市场映射，别当主力来源。
+
+#### 19.16.4 「个股解禁」的现行口径：数据在 `extra_json` 里，**登记面**才是缺口
+
+- **数据面：有。** `cal:unlock:{market_cap,company_count,top_stock_cap}` 的
+  `extra_json.top_stocks` 带逐只个股明细（`code/name/market_cap/pct_of_float/share_type`）。
+- **登记面：缺。** `calendar_store.py` 只把**聚合三条**登记成了指标，**个股明细未登记为指标** ——
+  于是分析层拿到的只有"当日合计解禁 N 亿"，拿不到"招商银行哪天解禁多少股"。
+  这是**登记缺口**，不是数据缺口。
+- 判据（三态必须分开）：**命中** → 产点带明细；**窗口内查过但没有该 code** → `value=0.0`
+  + basis「窗口 X~Y 内共 N 个解禁日 / M 条明细，未出现该标的 ⇒ 真结论：无解禁计划」（**量到 0**）；
+  **窗口内一条 `cal:unlock:*` 都没有** → 不产点（**没量到**，属数据未同步）。
+  混了这两者，用户会把"没同步"读成"没有解禁"。
+
+#### 19.16.5 真实端到端验收发现的两处措辞问题（待修，已登记）
+
+1. **A13/A14 的"非本框架"**：兜底 Agent（A20）已接管银行，但 A13（科技）/A14（消费）
+   仍会输出「600036 属银行、**不在本次科技行业数据覆盖内**…无法给出可验证的持有结论」。
+   A20 已给出银行结论 ⇒ 这句不再是"没人管"，但**读起来仍像系统缺能力**。
+   → 下一轮应改为「本次由兜底行业 Agent 负责该标的的行业结论（见 A20）」，或直接不提。
+2. **`[幻觉防护提示]` 对数量级改写过严**：结论写 `1.70万亿` 而输入是 `17028亿`、
+   写 `90.18%` 而输入是 `90.183`，都被标成"未在输入数据中找到的数字"。
+   这会削弱该护栏自身的可信度（狼来了）→ 需要按**数值等价**而非字符串相等判定。
+
+**验收命令**：
+
+```bash
+uv run python scripts/_probe_valuation_provider.py   # 估值标签与前端是否逐字一致（只读）
+uv run python scripts/_probe_unlock_perstock.py      # 解禁明细在 extra_json 里的原始证据
+uv run python scripts/_probe_relevance_sources.py    # 相关度两张表的覆盖规模
+uv run python scripts/_probe_theme_join.py           # 相关度 → 拥挤度 的 join 命中率
+```
+
+> 以上四个探针是**本机脚本**（`scripts/` 默认不入库的政策，见 §13 与
+> `tests/unit/test_shipped_deps.py`），输出已摘录进本节。
+
+
+### 19.17 平台自有数据接入（二）：行业↔概念板块、板块资金流、行业轮动日报（`CHG-0088`）
+
+> 用户原话（2026-09-29，紧接 §19.16 的第二段）：
+> 「投研分析中，很多信息都可以从平台的其他功能板块获取后端相关数据，辅助分析。
+> **①** 用户输入内容中含有个股名或有输入标的（6位编码），要数据连接到**所属概念板块
+> 拥挤度**数据、**行情分析里个股估值打分**数据、**投资日历中的该股的解禁情况**数据。
+> **②** 用户输入内容中含有**行业**的，要连接到概念板块拥挤度的数据表，找与之**最相近的
+> 所属概念板块**，**如果找不到就不提示未找到数据**。也可以接入"**板块资金流**"功能板块
+> 的数据，查询该板块**近期资金流方向**。
+> **③** 用户问到**当下和未来近期行情**的，可以接入"**行业轮动日报**"里的数据，
+> 寻找相关参考。」
+
+#### 19.17.1 需求分解（T0：可判定条目，原话不改写）
+
+| # | 需求原话 | 可观察行为（判据） | 关键词 | 判定 |
+|---|---|---|---|---|
+| ①-1 | 含**个股名**或 6 位编码 → 所属**概念板块拥挤度** | 输入「招商银行」或「600036」时，A10/A20 的上下文里出现 `概念拥挤度:600036`（含板块名 + `water_level`） | 概念板块拥挤度 / 个股名 | §19.16 已建 `概念拥挤度:{code}`，**增补判据要看 `focus_stock_code`** |
+| ①-2 | 个股 → **个股估值打分** | 上下文出现 `估值水位:{code}`，且档位/标签与前端**逐字一致** | 估值透支/估值合理偏贵 | §19.16 已建（复用 `src/intraday/valuation.py`） |
+| ①-3 | 个股 → **解禁情况** | 上下文出现 `解禁计划:{code}`（未来 30 天窗口，三态分开） | 解禁 | §19.16 已建 |
+| ②-1 | 含**行业** → 概念板块拥挤度，找**最相近**的所属概念板块 | 输入「银行」时按**相关度口径**选出最相近概念板块并给出其水位 | 最相近 / 所属概念板块 | **本轮新增** `行业拥挤度:{行业名}` |
+| ②-2 | **找不到就不提示未找到数据** | 行业↔概念板块匹配不上时：**不产点**、**不登记缺口**、结论与 `data_gaps` 里**不出现**"未找到数据/缺数据" | 不提示未找到 | **本轮新增**（见 §19.17.4，是**用户点名的例外**） |
+| ②-3 | 接入**板块资金流**，查该板块**近期资金流方向** | 输入板块/行业名时出现 `板块资金流:{板块名}`（近 N 日净额 + 方向 + 榜单排名） | 板块资金流 / 资金流方向 | **本轮新增**（功能板块早已存在，PRD 从未登记 → `MISS_PRD`） |
+| ③ | 问到**当下和未来近期行情** → **行业轮动日报** | 出现 `行业轮动:{行业名}`（该行业涨跌幅 + 主力净额 + 全局研判 + 报告日期/落伍天数） | 当下/未来近期行情、轮动 | **本轮新增**（同上，`MISS_PRD`） |
+
+T1 对账证据（可复跑）：
+
+```bash
+uv run python scripts/prd_sync_check.py --keyword "板块资金流"   # 改前 = MISS_PRD
+uv run python scripts/prd_sync_check.py --keyword "行业轮动"     # 改前 = MISS_PRD
+uv run python scripts/prd_sync_check.py --keyword "拥挤度"       # OK（§19.16）
+uv run python scripts/prd_sync_check.py --keyword "解禁"         # 改前 = MISS_LEDGER
+```
+
+#### 19.17.2 两个"仓库做了、PRD 里查不到"的功能板块（`MISS_PRD` 的实体）
+
+这一条本身就是本项目的老毛病（§十七：`QMT` 0 处 / 实现面 440 处）：**平台功能板块
+存在、有路由、有调度、有前端，但 PRD 里一个字都没有** —— 于是"接进投研分析"这件事
+在文档层面看起来像"要新建能力"，实际只是"接线"。
+
+| 功能板块 | 实现入口（单一事实源） | 对外接口 | 落盘/口径 |
+|---|---|---|---|
+| **板块资金流** | `src/fundflow/provider.py::FundFlowProvider`（`sector_snapshot` / `sector_history` / `sector_history_many`）、榜单 `src/fundflow/service.py::FundFlowService.snapshot()` → `_rank_sectors`，数据形状 `src/fundflow/models.py::FlowEntity/FlowPoint` | `/api/v1/fundflow/{snapshot,watch,search,pick}` | 同花顺即时板块资金流（盘中实时层）+ 东财 `moneyflow_ind_dc`（历史）；两者是**不同口径**，必须随数据下发 |
+| **行业轮动日报** | `src/sector_rotation/service.py::assemble()`（`industries` / `indices` / `narrative` / `meta`）、`pick_heat()`、`is_stale()` | `/api/v1/sector_rotation/*`（JSON/HTML） | 每交易日**一份 JSON 落盘** `data/sector_rotation/report_YYYYMMDD.json`（读侧 `store.latest_date()/load()/history()`）；调度作业 `sector_rotation_report` 工作日 **15:40** 生成 |
+
+#### 19.17.3 三族新指标（指标 id 与语义）
+
+| 指标 id | value | 关键 extra | 数据来源 |
+|---|---|---|---|
+| `行业拥挤度:{行业名}` | 该行业**最相近概念板块**的 `water_level`（0~1） | `matched_board{code,name}`、匹配依据（哪个口径命中）、`water_level_measured`、`candidates` | `mainline_cache::ml_member_corr` / `ml_stock_theme` × `legacy_main::sector_crowding_daily`（与 `概念拥挤度` **同一套相关度口径**，不另写模糊匹配） |
+| `板块资金流:{板块名}` | 近 N 日主力净流入合计（元） | 方向（净流入/净流出/基本持平）、当日截面、榜单排名、`source`（同花顺即时 / 东财历史）、窗口 | `src/fundflow/`（**复用** provider/service，不绕过它自建 SQL） |
+| `行业轮动:{行业名}` | 该行业当日涨跌幅（%） | 主力净额、`narrative.headline/body/views`（规则研判）、`report_date`、`stale_days` | `src/sector_rotation/`（读落盘 JSON） |
+
+**为什么不允许另写一份取数**：这三块数据在平台上**已经有生产者在写、有前端在读**，
+Agent 侧再写一份 SQL 就会出现"界面一个数、Agent 另一个数"（§19.16 纪律一的同一个
+失败模式）。所以只允许**调用既有入口**，口径差异（实时 vs 历史、报告落伍天数）
+**随 extra 下发**。
+
+#### 19.17.4 ★「找不到就不提示未找到数据」的机器判据（用户点名的例外）
+
+`AGENTS.md` 的硬约束是「**没量到 ≠ 量到 0**，缺数据必须如实登记」。
+本条是**用户明确点名的例外**，所以必须把例外的**边界**写死，否则它会变成
+"以后所有缺口都可以不提示"的通行证：
+
+- **适用面只有一族**：`行业拥挤度:{行业名}`（②-1/②-2）。其余族一律照旧登记缺口。
+- **理由（可判定）**：行业（申万/名录行业名）与概念板块**本来就不是一一对应**
+  —— "这个行业没有相近概念板块"是**正常结论**，不是"平台缺数据"。
+  把它写成"未找到数据"，用户会去追一个根本不存在的缺口。
+- **机器判据（三条同时成立）**：
+  1. 该族匹配不上时 `fetch()` 返回 `[]`（**不产点**）；
+  2. `diagnose()` 的 `reason` **不是**缺口措辞 —— 且该 reason **不得**进入
+     A17 的 `data_gaps`、不得出现在前端"缺少数据"提示里；
+  3. 与"平台表不存在/库读不到"**必须可区分**：后者是**真缺口**（存储层异常），
+     照旧上报 —— 例外的边界是"匹配不上"，不是"读不到"。
+- 护栏：`tests/unit/test_platform_data_connector.py` 里两条**反向**判据
+  ——（a）匹配不上时不产点且 reason 非缺口；（b）存储层不可用/表缺失时**仍然**
+  按缺口上报（防止把例外做成"静默吞异常"）。
+
+#### 19.17.5 个股三族的挂载判据：**个股名**走既有的唯一解析入口
+
+"含有个股名"不需要新写名称解析：`src/api/routes/research.py:315-336` 已经用
+`query_needs_stock_resolution()` + `resolve_stock()` 把问句里的个股名解析成
+`state["focus_stock_code"]`（这一跳是 2026-09-28 第二十三轮为"高股息招商银行"
+那个报障补的）。三族个股指标的增补判据是：
+
+```
+state["focus_stock_code"] 非空  → 补 估值水位/概念拥挤度/解禁计划 + 主线告警/个股告警（均带 code 后缀）
+```
+
+**不许**在规划层再抄一份"名字→代码"（两份必然漂移，且漂移的表现是
+"解析出的代码与 target 不是同一只票"，不报错）。
+
+#### 19.17.6 验收命令与判据
+
+```bash
+# 契约与接线（改指标/白名单/登记表必跑）
+uv run python -m pytest tests/unit/test_contract_consistency.py \
+    tests/unit/test_whitelist_coverage.py tests/unit/test_indicator_prefix_wiring.py -q
+# 本连接器的三态 + 「找不到不提示」反向判据
+uv run python -m pytest tests/unit/test_platform_data_connector.py -q
+# 真值探针（只读；判据是"取到没取到"与"数字是多少"，不是"看着像不像"）
+uv run python scripts/_probe_platform_connector_acceptance.py
+```
+
+判据写成**精确命中数 == 预期数**（白名单 0 命中会走兜底返回前 N 条，
+"看起来有数据"是假绿）。实测数字见 §19.18（端到端验收）。
 
 
 ---
