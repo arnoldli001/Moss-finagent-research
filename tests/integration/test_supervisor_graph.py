@@ -115,6 +115,10 @@ def _build(tmp_dir):
     graph = build_research_graph(
         agents, chain_path=f"{tmp_dir}/chain.jsonl",
         llm_audit_path=f"{tmp_dir}/llm.jsonl",
+        # ★ 第十一轮：必须传 repo —— SmartFetcher 用 repo._db_path 建 catalog，
+        # 不传的话会落到全局单例（生产 data/moss_finagent.db），
+        # 测试就会读到生产库里的 CPI/PPI 而跳过 live fetch。
+        repo=repo,
     )
     return graph, gw, repo
 
@@ -134,15 +138,34 @@ def _state(**over):
 
 
 async def test_collect_falls_back_to_stored_snapshot(tmp_dir):
-    """实时采集为空时，A01环节降级读取定时作业已入库的最近快照。"""
+    """实时采集为空时，A01环节降级读取定时作业已入库的最近快照。
+
+    ★ 第十一轮：SmartFetcher 引入后，"DB 命中"路径不再标 `storage_fallback`。
+    catalog 索引表记录 last_fetch_time；SmartFetcher 看到 fresh 直接读 DB。
+    本测试覆盖：
+      1) catalog 已登记该指标（仿真定时作业写过 catalog）
+      2) live 拿不到时回退 DB（与第十轮前的旧行为兼容）
+    """
     from src.core.schemas import DataPoint
+    from src.infrastructure.catalog import IndicatorMeta
+    from src.infrastructure.catalog.catalog_repo import CatalogRepository
 
     repo = MacroRepository(db_path=f"{tmp_dir}/fallback.db")
-    await repo.save_points([DataPoint(
+    point = DataPoint(
         indicator="mkt:turnover:total", value=16000.0, unit="亿元",
         period_date="2026-09-13", source_name="腾讯财经",
         source_url="http://qt.gtimg.cn/q=sh000001,sz399001", confidence=0.9,
-    )], "task_seed")
+    )
+    await repo.save_points([point], "task_seed")
+    # ★ SmartFetcher 路径：catalog 必须登记该指标 + freshness 状态
+    catalog = CatalogRepository(db_path=f"{tmp_dir}/fallback.db")
+    await catalog.ensure_schema()
+    await catalog.upsert_meta(IndicatorMeta(
+        indicator="mkt:turnover:total", category="mkt_liquidity",
+        frequency="realtime", freshness_hours=0.5,
+        primary_source="腾讯财经", source_url="", enabled=True, ttl_days=90,
+    ))
+    await catalog.update_from_points([point], "mkt:turnover:total")
     agents = {
         # A01实时采集对该指标返回空（模拟东财/腾讯同时不可用）
         "A01_data_collector": FakeCollector({}),
@@ -163,8 +186,7 @@ async def test_collect_falls_back_to_stored_snapshot(tmp_dir):
     assert len(pts) == 1
     assert pts[0]["indicator"] == "mkt:turnover:total"
     assert pts[0]["period_date"] == "2026-09-13"
-    assert pts[0]["extra"]["storage_fallback"] == "live_empty_or_failed"
-    # 有快照兜底时A01不计硬错误
+    # 有快照兜底时A01不计硬错误（DB 命中路径也不应报错）
     assert not [e for e in final["errors"] if "A01_data_collector" in e]
 
 
@@ -209,7 +231,25 @@ async def test_plan_routes_by_analysis_type():
     assert "A05_verifier" in stock_plan["agents"]
 
     macro_plan = plan_run("macro", "")
-    assert macro_plan["indicators"] == ["CPI", "PPI"]
+    # ★ 2026-09-29（`CHG-0100`）：宏观问的指标集从 `["CPI","PPI"]` 扩到**中国宏观
+    #   四件套**。原断言写的是旧契约，而旧契约正是报障现场：
+    #   用户问「当前宏观环境如何…」时系统答「**中国端：中国宏观数据缺失**」，
+    #   而库里 `CPI` 229 行 / `PPI` 229 行 / `M2` 119 行 / `社融` 115 行。
+    #   根因不是数据、也不是白名单，而是**计划里压根没有这两条**
+    #   （实测 LLM 规划那条路上的 20 条指标里一条中国宏观都没有）。
+    #   判据：`supervisor.ensure_macro_indicators()`（只增不减、幂等）。
+    # ★ 2026-09-30（`CHG-0107`）：再扩一组 —— **美国/利率侧必查项**。
+    #   用户口径：「把**美债收益率/失业率**作为宏观结论的**必查项**写进
+    #   **数据侧的组装逻辑**，而不是写进 prompt」。
+    #   旧的"美国宏观"分支只追加 `us_*` 五条**已停产**的 id（源停更）⇒
+    #   排了也取不到；现改为确定性的 `_US_RATES_INDICATORS`（FRED 换源后的
+    #   活序列 + `fed:` 政策利率三条）。
+    assert macro_plan["indicators"] == [
+        "CPI", "PPI", "M2", "社融",
+        "fred:DGS10", "fred:T10Y2Y", "fred:UNRATE", "fred:PAYEMS",
+        "fred:CPILFESL", "fred:PCEPILFE",
+        "fed:target_upper", "fed:target_lower", "fed:effr",
+    ]
     assert "A10_micro" not in macro_plan["agents"]
 
     unknown = plan_run("whatever", "x")
@@ -223,17 +263,22 @@ async def test_collector_error_is_contained(tmp_dir):
 
     gw = FakeGateway()
     gw.set("投研委员会主席", REPLY17)
+    # ★ 第十一轮：repo 必须传 —— SmartFetcher 用它建 catalog。
+    # 不传会落到全局单例（生产库），生产库里有 CPI/PPI →
+    # SmartFetcher 直接 DB 命中，ExplodingCollector 根本不会被调用。
+    repo = MacroRepository(f"{tmp_dir}/x.db")
     agents = {
         "A01_data_collector": ExplodingCollector(),
         "A02_data_cleaner": DataCleanerAgent(),
         "A03_data_validator": DataValidatorAgent(),
-        "A04_data_storage": DataStorageAgent(MacroRepository(f"{tmp_dir}/x.db")),
+        "A04_data_storage": DataStorageAgent(repo),
         "A08_macro": MacroAnalysisAgent(gw),
         "A17_recommend": RecommendationAgent(gw),
         "A18_audit": AuditAgent(),
     }
     graph = build_research_graph(agents, chain_path=f"{tmp_dir}/c.jsonl",
-                                 llm_audit_path=f"{tmp_dir}/l.jsonl")
+                                 llm_audit_path=f"{tmp_dir}/l.jsonl",
+                                 repo=repo)
     final = await graph.ainvoke(_state(analysis_type="macro"))
 
     assert any("A01" in e for e in final["errors"])      # 采集失败被吞入errors

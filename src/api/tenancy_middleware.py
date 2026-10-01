@@ -43,6 +43,8 @@ from src.core.tenancy import (
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel  # noqa: E402
+
 #: 免鉴权路径（健康检查与前端静态资源）。**只放确实不需要身份的。**
 #:
 #: `/api/v1/health/live` 必须在这里，两个理由：
@@ -55,9 +57,18 @@ logger = logging.getLogger(__name__)
 #: ⚠️ 但**聚合健康度 `/api/v1/health` 故意不放进来**：它会返回 Ollama/
 #: DeepSeek 配置状态、数据源健康度、库表行数 —— 那是内部拓扑，
 #: 匿名可读等于给攻击者一份踩点清单。所以"存活免鉴权、就绪要鉴权"。
+#:
+#: ★ **2026-09-30 更正（`CHG-0128`）**：这里曾写着
+#: ~~`/api/v1/metrics/health`~~、~~`/api/v1/metrics/ready`~~，注释说它们是
+#: "既有公开探针" —— **它们从来没有路由**（实测 404），是从
+#: `docs/PLATFORM_MULTI_TENANCY_DESIGN.md` 的**计划**里抄进白名单的。
+#: 留在白名单里不授予任何东西，却让人（包括我自己）以为它们能用：
+#: 照 `docs/DEMO_GUIDE.md` 那条命令探活会拿到 404 并判"服务挂了"。
+#: 已删除；`/healthz` 则从"写了但没实现"变成**真有路由**。
+#: **白名单里的每一条都必须有路由在服务它** —— 由
+#: `tests/unit/test_public_path_contract.py` 机器核对。
 _PUBLIC_PATHS: frozenset[str] = frozenset({
-    "/api/v1/metrics/health", "/healthz", "/favicon.ico",
-    "/api/v1/metrics/ready", "/api/v1/health/live",
+    "/healthz", "/favicon.ico", "/api/v1/health/live",
 })
 
 #: 仅开发环境可用：允许用请求头声明身份（`MOSS_ALLOW_HEADER_IDENTITY=1` 时才生效）
@@ -93,7 +104,7 @@ def _header_identity_allowed() -> bool:
 
 
 def _default_audit_dir() -> Path:
-    return Path(os.environ.get("MOSS_AUDIT_DIR", "data/audit"))
+    return Path(os.environ.get("MOSS_AUDIT_DIR") or store_rel("access_audit"))
 
 
 class TenantAuditLog:

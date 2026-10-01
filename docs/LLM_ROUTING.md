@@ -26,8 +26,20 @@ provider 整体不可用时主备会一起失败。
 
 ## 二、熔断器三态
 
-实现：`src/infrastructure/llm/circuit_breaker.py`，按 provider 隔离
-（`CircuitBreakerRegistry`）。deepseek 的默认参数：
+实现：`src/infrastructure/llm/circuit_breaker.py`，按 **provider × 租户** 隔离
+（`CircuitBreakerRegistry`；key 由唯一的 `breaker_key(provider, tenant)` 构造，
+调用点用 `for_call(provider, tenant)`）。
+
+> ★ 2026-10-01 的口径变更（`CHG-0154`）：**原先只按 provider 隔离**，
+> 后果是「一个用户的突发流量把所有人打到 circuit_open」
+> （失败按**请求方**累积、却按**提供商**生效）。现在每个租户一个桶
+> （`deepseek:vip` / `deepseek:trial`）；**拿不到租户身份时退回 provider 级全局桶，
+> 仍然熔断**（后台作业走这条）。逐桶状态挂 `/health` 的
+> `llm_circuit_breakers`（`open` 列出开着的桶）—— 没有这个可见性，
+> "隔离生效"与"某租户被静默降级"在界面上长得一样。
+> 判据：`tests/unit/test_circuit_breaker_tenancy.py`（6 条，含自证）。
+
+deepseek 的默认参数（**按 provider 取**，租户只是多一维 key）：
 
 | 参数 | 值 | 含义 |
 |---|---|---|

@@ -22,6 +22,7 @@ from src.domain.agents.engineering.code_engineer import CodeEngineerAgent
 from src.domain.agents.industry import (
     ConsumerIndustryAgent,
     CyclicalIndustryAgent,
+    GenericIndustryAgent,
     PharmaIndustryAgent,
     TechIndustryAgent,
 )
@@ -33,13 +34,20 @@ from src.infrastructure.connectors.a_share_liquidity_connector import (
     AShareLiquidityConnector,
 )
 from src.infrastructure.connectors.akshare_connector import AkshareConnector
+from src.infrastructure.connectors.bank_statement_connector import (
+    BankStatementConnector,
+)
 from src.infrastructure.connectors.baostock_connector import BaostockConnector
 from src.infrastructure.connectors.cached_news_fetcher import CachedNewsFetcher
 from src.infrastructure.connectors.coal_inventory_connector import (
     CoalInventoryConnector,
 )
+from src.infrastructure.connectors.compliance_fin_connector import (
+    ComplianceFinConnector,
+)
 from src.infrastructure.connectors.dynamic_loader import get_dynamic_loader
 from src.infrastructure.connectors.fedwatch_connector import FedWatchConnector
+from src.infrastructure.connectors.fred_connector import FredConnector
 from src.infrastructure.connectors.index_valuation_connector import (
     IndexValuationConnector,
 )
@@ -50,6 +58,7 @@ from src.infrastructure.connectors.liquor_price_connector import (
     LiquorPriceConnector,
 )
 from src.infrastructure.connectors.local_csv_connector import LocalCsvConnector
+from src.infrastructure.connectors.macro_extra_connector import MacroExtraConnector
 from src.infrastructure.connectors.margin_trading_connector import (
     MarginTradingConnector,
 )
@@ -61,6 +70,9 @@ from src.infrastructure.connectors.penetration_rate_connector import (
     PenetrationRateConnector,
 )
 from src.infrastructure.connectors.pharma_ind_connector import PharmaIndConnector
+from src.infrastructure.connectors.platform_data_connector import (
+    PlatformDataConnector,
+)
 from src.infrastructure.connectors.real_industry_connector import RealTechIndustryConnector
 from src.infrastructure.connectors.router import ConnectorRouter
 from src.infrastructure.connectors.star_chinext_connector import (
@@ -169,8 +181,12 @@ def build_runtime() -> Runtime:
     #     ① QMT 在链首时每次取数都要先等一次必然失败的连接；
     #     ② 本地CSV（已停更）排在**在线源之前**，会把 AkShare/腾讯/Tushare 挡在门外
     #        —— 实测就出现过"日K面板停在 2026-08-31，而腾讯当天明明有数据"。
-    #   新序 AkShare → 腾讯 → Tushare → baostock → 本地CSV → [QMT 仅在开关打开时]
-    #     ① 先打在线的活源；② 停更的本地CSV退到最后；③ QMT 默认关闭且排**全链最后**
+    #   新序 AkShare → 腾讯 → Tushare → baostock → [本地CSV开关] → [QMT 仅在开关打开时]
+    #     ① 先打在线的活源；② 本地CSV退到最后；③ QMT 默认关闭且排**全链最后**
+    #     ⚠️ 2026-09-28（CHG-0061）：`LOCAL_QUOTE_DIR` 已留空 —— 它原指向的
+    #     `D:/quantTrader/data` 其实是本机 MariaDB 的 datadir，其 SH/SZ 两个
+    #     QMT CSV 子目录已删除。所以**第五跳当前不注册**（`if settings.local_quote_dir`
+    #     为假），实际生效的是前四跳全在线。恢复时指向专用导出目录，勿指向数据库目录。
     #        —— 终端短期内无法恢复行情权限，放在任何位置之前都只会贡献一次
     #        必然失败的连接等待（实测 4~5s）。将来权限恢复时改一个环境变量即可兜底。
     routes: list[tuple[Any, Any]] = []
@@ -254,6 +270,77 @@ def build_runtime() -> Runtime:
     # 创新药IND申报：CDE药审中心受理品种信息（公开JSON接口，月度件数）
     pharma_ind = PharmaIndConnector()
     routes.append((pharma_ind, PharmaIndConnector.supports))
+    # 中国宏观补充：官方PMI(制造业/非制造业) + GDP(累计值亿元/累计同比%)。
+    #   为什么必须补：`PMI` / `GDP` 在采集侧此前**无人实现**（19 个连接器
+    #   `supports()` 全为 False），而下游三处独立契约早把它们当真实指标 ——
+    #   A08 白名单字面量 `"PMI"`/`"GDP"`、`catalog/fetch_depth` 的 12/8 条深度、
+    #   `catalog/synonym_dict` 的 `"pmi"`/`"gdp"` 别名。缺口不报错，
+    #   只表现为"宏观结论里没有 PMI/GDP 这一维"。
+    #   实测（2026-09-28）：东财口径 0.15~0.2s 取全历史（PMI 224 期 / GDP 82 期），
+    #   备源国家统计局 NBS 同口径逐值对拍一致；东财被阻断时自动走 NBS。
+    #   追加在**静态链末尾、动态连接器之前**：动态路由（自修复生成）按设计
+    #   优先级最低、不覆盖已有静态指标。
+    macro_extra = MacroExtraConnector()
+    routes.append((macro_extra, MacroExtraConnector.supports))
+    # A12 合规规则的**比率族生产者**：商誉占净资产比 / 货币资金占总资产比 /
+    # 有息负债占总资产比 / 大股东质押比例 / 对外担保占净资产比（`:{code}` 形态）。
+    #   为什么必须补：这 6 个族在采集侧**零生产者**（实测 19 个连接器
+    #   `supports()` 全为 False，见 `scripts/_probe_compliance_families.py`），
+    #   而 `compliance/logic.py` 的 4 条比率规则 + 存贷双高**直接消费**它们。
+    #   缺口不报错：规则永不触发，而 `compliance_level_calc` 会稳稳给出结论
+    #   —— 以前是伪造成「无风险」，现在（CHG-0073）如实报「未量到」，
+    #   但**如实报缺口不等于补上缺口**，所以才要这个连接器。
+    #   `关联交易占营收比` **刻意不支持**：免费源只有公告标题/日期/网址、
+    #   没有金额字段（且不许退化成计数口径 —— 规则按子串取值，
+    #   计数会被当成百分数去比 >30）。理由写在连接器的 `_UNSUPPORTED_FAMILIES`。
+    #   追加在静态链末尾、动态连接器之前（与 `macro_extra` 同位置，理由同上）。
+    compliance_fin = ComplianceFinConnector()
+    routes.append((compliance_fin, ComplianceFinConnector.supports))
+    # 平台**自有后端数据**（八族）：个股侧五族 —— 估值水位（复用
+    # `src/intraday/valuation.py` 的权威档位与标签，与前端逐字段一致）、
+    # 概念拥挤度（按**个股相关度**排序：ml_member_corr/ml_stock_theme ×
+    # sector_crowding_daily）、主线告警、个股告警、解禁计划（投资日历
+    # `fact_data_points.extra_json.top_stocks` 的个股明细）；
+    # 行业侧三族 —— 行业拥挤度 / 板块资金流（复用 `FundFlowProvider`）/
+    # 行业轮动（复用 `src/sector_rotation`）。
+    #   为什么必须补：这些数据**平台早就在算**（前端看板/主线挖掘/投资日历），
+    #   但采集侧零生产者 ⇒ Agent 侧完全看不到，用户看到的是"缺数据"
+    #   （与 `fed:policy_range` 那条报障同一形状：数据在库里、Agent 看不见、不报错）。
+    #   追加在静态链末尾、动态连接器之前（与 `macro_extra` / `compliance_fin` 同位置）。
+    platform_data = PlatformDataConnector()
+    routes.append((platform_data, PlatformDataConnector.supports))
+    # ★ 2026-09-29：**银行报表口径**字段（`利息净收入`/`利息收入`/`利息支出`/`总资产`）。
+    #   为什么必须补：用户点名的「银行息差」的**公式输入**此前一条都取不到
+    #   （实测 `grep 利息|生息资产|净息差` 全仓库 0 处）⇒ 派生流水线
+    #   （`configs/derived_indicators.yaml`）只能报缺口、`净息差:{code}` 永远算不出来。
+    #   实测 600036（2026-06-30）：`利息净收入 1,120.22 亿 =
+    #   利息收入 1,727.33 亿 − 利息支出 607.11 亿` ✓（**内部自洽**），
+    #   `总资产 13.785 万亿`（作生息资产的**粗近似**，bias 随 extra 下发）。
+    routes.append((BankStatementConnector(), BankStatementConnector.supports))
+    # ★ 2026-09-29：**FRED 通用连接器**（按序列号取数，免费无 key）。
+    #   为什么必须补：AkShare 的东财 macro_usa_* **接口本身停更**
+    #   （实测 us_unemployment/us_nonfarm 最新行 2025-09-05 且值为 nan、
+    #   us_fed_rate 2025-10-30 nan、us_pce 2025-08-29）⇒ 库里那几条只能停在
+    #   2025-07/08。换到 FRED 实测补齐到最新：UNRATE 2026-08-01 = 4.1、
+    #   CPILFESL 2026-08-01 = 337.765、PAYEMS 2026-08-01、
+    #   DGS10 2026-09-25 = 5.17%（美债收益率，用户报障里点名要的那条）。
+    #   ⚠️ 用户口径（2026-09-29）：「**尽可能不要把任务交给 prompt 教学**，
+    #   联网查询各类问题能否**不用提示词也精准连接**」——本连接器就是那个机制：
+    #   可达性由 supports('fred:<SERIES>') 的**机器判据**决定，加一条新序列
+    #   只需在 configs/indicators.yaml 登记一行，**不写代码、不教模型**。
+    routes.append((FredConnector(), FredConnector.supports))
+    # ★ 2026-09-30：**东财 Choice（EMQuantAPI）** 的接线点（`CHG-0130`）。
+    #   PRD §19.33.5 声明它就是"ConnectorRouter 链上的一环"，前置条件是
+    #   `check_external_sources.py` **退出码 0**（账号开通量化接口权限）。
+    #   现在**调用它是安全的、而且必须是这一行**：
+    #     · `INDICATORS` 为空 ⇒ 它返回 `[]`，**连网络都不打**（启动期多一次
+    #       Choice 登录等待，正是 `CHG-0101` 那次 24 分钟不可用要避免的形状）；
+    #     · 于是"今天不接线、也不声明可用"**不是靠记得**，而是靠这一行的返回值；
+    #     · 权限开通后要改的只有 `INDICATORS` 那张表（口径要亲手量），**逻辑不动**。
+    #   放在链末：它今天不可能被选中；将来即使被选中，也只对
+    #   `INDICATORS` 里**量过**的指标生效，不会影响既有源的顺序。
+    from src.infrastructure.connectors.choice_connector import build_choice_routes
+    routes.extend(build_choice_routes())
     # 动态连接器（自修复生成的，热加载；优先级最低，不覆盖已有静态指标）
     # 同时恢复动态调度作业
     from src.scheduler.registry import load_dynamic_jobs
@@ -261,6 +348,11 @@ def build_runtime() -> Runtime:
     dynamic_routes = get_dynamic_loader().load_all()
     routes.extend(dynamic_routes)
     backend = ConnectorRouter(routes, repo=repo)
+    # ★ 平台自有数据连接器的**采集链回注**：`估值水位` 要走
+    #   `ValuationProvider`（个股分位 + 同业 + 行业中位数），那是与前端**逐字段一致**
+    #   的唯一路径；而 `ConnectorRouter` 只能在全部路由装配完之后才存在，
+    #   所以这里回注（**顺序不可调换**：在 `ConnectorRouter(...)` 之前调用会 NameError）。
+    platform_data.bind_backend(backend)
     # 个股新闻自动抓取（akshare缺失/失败时fetch_news返回空列表，不阻断主链路）。
     # 用组合版：akshare 取不到时退本地私有直连源（公开仓库无该来源 → 行为同原实现），
     # 否则本机 `ak.stock_news_em()` 恒为空，做T「消息面情绪」整块没数据。
@@ -298,6 +390,12 @@ def build_runtime() -> Runtime:
         "A14_consumer": ConsumerIndustryAgent(gateway),
         "A15_cyclical": CyclicalIndustryAgent(gateway),
         "A16_pharma": PharmaIndustryAgent(gateway),
+        # ★ 2026-09-29：**兜底行业 Agent**（用户报障「缺少银行 agent 吗？」）。
+        #   行业名与关注指标都在 Agent 内部按请求解析（本地名录
+        #   `quant_stock_basic.industry`：600036→银行、600519→白酒），
+        #   所以它是**单例服务任意行业**，不需要为每个行业各建一个类。
+        #   路由由 `supervisor.needs_generic_industry()` 决定（无专属 Agent 覆盖时挂它）。
+        "A20_generic_industry": GenericIndustryAgent(gateway),
         "A17_recommend": RecommendationAgent(gateway),
         "A18_audit": AuditAgent(),
         "A19_code_engineer": CodeEngineerAgent(gateway),

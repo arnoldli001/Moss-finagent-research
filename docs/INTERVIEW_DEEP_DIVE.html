@@ -411,7 +411,10 @@ for index, model_name in enumerate(chain):
     if cancel_token is not None:
         cancel_token.check()  # 每跳都查
     spec = self._spec(model_name)
-    cb = get_circuit_registry().get_or_create(spec.provider)
+    cb = get_circuit_registry().for_call(spec.provider, caller_tenant_id())
+    # ★ 2026-10-01：key 从 provider 改成 provider × 租户（CHG-0154）。
+    #   原先只用 spec.provider ⇒ 一个用户的突发把所有人打到 circuit_open
+    #   （失败按请求方累积、却按提供商生效）。取不到租户 ⇒ 退回 provider 级全局桶。
     if not cb.allow_request():
         # 熔断中：跳过该 provider，继续链上下一个
         ...记录审计 circuit_open...
@@ -448,7 +451,7 @@ for index, model_name in enumerate(chain):
 <li><b>空响应不命中</b>：<code>hit.content.strip()</code> 才 return — <code>gateway.py:319</code></li>
 <li><b>空响应不写</b>：<code>if use_cache and (resp.content or "").strip()</code> — <code>gateway.py:467</code></li>
 <li><b>Token 预算仅 DeepSeek</b>：<code>PAID_PROVIDERS = frozenset({"deepseek"})</code> — <code>gateway.py:38</code></li>
-<li><b>熔断器按 provider 隔离</b>：<code>get_or_create(spec.provider)</code> — <code>gateway.py:353</code></li>
+<li><b>熔断器按 provider × 租户 隔离</b>：<code>for_call(spec.provider, caller_tenant_id())</code> — <code>gateway.py</code>（<code>CHG-0154</code>；此前只按 provider，一个租户能把所有人打到 circuit_open）</li>
 <li><b>配置类错误不计熔断</b>：<code>_CONFIG_STATUS = {401,402,403}</code> — <code>providers.py:26</code></li>
 </div>
 
@@ -583,7 +586,7 @@ except LLMGatewayError as exc:
 <li><b>失败次数滑动窗口</b>：60s 外的旧失败会被清理 — <code>circuit_breaker.py:88-91</code></li>
 <li><b>deepseek 3/60s/30s/2</b>，ollama 5/60s/15s/1 — <code>circuit_breaker.py:135-148</code></li>
 <li><b>配置错误不计熔断</b>：<code>_CONFIG_STATUS = {401,402,403}</code> — <code>providers.py:26</code></li>
-<li><b>按 provider 隔离</b>：<code>get_or_create(spec.provider)</code> — <code>circuit_breaker.py:153</code></li>
+<li><b>按 provider × 租户 隔离</b>：<code>for_call(provider, tenant)</code>（key 由唯一的 <code>breaker_key()</code> 构造）— <code>circuit_breaker.py</code>（<code>CHG-0154</code>）</li>
 </div>
 
 <h3>HR 必问："为什么网关不做重试？"</h3>
@@ -596,7 +599,15 @@ except LLMGatewayError as exc:
 <div class="q-a">
 <strong>答：</strong>熔断的本质是"外部依赖不可用"。同一 provider 的不同 model 是<b>同一个故障域</b>——如果 deepseek 的 API 挂了，deepseek-v4-pro 和 deepseek-flash 一起挂。<br><br>
 如果按 model 隔离，deepseek-v4-pro 熔断了，deepseek-flash 还能继续——但它们<b>用的是同一个 API endpoint、同一个 key、同一个熔断器</b>。这会让熔断器变假象：<code>deepseek-v4-pro</code> 报熔断，但 <code>deepseek-flash</code> 还能调，结果降级链里 <code>deepseek-flash</code> 也失败，整个降级链断掉，链路 100% 失败。<br><br>
-所以按 provider 隔离 = 让熔断器的判定和实际故障一致，<b>不是装饰</b>。
+所以按 provider 隔离 = 让熔断器的判定和实际故障一致，<b>不是装饰</b>。<br><br>
+<b>★ 追问的下一层（2026-10-01 补）：那"按 provider"是不是就够了？不够。</b>
+故障域有<b>两个方向</b>：provider 维度（外部依赖挂了）之外还有<b>请求方</b>维度——
+失败是<b>按请求方累积</b>的，却按提供商生效。于是 A 租户 60 秒内 3 次失败，
+把 <code>deepseek</code> 桶打成 OPEN，<b>B 租户连 API 都不试</b>（实测现象就是
+"一个用户的突发流量让所有用户被拒"）。修法：key = <code>provider × 租户</code>
+（<code>deepseek:vip</code>），拿不到租户身份时退回 provider 级全局桶<b>并且仍然熔断</b>
+（后台作业走这条，如实退化）。判据里带<b>自证</b>：用"丢掉租户维度"的旧注册表
+跑同一条场景，B 必须<b>被拒</b>——同一场景两种机制结论相反，才证明隔离判据不是恒绿。
 </div>
 </div>
 
@@ -1152,9 +1163,13 @@ flowchart LR
 </div>
 
 <h3>核心：<code>call_cost_cny</code> 单一计价</h3>
-<pre><code># src/core/budget.py:152-173
+<pre><code># src/core/budget.py（2026-09-30 参数改名：cache_hit → provider_cache_hit）
+#   ★ 为什么改名：审计字段 cache_hit 说的是「**本地响应缓存**命中 ⇒
+#     这次根本没请求提供商 ⇒ ¥0」，而计价参数说的是「**提供商的**上下文缓存
+#     命中 ⇒ 输入单价便宜一点」。同名不同义 ⇒ 运维页把 31,233 行（58.5%）
+#     没花钱的调用计成 ¥408.75，总额虚高 65.5%。改名后误配 = TypeError。
 def call_cost_cny(*, provider, model, tokens_in, tokens_out,
-                  cache_hit=False, prices=None):
+                  provider_cache_hit=False, prices=None):
     """一次调用的费用（元）。**唯一的计价实现**。
     
     · provider != "deepseek"（本地 Ollama 等）→ 0 元

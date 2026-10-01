@@ -190,3 +190,73 @@ def test_replace_flag_is_never_used_by_watchdog() -> None:
     body = inspect.getsource(manage._ensure_restart)
     assert "replace=False" in body, "必须显式关掉 replace"
     assert "replace=True" not in body
+
+
+# ======================================================================
+# 判据 5：不把"忙"判成"死"（P15，2026-09-27 实测对外中断）
+# ======================================================================
+
+def test_listening_socket_wins_over_slow_connect(monkeypatch) -> None:
+    """★ 只要有人持有 LISTEN 套接字，就算"活着" —— 与它答不答无关。
+
+    P15 事故：`diagnose_port` 原来第一道门是 `port_open(timeout=0.4)`，
+    0.4 秒连不上就返回 `occupied: False`。后端忙 >0.4s（冷启动 / 进程内调度
+    跑数据作业 / 多实例争 SQLite 单写者）→ 被判"进程已消失" → `ensure` 再起一个
+    → **Windows 允许重复绑定同一 LISTEN 端口** → 两个实例争单写者 → 更慢
+    → 下一次探测更容易超时 → 正反馈成风暴。
+
+    外部表现是"后端静默死亡：无崩溃日志、不走 lifespan、`in_job: none`"，
+    而真相是**没有任何进程被杀**。
+
+    本用例把 connect 固定成"永远失败"（模拟忙到不应答），
+    期望结论仍是"有人在、而且是我们的实例"。
+    """
+    monkeypatch.setattr(manage, "find_listening_pid", lambda port: 4321)
+    monkeypatch.setattr(manage, "get_cmdline",
+                        lambda pid: "uvicorn src.api.main:app")
+    monkeypatch.setattr(manage, "health_signature", lambda port: None)
+    monkeypatch.setattr(manage, "port_open", lambda *a, **k: False)
+
+    info = manage.diagnose_port(8110)
+    assert info["occupied"] is True, (
+        "★ 有 LISTEN 套接字就是活着 —— 判成空闲会让 ensure 复制实例（P15）")
+    assert info["is_ours"] is True
+    assert info["pid"] == 4321
+
+
+def test_single_connect_timeout_cannot_decide_dead(monkeypatch) -> None:
+    """★ 单次 connect 超时**不足以**判"没人听"：必须稳定复现才算。
+
+    netstat 看不到 LISTEN 时才退到 connect 复核，且要求连续多次都失败。
+    这里让第 2 次就成功 —— 期望结论是"有人在"，而不是"空闲、可以重启"。
+    """
+    monkeypatch.setattr(manage, "find_listening_pid", lambda port: None)
+    monkeypatch.setattr(manage, "health_signature", lambda port: None)
+    calls = {"n": 0}
+
+    def flaky(*_a, **_k):
+        calls["n"] += 1
+        return calls["n"] >= 2          # 第 2 次起可连
+
+    monkeypatch.setattr(manage, "port_open", flaky)
+
+    info = manage.diagnose_port(8110)
+    assert info["occupied"] is True, "复核期间连上了 → 绝不能判成空闲"
+    assert calls["n"] >= 2, "必须重试；一次 0.4 秒超时不许作为结论"
+
+
+def test_truly_free_port_is_reported_free(monkeypatch) -> None:
+    """真的没人听时才允许判空闲（`ensure` 据此重启，这是它的正常工作路径）。"""
+    monkeypatch.setattr(manage, "find_listening_pid", lambda port: None)
+    monkeypatch.setattr(manage, "port_open", lambda *a, **k: False)
+
+    info = manage.diagnose_port(8110)
+    assert info["occupied"] is False
+    assert info["is_ours"] is False
+
+
+def test_port_probe_parameters_cannot_regress_to_one_shot() -> None:
+    """护栏：探测参数不许被改回"一次 0.4 秒就下结论"（P15 的成因）。"""
+    assert manage.PORT_PROBE_ATTEMPTS >= 2, "必须重试"
+    assert manage.PORT_PROBE_TIMEOUT >= 0.8, "单次超时不能太短"
+    assert manage._connect_fails_consistently.__doc__, "复核函数必须有说明"

@@ -31,7 +31,28 @@ CME FedWatch 给"下次会议各区间概率"，而 **FRED 给当前目标区间
 - "fed:rate_prob:next"        → 下一次FOMC各利率区间概率（每个区间一个DataPoint，
                                 value=概率%，extra含区间标签/会议日/EFFR/降息-不变-加息概率）
 - "fed:rate_prob:{YYYY-MM-DD}" → 指定会议日
-- "fed:policy_range"          → **新增**：当前目标区间上下限+有效利率（FRED 源）
+- "fed:policy_range"          → 当前目标区间上下限+有效利率（FRED 源）
+- "fed:target_upper"          → ★ 第二十三轮：目标区间**上限**（DFEDTARU，独立指标）
+- "fed:target_lower"          → ★ 第二十三轮：目标区间**下限**（DFEDTARL，独立指标）
+- "fed:effr"                  → ★ 第二十三轮：**有效联邦基金利率**（DFF，独立指标）
+
+## ★★★ 2026-09-28 第二十三轮：为什么必须拆出三个独立指标
+
+`fed:policy_range` 原先把 **三个 FRED 序列写进同一个 indicator** ——
+一天产 3 条点（上限/下限/有效利率），全部标着 `indicator="fed:policy_range"`
+和同一个 `period_date`。于是**"这个指标的值是多少"这个问题没有答案**：
+它同时是 4.00、3.75 和 3.88。
+
+read 侧的实测后果（比"缺数据"更危险，因为数字看着有据）：
+
+    A08 的 `_latest_numeric(pts, "fed:policy_range")` 取"最新一条"
+    → 同日三条里挑中**上限或下限之一**
+    → 结论写成「目标区间 3.75%（FRED 口径）」
+    → **把区间下限当成政策利率报给用户**（3.75 是 DFEDTARL，不是利率）
+
+拆开之后每个 indicator 各自是**单值时间序列**，"最新一条"才有意义。
+`fed:policy_range` 继续产出（向后兼容：历史库里那 3 条点不能读不出来），
+但 **read 侧要优先用拆开的三个**（见 `macro/agent.py::_build_rule_only_result`）。
 """
 
 from __future__ import annotations
@@ -52,8 +73,13 @@ from src.infrastructure.connectors.source_cooldown import get_cooldown
 logger = logging.getLogger(__name__)
 
 _FED_RE = re.compile(r"^fed:rate_prob:(next|\d{4}-\d{2}-\d{2})$")
-#: FRED 兜底源（当前目标区间/有效利率）
-_FRED_RANGE_RE = re.compile(r"^fed:(policy_range|target_range)$")
+#: FRED 兜底源。
+#:
+#: ★ 第二十三轮：增加三个**独立单值序列**（`fed:target_upper` /
+#: `fed:target_lower` / `fed:effr`），与旧的混合口径 `fed:policy_range` 并存。
+#: 拆分理由见模块 docstring（"把区间下限当利率"那个 bug）。
+_FRED_RANGE_RE = re.compile(
+    r"^fed:(policy_range|target_range|target_upper|target_lower|effr)$")
 #: 单次调用的硬超时。**这个值是投研链路的墙钟瓶颈**（2026-09-26 实测：
 #: 外网不可达时这里等满 23.5s，而 A01 用 asyncio.gather 并发采集，
 #: 于是整个"数据采集"阶段就被它拖到 23.5s）。配合下面的失败冷却，
@@ -62,12 +88,25 @@ _TIMEOUT_SEC = 25
 _COOLDOWN_KEY = "fedwatch:rate_prob"
 _FRED_COOLDOWN_KEY = "fred:policy_range"
 
-#: FRED 序列 ID → (字段含义, 单位)
-_FRED_SERIES: tuple[tuple[str, str], ...] = (
-    ("DFEDTARU", "目标区间上限"),
-    ("DFEDTARL", "目标区间下限"),
-    ("DFF", "有效联邦基金利率"),
+#: FRED 序列 ID → (字段含义, 单位, **独立指标名**)。
+#:
+#: ★ 第二十三轮：加了第三列 —— 每个序列有自己的 indicator id。
+#: 第三列为空串表示"挂到请求的那个 indicator 上"（旧行为）。
+#: 这样：
+#:   · 请求 `fed:policy_range` → 三条点都挂 `fed:policy_range`（**兼容历史**）
+#:   · 请求 `fed:target_upper` → 只取 DFEDTARU 一条，挂 `fed:target_upper`
+#:   · 请求 `fed:effr`        → 只取 DFF 一条
+_FRED_SERIES: tuple[tuple[str, str, str], ...] = (
+    ("DFEDTARU", "目标区间上限", "fed:target_upper"),
+    ("DFEDTARL", "目标区间下限", "fed:target_lower"),
+    ("DFF", "有效联邦基金利率", "fed:effr"),
 )
+
+#: 旧混合口径 → 它包含哪些独立指标（read 侧与采集侧共用这张映射）。
+FRED_SERIES_BY_RANGE_ID: dict[str, tuple[str, ...]] = {
+    "fed:policy_range": ("fed:target_upper", "fed:target_lower", "fed:effr"),
+    "fed:target_range": ("fed:target_upper", "fed:target_lower", "fed:effr"),
+}
 _FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv"
 #: FRED 单序列请求超时（实测 1.0~1.3s，给 20s 很宽）
 _FRED_TIMEOUT_SEC = 20.0
@@ -84,11 +123,18 @@ class FedWatchConnector(BaseConnector):
             "name": self.source_name,
             "source_type": DataSourceType.API.value,
             "indicators": ["fed:rate_prob:next", "fed:rate_prob:{YYYY-MM-DD}",
-                           "fed:policy_range"],
+                           "fed:policy_range",
+                           # ★ 第二十三轮：三个独立单值序列
+                           "fed:target_upper", "fed:target_lower", "fed:effr"],
             "notes": ("概率单位%；依赖CME/FRED外网。"
                       "⚠️ CME 在本机网络不可达（TCP 443 不通），"
                       "fed:rate_prob:* 会记冷却并降级；"
-                      "fed:policy_range 走 FRED（实测可达）给当前目标区间"),
+                      "fed:policy_range / fed:target_upper / fed:target_lower / "
+                      "fed:effr 走 FRED（实测可达）。"
+                      "★ 判断政策利率请用 `fed:effr`（单值）或 "
+                      "`fed:target_upper`+`fed:target_lower`（区间成对）；"
+                      "**不要**用 `fed:policy_range` 取单点 —— 它同日有上下限两条，"
+                      "取最新一条会把区间下限当成利率"),
         }
 
     @staticmethod
@@ -165,11 +211,23 @@ class FedWatchConnector(BaseConnector):
     # ---------- FRED 兜底源 ----------
 
     async def _fetch_fred_range(self, indicator: str) -> list[DataPoint]:
-        """从 FRED 取当前目标区间与有效联邦基金利率（CME 不可达时的官方替代）。
+        """从 FRED 取政策利率口径（CME 不可达时的官方替代）。
 
         为什么这条能work而 CME 不行：实测 `api.stlouisfed.org:443` /
         `fred.stlouisfed.org:443` 都通，而 `www.cmegroup.com:443` 不通。
-        三个序列串行取（各自 1~2s），总计约 4s —— 远低于 CME 那 23.4s 超时。
+        序列串行取（各自 1~2s），最多 3 条总计约 4s —— 远低于 CME 那 23.4s 超时。
+
+        ## ★ 第二十三轮：支持"只取单个序列"
+
+        `indicator` 可能是**混合口径**（`fed:policy_range`，取全部 3 个序列、
+        全部挂同一个 id —— 兼容历史库那 3 条点），
+        也可能是**独立序列**（`fed:target_upper` / `fed:target_lower` /
+        `fed:effr`，只取对应那一个）。
+
+        为什么独立序列是必需的：混合口径下"这个指标的值是多少"**没有答案**
+        （同日三条：4.00 / 3.75 / 3.88），read 侧取"最新一条"会挑中
+        上限或下限之一 —— 实测把**区间下限 3.75 当成政策利率**报了出去。
+        拆开后每个 id 各自是单值时间序列，"最新一条"才有意义。
 
         失败降级为空列表并记冷却（与 FedWatch 同一套机制），不阻断主链路。
         """
@@ -178,11 +236,28 @@ class FedWatchConnector(BaseConnector):
             logger.debug("FRED 处于失败冷却中，跳过")
             return []
 
+        # 决定本次要取哪些序列、各自挂到哪个 indicator 上。
+        wanted: list[tuple[str, str, str]] = []   # (series_id, label, out_id)
+        if indicator in FRED_SERIES_BY_RANGE_ID:
+            # 混合口径：全部序列都挂到请求的这个 id（保持历史行为）
+            for series_id, label, _own_id in _FRED_SERIES:
+                wanted.append((series_id, label, indicator))
+        else:
+            # 独立序列：只取匹配的那一个
+            for series_id, label, own_id in _FRED_SERIES:
+                if own_id == indicator:
+                    wanted.append((series_id, label, own_id))
+        if not wanted:
+            logger.debug("FRED 不认识的指标 %s（支持的：%s）", indicator,
+                         [i for _, _, i in _FRED_SERIES]
+                         + list(FRED_SERIES_BY_RANGE_ID))
+            return []
+
         points: list[DataPoint] = []
         failures: list[str] = []
         async with httpx.AsyncClient(timeout=_FRED_TIMEOUT_SEC,
                                      follow_redirects=True) as client:
-            for series_id, label in _FRED_SERIES:
+            for series_id, label, out_id in wanted:
                 try:
                     resp = await client.get(
                         _FRED_CSV, params={"id": series_id,
@@ -197,7 +272,7 @@ class FedWatchConnector(BaseConnector):
                     continue
                 period, value = parsed
                 points.append(DataPoint(
-                    indicator=indicator, value=value, unit="%",
+                    indicator=out_id, value=value, unit="%",
                     period_date=period,
                     extra={"series_id": series_id, "label": label,
                            "source": "FRED (St. Louis Fed)",
@@ -209,12 +284,12 @@ class FedWatchConnector(BaseConnector):
 
         if points:
             cooldown.record_success(_FRED_COOLDOWN_KEY)
-            logger.info("FRED 目标区间取数成功：%d 个序列（%s）",
+            logger.info("FRED 政策利率取数成功：%d 个序列（%s）",
                         len(points), indicator)
         else:
             cooldown.record_failure(_FRED_COOLDOWN_KEY,
                                     reason="; ".join(failures)[:80])
-            logger.warning("FRED 目标区间取数失败（降级为数据缺口）: %s",
+            logger.warning("FRED 政策利率取数失败（降级为数据缺口）: %s",
                            "; ".join(failures)[:200])
         return points
 

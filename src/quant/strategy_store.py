@@ -39,7 +39,9 @@ from src.core.errors import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DIR = Path("data/quant/strategies")
+from src.infrastructure.catalog.data_stores import store_rel  # noqa: E402
+
+DEFAULT_DIR = Path(store_rel("quant_strategies"))
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{4,64}$")
 _HASH_LENGTH = 8
 

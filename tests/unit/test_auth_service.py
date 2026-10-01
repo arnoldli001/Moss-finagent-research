@@ -151,7 +151,11 @@ def test_period_is_calendar_month() -> None:
 def test_password_hash_roundtrip_and_salt() -> None:
     h1, algo = hash_password(PASSWORD)
     h2, _ = hash_password(PASSWORD)
-    assert algo.startswith("pbkdf2")
+    # 算法是**环境相关**的：`_pick_algo()` 按 argon2id > bcrypt > pbkdf2_sha256
+    # 自动选当前可用的最强算法（见 auth_sqlite_repo 的注释）。所以这里断言的是
+    # "落在受支持集合里"，不是某一个具体算法 —— 原先写死 `startswith("pbkdf2")`，
+    # 装了 bcrypt 之后就一直红灯，而红灯的原因恰恰是"安全等级变好了"。
+    assert algo in {"argon2id", "bcrypt", "pbkdf2_sha256"}
     assert h1 != h2, "两次哈希必须不同（盐必须随机）"
     assert verify_password(PASSWORD, h1)
     assert not verify_password("wrong", h1)

@@ -7,15 +7,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
 import time
 from contextlib import asynccontextmanager
-from numbers import Integral, Real
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -24,7 +22,7 @@ from src.api.data_health import warm as warm_data_health
 from src.api.event_wiring import build_event_stack
 from src.api.exception_handlers import register_handlers
 from src.api.login_gate import LoginGateMiddleware, docs_kwargs
-from src.api.routes import api_router
+from src.api.routes import _mark_inflight, api_router
 from src.api.runtime import build_runtime
 from src.api.tasks import TaskStore
 from src.api.tenancy_middleware import TenancyMiddleware, describe_enforcement
@@ -32,16 +30,23 @@ from src.core.config import describe_environment, get_settings
 from src.core.errors import BRIEF_DEFAULT, brief
 from src.core.exceptions import ConfigError
 from src.core.executors import shutdown_infra_executors
-from src.core.sqlite_recovery import (
-    checkpoint_and_close,
-    ensure_all_usable,
-    release_all_connections,
-)
+from src.core.float_precision import round_payload
+from src.core.sqlite_recovery import ensure_all_usable
 from src.scheduler.run_log import RunLog
 from src.scheduler.service import CronScheduler
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+# ★ 2026-09-29：**必须在任何业务 logger 之前**装配（模块导入期，幂等）。
+#   为什么：全仓库没有 `basicConfig`/`dictConfig` ⇒ root 没有 handler
+#   ⇒ INFO 级日志被 last-resort 静默丢弃（只兜 WARNING+）。
+#   用户要求「数据采集 agent 要记录任何未能获取到的信息日志，展示在后端日志里」
+#   —— 不装配的话，"采集成功/计划修正"这类 INFO 一个字都不会落盘。
+#   详见 `src/core/logging_setup.py` 的实测说明。
+from src.core.logging_setup import configure_src_logging  # noqa: E402
+
+configure_src_logging()
 
 
 def _sqlite_paths_to_check() -> list[str]:
@@ -52,23 +57,15 @@ def _sqlite_paths_to_check() -> list[str]:
     每个走它的请求都会拿到 `disk I/O error` → 仓储 fail-open 穿透网络链 →
     首次请求几十秒（实测重启后 `intraday/watchlist` 首次 182.9s，第二次 0.0s）。
 
-    刻意**不含** `data/quant/warehouse.db`：那是 15GB 只读为主的行情仓库，
-    没有 WAL 一致性问题的历史，不该在启动时对它做任何写动作；
-    即使它出问题也应该人工介入，而不是自动隔离伴生文件。
+    ★ 2026-09-30（`CHG-0139`）：清单本体已搬到
+    `src/core/sqlite_recovery.sqlite_paths_to_check()` —— 因为调度 worker
+    拆成了独立进程，**两个进程都要**在关停时 checkpoint 同一批库，
+    而"同一件事写两处"必然漂移（worker 那份漏改的症状是脏 `-wal`）。
+    这里保留函数名（既有调用点与判据都按这个名字写），实现只有一处。
     """
-    paths = [str(settings.sqlite_path)]
-    for name in ("alert_db_path", "scheduler_dir"):
-        raw = getattr(settings, name, None)
-        if isinstance(raw, str) and raw.endswith(".db"):
-            paths.append(raw)
-    # 去重保序
-    seen: set[str] = set()
-    unique: list[str] = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-    return unique
+    from src.core.sqlite_recovery import sqlite_paths_to_check
+
+    return sqlite_paths_to_check()
 
 
 
@@ -313,6 +310,43 @@ async def _warm_llm_cache_index(runtime: Any, *, delay: float = 5.0) -> None:
         logger.warning("LLM 语义缓存索引预热失败（忽略，将按需懒建）", exc_info=True)
 
 
+async def _warm_column_index(*, delay: float = 8.0) -> None:
+    """后台预热**列级数据资产索引**（把冷启动代价摘出请求路径）。
+
+    ## 为什么要预热（实测数字，不是担心）
+
+    列级索引要扫全部库的 表×列×行数×MAX(时间)：
+
+        发现库             101 ms
+        扫描表×列×行数    1735 ms   ← 只有这一块在请求路径上会痛
+        反向索引查一次     0.029 ms
+
+    也就是说 **查询本身是微秒级，代价全在"首次建索引"的 1.7 秒**。
+    A17 的 `query_data` 走「先查已采集数据点 → 未命中则问本地库」，
+    如果索引是冷的，那个"未命中"的查询就要用户等 1.7 秒。
+
+    ## 与 `_warm_llm_cache_index` 同一形态（复用既有机制，不另造一套）
+
+    · 走线程池（`asyncio.to_thread`），不阻塞事件循环
+    · 延迟几秒再跑：启动瞬间把磁盘留给首屏
+    · **失败只记日志** —— 索引是优化，未建时按需懒建，行为不变
+
+    ## 顺带把"审计分析"排除在预热之外
+
+    `unconsumed_investable_columns()`（未消费列清单）**不做预热**：
+    它是**审计报告**用的，且实测优化前要 **16 秒**（对每个列名跑一次全源码正则）。
+    预热只建"查询要用的东西"。
+    """
+    try:
+        await asyncio.sleep(delay)
+        from src.infrastructure.catalog.column_index import get_column_index
+
+        idx = await asyncio.to_thread(get_column_index)
+        logger.info("列级数据资产索引预热完成：%d 张表", len(idx.tables))
+    except Exception:  # noqa: BLE001 预热失败不影响任何功能（按需懒建兜底）
+        logger.warning("列级索引预热失败（忽略，将按需懒建）", exc_info=True)
+
+
 async def _check_quant_sync_at_startup(scheduler: Any, runtime: Any, *,
                                        delay: float = 30.0) -> None:
     """服务启动后自检行情数据是否同步；缺了就**自动补一次**。
@@ -521,6 +555,91 @@ async def _run_retention_on_startup(*, delay: float = 120.0) -> None:
         logger.warning("启动数据保留异常（忽略）", exc_info=True)
 
 
+async def _rebuild_catalog_and_assets_later(settings) -> None:  # noqa: ANN001
+    """**启动后**重建指标索引 + 扫数据资产（不挡就绪；`CHG-0147`）。
+
+    两件事都在 `asyncio.to_thread` 里跑（不占事件循环），所以本任务只负责
+    **不让人等它**：原先它们被 `await` 在 lifespan 里 ⇒ 端口虽已监听、
+    请求却排到 25 秒之后 ⇒ 前端 4 秒探针必然超时（用户看到「后端不可达」）。
+
+    为什么单独抽成一个函数（而不是在 lifespan 里就地 `create_task`）：
+    判据要能在**不启动整站**的前提下断言"lifespan 里没有 `await` 这两步"
+    （`tests/unit/test_startup_does_not_block_readiness.py`）。
+
+    失败一律降级（与原先两段 try/except 一字不差）：索引陈旧只会让
+    SmartFetcher 多联网一次，不该让服务起不来。
+    """
+    from src.core import inflight
+
+    inflight.enter("task:catalog-rebuild")
+    try:
+        try:
+            from src.infrastructure.catalog.catalog_repo import CatalogRepository
+
+            cat = CatalogRepository(db_path=settings.sqlite_path)
+            stats = await cat.rebuild_all()
+            logger.info(
+                "指标索引已重建：元数据 %d 条，回填运行时状态 %d 个指标",
+                stats["metas_synced"], stats["indicators_backfilled"])
+        except Exception:  # noqa: BLE001
+            logger.warning("指标索引重建失败（降级：SmartFetcher 会判 stale 而多联网）",
+                           exc_info=True)
+
+        # ★ 数据资产全量扫描（回答"本地到底有哪些数据"）
+        # 与指标索引是**两层**：资产层 = 表/目录级家底；指标层 = 单个指标的新鲜度。
+        # 资产层漏了 `sector_crowding_daily`（218 万行，比 fact_data_points 还大）
+        # 就谈不上"全量索引"—— 用户原话："把常用的宏观数据、行业数据、产业数据、
+        # 股市数据等本地已有数据表，建一个全量的索引"。
+        try:
+            from src.infrastructure.catalog.assets import DataAssetCatalog
+
+            asset_cat = DataAssetCatalog(db_path=settings.sqlite_path)
+            ast = await asset_cat.scan_and_store()
+            logger.info(
+                "数据资产已扫描：%d 个资产（%s），合计 %s 行",
+                ast["assets"],
+                ", ".join(f"{k}={v}" for k, v in
+                          sorted(ast["by_category"].items())),
+                f"{ast['total_rows']:,}")
+        except Exception:  # noqa: BLE001
+            logger.warning("数据资产扫描失败（降级：无法回答「本地有哪些数据」）",
+                           exc_info=True)
+    finally:
+        inflight.leave()
+
+
+def _bg_run(name: str, coro) -> asyncio.Task:  # noqa: ANN001
+    """把一段**启动后台活**登记进在飞簿再跑（`CHG-0147` 的第二半）。
+
+    ## 为什么必须登记（2026-09-30 实测）
+
+    把索引重建挪到后台之后，重启后就绪 ~0.6 秒（原 ~20 秒），但**紧接着**仍然
+    出现 1.2 s / 3.6 s 的循环卡顿，而卡顿行印的是：
+
+        [循环延迟] 本次 3578ms（…）—— 卡顿时刻在飞：（无在飞请求）
+
+    「无在飞请求」在**请求路径**上是对的，但那句话读起来像"没人干活"——
+    真相是**后台任务在干**，而它们**没登记** ⇒ 仪器**点名不了**。
+    这正是本项目反复记的那条：**没有名字的观测只能告诉你"卡了"，不能告诉你"谁卡的"**。
+
+    ## 语义
+
+    与路由依赖同一个登记簿（`src/core/inflight.py`）：任务**开始**时登记
+    `task:<名字>`、**结束**时注销。所以卡顿时刻的 `describe()` 会印出
+    `task:data-health-warm(4200ms)` 这样的名字 —— 下一刀才有靶子。
+    """
+    from src.core import inflight
+
+    async def _wrapped() -> None:
+        inflight.enter(f"task:{name}")
+        try:
+            await coro
+        finally:
+            inflight.leave()
+
+    return asyncio.create_task(_wrapped(), name=name)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 先确认可写 SQLite 库能正常打开，再组装 Runtime：陈旧 WAL 索引会让每个
@@ -569,8 +688,77 @@ async def lifespan(app: FastAPI):
     except ConfigError as exc:
         logger.warning("事件告警子系统不可用（降级）: %s", brief(exc, BRIEF_DEFAULT))
     # 零依赖演示模式：进程内Cron调度（生产用Celery Beat，见celery_app.py）
+    #
+    # ★ 2026-09-28 第十二轮：先装 catalog 驱动的采集作业，再启动调度器。
+    # 顺序不能反 —— `CronScheduler.__init__` / `_loop` 会遍历 JOB_REGISTRY，
+    # 装晚了这批作业要等到下次重启才生效。
+    # 失败不阻断启动（索引作业是加速结构，没有它系统照常跑，只是每次现拉）。
+    try:
+        from src.scheduler.catalog_jobs import install_catalog_jobs
+
+        plans = install_catalog_jobs()
+        logger.info("catalog 采集作业已注册：%d 个作业 / %d 个指标",
+                    len(plans), sum(len(p.indicators) for p in plans))
+    except Exception:  # noqa: BLE001
+        logger.warning("catalog 作业注册失败（降级：指标靠请求时现拉）",
+                       exc_info=True)
+
+    # ★★★ 2026-09-28 第十三轮：**全量重建指标索引 + 数据资产扫描**
+    #
+    # 不做这一步的后果（实测确认过，不是推测）：
+    #   · YAML 43 条指标 → 索引表只有 16 条（`refresh_from_registry` 从没被调过）
+    #   · 事实表 `mkt:turnover:total` 有 241 条 → 索引表记 `row_count=0`
+    #     （`refresh_stats_from_facts` 只对"本次任务涉及的指标"调用过）
+    #   · 于是 SmartFetcher 查索引判 stale → **库里明明有最新数据还是去联网**
+    #     （用户实测：今天的数据已入库，仍白等 13.1s）
+    #
+    # 修复后实测：端到端 13,100ms → 39ms；联网指标 3 个 → 0 个。
+    #
+    # 这是 AGENTS.md 记过的最贵的坑：「我改了」是意图，「它生效了」才是事实。
+    # 增量回填（A04 节点里做）只覆盖"新采的数据"，**存量数据必须全量重建一次**。
+    #
+    # 合规性由 `scripts/audit_data_index.py` 逐条验证（7 条设计要求）。
+    #
+    # ★★ 2026-09-30（`CHG-0147`）：**这一步挪成"不挡就绪"的后台任务**。
+    #
+    # 为什么必须挪（实测数据）：两段合起来要 **16~25 秒**，而它们原先被
+    # `await` 在 lifespan 里 ⇒ **端口虽然已监听、请求却排到启动完成之后**
+    # ⇒ 重启期间前端探针（4 秒）必然超时，用户看到的就是「后端不可达」。
+    # 实测日志时间线（2026-09-30 17:03:11 → 17:03:32）：
+    #
+    #     17:03:12.4 catalog 作业已注册
+    #     17:03:28.5 频率推断：修正 1038 个自动登记指标     ← 中间 **16 秒**
+    #     17:03:28.5 指标索引已重建（元数据 1216 / 回填 2173）
+    #     17:03:29.3 资产扫描…
+    #
+    # ★ 而且 `loop_lag` **永远看不见这一段** —— 监控是在它之后才启动的
+    #   （`[循环延迟] 监控已启动` 出现在 17:04:04）⇒ "卡顿表里没有它"不等于
+    #   "它不卡"，这也是本轮把 B 类单独拎出来的原因。
+    #
+    # 安全性：`rebuild_all()` / `scan_and_store()` 内部**本来就是**
+    # `asyncio.to_thread`（不占事件循环），挪成后台任务只改"谁等它"，
+    # 不改它的执行方式。代价：头几秒索引可能仍是旧的 ⇒ SmartFetcher 可能多联网
+    # 一次（那正是本段要消灭的 13.1s）—— 两害相权：**几秒的索引陈旧**
+    # 远轻于 **25 秒的整站不可用**；且它**立刻**在后台开跑，窗口很短。
+    _bg_run("catalog-rebuild-background",
+            _rebuild_catalog_and_assets_later(settings))
+
     app.state.scheduler = CronScheduler(runtime, app.state.run_log)
     await app.state.scheduler.start()
+
+    # ★ 2026-09-30（`CHG-0137`）：**事件循环延迟监控 + 探针打点**。
+    #
+    # 为什么必须有：用户三次报"后端不可达"，而**决定横幅的那个探针**
+    # （`/api/v1/health/live`）是公开路径 ⇒ 被访问审计跳过 ⇒ **它在审计里一条都没有**；
+    # "循环卡了多久"当时只能靠请求延迟反推。实测那次根因是
+    # 日K预热一轮 316s（预算 90s / cron 120s）占住同一个事件循环。
+    # 这个监控把"服务此刻还能不能及时响应"变成 1 Hz 的直接观测。
+    try:
+        from src.core import loop_lag as _loop_lag
+
+        _loop_lag.start()
+    except Exception:  # noqa: BLE001 观测组件起不来不该阻断启动
+        logger.warning("事件循环延迟监控启动失败（忽略）", exc_info=True)
 
     # ★ 主线挖掘「热快照」：启动即装回进程内缓存。
     #
@@ -600,7 +788,7 @@ async def lifespan(app: FastAPI):
     # （这段时间 /health 也不响应，隧道那边会判成 502）。挂后台即可 ——
     # 预热完成前到的请求照常自己算，只是那一个慢；完成后所有人都是 0 ms。
     # 且它自己还要先睡 `_FUNDFLOW_WARM_DELAY`（见那里的实测依据）。
-    asyncio.create_task(_warm_fundflow(runtime), name="fundflow-warm")
+    _bg_run("fundflow-warm", _warm_fundflow(runtime))
 
     heartbeat_task: asyncio.Task | None = None
     if runtime.alert_hub is not None:
@@ -613,7 +801,7 @@ async def lifespan(app: FastAPI):
                     raise
                 except Exception:  # noqa: BLE001 心跳异常不影响主进程
                     logger.debug("告警WS心跳异常", exc_info=True)
-        heartbeat_task = asyncio.create_task(_hub_keepalive())
+        heartbeat_task = _bg_run("alert-hub-keepalive", _hub_keepalive())
     # 做T权重档案表（`dim_intraday_profile`）：与 fact_* 三张表同库。
     # 建表失败只让档案接口降级 —— 做T主链路继续按 YAML/全局口径出分。
     if runtime.intraday_profile_repo is not None:
@@ -663,51 +851,48 @@ async def lifespan(app: FastAPI):
     # 放后台线程算一次，用户第一次打开「运行指标」页就是热的（不再一直转圈）。
     # **延后 `_WARM_DATA_HEALTH_DELAY` 秒**：它立刻开跑会与首屏抢磁盘/CPU/GIL，
     # 实测冷启动首屏 2.7s → 4.7s（见该常量的表）。
-    asyncio.create_task(_warm_data_health_later(runtime),
-                        name="data-health-warm")
+    _bg_run("data-health-warm", _warm_data_health_later(runtime))
     # 集合竞价选股调度：开市日 09:15 预热、09:25 出池（要求 09:27 前）。
     # 放**服务进程内**的守护线程，不额外起服务、不改系统计划任务 ——
     # 竞价数据是盘中实时的，取完要立刻算分落库给前端，独立进程还要额外解决
     # SQLite 双写与结果传递。放后台任务启动，不阻塞首屏。
-    asyncio.create_task(_start_auction_scheduler_later(),
-                        name="auction-select-scheduler")
+    _bg_run("auction-select-scheduler", _start_auction_scheduler_later())
     # 行情同步启动自检：比对「分区 / 仓库 / 应该有」三层，缺了就自动补一次
     # （2026-09-23 事故：`stk_limit` 分区 0922、仓库 0917，选股因此停在 0917）。
     # 延迟 + 后台，且失败只记日志 —— 见 `_check_quant_sync_at_startup` 的说明。
-    asyncio.create_task(
-        _check_quant_sync_at_startup(app.state.scheduler, runtime),
-        name="quant-sync-startup-check")
+    _bg_run("quant-sync-startup-check",
+            _check_quant_sync_at_startup(app.state.scheduler, runtime))
     # 行业轮动日报启动自检：主机关机错过 15:40 调度（或关机期间 Celery
     # 补跑窗口也错过）时，**重启是唯一确定会发生的动作** —— 与上面行情
     # 同步自检同一解法：启动后后台比对"落盘交易日 vs 应有交易日"，
     # 落伍就自动补生成一次。已最新则零成本跳过（一次本地日历比较）。
-    asyncio.create_task(
-        _check_sector_rotation_at_startup(), name="sector-rotation-startup-check")
+    _bg_run("sector-rotation-startup-check", _check_sector_rotation_at_startup())
     # LLM 语义缓存索引预热：首次语义查找要扫描整个缓存目录建索引
     # （本机 3108 文件约 0.7s）。虽然是走线程池、不阻塞事件循环，
     # 但冷启动后第一个用户的第一次未命中要白等这一次。
     # 放后台建一次，把它从请求路径上彻底摘掉。
-    asyncio.create_task(_warm_llm_cache_index(runtime), name="llm-cache-warm")
+    _bg_run("llm-cache-warm", _warm_llm_cache_index(runtime))
     # 外网数据源预探：fed:rate_prob:next 不可达时要等满 25s 硬超时，
     # 而 A01 并发采集会被它拖到 23.5s。启动先探一次，让失败冷却提前就位，
     # 第一个用户就不必替所有人挨这一下。见 _warm_external_sources。
-    asyncio.create_task(
-        _warm_external_sources(runtime), name="external-source-warm")
+    _bg_run("external-source-warm", _warm_external_sources(runtime))
     # 「策略回测」数据条体检预热：仓库 10 张表约 1 亿行、日期列无索引，
     # 冷算实测 7.18s（公网首屏 13.09s）。它已经不在事件循环上（不会再拖累别人），
     # 这里再把"第一个用户"这一次也摘掉。见 _warm_quant_data_status。
-    asyncio.create_task(
-        _warm_quant_data_status(), name="quant-data-status-warm")
+    _bg_run("quant-data-status-warm", _warm_quant_data_status())
+    # ★ 列级数据资产索引预热：**查询本身是微秒级**（0.029ms），
+    #   代价全在首次建索引的 ~1.7s（扫 204 张表的 列×行数×MAX(时间)）。
+    #   不预热的话，A17 的 query_data 走"本地库兜底"时第一个用户要等这一下。
+    #   走线程池 + 延迟 + 失败只记日志（与 llm-cache-warm 同一形态）。
+    _bg_run("column-index-warm", _warm_column_index())
     # 事件告警启动补扫：**只要服务在启动就自动跑一次扫描**（用户口径 2026-09-24），
     # 让"盘中重启"不必干等到下一个定时点位。延迟 + 后台 + 失败只记日志，
     # 详见 `_run_event_alert_on_startup` 的说明。
-    asyncio.create_task(
-        _run_event_alert_on_startup(app.state.scheduler, runtime),
-        name="event-alert-startup-scan")
+    _bg_run("event-alert-startup-scan",
+            _run_event_alert_on_startup(app.state.scheduler, runtime))
     # 数据保留启动清理：最多保留 N 年数据点 / N 天新闻，延迟后台执行，
     # 与每日 03:30 的定时作业互补；失败只记日志。
-    asyncio.create_task(_run_retention_on_startup(),
-                        name="data-retention-startup")
+    _bg_run("data-retention-startup", _run_retention_on_startup())
     # 情报流后台预热（用户口径 2026-09-25）：先把**上次落盘的 payload 热加载**
     # 进内存缓存（用户此刻打开页面就是已有数据、0 IO），再起后台循环，每 15 分钟
     # 检查"工作日 + 距上次抓取 ≥2 小时"，满足就在后台抓一次并推送前端。
@@ -729,12 +914,10 @@ async def lifespan(app: FastAPI):
             _intel_prewarm.prime_slow()
         except Exception:  # noqa: BLE001 只是少一条状态日志
             logger.warning("情报慢聚合缓存状态检查失败（忽略）", exc_info=True)
-        asyncio.create_task(
-            _run_intel_prewarm(runtime), name="intel-feed-prewarm")
+        _bg_run("intel-feed-prewarm", _run_intel_prewarm(runtime))
     # ETF 份额自检：最新交易日的份额成片为 NULL 时补拉（每晚都会重演的时序问题，
     # 见 `_ensure_etf_shares_later`）。同样延迟 + 后台，绝不阻塞首屏。
-    asyncio.create_task(_ensure_etf_shares_later(),
-                        name="etf-share-guard")
+    _bg_run("etf-share-guard", _ensure_etf_shares_later())
     # 板块快照预热：自选池涉及几十个板块，逐个取要几十次子进程（每次 ~1s 固定成本，
     # 主因是 `import akshare`），整表重算实测 110 秒。这里用**一个**子进程全取回来，
     # 之后每只票的快照都命中缓存。放后台任务，不阻塞启动也不影响首个请求。
@@ -747,11 +930,16 @@ async def lifespan(app: FastAPI):
     if runtime.intraday is not None:
         # 不保存 task 引用：它是"发后不管"的预热，异常已在方法内部消化，
         # 存着反而会在关停时引入"要不要 await"的额外分支。
-        asyncio.create_task(
-            _warm_board_snapshots_later(runtime), name="intraday-board-warmup")
+        _bg_run("intraday-board-warmup", _warm_board_snapshots_later(runtime))
     yield
     if heartbeat_task is not None:
         heartbeat_task.cancel()
+    try:
+        from src.core import loop_lag as _loop_lag
+
+        await _loop_lag.stop()
+    except Exception:  # noqa: BLE001 关停是尽力而为
+        logger.debug("循环延迟监控停止失败（忽略）", exc_info=True)
     await app.state.scheduler.stop()
     # 竞价选股的两个调度线程：daemon 线程本来会随进程退出，但显式停更干净
     # （避免关停瞬间正好在写库，留下半写状态）
@@ -788,9 +976,12 @@ async def lifespan(app: FastAPI):
     # 收干。硬杀（taskkill /F）时这段不会执行 —— 那正是下次启动读到陈旧
     # `-wal`/`-shm` 的原因；能走到这里的优雅关停至少要留下一个干净的库。
     try:
-        released = release_all_connections()
-        cleaned = sum(
-            1 for db in _sqlite_paths_to_check() if checkpoint_and_close(db))
+        # ★ `CHG-0139`：收尾实现只有一处（`sqlite_recovery`），调度 worker 进程
+        #   关停时调的是**同一个函数** —— 否则两个进程各写一份清单，必然漂移，
+        #   而症状是 worker 被杀后留下脏 `-wal`（本文件上面那段血案的复现）。
+        from src.core.sqlite_recovery import checkpoint_and_release_all
+
+        released, cleaned = checkpoint_and_release_all()
         logger.info("关停：释放常驻 SQLite 连接 %d 个，checkpoint 主库 %d 个",
                     released, cleaned)
     except Exception:  # noqa: BLE001 checkpoint 失败不能把关停搞崩
@@ -799,7 +990,7 @@ async def lifespan(app: FastAPI):
 
 
 class _SafeJSONResponse(JSONResponse):
-    """把非有限浮点（NaN / ±Inf）换成 `null` 再序列化。
+    """把非有限浮点（NaN / ±Inf）换成 `null` 再序列化；并把下发浮点压到统一精度。
 
     ## 为什么需要它（2026-09-27 做T快照 500 的成因）
 
@@ -824,26 +1015,38 @@ class _SafeJSONResponse(JSONResponse):
 
     所以在**出口集中兜一次**：非有限 → `null`，语义上等于"这个数没有"，
     与项目里 `None` 表示缺失的约定一致。**前端不需要改**。
+
+    ## ★ 2026-09-30 追加：统一浮点下发精度（`CHG-0138`）
+
+    同一个出口顺带做第二件事 —— **把下发浮点压到 3 位有效数字**
+    （用户原话：「一律 3 位有效数字，同时作用于服务端出口和前端缓存写入」）。
+
+    理由与 NaN 那条**完全同构**：这里也是唯一能"一次覆盖全平台"的地方。
+    项目里已有 600+ 处 `round(...)`，但**精度不统一**（1/2/3/4/6 位都有），
+    而且**漏掉的那几处正是体积大头**（裸 SQLite REAL 直接进响应体，见
+    `docs/PRD.md` §22 的拥挤度详情：19 位小数、gzip 压不动）。
+
+    实测收益（生产库，真实响应体，gzip 前后）：
+
+        /sector_crowding/sectors_max_ma5   31,485 B → 12,305 B   −61%
+        /sector_crowding/latest            14,945 B →  9,747 B   −35%
+        /sector_crowding/alerts            27,170 B → 19,225 B   −29%
+        /sector_crowding/config_list       24,333 B → 18,503 B   −24%（60s 轮询）
+
+    ## 一次遍历做两件事
+
+    NaN 兜底与精度压缩**都**需要"带着 key 递归"（豁免按字段名判定），
+    所以合并进 `round_payload` 的**同一次遍历**，不在出口跑两遍
+    —— 这条路径每个响应都要过，多一遍就是全站双倍成本。
+
+    口径、实测对照表、"为什么不是 3 位小数"、以及**豁免清单**（时间类字段）
+    见 `src/core/float_precision.py` 的模块头。
     """
 
-    @staticmethod
-    def _clean(value: Any) -> Any:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, Integral):
-            return int(value)
-        if isinstance(value, Real):
-            number = float(value)
-            return number if math.isfinite(number) else None
-        if isinstance(value, dict):
-            return {key: _SafeJSONResponse._clean(item)
-                    for key, item in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [_SafeJSONResponse._clean(item) for item in value]
-        return value
-
     def render(self, content: Any) -> bytes:
-        return super().render(self._clean(content))
+        # 一次遍历完成：非有限浮点 → null，其余浮点 → 3 位有效数字
+        # （豁免字段原样带走）。实现见 `src/core/float_precision.py`。
+        return super().render(round_payload(content))
 
 
 app = FastAPI(
@@ -878,7 +1081,55 @@ app.add_middleware(TenancyMiddleware)
 # 放在最外层的原因：它要把上下文包住下面所有中间件与路由（含它们
 # `create_task` 出来的后台任务），这样"钱花在哪个功能上"才是精确的。
 app.add_middleware(AccountingMiddleware)
-app.include_router(api_router)
+# ★ `CHG-0146`：**唯一**的 API 挂载点，顺手把"在飞登记"依赖挂上。
+#
+# 为什么必须挂在这里（而不是 `api_router.dependencies.append(...)`）：
+# FastAPI 的 `include_router` 只应用**调用时传进来的** `dependencies=`，
+# 父 router 事后往自己的 `.dependencies` 里 append **不生效** ——
+# 实测：挂错位置时请求跑完全程，登记簿里一条都没有，而"接线判据"
+# （断言依赖在列表里）照样是绿的。所以：
+#   ① 依赖挂在**唯一的 include 点**上；
+#   ② 判据改成**行为**判据（真发一个请求、断言登记被调用），不看形状。
+app.include_router(api_router, dependencies=[Depends(_mark_inflight)])
+
+
+# ============ 根级存活探针 `/healthz`（`CHG-0128`）============
+#
+# 为什么在**根**、而不是 `/api/v1/` 下面：探针路径不该跟着 API 版本走 ——
+# `Dockerfile` 的 HEALTHCHECK、Cloudflare 健康检查、k8s liveness probe 都按
+# 约定打 `/healthz`（`docs/PLATFORM_MULTI_TENANCY_DESIGN.md` 也是这么设计的）。
+#
+# ★ 而这个路径此前**写在两处免鉴权白名单里、也写在设计文档里，却从来没有路由**
+#   （2026-09-30 实测：`/healthz` → 404，且 `Dockerfile` 的 HEALTHCHECK 打的是
+#   同样不存在的 `/health`）⇒ **照文档配好的探针一律判"服务已死"**，
+#   而 `urlopen` 遇 4xx 直接抛异常，容器会**永远 unhealthy**。
+#   根因不是"少写一个路由"，是"**路径字符串写在文档/白名单里，却没有任何机器
+#   判据把它和真实路由表对一遍**"——字符串在白名单里和在路由表里长得一样。
+#   判据见 `tests/unit/test_public_path_contract.py`。
+#
+# 返回体与 `/api/v1/health/live` **同一个实现**（0 I/O、不含 pid/环境名/版本号）。
+# 注册位置必须在下面的 `app.mount("/", StaticFiles(...))` **之前** ——
+# 那个挂载会吃掉所有没被更早路由匹配到的路径。
+@app.get("/healthz", tags=["health"])
+async def healthz() -> dict:
+    """根级 0 I/O 存活探针（不带 API 版本号）。
+
+    `CHG-0137`：顺带做一次**计数打点**（内存累加，不碰磁盘 → 不破坏"0 I/O"）。
+    注意它测不到"循环被阻塞"（那时请求还在 socket 缓冲区里），仪器是
+    `src/core/loop_lag.py` 的 1 Hz 采样；这里只当计数对照。
+    """
+    import time as _time
+
+    from src.api.routes.research import liveness_payload
+
+    t0 = _time.perf_counter()
+    try:
+        from src.core import loop_lag
+
+        loop_lag.note_probe((_time.perf_counter() - t0) * 1000.0)
+    except Exception:  # noqa: BLE001 打点失败绝不影响探针
+        pass
+    return liveness_payload()
 
 
 # ============ 响应压缩（2026-09-26 用户报障：事件告警打开要等 1-2 秒）============
@@ -937,11 +1188,71 @@ async def no_cache_html(request, call_next):
 # 默认（不设该环境变量）仍是 `web/dist`，本地开发不受影响。
 _dist = Path(os.environ.get("MOSS_WEB_DIST")
              or Path(__file__).resolve().parents[2] / "web" / "dist")
+
+
+class _HttpOnlyStatic:
+    """把**非 HTTP 作用域**挡在静态挂载之外（`CHG-0149`）。
+
+    ## 它修的是什么（2026-09-30 公网链路体检当场复现）
+
+    `StaticFiles.__call__` 第一行就是
+
+        assert scope["type"] == "http"
+
+    而 SPA 的静态资源挂在 `/`（`Mount("/")` 匹配**任何**路径，包括 WebSocket 作用域）。
+    于是**任何**落到这里的非 HTTP 作用域都会变成：
+
+        AssertionError（starlette/staticfiles.py:91）
+        → uvicorn 记 `connection rejected (500 Internal Server Error)`
+        → 客户端看到 **500**
+
+    两个触发面（都不用恶意，正常误用就会踩）：
+
+    ① 给**HTTP-only 路径**发带升级头的请求（例如把 `/api/v1/health/live`
+       当 WS 地址连）；
+    ② 连一个**不存在的** WS 路径（前端写错路径、老版本客户端残留）。
+
+    正常前端走 `/api/v1/ws/*` 时行为本来就是对的（未登录被登录门槛拒 **403**）——
+    所以这里只需让"**没有任何 WS 路由匹配**"这种情况也给出**干净的回答**：
+    能支持「拒绝响应」扩展就回 **404**（可读、可排障），否则按 ASGI 规范
+    在 accept 之前 `websocket.close(1008)`（uvicorn 会把它渲染成 403 握手拒绝）。
+
+    ## 为什么不做在 `StaticFiles` 里 / 为什么不注册一条兜底 WS 路由
+
+    · 改 `StaticFiles` 是改第三方；包一层 5 行的 ASGI shim 就够了；
+    · 注册兜底 WS 路由要决定"哪条路径才算兜底"（`Mount("/")` 之后注册什么都不会命中），
+      而这里的问题是**作用域类型**，不是路径 —— 在作用域这一层回答最直接。
+    """
+
+    def __init__(self, app) -> None:  # noqa: ANN001
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:  # noqa: ANN001
+        kind = scope.get("type")
+        if kind == "websocket":
+            if "websocket.http.response" in scope.get("extensions", {}):
+                # 扩展可用：回一个真正的 404（人能看到原因，而不是"握手莫名失败"）
+                await send({"type": "websocket.http.response.start", "status": 404,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "websocket.http.response.body",
+                            "body": b'{"detail":"no websocket route at this path"}'})
+            else:
+                # 规范路径：accept 之前 close ⇒ 握手被拒（code 1008 = policy violation）
+                await send({"type": "websocket.close", "code": 1008})
+            logger.info("非 WS 路径收到 WebSocket 连接：%s（已按 404/1008 拒绝）",
+                        scope.get("path"))
+            return
+        if kind != "http":
+            return          # lifespan 等其它作用域：静态挂载不参与
+        await self.app(scope, receive, send)
+
+
 if _dist.is_dir():
     from fastapi.staticfiles import StaticFiles
 
     logger.info("前端静态资源托管目录：%s", _dist)
-    app.mount("/", StaticFiles(directory=_dist, html=True), name="web")
+    app.mount("/", _HttpOnlyStatic(StaticFiles(directory=_dist, html=True)),
+              name="web")
 elif os.environ.get("MOSS_WEB_DIST"):
     # 显式指定了却不存在的目录：必须吵，不能静默回落到别的目录
     # （否则"客户看到的到底是哪份前端"就说不清了）

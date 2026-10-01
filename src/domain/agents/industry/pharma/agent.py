@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.domain.agents.analysis.unlock_teaching import render_unlock_teaching
 from src.domain.agents.industry.base import IndustryAgentBase
 
 
@@ -16,6 +17,10 @@ class PharmaIndustryAgent(IndustryAgentBase):
     capabilities_names = ("policy_cycle_analysis", "pipeline_valuation")
 
     system_prompt = (
+
+        render_unlock_teaching("A16_pharma")
+
+        +
         "资深医药行业分析师，熟悉创新药/器械/医疗服务/中药。"
         "区分集采压制的仿制药与管线驱动的创新药；管线价值以临床/获批事件为锚，"
         "禁对在研产品收入做无据假设。"

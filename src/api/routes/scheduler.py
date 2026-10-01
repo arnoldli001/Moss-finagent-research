@@ -85,6 +85,23 @@ async def trigger_job(name: str, request: Request) -> dict:
     """
     if name not in JOB_REGISTRY:
         raise HTTPException(status_code=404, detail=f"未注册作业: {name}")
+    # ★ 手动触发是**第三条**触发路径（前两条：`_tick()` 定时、
+    #   `main.py` 启动自检的 `scheduler.trigger`）。三条必须同判据，否则
+    #   "按写权限裁掉更新作业"这件事会被这里一键绕过去（`CHG-0087`）。
+    #
+    # 为什么在**执行前**就拒，而不是让它跑到写闸门再失败：
+    #   `quant_data_sync` 的第一段是**下载分区**，写库是最后一段 ——
+    #   跑到最后才失败等于白下一遍数据（本项目为"下了但没入库"付过代价）。
+    #   且失败会落一条 `failed`，看起来是故障，实际是"这台机器不负责写"。
+    from src.scheduler.registry import job_deny_reason
+
+    denied = job_deny_reason(name)
+    if denied:
+        raise HTTPException(
+            status_code=409,
+            detail=(f"作业 {name} 在本实例上不会执行：{denied}。"
+                    "这是**写权限归属**决定的，不是故障（见 docs/PRD.md §18.6）；"
+                    "要真正跑它，请在承担该存储更新责任的实例上触发。"))
     record = await execute_job(
         request.app.state.runtime, name, _run_log(request), trigger="manual"
     )

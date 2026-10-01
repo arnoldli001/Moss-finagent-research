@@ -504,3 +504,66 @@ def test_manage_env_selfcheck_does_not_leak_environ(monkeypatch) -> None:
 
     assert "MOSS_ENV" not in os.environ
     assert "MOSS_PILOT_SINGLE_INSTANCE_ACK" not in os.environ
+
+
+# ======================================================================
+# test 环境必须真的隔离（CHG-0063，2026-09-28 补）
+# ======================================================================
+#
+# 规则文档《数据库管理》§6 反模式第一条是「同库同账号，靠 env 字段区分」。
+# 补这一档时的实测现场比该反模式更糟：`manage.py start --env test` **没有任何
+# 隔离分支**，直接落 `MOSS_SQLITE_PATH` 的默认值 `data/moss_finagent.db`
+# （manage.py 自己标注"生产用"），而 `manage.py test` 却走 `build_test_env()`
+# 的临时目录 —— **同一个 `test` 两套语义**。
+
+def test_start_test_env_is_isolated_and_self_consistent() -> None:
+    """`--env test` 必须拿到独立目录，**且改完之后仍然起得来**。
+
+    反向测试（"收紧判据"必须配的那条）：只证明"不隔离会被拒"是不够的 ——
+    还要证明"隔离之后自检通过"，否则改动方向就是"把能跑的也一起拒了"。
+    """
+    import manage  # noqa: PLC0415
+
+    env = manage.test_isolation_env()
+    assert env["MOSS_ENV"] == "test"
+    assert "test" in env["MOSS_SQLITE_PATH"].lower().replace("\\", "/"), env
+    assert env["MOSS_SQLITE_PATH"].endswith("moss_test.db"), env
+    # 不得落回默认主库
+    assert "moss_finagent" not in env["MOSS_SQLITE_PATH"].lower(), env
+
+    settings = Settings(_env_file=None, env="test",
+                        sqlite_path=env["MOSS_SQLITE_PATH"])
+    assert assert_environment_consistency(settings, environ=env) == [], (
+        "隔离路径竟然过不了自检 —— 那是把能跑的也一起拒了")
+
+
+def test_test_env_pointing_at_default_db_is_rejected() -> None:
+    """`--env test` 指向默认主库 → 必须被拒（这就是补这一档的原始缺陷）。"""
+    settings = Settings(_env_file=None, env="test",
+                        sqlite_path="data/moss_finagent.db")
+    problems = assert_environment_consistency(settings, environ={})
+    assert any("test 环境必须真的隔离" in p for p in problems), problems
+
+
+def test_all_three_isolation_envs_isolate_cache_and_audit() -> None:
+    """dev / test / pilot 三档都必须把**缓存与两类审计**改道，且互不相同。
+
+    为什么要断言"互不相同"而不是"各自非空"：三个实例指向同一个目录时，
+    每个值都非空、断言照样通过 —— 而那正是要防的（共用缓存/审计）。
+    """
+    import manage  # noqa: PLC0415
+
+    envs = {
+        "dev": manage.dev_isolation_env(),
+        "test": manage.test_isolation_env(),
+        "pilot": manage.pilot_isolation_env(),
+    }
+    for name, env in envs.items():
+        for key in ("MOSS_SQLITE_PATH", "LLM_CACHE_DIR", "MOSS_AUDIT_DIR",
+                    "LLM_AUDIT_DIR", "SCHEDULER_DIR"):
+            assert key in env, f"{name} 缺少 {key}"
+            assert env[key].strip(), f"{name} 的 {key} 为空"
+    for key in ("MOSS_SQLITE_PATH", "LLM_CACHE_DIR", "MOSS_AUDIT_DIR"):
+        seen = [env[key].replace("\\", "/").lower() for env in envs.values()]
+        assert len(set(seen)) == 3, f"{key} 三档没有互不相同：{seen}"
+

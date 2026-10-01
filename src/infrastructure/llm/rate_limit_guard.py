@@ -50,8 +50,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel  # noqa: E402
+
 #: 无隔离配置时的兜底路径（与 backend.pid / incidents 同目录，运维一眼能找到）。
-DEFAULT_STATE_PATH: str = "data/run/free_tier_429.json"
+DEFAULT_STATE_PATH: str = store_rel("run_dir") + "/free_tier_429.json"
 
 #: 连续多少次 429 就锁定（"连续"= 期间无成功）
 LOCK_THRESHOLD: int = 3

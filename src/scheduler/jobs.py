@@ -285,6 +285,23 @@ async def execute_job(
                     status="success" if boards else "partial",
                     records_processed=boards,
                     error_message=detail[:500])
+            if spec.kind == "unlock_plan":
+                # ★ 限售解禁逐股明细落库（用户 2026-09-29 口径：单独的表 + 月频调度）。
+                #   同步函数走 `to_thread`（与 `_sector_rotation` 等网络型作业同范式），
+                #   避免阻塞调度线程；失败**如实返回**（不抛），让运行台账记 partial/failed。
+                from src.infrastructure.repositories import unlock_plan_repo
+
+                horizon = int((spec.params or {}).get("horizon_days")
+                              or unlock_plan_repo.DEFAULT_HORIZON_DAYS)
+                outcome = await asyncio.to_thread(
+                    unlock_plan_repo.ingest, horizon_days=horizon)
+                if outcome.error:
+                    return run_log.finish(
+                        record, status="partial", records_processed=outcome.inserted,
+                        error_message=f"{outcome.render()}"[:500])
+                return run_log.finish(
+                    record, status="success", records_processed=outcome.inserted,
+                    error_message=outcome.render()[:500])
             if spec.kind == "mainline_warm":
                 # 与 `mainline_daily` 同一形态：detail 是 dict，失败时带 `failed`
                 processed, warm_detail = await _mainline_warm()
@@ -331,6 +348,23 @@ async def execute_job(
                 return run_log.finish(
                     record, status="success", records_processed=processed,
                     error_message=detail[:500])
+            if spec.kind == "daily_warm":
+                # 日K快照预热（`CHG-0092`）。只读：不写库/不写盘/不推送。
+                service = getattr(runtime, "intraday", None)
+                if service is None:
+                    return run_log.finish(
+                        record, status="failed",
+                        error_message="做T辅助服务未装配到Runtime（检查 configs/intraday.yaml）")
+                warm_report = await _daily_warm(service)
+                if warm_report.codes and not warm_report.warmed and warm_report.failed:
+                    status = "failed"          # 一只都没热成：真故障
+                elif warm_report.failed:
+                    status = "partial"         # 热了一部分：如实标注，不吞
+                else:
+                    status = "success"         # 含"非盯盘时段/自选池为空"的正常跳过
+                return run_log.finish(
+                    record, status=status, records_processed=warm_report.warmed,
+                    error_message=warm_report.render()[:500])
             if spec.kind == "quant_select":
                 service = getattr(runtime, "quant_select", None)
                 if service is None:
@@ -407,6 +441,81 @@ async def execute_job(
                 processed, errors = await _collect_through_pipeline(
                     runtime, indicators, "dyn_col")
                 return _finish_collection(record, run_log, processed, errors)
+            if spec.kind == "catalog_collection":
+                # ★ 2026-09-28 第十二轮：catalog 驱动的批量采集。
+                # 与 dynamic_collection 复用同一条 A01→A02→A03→A04 管线
+                # （禁止另写一条 —— 两条实现必然分叉，见 AGENTS.md
+                #  「同一判断只允许一份实现」）。
+                # 唯一差别：跑完后**幂等重算 indicator_catalog 索引**，
+                # 让 SmartFetcher 下次直接走 DB 命中而不是再联网。
+                indicators = spec.params.get("indicators") or []
+                processed, errors = await _collect_through_pipeline(
+                    runtime, indicators, "cat_col")
+                # 索引回填失败不影响作业结果（索引是加速结构，下次重算即可）
+                try:
+                    await _refresh_catalog_index(runtime, indicators)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("catalog 索引回填失败（忽略）: %s", exc)
+                return _finish_collection(record, run_log, processed, errors)
+            if spec.kind == "data_freshness_audit":
+                # ★ 2026-09-29 用户要求：「数据采集 agent 要记录任何未能获取到的
+                #   信息日志…**定期维护数据**」。
+                #
+                # 本分支回答"**拉回来的够不够新**"（`catalog_*` 批采只管"拉"）：
+                #   扫登记指标的事实序列 → 判陈旧/缺失/频率登记错 → 记 `[数据维护]`
+                #   日志 + 落 JSON 报告 + 把缺口入**既有**补采队列
+                #   （补取由 `gap_drain` 作业做，本作业**不自己取数**）。
+                # 判据全在 `src/scheduler/maintenance.py`（单一实现）。
+                from src.scheduler.maintenance import audit as _freshness_audit
+
+                stats = await _freshness_audit(
+                    enqueue=bool(spec.params.get("enqueue", True)),
+                    write_report=bool(spec.params.get("write_report", True)),
+                )
+                logger.info("%s", stats["summary"])
+                return _finish_collection(
+                    record, run_log, int(stats.get("issues") and
+                                         len(stats["issues"]) or 0), [])
+            if spec.kind == "derived_metrics":
+                # ★★ 2026-09-30 用户口径：「净息差的值，**每次记录**有利于
+                #    **统计变化趋势**，来衡量银行的收益曲线和映射业绩，
+                #    因为**银行主要赚息差**。」
+                # 本分支 = 按期把派生指标算一遍并**落事实表**（攒趋势）。
+                processed, errors = await _refresh_derived_metrics(runtime, spec)
+                return _finish_collection(record, run_log, processed, errors)
+            if spec.kind == "source_leads_audit":
+                # ★★ 2026-09-30（CHG-0118）：给 path C 的产物一个**消费方**。
+                # 此前 `source_reroute_log.jsonl` 是**只写不读**的（零消费方），
+                # 即 R2 说的"声明式通路"。本分支把它捞进运维日志。
+                # ⚠️ 声明了 `JobKind` 却忘了这一支 ⇒ 每次都记"未知作业类型"失败
+                #    （本项目真实踩过），所以护栏会断言这一支存在。
+                processed, errors = await _source_leads_audit(spec)
+                return _finish_collection(record, run_log, processed, errors)
+            if spec.kind == "gap_drain":
+                # ★ 2026-09-28 第十四轮：消费数据缺口队列（跨轮次补取）。
+                #
+                # A17 在链路末端报缺口 → 入队 → 本作业在**盘后**用 A19
+                # 生成连接器补取 → 落库 → 回填索引 → 次日分析 DB 命中。
+                #
+                # 为什么不在 A17 当场补：补到的数据本轮用不上（prompt 已发出），
+                # 而 A19 要跑 LLM 生成代码 + 沙箱验证，会让用户白等十几秒。
+                processed, errors = await _drain_gap_queue(runtime, spec)
+                return _finish_collection(record, run_log, processed, errors)
+            if spec.kind == "calendar_sync":
+                # ★ 2026-09-28 第十三轮：投资日历落库。
+                #
+                # 为什么单独一个 kind 而不是并进 catalog_collection：
+                # 日历数据来自 `fetch_unlock_schedule()` 这类**结构化 API**
+                # （东财汇总 + 巨潮公告双源），不是 A01 按 indicator 能直连的。
+                # 硬塞进批量链只会得到"该指标无连接器支持"的静默失败。
+                #
+                # 落库后由 `indicator_catalog` 索引接管 → 投研链路走 DB 命中。
+                # 用户原话：「加入到索引清单，避免下次取解禁数据取不到」。
+                horizon = int(spec.params.get("horizon_days") or 45)
+                stats = await _sync_calendar(runtime, horizon)
+                errs = list(stats.get("errors") or [])
+                return _finish_collection(
+                    record, run_log, int(stats.get("inserted") or 0), errs)
         except Exception as exc:  # noqa: BLE001 作业级兜底：失败入记录供告警/重试
             return run_log.finish(record, status="failed", error_message=brief(exc, BRIEF_LOG))
 
@@ -888,6 +997,33 @@ async def _intraday_t_scan(service: Any) -> tuple[int, str]:
         + (f"（{'；'.join(lines)}）" if lines else "")
     )
     return len(triggered), detail
+
+
+async def _daily_warm(service: Any) -> Any:
+    """日K快照预热：把自选池的日K快照算进做T服务的进程内缓存。
+
+    ## 为什么它是**作业**而不是请求路径上的优化
+
+    实测（2026-09-29）：`/api/v1/intraday/daily` **冷 4.19 s / 热 0.07 s**，
+    而缓存 TTL 只有 180 s，且全仓库**唯一的写入点就是 `IntradayService.daily()`
+    自己** —— 没有任何定时作业调它（交易时段每 5 分钟的 `intraday_t_scan`
+    走的是分钟级链 `service.watchlist()`；`mainline_warm` 预热的是主线快照）。
+    用户口径是「只要服务器开着，到了交易时间，就会自动获取数据，而不是冷加载」，
+    这条作业就是那句话的落地。
+
+    ## 与 `intraday_t_scan` 的关系（为什么不塞进它）
+
+    两者**语义不同**：`intraday_t_scan` 判信号并**推送**（有副作用），
+    本作业只把缓存养热（零副作用）。塞在一起会让"扫描失败"与"预热失败"
+    在台账里变成同一件事，而它们的处置完全不同（一个要查数据源，一个只要下一轮补）。
+    间隔也不同：本作业必须 < 缓存 TTL（120 s），而扫描是 5 分钟。
+
+    预热逻辑本身在 `src/intraday/warm.py`（并发/预算/窗口上限都在那里，
+    单一真值源）；本函数只做"取服务 → 调它 → 交回结果"。
+    """
+    from src.intraday.warm import warm_watchlist_daily
+
+    return await warm_watchlist_daily(service)
 
 
 async def _quant_select(service: Any, spec: Any) -> tuple[int, str]:
@@ -1646,6 +1782,456 @@ async def _penetration_rate_update(runtime: Any) -> tuple[int, list[str]]:
         except Exception as exc:  # noqa: BLE001 单赛道失败不阻断
             errors.append(f"{track}: {exc}")
     return total_points, errors
+
+
+async def _refresh_catalog_index(runtime: Any, indicators: list[str]) -> int:
+    """跑完批量采集后，幂等重算 `indicator_catalog` 索引（第十二轮）。
+
+    为什么必须在作业里做：`SmartFetcher` 靠索引表的 `last_fetch_time_ms` /
+    `row_count` 判断"能不能走 DB 命中"。定时作业落了库但**没回填索引**的话，
+    每次都还是判定 stale → 每次都联网 —— 索引等于白建。
+
+    用 `refresh_stats_from_facts`（对事实表 COUNT/MAX）而不是
+    `update_from_points`（累加 delta）：后者在"同一批数据被跑两次"时
+    会把 row_count 越加越大，虚高的 row_count 让 SmartFetcher 误判 fresh。
+    """
+    repo = getattr(runtime, "repo", None)
+    if repo is None or not indicators:
+        return 0
+    from src.infrastructure.catalog.catalog_repo import CatalogRepository
+
+    cat = CatalogRepository(db_path=getattr(repo, "_db_path", None))
+    return await cat.refresh_stats_from_facts(indicators)
+
+
+async def _drain_gap_queue(runtime: Any, spec: Any) -> tuple[int, list[str]]:
+    """消费数据缺口队列：A19 补取 → 回填索引。
+
+    返回 `(resolved_count, errors)`。
+    """
+    from src.domain.agents.decision.gap_queue import (
+        drain_catalog_gaps,
+        drain_gaps,
+        get_gap_queue,
+    )
+
+    q = get_gap_queue()
+    stats = q.stats()
+    logger.info("缺口队列状态：%s", stats)
+
+    items = q.pending()
+    if not items:
+        return 0, []
+
+    # A19 实例（复用 A17 的 gateway —— 与 _get_gap_resolver 同一装配路径）
+    a17 = getattr(runtime, "agents", {}).get("A17_recommend")
+    gw = getattr(a17, "_gateway", None) if a17 is not None else None
+    if gw is None:
+        return 0, ["A19 不可用（A17 gateway 未装配）"]
+
+    from src.domain.agents.data_gap_resolver import DataGapResolverAgent
+
+    repo = getattr(runtime, "repo", None)
+    catalog = None
+    if repo is not None:
+        try:
+            from src.infrastructure.catalog.catalog_repo import CatalogRepository
+
+            catalog = CatalogRepository(db_path=getattr(repo, "_db_path", None))
+        except Exception as exc:  # noqa: BLE001 回填是增强，失败不影响补取
+            logger.debug("catalog 装配失败（不做回填）: %s", exc)
+
+    max_items = int(spec.params.get("max_items") or 5)
+    is_registered, has_connector = _gap_route_predicates(runtime)
+
+    # ★★ 第零阶段：把 A17 的**散文缺口展开成指标 id**（2026-09-30）。
+    #    实测队列 35 条 pending 全是散文（"北向资金日度净买额（…停止披露）"），
+    #    A19 与批采都拿它没办法 ⇒ 一条都没被补过。
+    #    展开的三种结局（map / terminated / unmapped）写在
+    #    `domain/agents/decision/prose_map.py` 的逐条复核表里。
+    try:
+        from src.domain.agents.decision.prose_map import expand_prose_gaps
+
+        prose_stats = expand_prose_gaps(
+            q, is_registered=_gap_route_predicates(runtime)[0])
+        if any(prose_stats.values()):
+            logger.info("散文缺口展开：%s", prose_stats)
+    except Exception as exc:  # noqa: BLE001 展开坏了不该阻断补取
+        logger.warning("散文缺口展开失败：%s: %s", type(exc).__name__, exc)
+
+    # ★★ 第一阶段：**取数侧能补的先补**（不烧 LLM）。
+    #    用户 2026-09-30 口径：「所有过时数据或没登记更新周期的数据都触发月频更新一次」。
+    #    走的是既有批采入口 `_collect_through_pipeline`（= `catalog_*` 作业调的那个），
+    #    所以"补一次"和"定时采一次"**是同一条链**，不会两份实现分叉。
+    cat_stats: dict[str, int] = {}
+    cat_max = int(spec.params.get("catalog_max_items") or 20)
+    try:
+        cat_stats = await drain_catalog_gaps(
+            _make_catalog_gap_fetcher(runtime, catalog),
+            max_items=cat_max, is_registered=is_registered,
+            has_connector=has_connector)
+        logger.info("缺口补采（取数侧）：resolved=%d failed=%d 队列剩余=%d",
+                    cat_stats.get("resolved", 0), cat_stats.get("failed", 0),
+                    cat_stats.get("backlog", 0))
+    except Exception as exc:  # noqa: BLE001 取数侧坏了不该阻断 A19 那一阶段
+        logger.warning("缺口补采（取数侧）失败：%s: %s", type(exc).__name__, exc)
+
+    # ★ 第二阶段：A19 只处理"没有生产者"的那些（形态可判定、且不是散文）。
+    out = await drain_gaps(
+        DataGapResolverAgent(gw), max_items=max_items, repo=catalog,
+        data_repo=repo, is_registered=is_registered,
+        has_connector=has_connector)
+    errors: list[str] = []
+    if out["failed"]:
+        errors.append(f"{out['failed']} 条补取失败（已记入队列，可重试）")
+    logger.info("缺口补取完成：resolved=%d failed=%d 路由=%s", out["resolved"],
+                out["failed"], out.get("by_route") or "-")
+    return int(out["resolved"]) + int(cat_stats.get("resolved", 0)), errors
+
+
+def _make_catalog_gap_fetcher(runtime: Any, catalog: Any) -> Any:
+    """造一个"取数侧补一条缺口"的取数器（`drain_catalog_gaps` 注入用）。
+
+    它做四件事，**顺序即语义**：
+      ① 记下补前的最新期（从 catalog 索引读，零成本）；
+      ② 走**既有批采入口** `_collect_through_pipeline` 真取一次（A01→A04）；
+      ③ 回填索引（否则下次仍判 stale —— 本项目实测过"落库但索引没更 = 白落库"）；
+      ④ 读回补后的最新期，交给队列判"补到了 / 源停更 / 取不到"。
+    """
+
+    async def _fetch(indicator: str) -> dict[str, Any]:
+        before = ""
+        try:
+            entries = {str(e.indicator): e for e in await catalog.all()}
+            entry = entries.get(indicator)
+            before = str(getattr(entry, "last_period_date", "") or "")
+        except Exception as exc:  # noqa: BLE001 读不到索引不算失败（照常取）
+            logger.debug("缺口补采：读索引失败（%s）", exc)
+        try:
+            await _collect_through_pipeline(runtime, [indicator], "gapcat")
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "before": before, "after": "",
+                    "reason": f"补采异常 {type(exc).__name__}: {exc}"}
+        after = before
+        try:
+            await catalog.refresh_stats_from_facts([indicator])
+            entries = {str(e.indicator): e for e in await catalog.all()}
+            after = str(getattr(entries.get(indicator),
+                                "last_period_date", "") or "")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("缺口补采：回填索引失败（%s）", exc)
+
+        # ★★ 2026-09-30（用户口径）：「源停更 → 换源，这个可以在**每次联网找不到
+        #   数据时**，做个自动搜索其他网址，寻找数据源，**找到后就更新数据源地址**」。
+        #
+        # 接线位置是刻意的：**这里正是"源停更"证据的产生处**（取到了但与库内同期），
+        # 而且这是**盘后作业路径**（无防撞钟）。
+        # ⚠️ **绝不能挂在交互路径上**：换源要探测最多 `MAX_PROBE` 个源、每个 8s
+        #   ⇒ 最坏 24s，而交互路径的预算是 10s（`QUERY_DEADLINE_SEC`）——
+        #   接上去就是把"防撞钟"变成摆设。
+        if after and after <= before:
+            await _try_reroute_on_source_lag(runtime, indicator, before, after)
+        return {"ok": True, "before": before, "after": after, "reason": ""}
+
+    return _fetch
+
+
+async def _try_reroute_on_source_lag(runtime: Any, indicator: str,
+                                     before: str, after: str) -> None:
+    """源停更时换源（**免费路径 A**：在已有连接器里找替代 + 口径校验 + 落覆盖层）。
+
+    ⚠️ 能力边界（照实说）：仓库**没有搜索引擎能力** ⇒ 这里只能在**已有连接器**里找；
+    "联网查新网址"要么走 A19 的 LLM 提议（花钱），要么先接一个搜索源（需凭据）。
+    **绝不影响主链路**：任何异常都吞掉（换源是补救，不是主路径）。
+    """
+    try:
+        backend = getattr(
+            getattr(runtime, "agents", {}).get("A01_data_collector", None),
+            "_backend", None)
+        if backend is None:
+            return
+        from src.infrastructure.catalog.data_stores import PROJECT_ROOT, store_rel
+        from src.infrastructure.catalog.source_reroute import reroute
+
+        # 旧序列（用于口径比对）：直接从事实表取一段，够对齐即可
+        old_points: list[Any] = []
+        try:
+            import sqlite3
+
+            db = PROJECT_ROOT / store_rel("app_db")
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                rows = con.execute(
+                    "SELECT period_date, value FROM fact_data_points "
+                    "WHERE indicator=? AND value IS NOT NULL "
+                    "ORDER BY period_date DESC LIMIT 40", (indicator,)).fetchall()
+            finally:
+                con.close()
+            from src.core.schemas import DataPoint
+
+            old_points = [DataPoint(indicator=indicator, value=float(v),
+                                    period_date=str(p))
+                          for p, v in rows if v is not None]
+        except Exception as exc:  # noqa: BLE001 取不到旧序列 ⇒ 只能进影子期
+            logger.debug("换源：旧序列取不到（只能进影子期）: %s", exc)
+
+        points, why = await reroute(indicator, backend, old_points)
+        if points:
+            logger.warning("[换源] indicator=%s 原最新期 %s（本次仍为 %s）→ %s",
+                           indicator, before or "-", after or "-", why)
+        else:
+            logger.info("[换源] indicator=%s 未找到可用替代源：%s", indicator, why)
+        del points
+    except Exception as exc:  # noqa: BLE001 换源是补救，坏了不拖垮补采
+        logger.warning("[换源] 异常（忽略）：%s: %s", type(exc).__name__, exc)
+
+
+async def _source_leads_audit(spec: Any) -> tuple[int, list[str]]:
+    """把 path C 搜到的**候选数据源线索**送进运维日志（`CHG-0118`）。
+
+    返回 `(本轮上报条数, 错误列表)` —— 与其它作业同一个契约。
+
+    ## 为什么需要它（R2：禁止"声明式通路"）
+
+    `source_reroute.discover_candidate_urls()` 会把联网搜到的候选源网址写进
+    `source_reroute_log.jsonl`，但**此前没有任何东西读它**（实测零消费方）。
+    写了没人看 = 不存在。本作业就是那句"谁读它"。
+
+    ## 噪音纪律（三层，缺一不可 —— `AGENTS.md`《告警/通知硬约束》）
+
+      ① **事件级去重**：每条线索由 `lead_id` 标识，**报过一次就不再报**（状态落盘）；
+      ② **渠道级限速**：单轮最多 `max_per_run` 条（默认 10），其余留下一轮；
+      ③ **接收者静默**：只写**后端日志**（运维通道），不发邮件、不推前端。
+
+    ## 日志级别为什么是 WARNING
+
+    逐条线索用 **WARNING** 而不是 INFO：本项目实测过 **INFO 曾被整体丢弃**
+    （root 无 handler，last-resort 只兜 WARNING 及以上），而"线索没人看见"
+    正是这个作业要解决的问题本身 —— 用 INFO 等于把同一个坑再踩一遍。
+    汇总行用 INFO。
+
+    ## 绝不抛异常
+
+    换源是补救路径。审计读坏了、状态文件写不了，都只记 warning 并返回，
+    **不能**把它变成一次作业失败（那会把运行台账刷红，而根因只是证据文件脏）。
+    """
+    from src.infrastructure.catalog import source_leads as SL
+
+    errors: list[str] = []
+    try:
+        leads = SL.read_leads()
+    except Exception as exc:  # noqa: BLE001 读失败不许把作业打挂
+        logger.warning("[换源线索] 读取失败（忽略本轮）：%s: %s",
+                       type(exc).__name__, exc)
+        return 0, [f"读换源线索失败：{type(exc).__name__}: {exc}"]
+
+    if not leads:
+        logger.info("[换源线索] 无待复核候选源（path A/B 够用，或本轮还没触发过联网换源）")
+        return 0, []
+
+    fresh = SL.filter_new(leads)
+    if not fresh:
+        logger.info("[换源线索] %d 条候选源均已上报过，无新增", len(leads))
+        return 0, []
+
+    cap = int((getattr(spec, "params", None) or {}).get("max_per_run")
+              or SL.MAX_PER_RUN)
+    batch = fresh[:max(1, cap)]
+
+    for lead in batch:
+        logger.warning(
+            "[换源线索] indicator=%s ← 候选源 %s（%s）｜待人工或 A19 复核后"
+            "登记进 indicators.yaml（**自动流程不会改登记表**）",
+            lead["indicator"], lead["url"], (lead["title"] or "-")[:48])
+
+    SL.mark_surfaced([x["id"] for x in batch])
+
+    merged = "、".join(f"{k}×{v}" for k, v in SL.summarize(batch))
+    logger.info("[换源线索] 本轮上报 %d 条（待复核共 %d 条，单轮上限 %d）；"
+                "按指标合并：%s", len(batch), len(fresh), cap, merged or "-")
+    return len(batch), errors
+
+
+async def _refresh_derived_metrics(runtime: Any, spec: Any) -> tuple[int, list[str]]:
+    """按期把派生指标算一遍并**落事实表**（攒趋势）。返回 `(入库点数, 错误)`。
+
+    ## 三段各自的既有入口（不新造）
+
+      ① 标的从哪来：`spec.params["codes"]`，缺省取**自选池**（与 `daily_warm`
+         同一个 provider，不另写一套"谁是我关心的票"）；
+      ② 输入怎么取：`collect` = A01 的 `_backend.fetch`（既有确定性流水线）
+         → `fetch_inputs.build_fetcher`（CLI 与作业**共用**的实现）；
+      ③ 结果往哪写：A04 `data_storage`（既有幂等写入）。
+
+    ## 判据
+
+      * `to_point()` 返回 `None`（输入不齐/算不出）⇒ **不写库**，记一条缺口日志；
+      * `period_date` 取**输入的最新期间**（不是今天）⇒ 趋势点才对得上财报；
+      * 幂等：A04 按 (indicator, period_date) 去重 ⇒ 同一天跑两次不会刷两行，
+        但**新一期出来就会多一行** —— 这正是"每次记录、可统计趋势"的含义。
+    """
+    from src.core.models import AgentInput
+    from src.domain.indicators.derive import derive, load_specs
+    from src.domain.indicators.fetch_inputs import build_fetcher
+
+    agents = runtime.agents
+    a01 = agents.get("A01_data_collector")
+    a04 = agents.get("A04_data_storage")
+    if a01 is None or a04 is None:
+        return 0, ["A01/A04 未注册（派生落库需要采集与入库两个 Agent）"]
+
+    specs = load_specs()
+    wanted = spec.params.get("specs")
+    if wanted:
+        names = {str(x) for x in wanted}
+        specs = [s for s in specs if s.id in names or s.name in names]
+    if not specs:
+        return 0, []
+
+    codes = [str(c) for c in (spec.params.get("codes") or [])]
+    if not codes:
+        codes = await _default_derived_codes(int(spec.params.get("max_codes") or 60))
+    if not codes:
+        return 0, []
+
+    backend = a01._backend  # noqa: SLF001 权威入口（AGENTS.md 定过）
+
+    async def _collect(indicator: str) -> list[Any]:
+        # ⚠️ 定时路径**不传**防撞钟预算：重活正是要在那里做（AGENTS.md 纪律）。
+        return await backend.fetch(indicator)
+
+    stored = 0
+    errors: list[str] = []
+    for code in codes:
+        for one in specs:
+            indicator = f"{one.prefix}:{code}"
+            try:
+                fetch, trace = await build_fetcher(_collect, [one], code)
+                result = derive(indicator, code, fetch, [one])
+            except Exception as exc:  # noqa: BLE001 单条失败不阻断其余
+                errors.append(f"{indicator}: {type(exc).__name__}: {exc}")
+                continue
+            point = result.to_point()
+            if point is None:
+                # 缺口：**不写库**（没算出来绝不当 0）。
+                # ★ 入队时**必须带代码** —— 实测坑：原先入队的是候选名裸名
+                #   （`利息净收入`），而库里/连接器认的是 `利息净收入:600036`
+                #   ⇒ 队列里躺着一个**取数侧无法执行**的条目，而且它一进队列就被
+                #   散文规则判成"映射表未覆盖"。带代码之后它才是可判定的指标 id。
+                missing_names = [n for names in result.missing.values()
+                                 for n in names]
+                try:
+                    from src.domain.agents.decision.gap_queue import get_gap_queue
+
+                    queue = get_gap_queue()
+                    for name in missing_names:
+                        ind = name if ":" in name else f"{name}:{code}"
+                        queue.enqueue(
+                            ind,
+                            reason=f"派生指标 {indicator} 缺输入（{result.reason or '未取到'}）",
+                            source="derived_indicator")
+                except Exception as exc:  # noqa: BLE001 入队是增值，坏了不影响主流程
+                    logger.debug("派生缺口入队失败（忽略）: %s", exc)
+                logger.warning("[派生缺口] indicator=%s reason=%s 缺=%s 试过=%s",
+                               indicator, result.reason or "输入不齐",
+                               missing_names,
+                               " | ".join(t for t in trace if "未获取到" in t)[:160])
+                continue
+            try:
+                out = await a04.execute(AgentInput(
+                    task_id=f"derived_{uuid.uuid4().hex[:8]}",
+                    tenant_id="tenant_001",
+                    payload={"data_points": [point.model_dump(mode="json")]},
+                ))
+                got = int((out.result.get("storage_stats") or {}).get("total", 0))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{indicator}: 入库失败 {type(exc).__name__}: {exc}")
+                continue
+            stored += got
+            logger.info("[派生落库] indicator=%s value=%s period=%s 入库=%d",
+                        indicator, point.value, point.period_date, got)
+
+    if stored:
+        try:
+            await _refresh_catalog_index(runtime, [
+                f"{one.prefix}:{c}" for one in specs for c in codes])
+        except Exception as exc:  # noqa: BLE001 索引是加速结构，失败下次重算
+            logger.debug("派生指标索引回填失败（忽略）: %s", exc)
+    return stored, errors
+
+
+async def _default_derived_codes(limit: int) -> list[str]:
+    """缺省标的 = **自选池**（复用既有 provider，不另写一套"谁是我关心的票"）。"""
+    try:
+        from src.infrastructure.repositories.user_pool_sqlite_repo import (
+            get_watchlist_provider,
+        )
+
+        provider = get_watchlist_provider()
+        codes = [str(c) for c in (provider() or [])]
+        return codes[:limit]
+    except Exception as exc:  # noqa: BLE001 取不到自选池就别猜
+        logger.warning("派生落库：自选池取不到（%s: %s），本轮跳过",
+                       type(exc).__name__, exc)
+        return []
+
+
+def _gap_route_predicates(runtime: Any) -> tuple[Any, Any]:
+    """★ 缺口路由判据（`(is_registered, has_connector)`），取不到就返回 `(None, None)`。
+
+    `(None, None)` ⇒ `drain_gaps` **退化成旧行为**（所有 pending 都送 A19）——
+    刻意如此：判据装配失败时"少省一点钱"远好过"静默不补数据"。
+
+    `has_connector` 取自 **A01 的 `_backend`**（权威入口，`ConnectorRouter`）——
+    本项目实测过按"别的入口"猜连接器能力会得到 10 条全报"取不到"的假结论。
+    """
+    is_registered: Any = None
+    has_connector: Any = None
+    try:
+        from src.infrastructure.catalog.registry import get_registry
+
+        registry = get_registry()
+        is_registered = lambda ind: registry.get(ind) is not None  # noqa: E731
+    except Exception as exc:  # noqa: BLE001 判据缺失 = 少省钱，不该让作业失败
+        logger.debug("缺口路由：登记表判据不可用: %s", exc)
+    backend = getattr(
+        getattr(runtime, "agents", {}).get("A01_data_collector", None),
+        "_backend", None)
+    supports = getattr(backend, "supports", None)
+    if callable(supports):
+        has_connector = supports
+    else:
+        logger.debug("缺口路由：A01 backend 无 supports()（%s），跳过取数侧判据",
+                     type(backend).__name__)
+    return is_registered, has_connector
+
+
+async def _sync_calendar(runtime: Any, horizon_days: int) -> dict[str, Any]:
+    """投资日历 → fact_data_points（解禁/财报/宏观日程）。
+
+    落库后立刻回填 `indicator_catalog` 索引 —— 否则 SmartFetcher
+    仍会判 stale（索引没更新 = 白落库，本项目已因同类问题损失过 13 秒/次）。
+    """
+    from src.domain.intel.calendar_store import sync_calendar_to_store
+
+    repo = getattr(runtime, "repo", None)
+    if repo is None:
+        return {"inserted": 0, "errors": ["repo 未注册"]}
+    stats = await sync_calendar_to_store(repo, horizon_days=horizon_days)
+    # 索引回填（失败不影响作业结果）
+    try:
+        from src.infrastructure.catalog.catalog_repo import CatalogRepository
+
+        cat = CatalogRepository(db_path=getattr(repo, "_db_path", None))
+        # 日历指标名是固定的几个，直接全量重算
+        cal_inds = [
+            "cal:unlock:market_cap", "cal:unlock:company_count",
+            "cal:unlock:top_stock_cap", "cal:earnings:company_count",
+        ]
+        await cat.refresh_stats_from_facts(cal_inds)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("日历索引回填失败（忽略）: %s", exc)
+    return stats
 
 
 def _finish_collection(

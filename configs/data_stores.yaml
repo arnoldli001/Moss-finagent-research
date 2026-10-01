@@ -1,0 +1,330 @@
+# 本地存储清单 —— **单一事实源**（CHG-0066 / PRD §16）
+#
+# 为什么要有这个文件（一次真实报障换来的）：
+#   项目里曾同时存在 **3 份"本地有什么"的清单**，各自用不同的枚举方式、
+#   各自漏掉不同的一块，于是 pilot 的投研取数"查不到"：
+#     · `assets.py` 的 `data_asset_catalog` 只扫 `settings.sqlite_path` **一个库**
+#     · `ColumnIndex` 递归 `data/**.db`，但**按名字跳过 `warehouse.db`**
+#       *且*受 8 GiB 体积上限（行情仓 14.36 GiB）→ **双重跳过**
+#     · `TABLE_FREQUENCY` / `DIR_FREQUENCY` 是**手写**的，没有 `quant_daily*`
+#   同时有 **3 套库路径解析器**（`settings.sqlite_path` / `WarehouseConfig.from_env()`
+#   / 模块自带 config.yaml 硬编码），`src/` 里散着 67 处路径字面量。
+#
+# 本文件就是"**库在哪、谁能写、能不能删**"的唯一答案。**新增存储必须在这里登记**，
+# 否则 `tests/unit/test_store_registry.py` 会红灯（而不是静默漏掉）。
+#
+# ---------------------------------------------------------------------------
+# 字段口径
+# ---------------------------------------------------------------------------
+#   name        引用键（代码里 `resolve_store("<name>")`）
+#   kind        sqlite | dir | file
+#   path        sqlite/file：相对仓库根的路径；dir：目录
+#               ★ 支持 `{env_root}` 占位符 = 该环境自己的数据根（见 isolation=per_env）
+#   isolation   shared  = 所有环境共用同一份（市场数据，**有意共用**）
+#               per_env = 每个环境一份（应用库/缓存/审计/调度）
+#   writer      唯一写者：main（主实例）| own（本环境实例）
+#               | dev / test / pilot（**点名到具体环境**，见 CHG-0087）| none（只读）
+#               ★ 口径（用户 2026-09-29 裁定）：
+#                 「共享行情仓，dev 读，pilot 写和读。
+#                   同时看下更新数据是谁负责的，**谁负责更新数据谁有写权限**。」
+#                 → writer 写的是**承担更新责任的那个环境**，不是"主实例"这类
+#                   模糊说法。写权限跟着**责任**走：负责更新的人拿写权，
+#                   其余实例一律只读（`writable_here()` 直接拒绝，不只是提示）。
+#                 → 连带效果：更新作业（`JobSpec.updates` 声明了本存储的那些）
+#                   在非写者实例上**根本不会被触发**（否则每次都会撞写闸门失败，
+#                   把运行台账刷成一片红 —— 而那不是故障，是这台机器不负责这件事）。
+#   writable    是否允许本项目的任何进程写入（protected 的补充语义）
+#   protected   **不得删除**（清理口径不得覆盖）。用户 2026-09-28 明确声明：
+#               「data/quant/warehouse.db 14.36 GiB 这是我行情数据库
+#                 不能随便删，前端要用的」
+#   role        source（外部采集来的）| derived（本系统算出来的）
+#               | dim（维度/映射）| ops（运维/用户）
+#               —— 决定它该不该参与"取本地还是联网"的路由（同 assets.TABLE_ROLE_RULES）
+#   time_column 新鲜度判据列（可空）
+#   note        人话说明（会被 `/health` 与审计脚本原样展示）
+# ---------------------------------------------------------------------------
+
+version: 1
+updated: "2026-09-28"
+
+stores:
+  # ======================= 数据库 =======================
+
+  - name: app_db
+    kind: sqlite
+    path: "{env_root}/moss_{env}.db"
+    main_path: "data/moss_finagent.db"
+    isolation: per_env
+    writer: own
+    writable: true
+    protected: false
+    role: ops
+    note: >-
+      应用库：账号/会话/告警/事件/自选/池子/选股结果/主线结果/索引。
+      由 `MOSS_SQLITE_PATH` 注入（`manage.py` 的 dev/test/pilot 三档隔离）。
+      **主实例**（未注入）沿用 `data/moss_finagent.db`（= `legacy_main`），
+      与改动前的行为**逐字一致**。
+      ⚠️ 默认值是遗留主库这一点曾被写成代码字面量 —— 于是"漏传 db_path 就写到共享库"；
+      现在由本文件表达，`default_app_db()` 默认取**本环境**的库（CHG-0069 / CHG-0071）。
+
+  - name: warehouse
+    kind: sqlite
+    path: data/quant/warehouse.db
+    isolation: shared
+    # ★ 唯一写者 = **pilot**（用户 2026-09-29 裁定：谁负责更新数据谁有写权限）。
+    #
+    # 为什么是 pilot 而不是 main：实测（2026-09-28 夜间）三个实例的调度器
+    # **都在**跑 `quant_data_sync` —— `data/dev/scheduler` 33 条（最后 23:30:03）、
+    # `data/pilot/scheduler` 43 条（最后 23:30:02）、`data/scheduler` 7 条 ——
+    # 也就是 dev 与 pilot 在**同一分钟**往同一个 14.36 GiB 的库里 upsert。
+    # 而 pilot 是**对外那个实例**（hk.wujiaitool.cn，前端直接就靠它），
+    # 更新责任落在它身上，dev 降为只读。
+    #
+    # ⚠️ 后果要说清楚：**主实例（未注入 MOSS_ENV 的那个，现未运行）也变成只读**
+    # —— `data/scheduler` 里那 7 条 `quant_data_sync` 记录不会再增长。
+    # 这是有意的（一个共享文件一个写者）。要改回来只需改这一个字段。
+    writer: pilot
+    writable: true
+    protected: true
+    role: source
+    time_column: trade_date
+    note: >-
+      **共享行情仓**（14.36 GiB，Tushare 口径）。`quant_daily` 1,542 万行、
+      `quant_daily_basic` 1,542 万行，2006-01-04 起、更新到最近交易日。
+      **它是全项目唯一权威的行情日频库** —— 日K补充字段（换手率/资金净流入）、
+      股票名录、板块行情、回测、以及 `_quant_column_points` 的估值列都读它。
+      ⚠️ 曾被三份清单同时漏掉（按名字 + 8 GiB 上限双重跳过），
+      于是"库里有 1500 万行，Agent 一条看不到"。
+
+  - name: legacy_main
+    kind: sqlite
+    path: data/moss_finagent.db
+    isolation: shared
+    writer: main
+    writable: true
+    protected: true
+    role: source
+    time_column: period_date
+    note: >-
+      **遗留主库**（2.4 GiB）。`reset_admin_password.py` 称它"遗留空库"——
+      **那个标签只对认证表成立**（18 张为空）；它的 `fact_data_points` 是
+      **全项目覆盖最全**的一份（756 指标 / 199.8 万行）。
+      ⚠️ **不得据"空库"标签判定整库可删**（CHG-0060）。已回填 127 万行到 pilot。
+
+  - name: mainline_cache
+    kind: sqlite
+    path: data/mainline_cache.db
+    isolation: shared
+    writer: main
+    writable: true
+    protected: false
+    role: source
+    note: >-
+      主线挖掘数据仓（906 MiB）：板块指数/资金流/两融/北向/龙虎榜/ETF/宏观/期货。
+      回测与实盘**共用同一份输入**（`src/mainline/datastore.py`）。
+
+  - name: mainline_archive
+    kind: sqlite
+    path: data/archive/mainline_archive.db
+    isolation: shared
+    writer: main
+    writable: false
+    protected: false
+    role: derived
+    note: >-
+      归档库（3.4 GiB，9 张表**全是 `_bak_`**）——历次重算前的快照。
+      只应人工写入；清理前需确认不再需要回溯。
+
+  - name: archive_root
+    kind: dir
+    path: data/archive
+    isolation: shared
+    writer: main
+    writable: false
+    role: derived
+    note: >-
+      归档区（3,489 MiB / 110 文件）。放历次快照库（`mainline_archive.db`、
+      `mainline_cache_archive.db`）。**只应人工写入**；清理前需确认不再需要回溯。
+      登记为**目录**而不是逐个文件，是为了让"data 下还有没有没登记的库"这个判据
+      不靠人肉维护清单 —— 落在本目录下的库视为已覆盖。
+
+  - name: backups
+    kind: dir
+    path: data/backups
+    isolation: shared
+    writer: main
+    role: ops
+    note: >-
+      破坏性操作前的备份区。命名约定 `<用途>_before_<动作>_<时间戳>.db`，
+      由 `VACUUM INTO` 生成（对运行中的 WAL 库是**一致快照**，不需要停服）。
+      现有：`dev_before_fossil_drop_*.db`、`pilot_before_backfill_*.db`
+      以及回填的 `pilot_backfill_ids_*.txt`（可据此精确回滚）。
+
+  # ======================= 目录型存储 =======================
+
+  - name: tushare_partitions
+    kind: dir
+    path: data/quant/tushare
+    isolation: shared
+    writer: main
+    role: source
+    note: 35,788 个 CSV/parquet 分区（2.4 GiB）。行情仓的**上游**；仓不可用时回退分区。
+
+  - name: quant_prices
+    kind: dir
+    path: data/quant/prices
+    isolation: shared
+    writer: main
+    role: source
+    note: >-
+      全市场前复权日线（PriceStore 落盘）。`configs/indicators.yaml` 声明它供数，
+      但**实测为空目录**（0 文件）—— 即"声明了来源、里面没有数据"，
+      是"没量到 ≠ 量到 0"的一个现场。
+
+  - name: quant_fundamentals
+    kind: dir
+    path: data/quant/fundamentals
+    isolation: shared
+    writer: main
+    role: source
+    note: 财务指标分区（含带日期的季报快照）。
+
+  - name: auction_hist
+    kind: dir
+    path: data/auction_hist
+    isolation: shared
+    writer: main
+    role: source
+    note: >-
+      竞价冻结录像带（178 MiB，逐日 `tick_auction_*.parquet`）。
+      **竞价链唯一的免费历史来源**（QMT tick 需权限、eltdx 只有盘中实时、
+      Tushare 无竞价过程）—— 删了不可再生，清理时必须排除。
+
+  - name: cache_root
+    kind: dir
+    path: data/cache
+    isolation: shared
+    writer: main
+    role: derived
+    note: 派生缓存根：fundflow / intel / auction_select 预热等。
+
+  - name: fundflow_cache
+    kind: dir
+    path: data/cache/fundflow
+    isolation: shared
+    writer: main
+    role: derived
+    note: 资金流横截面缓存（`stock_frame_*.parquet`）。
+
+  - name: intel_cache
+    kind: dir
+    path: data/cache/intel
+    isolation: shared
+    writer: main
+    role: derived
+    note: 情报预热状态与 feed 载荷（`prewarm_state.json` / `feed_payload.json`）。
+
+  - name: intel_bodies
+    kind: dir
+    path: data/intel
+    isolation: shared
+    writer: main
+    role: source
+    note: 情报正文落地（按条目哈希分片）。
+
+  - name: backtest
+    kind: dir
+    path: data/backtest
+    isolation: shared
+    writer: main
+    role: derived
+    note: >-
+      回测实验产物（1,264 文件 / 1,058 MiB）。"非最后一次"由**实验变体名**
+      区分（`result_v3/v5a/v5b/v6d/w0/w1…`），**不是时间戳** ——
+      所以自动清理找不到"旧版本"，必须由人指定哪个变体是最后一次。
+
+  # ======================= 按环境隔离的目录 =======================
+
+  - name: llm_cache
+    kind: dir
+    path: "{env_root}/llm_cache"
+    main_path: "data/llm_cache"
+    isolation: per_env
+    writer: own
+    role: derived
+    note: >-
+      LLM 响应缓存。**2026-09-28 起按环境隔离**（CHG-0066）—— 原先三实例共用
+      `data/llm_cache`，而本项目缓存 scope **不含 provider/model**，
+      共用会让跨环境对比直接失真。
+
+  - name: llm_audit
+    kind: dir
+    path: "{env_root}/audit"
+    main_path: "data/audit"
+    isolation: per_env
+    writer: own
+    role: ops
+    note: LLM 调用审计与哈希链（`llm_audit.jsonl` / `audit_chain.jsonl`）。
+
+  - name: access_audit
+    kind: dir
+    path: "{env_root}/access_audit"
+    main_path: "data/audit"
+    isolation: per_env
+    writer: own
+    role: ops
+    note: >-
+      访问审计（`MOSS_AUDIT_DIR`）。⚠️ 与 `llm_audit` 的**默认值曾同为
+      `data/audit`**，而 dev 只重定向了后者 → 访问审计长期写在共用目录（CHG-0066 已修）。
+
+  - name: quant_strategies
+    kind: dir
+    path: data/quant/strategies
+    isolation: shared
+    writer: main
+    role: derived
+    note: >-
+      策略档案目录。策略的"哪些真的跑赢过基准"要**跨策略查询**（按超额排序、
+      按时段筛、按标的找），所以它们也进 `quant_strategy` 表；本目录留 JSON 快照。
+      实测为空目录（0 文件）—— 是"声明了位置、还没有产物"，不是"没量到"。
+
+  - name: gap_queue
+    kind: file
+    path: data/gap_queue.jsonl
+    isolation: shared
+    writer: main
+    role: derived
+    note: 决策层的**数据缺口队列**（A17 写、补数链路读）。共用是刻意的：
+      缺口是"全系统缺什么"，不随环境而变。
+
+  - name: scheduler_dir
+    kind: dir
+    path: "{env_root}/scheduler"
+    main_path: "data/scheduler"
+    isolation: per_env
+    writer: own
+    role: ops
+    note: 定时作业运行记录（`runs.jsonl`）。
+
+  - name: industry_metrics
+    kind: dir
+    path: "{env_root}/industry_metrics"
+    main_path: "data/industry_metrics"
+    isolation: per_env
+    writer: own
+    role: derived
+    note: 行业指标落地（`real_industry_connector` 按 `sqlite_path` 同级解析）。
+
+  # ======================= 共用但**已知有风险** =======================
+
+  - name: run_dir
+    kind: dir
+    path: data/run
+    isolation: shared
+    writer: main
+    role: ops
+    note: >-
+      ⚠️ **三实例共用**的运行时目录（日志/锁/PID/一次性探针产物）。
+      已验证过一次事故：限流熔断状态文件写死这里，dev 调试出的 3 次 429
+      会把线上同一跳锁 10 分钟（CHG-0053 改为按实例隔离）。
+      本目录仍在共用名单里 —— 属审计项 **A7**，待用户裁定。

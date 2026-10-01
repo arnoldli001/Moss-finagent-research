@@ -214,6 +214,20 @@ class SkillLibrary:
             return [meta.name]
         return [t.strip() for t in re.split(r"[、，,；;。\n]", m.group(1)) if t.strip()]
 
+    @staticmethod
+    def trigger_terms_text(index_entry: dict[str, object] | SkillMeta) -> list[str]:
+        """触发短语提取（接受 L0 dict 或 SkillMeta）—— 第十轮 A17 prompt 精简用。
+
+        L0 dict 来自 ``list_skills()`` 返回值（只含 name/description/tags）；
+        仍能从 description 提取触发短语，避免路径上必须先建 SkillMeta 实例。
+        """
+        desc = str(index_entry.get("description", "")) if index_entry else ""
+        name = str(index_entry.get("name", "")) if index_entry else ""
+        m = re.search(r"触发短语[:：](.+)", desc, re.DOTALL)
+        if not m:
+            return [name] if name else []
+        return [t.strip() for t in re.split(r"[、，,；;。\n]", m.group(1)) if t.strip()]
+
     def match_skills(
         self, agent_id: str, text: str, *, max_skills: int = 2,
     ) -> list[dict[str, str]]:

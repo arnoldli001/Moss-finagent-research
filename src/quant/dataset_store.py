@@ -28,7 +28,9 @@ from src.core.errors import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROOT = "data/quant/tushare"
+from src.infrastructure.catalog.data_stores import store_rel as _store_rel  # noqa: E402
+
+DEFAULT_ROOT = _store_rel("tushare_partitions")
 _MANIFEST = "_manifest.json"
 
 

@@ -97,13 +97,34 @@ def test_industry_sector_strategy_triggers_board_indicators():
 
 
 def test_us_macro_prediction_not_false_trigger_board_data():
-    """纯美国宏观预测（无A股语境词）不得误触发A股/双创指标。"""
+    """纯美国宏观预测（无A股语境词）不得误触发A股/双创指标。
+
+    ## ★ 2026-09-30 本判据被**更新过一次**（如实记）
+
+    原来断言的是 `"us_nonfarm" in inds`（老的 Tushare 口径序列）。
+    那条断言现在**必须失败**，而且**不该被"修好"** —— 因为 `us_nonfarm` 已经
+    **源停更**：实测库里 **107 条、最新期 2025-08-01**（停在 13 个月前），
+    而接替它的 `fred:PAYEMS` 有 **1052 条、最新期 2026-08-01**。
+
+    也就是说：要求规划器追加 `us_nonfarm`，等于要求它去排一条
+    **必然取不到数据的序列** —— 正是 `AGENTS.md`《必然失败的指标不许留在
+    喂给 LLM 的菜单里》要挡的事（本项目为此付过代价：`股息率` 每次都失败）。
+    `_US_RATES_INDICATORS` 里放的也确实是 `fred:PAYEMS`。
+
+    ⇒ 判据改成断言**当前存活**的那条序列（断言的是"美国非农**这一维**仍在
+    计划里"这个意图，而不是某个具体来源名）。
+    """
     plan = plan_run("macro", "", query="预测下个月美国非农就业和美联储利率决议")
     inds = plan["indicators"]
     assert not any(i.startswith("mkt:") for i in inds)
     assert not any(i.startswith("mkt:cybkcb") for i in inds)
-    # 美国宏观指标仍正常追加
-    assert "us_nonfarm" in inds
+    # 美国宏观指标仍正常追加：非农那一维在（用**存活**的 FRED 序列）
+    assert "fred:PAYEMS" in inds, (
+        "美国非农这一维没进计划 —— `_US_RATES_INDICATORS` 或触发词漏了")
+    #: 反向判据：**不许**再去排已停更的 `us_nonfarm`（否则必然取不到）
+    assert "us_nonfarm" not in inds, (
+        "计划里出现了源停更的 `us_nonfarm`（库内最新期 2025-08-01）—— "
+        "「必然失败的指标不许留在菜单里」")
 
 
 def test_append_helper_includes_board_indicators():

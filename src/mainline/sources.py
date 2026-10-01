@@ -639,7 +639,14 @@ class WarehouseSource:
     只读连接（`mode=ro`）：这个库是 15 GiB 的行情仓库，绝不能被本模块写入。
     """
 
-    def __init__(self, path: str | Path = "data/quant/warehouse.db") -> None:
+    def __init__(self, path: str | Path | None = None) -> None:
+        # 默认从 registry 取（`CHG-0069`）—— **必须在函数体里补回落**：
+        # 把默认值从字面量改成 `None` 却不补，等于把 `Path(None)` 抛给所有
+        # 不传参的调用方（实测：11 个 mainline 用例当场 TypeError）。
+        if path is None:
+            from src.infrastructure.catalog.data_stores import store_rel
+
+            path = store_rel("warehouse")
         self.path = Path(path)
         self._available: bool | None = None
         self._gap = ""

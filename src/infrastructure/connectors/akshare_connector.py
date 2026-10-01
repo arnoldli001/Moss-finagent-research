@@ -335,6 +335,225 @@ def _is_etf_code(code: str) -> bool:
     return len(code) == 6 and code.isdigit() and code.startswith(_ETF_PREFIXES)
 
 
+# ============================================================================
+# Module-level stock financial / dividend indicator contracts.
+# KEEP THIS OUTSIDE THE CLASS -- on 2026-09-28 this block was inserted
+# inside the class body, splitting it in two (ast: unexpected indent)
+# and breaking the whole connector import. After structural edits run:
+#   python -c "import ast,pathlib;ast.parse(pathlib.Path('src/infrastructure/connectors/akshare_connector.py').read_text(encoding='utf-8'))"
+# ============================================================================
+
+_FIN_RATIO_INDICATORS: dict[str, str] = {
+    # —— 偿债（100% / 60% 覆盖）——
+    "资产负债率": "资产负债率(%)",
+    "流动比率": "流动比率",
+    "速动比率": "速动比率",
+    "产权比率": "产权比率(%)",
+    # —— 盈利（100% / 60%）——
+    "ROE": "净资产收益率(%)",
+    "ROE加权": "加权净资产收益率(%)",
+    "ROA": "总资产净利润率(%)",
+    "销售净利率": "销售净利率(%)",
+    "成本费用利润率": "成本费用利润率(%)",
+    # —— 营运（60%）——
+    "存货周转率": "存货周转率(次)",
+    "应收账款周转率": "应收账款周转率(次)",
+    "总资产周转率": "总资产周转率(次)",
+    # —— 成长（100% / 60%）——
+    "净利润增长率": "净利润增长率(%)",
+    "总资产增长率": "总资产增长率(%)",
+    "净资产增长率": "净资产增长率(%)",
+    "营收增长率": "主营业务收入增长率(%)",
+    # —— 每股（100%）——
+    "EPS": "摊薄每股收益(元)",
+    "EPS加权": "加权每股收益(元)",
+    "每股净资产": "每股净资产_调整前(元)",
+    "每股经营现金流": "每股经营性现金流(元)",
+    "每股未分配利润": "每股未分配利润(元)",
+    "每股资本公积": "每股资本公积金(元)",
+}
+
+#: ★ 由**两个源合成**的指标（不是简单取列）：指标前缀 → 说明。
+#:
+#: `股息率` 的算法（这是用户明确问的那个口径）：
+#:     股息率(%) = 最近一次实施的每股派息 ÷ 同期收盘价 × 100
+#:   · 每股派息 ← `ak.stock_history_dividend_detail`（**28 条历史，实测可达**）
+#:   · 收盘价   ← `ak.stock_zh_a_hist`（同一连接器已用于日线）
+#:
+#: ⚠️ **原来的理由已不成立（`CHG-0059`，2026-09-28）**：这里曾写
+#: 「为什么不用 `quant_daily_basic.dv_ratio`：那张表停在 2023-11-10」——
+#: 那是**化石副本**的特征。共享行情仓的同名列一直更新到最近交易日
+#: （实测 600036 的 `dv_ratio` 4,981 个点、最新 4.9213 @20260928）。
+#: 但**本轮刻意不改算法**：自算 vs 直接取列是两种口径（前者跟随最新一次分红、
+#: 后者是 Tushare 的 TTM 口径），换口径会让同一个"股息率"数字变形 ——
+#: 那是独立决策，需单独评估与回归，不混在"修库来源"这一改里。
+#: 若将来要改，判据是：同一 code/日期下两种口径的差值分布 + 分析层是否被告知。
+_DERIVED_STOCK_INDICATORS: dict[str, str] = {
+    "股息率": "最近实施每股派息 ÷ 同期收盘价（自行计算，非直接取列）",
+}
+
+#: 个股财务类指标的前缀全集（连接器 supports 用；由上面两张表派生，**不手写**）。
+_FIN_PREFIXES: tuple[str, ...] = tuple(_FIN_RATIO_INDICATORS) + tuple(
+    _DERIVED_STOCK_INDICATORS)
+
+
+def _suggest_columns(target: str, columns: list[str], top: int = 3) -> list[str]:
+    """给「列名写错」的场景给出**最相近的候选列名**（排查一步到位）。
+
+    为什么不直接打印前 8 列：源表有 86 列，前 8 列里往往根本没有相关列 ——
+    实测报错时打印的样例全是「每股收益(元)」，而要找的是「流动比率」，
+    看了等于没看。相似度排序才能让人（和模型）立刻定位。
+    """
+    import difflib
+
+    scored: list[tuple[float, str]] = []
+    for col in columns:
+        ratio = difflib.SequenceMatcher(None, target, col).ratio()
+        # 共享子串加权：中文列名靠"字面包含"比靠字符序列更靠谱
+        if target and (target in col or col in target):
+            ratio = max(ratio, 0.9)
+        scored.append((ratio, col))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [c for r, c in scored[:top] if r > 0.3]
+
+
+def _parse_payout_per_share(raw: Any) -> float | None:
+    """把分红表里的「派息」列解析成**每股派息（元）**。
+
+    东财/新浪的分红表口径是"**每 10 股派息**"（如 `10.03` 表示 10 派 10.03 元），
+    所以必须 ÷10。单位搞错会让股息率差 10 倍 —— 而那个数字看起来完全正常。
+    """
+    try:
+        val = float(str(raw).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    return val / 10.0
+
+
+def _dividend_yield_points(
+    indicator: str, code: str, dividend_df: Any, price_df: Any,
+) -> list[Any]:
+    """用「每股派息 ÷ 收盘价」合成股息率序列。
+
+    两端都取**最近可用值**（口径写在 `extra` 里，随数据一起下发 ——
+    AGENTS.md："口径与局限随数据一起下发"）。
+    """
+    from src.core.schemas import DataPoint, FetchMethod
+
+    if dividend_df is None or price_df is None or len(dividend_df) == 0 \
+            or len(price_df) == 0:
+        return []
+
+    # 每股派息：取最近一条**已实施**的
+    payout = None
+    payout_date = ""
+    try:
+        for _, row in dividend_df.iterrows():
+            progress = str(row.get("进度", "") or "")
+            if "实施" not in progress:
+                continue
+            p = _parse_payout_per_share(row.get("派息"))
+            if p is not None:
+                payout = p
+                payout_date = str(row.get("公告日期", "") or "")[:10]
+                break
+    except Exception:  # noqa: BLE001 解析失败按缺口处理
+        return []
+    if payout is None:
+        return []
+
+    close = None
+    close_date = ""
+    try:
+        col = next((c for c in ("收盘", "close", "收盘价") if c in price_df.columns), None)
+        date_col = next((c for c in ("日期", "date") if c in price_df.columns), None)
+        if col is not None and len(price_df):
+            close = float(price_df.iloc[-1][col])
+            close_date = str(price_df.iloc[-1][date_col])[:10] if date_col else ""
+    except Exception:  # noqa: BLE001
+        return []
+    if not close or close <= 0:
+        return []
+
+    yield_pct = round(payout / close * 100.0, 4)
+    return [DataPoint(
+        indicator=indicator, value=yield_pct, unit="%",
+        period_date=close_date or payout_date,
+        extra={
+            "dividend_per_share": payout, "close": close,
+            "payout_announce_date": payout_date, "close_date": close_date,
+            "formula": "最近实施每股派息 / 同期收盘价",
+            "note": ("口径：把最近一次已实施的每10股派息 ÷10 得到每股派息，"
+                     "再除以最近收盘价；分红频率因公司而异，"
+                     "股息率会随股价波动"),
+        },
+        source_name="东方财富(分红)+腾讯/东财(收盘)",
+        source_url="https://data.eastmoney.com/yjfp/",
+        fetch_method=FetchMethod.API_CALL, confidence=0.75,
+    )]
+
+
+#: 个股估值类字段：指标前缀 → `quant_daily_basic` 的列名。
+#:
+#: 这张表解决的是"库里有上千万行、投研链路零命中"那个洞（用户 2026-09-28 报障）：
+#: 它含 `dv_ratio`（股息率）/`dv_ttm`/`total_mv`/`turnover_rate`…，
+#: 而 `SmartFetcher` 与数据仓储里 `quant_daily_basic` 零命中。
+#:
+#: ⚠️ **旧注释曾写「只存在于 dev 库 / 停在 2023-11-10 / 生产上永远取不到」，那是错的**
+#: （`CHG-0059`）：那是 `data/dev/moss_dev.db` 里一份**化石副本**的特征；
+#: 权威副本在**共享行情仓** `data/quant/warehouse.db`，与 dev 副本同 19 列、
+#: 且持续更新到最近交易日。**行数与最新日期一律现算，不许写进注释** ——
+#: 那个"行数常量"（一万一千八百多万那种写法）曾被抄到 6 处，其中
+#: `_DERIVED_STOCK_INDICATORS` 据此决定"不走本地、改走网络自算股息率"，
+#: 为一个不成立的前提长期付网络成本。**一律现算**：见
+#: `scripts/_probe_quant_columns.py`（一次性）或
+#: `src/infrastructure/catalog/data_stores.py` 的存储视图。
+_QUANT_COLUMN_INDICATORS: dict[str, str] = {
+    "股息率TTM": "dv_ttm",
+    "总市值": "total_mv",
+    "流通市值": "circ_mv",
+    "换手率": "turnover_rate",
+    "量比": "volume_ratio",
+    "市销率": "ps_ttm",
+}
+
+
+def _quant_basic_db_path() -> str:
+    """`quant_daily_basic` 所在的库 —— **共享行情仓**，不是应用库。
+
+    ## 为什么必须有这个函数（而不是各处自己写路径）
+
+    2026-09-28（`CHG-0059`）实测：同一张表在项目里有**三份**同名副本 ——
+
+    | 位置 | 性质 |
+    |---|---|
+    | `data/quant/warehouse.db` | **权威**（共享行情仓，dev/pilot 都读它） |
+    | `data/dev/moss_dev.db` | **化石副本**（2026-09-23 之前行情仓也认 `MOSS_SQLITE_PATH` 时留下的，停在 2023-11-10） |
+    | `data/pilot/moss_pilot.db` | **没有这张表** |
+
+    原先取数读的是 `settings.sqlite_path`（应用库）→ pilot 报 `no such table`、
+    dev 读到 2023 年的化石。**"库在哪"必须只有一个答案**，所以收敛到这里，
+    由 `WarehouseConfig.from_env()` 解析（与 `day_extras` / 股票名录同源）。
+    """
+    from src.quant.warehouse import WarehouseConfig
+
+    cfg = WarehouseConfig.from_env()
+    if cfg.dialect != "sqlite":
+        # 行情仓切到 MySQL 时这条本地直读路径不适用：如实报错，
+        # 不要静默回退到应用库（那正是本函数要修掉的缺陷）。
+        raise DataFetchError(
+            f"quant_daily_basic 本地直读仅支持 SQLite 行情仓，"
+            f"当前为 {cfg.dialect}（{cfg.description}）；"
+            f"请改走仓储层 load_dataset，或把该指标交给在线源")
+    prefix = "sqlite:///"
+    url = cfg.url
+    if not url.startswith(prefix):
+        raise DataFetchError(f"无法解析行情仓 URL：{cfg.description}")
+    return url[len(prefix):]
+
+
 class AkshareConnector(BaseConnector):
     """AkShare连接器：宏观(CPI/PPI/M2/社融)、A股行情、估值、财务比率、部分行业真实指标。"""
 
@@ -372,7 +591,24 @@ class AkshareConnector(BaseConnector):
                    {"unit": "同比%", "country": "US",
                     "note": "核心PCE"}, 0.8),
     }
-    _CODE_PREFIXES = ("PE(TTM):", "PB:", "资产负债率:", "流动比率:")
+    #: 个股**季度财务比率**：指标前缀 → 新浪财务分析指标表的**列名**。
+#:
+#: ## 为什么做成表而不是一串 if-elif（2026-09-28 第二十四轮）
+#:
+#: 原先只实现了两个（资产负债率/流动比率），代码里是一条三元的
+#: `col_keyword = "资产负债率" if ... else "流动比率"` ——
+#: **再加第三个就得改逻辑**，于是"A11 声称会读 ROE/商誉/应收账款，而采集侧
+#: 一个都没实现"活了很多轮没人发现（用户报障："招商银行缺基本面数据，
+#: 本地库/腾讯/东财都该有，为什么没找到"）。
+#:
+#: 现在把"指标名 → 列名"变成**纯数据**。加一个指标 = 加一行，
+#: 不改逻辑；并且护栏测试会自动检查「连接器 supports 的每个指标都在
+#: indicators.yaml 登记」与「这里写的列名在源表里真实存在」。
+#:
+#: ⚠️ **只收录实测有覆盖率的列**（`scripts/_probe_financial_columns.py`：
+#: 5 只股票 × 多期，非空率见注释）。覆盖率 0% 的列名（如"销售毛利率(%)"、
+#: "调整后的每股净资产(元)"）**故意不收** —— 接了也是永远空值，
+#: 只会把"数据缺失"从"没实现"伪装成"接口没给"。
 
     # CPI/PPI 走国家统计局NBS（旧英为财情macro_china_*源2025-09后停更）。
     # NBS目录按年代分段，列"(上年同月=100)指数"→同比%=指数-100。
@@ -467,6 +703,9 @@ class AkshareConnector(BaseConnector):
                 "stock_close:{code}", "index_close:{code}", "etf_close:{code}",
                 "PE(TTM):{code}", "PB:{code}",
                 "资产负债率:{code}", "流动比率:{code}",
+                # ★ 第二十四轮：财务比率族与 quant 列族（从映射表派生）
+                *(f"{p}:{{code}}" for p in _FIN_PREFIXES),
+                *(f"{p}:{{code}}" for p in _QUANT_COLUMN_INDICATORS),
                 "ind:社会消费品零售总额同比", "ind:动力煤价格(元/吨)",
                 *self._US_MACRO_SERIES.keys(),
             ],
@@ -482,6 +721,18 @@ class AkshareConnector(BaseConnector):
             or indicator.startswith(
                 QUOTE_PREFIXES + AkshareConnector._CODE_PREFIXES)
         )
+
+    #: 本连接器支持的**个股类**指标前缀（带 `:{code}` 后缀）。
+    #:
+    #: ★ 2026-09-28 第二十四轮：从三张映射表**派生**，不再手写元组。
+    #: 手写的那版只有 4 个（PE/PB/资产负债率/流动比率），而 A11 的 prompt
+    #: 声称会读 ROE/商誉/应收账款 —— 采集侧一个都没实现，且**没有任何测试
+    #: 会发现这个缺口**。改成派生后：映射表加一行，supports 自动跟上。
+    _CODE_PREFIXES: tuple[str, ...] = (
+        "PE(TTM):", "PB:",
+        *(f"{p}:" for p in _FIN_PREFIXES),
+        *(f"{p}:" for p in _QUANT_COLUMN_INDICATORS),
+    )
 
     def _load_dataframe(
         self, indicator: str, start_date: str | None, end_date: str | None
@@ -626,17 +877,148 @@ class AkshareConnector(BaseConnector):
                 extra={"valuation": baidu_ind}, confidence=0.8)
 
         # ETF无个股财务报表，禁止误打个股接口产生误导性数据
-        if prefix in ("资产负债率", "流动比率") and _is_etf_code(code):
-            raise DataFetchError(f"ETF({code})无个股{prefix}财务指标")
+        if prefix in (*_FIN_PREFIXES, *_QUANT_COLUMN_INDICATORS) \
+                and _is_etf_code(code):
+            raise DataFetchError(f"ETF({code})无个股{prefix}财务/基本面指标")
 
-        # 季度财务比率（资产负债率/流动比率），一次拉取整表后取列
+        # ---------- 族 A：由 quant_daily_basic 列直接取（★ 第二十四轮新增）----------
+        if prefix in _QUANT_COLUMN_INDICATORS:
+            return self._quant_column_points(
+                indicator, code, _QUANT_COLUMN_INDICATORS[prefix],
+                start_date, end_date)
+
+        # ---------- 族 B：合成指标（股息率 = 每股派息 ÷ 收盘价）----------
+        if prefix in _DERIVED_STOCK_INDICATORS:
+            if prefix != "股息率":
+                raise DataFetchError(f"暂不支持的合成指标: {prefix}")
+            div_df = ak.stock_history_dividend_detail(symbol=code, indicator="分红")
+            px = ak.stock_zh_a_hist(symbol=code, period="daily",
+                                    adjust="qfq")
+            return _dividend_yield_points(indicator, code, div_df, px)
+
+        # ---------- 族 C：新浪财务分析指标表取列（原来的两个也走这里）----------
+        col_keyword = _FIN_RATIO_INDICATORS.get(prefix)
+        if col_keyword is None:
+            raise DataFetchError(f"未登记的个股财务指标: {prefix}")
         start_year = int(start_date[:4]) if start_date else datetime.now().year - 3
         df = ak.stock_financial_analysis_indicator(symbol=code, start_year=str(start_year))
-        col_keyword = "资产负债率" if prefix == "资产负债率" else "流动比率"
-        return series_to_points(
+        points = series_to_points(
             df, indicator, date_keywords=("日期",), value_keywords=(col_keyword,),
             start_date=start_date, end_date=end_date,
-            extra={"frequency": "quarterly"}, confidence=0.8)
+            extra={"frequency": "quarterly", "source_column": col_keyword},
+            confidence=0.8)
+        if not points:
+            # 空结果必须**分成两类**，否则排查方向完全相反：
+            #   A) 列名根本不在源表里 → **我们的契约写错了**（要改映射表）
+            #   B) 列在、但这只票没有值 → **语义正确**（如银行资产负债不划分
+            #      流动/非流动，「流动比率」对银行必然为空）。当成缺陷去修会
+            #      白费力气，还会把"这个口径对银行不适用"这条真信息抹掉。
+            cols = [str(c) for c in df.columns]
+            if col_keyword not in cols:
+                near = _suggest_columns(col_keyword, cols)
+                raise DataFetchError(
+                    f"财务指标列未命中：{code} 的 {col_keyword!r} 不在源表列中。"
+                    f"最相近的列：{near or '（无）'} —— "
+                    "请在 `_FIN_RATIO_INDICATORS` 里改正列名")
+            raise DataFetchError(
+                f"{code} 的 {col_keyword!r} 在源表中**该实体无值**"
+                f"（已取到 {len(df)} 期）。这通常是**语义正确**而非缺陷 ——"
+                "例如银行资产负债不划分流动/非流动，「流动比率」对银行必然为空。"
+                "请换用适用于该行业的杠杆/资本类口径（资产负债率/产权比率等）。")
+        return points
+
+    # ---------------- 族 A：quant_daily_basic 列 ----------------
+
+    def _quant_column_points(
+        self, indicator: str, code: str, column: str,
+        start_date: str | None, end_date: str | None,
+    ) -> list[DataPoint]:
+        """从 `quant_daily_basic`（全A股日频截面）取一列。
+
+        ## 为什么需要它（用户 2026-09-28 报障）
+
+        用户问"招商银行缺基本面与股息率数据…本地数据库应该有"。
+        该表含 `dv_ratio`(股息率) / `dv_ttm` / `total_mv` / `turnover_rate` …，
+        而**投研链路完全不认识它**（`SmartFetcher` 与数据仓储里零命中）
+        —— "库里有上千万行，Agent 一条看不到"。
+
+        ## ⚠️ 库来源修正（2026-09-28 · CHG-0059）
+
+        原先这里从 `settings.sqlite_path` 读，即**应用库**（dev / pilot 各自的库），
+        而 `quant_daily_basic` 实际在**共享行情仓**里。后果实测：
+
+        | 环境 | 修正前 | 修正后 |
+        |---|---|---|
+        | pilot | `no such table: quant_daily_basic` | 取到 |
+        | dev   | 报"期间内没有数据"（读到的是停在 2023-11-10 的化石副本） | 取到 |
+
+        现在库路径由 `_quant_basic_db_path()` 单点解析（行情仓）。
+
+        ## 诚实边界（随数据一起下发）
+
+        `latest_trade_date` 与 `staleness_days` 仍然写进 `extra`：
+        行情仓是**日频定稿**数据（当日 15:00~16:00 后才入库），
+        盘中取到的最后一天是上一交易日 —— 调用方要能看出来，而不是当成实时值。
+        """
+        db_path = _quant_basic_db_path()
+        sql = (f'SELECT trade_date, "{column}" FROM quant_daily_basic '
+               f'WHERE code = ? AND "{column}" IS NOT NULL')
+        params: list[Any] = [code]
+        if start_date:
+            sql += " AND trade_date >= ?"
+            params.append(str(start_date).replace("-", "")[:8])
+        if end_date:
+            sql += " AND trade_date <= ?"
+            params.append(str(end_date).replace("-", "")[:8])
+        sql += " ORDER BY trade_date"
+
+        try:
+            import sqlite3
+
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                rows = list(con.execute(sql, params))
+            finally:
+                con.close()
+        except Exception as exc:  # noqa: BLE001 表缺失/库不可读 → 明确报错
+            raise DataFetchError(
+                f"quant_daily_basic 不可读（{code} 的 {column}）：{exc}") from exc
+
+        if not rows:
+            raise DataFetchError(
+                f"quant_daily_basic 里没有 {code} 的 {column} 数据"
+                f"（或期间不在 {start_date}~{end_date} 内）")
+
+        latest = str(rows[-1][0])
+        # 陈旧度：表停更时所有人都会拿到同一个"最新日"，必须让上游看得见
+        stale_days = None
+        try:
+            from datetime import date as _d
+
+            y, m, d = int(latest[:4]), int(latest[4:6]), int(latest[6:8])
+            stale_days = (_d.today() - _d(y, m, d)).days
+        except (ValueError, IndexError):
+            pass
+
+        return [
+            DataPoint(
+                indicator=indicator, value=float(v),
+                period_date=f"{td[:4]}-{td[4:6]}-{td[6:8]}",
+                extra={
+                    "column": column, "table": "quant_daily_basic",
+                    "latest_trade_date": latest,
+                    "staleness_days": stale_days,
+                    "staleness_note": (
+                        f"⚠️ 最新交易日 {latest} 距今 {stale_days} 天，"
+                        "**不可当作当前值**；如需当日值请改用日频在线源"
+                        if (stale_days or 0) > 90 else ""),
+                },
+                source_name="本地 quant_daily_basic(Tushare daily_basic 导入)",
+                source_url="https://tushare.pro/document/2?doc_id=32",
+                fetch_method=FetchMethod.FILE_READ, confidence=0.6,
+            )
+            for td, v in rows
+        ]
 
     # ---------------- ETF 代理估值 ----------------
 
@@ -966,3 +1348,4 @@ class AkshareConnector(BaseConnector):
         end_date: str | None = None,
     ) -> list[DataPoint]:
         return await asyncio.to_thread(self._fetch_sync, indicator, start_date, end_date)
+

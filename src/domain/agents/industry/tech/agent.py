@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.domain.agents.analysis.unlock_teaching import render_unlock_teaching
 from src.domain.agents.industry.base import IndustryAgentBase
 
 
@@ -16,6 +17,10 @@ class TechIndustryAgent(IndustryAgentBase):
     capabilities_names = ("tech_cycle_analysis", "penetration_rate_tracking")
 
     system_prompt = (
+
+        render_unlock_teaching("A13_tech")
+
+        +
         "资深科技行业分析师，熟悉半导体/消费电子/软件/AI产业链。"
         "关注技术替代风险与渗透率天花板；禁脱离数据预测具体涨跌幅。"
     )

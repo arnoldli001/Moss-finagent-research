@@ -71,6 +71,12 @@ class DataSourceType(str, Enum):
     FILE = "file"
     REPORT = "report"
     NEWS = "news"
+    #: ★ 2026-09-30：**算出来的**（派生指标，如 `净息差:600036`）。
+    #:
+    #: 为什么要单独一个取值而不是复用 `report`：下游要能一眼分辨
+    #: "这是原始读数"还是"这是用公式算的"（口径/偏置随 `extra` 下发），
+    #: 也便于按来源筛选与审计。判据只认枚举，不认人话文案。
+    DERIVED = "derived"
 
 
 class FetchMethod(str, Enum):
@@ -82,6 +88,8 @@ class FetchMethod(str, Enum):
     MANUAL_INPUT = "manual_input"
     # 降级/代理值：主源不可用时用独立故障域备源或常数代理
     FALLBACK = "fallback"
+    #: ★ 2026-09-30：本地按公式**计算**得出（没有网络往返、没有源）。
+    COMPUTED = "computed"
 
 
 def hash_content(raw: Any) -> str:

@@ -211,7 +211,7 @@ class StockDirectory:
 
     # ---------- 建库 ----------
 
-    def build_from_stock_basic(self, *, root: str | Path = "data/quant/tushare",
+    def build_from_stock_basic(self, *, root: str | Path | None = None,
                                universe: str = "a_share") -> dict[str, Any]:
         """用 Tushare `stock_basic` 批量建库（离线，含拼音）。
 
@@ -220,6 +220,13 @@ class StockDirectory:
         """
         from src.quant.dataset_store import DatasetStore
 
+        # 默认从 registry 取（`CHG-0069`）。**必须在函数体里补回落**：
+        # 只把签名默认值改成 `None` 会把 `None` 一路传进 `DatasetStore(root=None)`
+        # 与 `QuantWarehouse(root=None)`，实测 11 个用例当场 TypeError。
+        if root is None:
+            from src.infrastructure.catalog.data_stores import store_rel
+
+            root = store_rel("tushare_partitions")
         store = DatasetStore("stock_basic", root=root, universe=universe)
         keys = store.keys()
         if not keys:
@@ -266,8 +273,34 @@ class StockDirectory:
             if entry is not None:
                 found.append(entry)
         if found:
-            self.upsert(found)
+            self._cache_entries(found)
         return found
+
+    def _cache_entries(self, entries: list[StockEntry]) -> None:
+        """把补录结果写回字典库 —— **尽力而为**（`CHG-0087`，共享仓单写者）。
+
+        ## 为什么这里不能抛
+
+        `enrich()` 跑在**读路径**上（`GET /quant/stocks/{code}` 的
+        `auto_enrich`、做T自选渲染时的名称补全）。共享行情仓的写权限归
+        `warehouse.writer`（现行 = pilot），其余实例**只读** —— 所以这里的写入
+        在 dev / 主实例上**必然被拒**。
+
+        但被拒的是"顺手把结果缓存到共享库"这一步，**不是这次查询**：
+        名字已经从东财取到了，如实返回它；写不进去只记一条 warning。
+        否则一次读操作会因为"缓存写不进去"而 500 —— 故障方向完全错了。
+
+        对照：`build_from_stock_basic()` 是**显式**重建设字典（管理端点触发），
+        那是"我就是要写"，**必须**把异常抛出去告诉调用方为什么写不进去。
+        """
+        try:
+            self.upsert(entries)
+        except Exception as exc:  # noqa: BLE001
+            # 两种异常都要接：显式闸门抛 `WarehouseError`，
+            # 而连接级 `PRAGMA query_only=1` 兜底抛的是 SQLAlchemy `OperationalError`
+            # （`attempt to write a readonly database`）。
+            logger.warning("股票字典补录结果未落库（本实例对共享仓只读）：%s",
+                           brief(exc, BRIEF_TIGHT))
 
     # ---------- 查询 ----------
 
@@ -422,9 +455,14 @@ def _fetch_eastmoney(code: str, *, timeout: int = 12) -> StockEntry | None:
     return None
 
 
-def stock_directory(root: str | Path = "data/quant/tushare") -> StockDirectory:
+def stock_directory(root: str | Path | None = None) -> StockDirectory:
     from src.quant.warehouse import QuantWarehouse
 
+    # 同 `build_from_stock_basic`：默认从 registry 取，且**必须补回落**。
+    if root is None:
+        from src.infrastructure.catalog.data_stores import store_rel
+
+        root = store_rel("tushare_partitions")
     return StockDirectory(warehouse=QuantWarehouse(root=root))
 
 

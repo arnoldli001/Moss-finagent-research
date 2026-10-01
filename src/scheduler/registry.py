@@ -7,6 +7,7 @@ cron（见 docs/SCHEDULER_DESIGN.md）。Celery Beat与管理API均从本表生�
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -24,7 +25,11 @@ JobKind = Literal[
     "board_intraday_snapshot", "board_daily_snapshot",
     "event_alert_scan", "tech_industry_snapshot",
     "intraday_t_scan",  # 做T辅助：自选标的盘中扫描 + 正式信号推送
+    "daily_warm",       # 日K快照预热（消除「点开日K先等 4 秒」的冷加载）
     "dynamic_collection",  # 自修复生成的动态指标采集
+    "catalog_collection",  # ★ 第十二轮：catalog 驱动的批量采集（按 frequency 聚合）
+    "calendar_sync",       # ★ 第十三轮：投资日历落库（解禁/财报/宏观日程）
+    "gap_drain",           # ★ 第十四轮：数据缺口补取（A17 报缺口 → A19 生成连接器）
     "strategy_cases_fetch",  # 开源策略案例抓取（多因子页按周 / 单股票页按日）
     "quant_select",      # 量化选股：3 档模型在开盘/尾盘窗口自动选股
     "model_retrain",     # 模型重训：每周非交易时段重训 3 档模型 + 回归报告
@@ -38,6 +43,10 @@ JobKind = Literal[
     "intel_hot_rank",     # 各平台人气/热搜榜（接口只读落盘结果，不再实时抓）
     "mainline_warm",      # 主线热快照预热（只读；消除 8~23 秒的冷启动）
     "sector_rotation_report",  # 行业轮动日报：收盘后生成热力图+主力流向+规则研判
+    "unlock_plan",         # ★ 限售解禁逐股明细表（月频）：连接器查"未来一个月该股解禁"的取数面
+    "data_freshness_audit",  # ★ 定期数据维护：扫陈旧/缺失序列 → 报日志 + 落报告 + 入补采队列
+    "derived_metrics",       # ★ 派生指标落库（净息差等）：每次计算都记一行 ⇒ 攒趋势
+    "source_leads_audit",    # ★ 换源线索上报：把 path C 搜到的候选源网址送到运维日志
 ]
 
 
@@ -48,6 +57,24 @@ class JobSpec:
     kind: JobKind
     description: str
     params: dict
+    #: 本作业**会写哪些存储**（`configs/data_stores.yaml` 里的存储名）。
+    #:
+    #: ## 为什么作业要声明这个（`CHG-0087`）
+    #:
+    #: 用户裁定「共享行情仓：**dev 读，pilot 写和读**；谁负责更新数据谁有写权限」。
+    #: 落地这件事需要两个动作，而它们必须**同源**：
+    #:
+    #:   ① **写闸门**：`QuantWarehouse.upsert()` 对不可写的实例 fail-closed；
+    #:   ② **调度裁剪**：更新作业在只读实例上**根本不该被触发** ——
+    #:      否则它每次都会撞闸门失败，把运行台账刷成一片红（而那不是"故障"，
+    #:      是"这台机器本来就不负责这件事"）。
+    #:
+    #: 把"谁写什么"写在这一处，① 与 ② 都从 `data_stores.writable_here()` 派生 ——
+    #: 而不是在 `manage.py` 里手写一份任务黑名单（手写的那份必然漂移：
+    #: `MOSS_SCHEDULER_DENY` 就是一个**只被注释提到、从未实现**的开关）。
+    #:
+    #: 留空 = 不写任何被登记的存储（读侧作业、纯计算作业）。
+    updates: tuple[str, ...] = ()
 
 
 # 演示环境作业集（付费产业接口接入后，fetch_industry的模拟源自动替换为真实源）
@@ -110,6 +137,11 @@ JOB_REGISTRY: dict[str, JobSpec] = {
             "增量入库供多因子页「最新开源回测策略」展示"
         ),
         params={"sources": ["GitHub", "arXiv q-fin", "CSDN"]},
+        # ★ 写共享行情仓（`strategy_case_store(...).upsert()` → 仓库库里的
+        # `quant_strategy_case` 表）。写者归属见 `CHG-0087`：
+        # 非写者实例上本作业会被**裁掉**，而不是每班撞一次写闸门
+        # （撞闸门会在运行台账里刷出一片"失败"—— 那不是故障，是这台机器不负责写）。
+        updates=("warehouse",),
     ),
     "strategy_cases_daily": JobSpec(
         name="strategy_cases_daily",
@@ -119,6 +151,7 @@ JOB_REGISTRY: dict[str, JobSpec] = {
             "每日08:20抓取开源策略案例，增量入库供单股票页「开源策略库」展示"
         ),
         params={"sources": []},
+        updates=("warehouse",),   # 同上：写共享行情仓
     ),
     "market_daily_snapshot": JobSpec(
         name="market_daily_snapshot",
@@ -272,6 +305,44 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         ),
         params={},
     ),
+    # ★ 日K快照预热（`CHG-0092`，用户 2026-09-29 口径）：
+    #   「理论上只要服务器开着，到了交易时间，就会自动获取数据，而不是冷加载」。
+    #
+    # 现状（实测，2026-09-29）：`/api/v1/intraday/daily` **冷 4.19 s / 热 0.07 s**，
+    # 而缓存 TTL 只有 180 s、**唯一的写入点就是 `daily()` 自己** ——
+    # 交易时段每 5 分钟的 `intraday_t_scan` 走的是分钟级链（`service.watchlist()`），
+    # `mainline_warm` 预热的是主线快照，**日K一直没有预热作业**。
+    # 于是"服务器一直开着"并不等于"日K是热的"：每次点开都要现场取数 + 250 根 bar
+    # 量价规则 + 30 根 bar 信号回放，用户看到的是「正在取日线并跑量价规则…」。
+    #
+    # 为什么是 `*/2`（120 s）而不是 `*/5`：
+    #   **预热间隔必须小于缓存 TTL**（本项目硬约束）。TTL = `daily_snapshot_ttl`
+    #   = 180 s，取 120 s 才留出 60 s 余量；取 5 分钟 = 300 s > 180 s，
+    #   等于每轮都踩在过期线上（前端面板自己按 180 s 轮询，正好卡在边界）。
+    #   这条判据有机器护栏：`tests/unit/test_daily_warm.py`
+    #   （从 cron 现读间隔、从配置现读 TTL，不写死数字）。
+    #
+    # 为什么 cron 覆盖 9~11 / 13~14 而作业内还要再判窗口：
+    #   与 `quant_select_*` 同一套路 —— cron 粒度粗一点更抗"服务当时没起来"，
+    #   真正的 09:15~11:30 / 13:00~15:00 边界由 `intraday.warm.in_warm_window()`
+    #   用 `core.trading_session.WATCH_WINDOWS`（全站唯一权威）判，
+    #   窗口外直接 skipped，不留下"跑了但没到点"的记录。
+    #
+    # 只读：不写库、不写盘、不推送（`updates` 留空），因此**任何实例都能跑** ——
+    # 与 `mainline_warm` 同理，多实例并存不会互相踩。
+    "daily_warm": JobSpec(
+        name="daily_warm",
+        cron="*/2 9-11,13-14 * * 1-5",
+        kind="daily_warm",
+        description=(
+            "日K快照预热：交易时段每 2 分钟（< 缓存 TTL 180s）把**自选池 ∪ 最近点开过**"
+            "的日K快照算进进程内缓存，让「点开日K」命中 0.07s 的热路径而不是 4.19s 的"
+            "冷加载。只读：不写库、不落盘、不推送；并发 3（`CHG-0099` 起计算段已移出"
+            "事件循环，实测 max 停顿 188ms）、整轮预算 90s（< tick 120s）、目标封顶 80 只，"
+            "超出的按顺序留给下一轮"
+        ),
+        params={},
+    ),
     # 量化选股（用户口径 2026-09-18）：每个 A 股开市日 09:25–09:45 与 14:45
     # 各跑一轮，用那 3 个按流通市值分档的已训练模型选出标的，结果进前端
     # 「量化选股」模块（**不**自动写自选池，由用户一键加自选）。
@@ -337,6 +408,19 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         # bak_daily（内盘外盘等特色字段）。漏同步的后果是**静默降级**而不是报错：
         # `adj_factor` 缺数据时价格不复权，面板照算不误，只在除权日出现假跳空。
         params={"datasets": list(DAILY_DATASETS)},
+        # ★ 本作业**就是**行情仓库的更新者 —— 与 `configs/data_stores.yaml` 里
+        # `warehouse.writer` 是同一件事的两面（`CHG-0087`，用户裁定
+        # 「谁负责更新数据谁有写权限」）。
+        #
+        # 声明它带来两个自动结果，都不需要第二处清单：
+        #   ① `MOSS_SCHEDULER` 在**没有写权限**的实例上不会触发本作业
+        #      （否则每次撞写闸门失败，台账刷成一片红 —— 而那不是故障，
+        #        是"这台机器本来就不负责更新行情"）；
+        #   ② 反过来，谁拿到 `warehouse.writer` 谁就自动获得这个作业的执行权。
+        # 依据：2026-09-29 实测 dev 与 pilot 的调度器在**同一分钟**（23:30:0x）
+        # 往同一个 14.36 GiB 文件里写 —— 两个写者同时 upsert 同一个 SQLite，
+        # 且各自以为自己是唯一写者。
+        updates=("warehouse",),
     ),
     # 板块拥挤度周频异动指标（前端告警面板的 4 列）。
     #
@@ -358,7 +442,101 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         ),
         params={"force": False},
     ),
-    # 涨停股竞价过程采集（用户口径 2026-09-22）：**防过期**，每个交易日必跑。
+    # ★ 限售解禁**逐股明细表**（用户 2026-09-29 口径）：
+    #   「按投研分析要查的股票、解禁日期、**解禁数量**落入到数据库**单独的表中**，
+    #     **每月自动调度一次**……然后 agent 数据连接对接这个单独的表，
+    #     查询未来一个月这个股的解禁数据。**直接精准哈希就找到了**。」
+    #
+    # 为什么是月频而不是日频：解禁日是**交易所规则确定**的（`certainty=rule`，
+    #   不会改期），一个月落一次足够；而每次落库要拉一次全市场明细（实测
+    #   120 天视野 577 行、一次调用约 1~2s），日频纯属浪费且会天天抢源。
+    # 为什么排 08:20（每月 1 日）：不与 08:30 的周频拥挤度、16:40 的仓库同步抢源，
+    #   且赶在开盘前把新一个月的解禁注进表里。
+    # 视野为什么 400 天（≈13 个月）：用户口径是"未来一个月"，但月频作业若只落
+    #   30 天，月初那几天一过就会出现"窗口有交集却没有行"的**假阴性**
+    #   （会被答成"无解禁"）。留足一年多，任何"未来一个月"的查询都落在覆盖内。
+    # 幂等：主键 `(code, unlock_date, share_type)` + 内容哈希 ⇒ 重复触发不产生新行、
+    #   也不刷新 `fetched_at`。
+    "unlock_plan_monthly": JobSpec(
+        name="unlock_plan_monthly",
+        cron="20 8 1 * *",
+        kind="unlock_plan",
+        description=(
+            "限售解禁逐股明细落库（每月 1 日 08:20）：从投资日历同源（东财个股明细）"
+            "落 `app_db::unlock_plan`，字段含股票/解禁日期/解禁数量/解禁市值/占流通比/"
+            "解禁前后涨跌幅；连接器 `解禁计划:{code}` 用它做索引点查"
+        ),
+        params={"horizon_days": 400},
+        updates=("app_db",),   # 本环境自己的库（per_env + writer: own）⇒ 每个实例都该跑
+    ),
+    # ★ 2026-09-29 用户要求：「数据采集 agent 要记录任何未能获取到的信息日志…
+    #   **定期维护数据**」。本作业回答的是"**拉回来的够不够新**"——
+    #   与 `catalog_*` 批采作业互补：批采可能一直在跑，而某个源自己停更了。
+    #   实测证据（本条上线当天就跑出来的，见 PRD §19.22）：
+    #     · `us_fed_rate`/`us_nonfarm`/`us_unemployment`/`us_core_cpi`/`us_pce`
+    #       **停在 2025-07/08**（陈旧 396~425 天）；
+    #     · `社融` 停在 2026-04（181 天）；
+    #     · `stock_close` 家族 **487 只**停在 2026-09-14（15 天，批采覆盖不全）。
+    #   为什么是 07:45：早于 08:20 的解禁作业与 08:30 的周频拥挤度，开盘前出结论；
+    #     它**只读事实表 + 入补采队列**（不自己取数、不写事实表），
+    #     所以任何实例都能跑，也不会与写者抢 SQLite。
+    "data_freshness_audit": JobSpec(
+        name="data_freshness_audit",
+        cron="45 7 * * *",
+        kind="data_freshness_audit",
+        description=(
+            "定期数据维护（每日 07:45）：扫登记指标的事实序列，判"
+            "陈旧/缺失/频率登记错（`freq_mismatch`）；逐条记 `[数据维护]` 日志、"
+            "落 `data/run/data_freshness_report.json`、并把缺口入既有补采队列"
+            "（由 `drain_gap_queue` 作业补取）"
+        ),
+        params={"enqueue": True, "write_report": True},
+        updates=(),   # 只读事实表 + 写队列/报告文件 ⇒ 不声明存储写入
+    ),
+    # ★★ 换源线索上报（`CHG-0118`）：给 path C 的产物一个**消费方**。
+    #
+    # 为什么必须有这个作业：`discover_candidate_urls()` 把联网搜到的候选数据源
+    # 网址写进了 `source_reroute_log.jsonl`，但**此前没有任何东西读它** ——
+    # 实测 `grep -r "source_reroute_log|search_candidates" src/` **零消费方**，
+    # 即 R2 说的"声明式通路"（写了没人看 = 不存在）。
+    #
+    # cron 排在 08:20：在 `data_freshness_audit`（07:45，它会入缺口队列）与
+    # `gap_drain`（盘后）之间 —— 让"这一夜新搜到的线索"在开盘前就进日志。
+    #
+    # `updates=()`：**只读**审计、只写自己的上报状态文件，任何实例都能跑。
+    "source_leads_audit": JobSpec(
+        name="source_leads_audit",
+        cron="20 8 * * *",
+        kind="source_leads_audit",
+        description=(
+            "换源线索上报（每日 08:20）：读换源审计里 path C 搜到的候选数据源网址，"
+            "**每条只报一次**（状态落盘）、单轮最多 10 条，记 `[换源线索]` 后端日志，"
+            "供人工或 A19 复核 ⇒ 把「待复核线索」从 JSONL 里捞出来给人看"
+        ),
+        params={"max_per_run": 10},
+        updates=(),   # 只读审计 + 写状态文件 ⇒ 不声明存储写入
+    ),
+    # ★★ 派生指标落库（用户 2026-09-30 原话）：
+    #   「2 的 **净息差的值，每次记录**有利于**统计变化趋势**，来衡量银行的
+    #     收益曲线和映射业绩，因为**银行主要赚息差**。」
+    # 为什么必须是作业而不是只留 CLI：趋势靠**按期累积**，靠人手跑必然断档。
+    # 为什么 cron 是每月 6 号 08:10：
+    #   · 银行季报（3/6/9/12 月末）披露后，`derive` 取到的是**最新一期**，
+    #     所以月频足够把"新报告出来"这件事在几天内记下来；
+    #   · 排在 `catalog_quarterly`（每月 5 日 09:00）之后 ⇒ 输入先到位再算，
+    #     否则每次都在"输入还没采到"时算一遍空（那是自己制造缺口）。
+    # 只读输入、写事实表 ⇒ `updates=("app_db",)`。
+    "derived_metrics_monthly": JobSpec(
+        name="derived_metrics_monthly",
+        cron="10 8 6 * *",
+        kind="derived_metrics",
+        description=(
+            "派生指标（净息差等）月度落库：对自选池逐标的按注册公式计算并按"
+            "**期间**写一行 ⇒ 攒出可统计的变化趋势（银行主要赚息差）"
+        ),
+        params={"specs": None, "codes": None, "max_codes": 60},
+        updates=("app_db",),
+    ),
     #
     # 为什么是 09:40 而不是收盘后：竞价过程（09:15~09:25 每 3 秒）在 QMT 服务器上
     # 只保留约 1 个月，而 09:25 那一刻的完整序列**只有当天能取**——生产自己也是
@@ -734,6 +912,129 @@ def get_job(name: str) -> JobSpec:
     if name not in JOB_REGISTRY:
         raise KeyError(f"未注册的调度作业: {name}")
     return JOB_REGISTRY[name]
+
+
+# ===========================================================================
+# 本实例**不该触发**哪些作业（`CHG-0087`）
+# ===========================================================================
+#
+# 背景（2026-09-29 实测）：三个实例的调度器**都在**跑 `quant_data_sync` ——
+# `data/dev/scheduler` 33 条（最后 23:30:03）、`data/pilot/scheduler` 43 条
+# （最后 23:30:02）、`data/scheduler` 7 条。也就是 dev 与 pilot 在**同一分钟**
+# 往同一个 14.36 GiB 的库里 upsert，而且各自以为自己是唯一写者。
+#
+# 用户裁定：「共享行情仓，dev 读，pilot 写和读。同时看下更新数据是谁负责的，
+# **谁负责更新数据谁有写权限**。」
+#
+# 落地这件事需要两个动作，它们必须**同源**：
+#   ① 写闸门（`QuantWarehouse.upsert()` 层，见 `data_stores.writable_here`）；
+#   ② 调度裁剪（本段）—— 更新作业在只读实例上**根本不该被触发**，
+#      否则它每一班都撞闸门失败，把运行台账刷成一片红；而那不是"故障"，
+#      是"这台机器本来就不负责更新行情"。**假红灯和假绿灯一样有害**：
+#      它会让下一次真故障淹没在噪音里。
+#
+# 所以裁剪清单是**派生**的：读 `JobSpec.updates`（作业声明它会写哪些存储）
+# × `data_stores.writable_here()`（本实例能不能写）。没有任何手写黑名单 ——
+# 手写的那份必然漂移，本仓库的 `MOSS_SCHEDULER_ENABLED` 就是前车之鉴
+# （manage.py 里设了它，**零处读取**，从来没关掉过任何任务）。
+
+#: 手工禁用清单的环境变量名（逗号/空格分隔的**作业名**）。
+#:
+#: 为什么还需要它（明明有了派生裁剪）：派生裁剪只能回答"这个作业声明的更新目标
+#: 我能不能写"，答不了"这台机器上我不想让它跑"（排障、灰度、临时止血）。
+#: ⚠️ 它**只允许当临时开关**：长期差异必须落进 `data_stores.yaml` 的 `writer`
+#: 或 `JobSpec.updates`，否则两台机器为什么不一样就没人说得清了。
+SCHEDULER_DENY_ENV = "MOSS_SCHEDULER_DENY"
+
+
+def _denied_by_env() -> tuple[str, ...]:
+    """`MOSS_SCHEDULER_DENY` 里的作业名（原样返回，含不存在的名字）。"""
+    raw = os.environ.get(SCHEDULER_DENY_ENV, "")
+    return tuple(part for part in
+                 (piece.strip() for piece in raw.replace(";", ",").split(","))
+                 if part)
+
+
+def unknown_denied_names() -> tuple[str, ...]:
+    """`MOSS_SCHEDULER_DENY` 里**拼错的**作业名。
+
+    为什么单独暴露：写错一个字母的效果是"什么都没发生"，与"本来就不需要禁"
+    在日志里长得一模一样 —— 那正是"设了但不生效的开关"的复发形态。
+    调用方（`SchedulerService.start`）对非空结果打 warning 并列出可用名字。
+    """
+    return tuple(name for name in _denied_by_env() if name not in JOB_REGISTRY)
+
+
+def job_deny_reason(name: str) -> str:
+    """本实例**不该触发** `name` 吗？→ 人话理由（`""` = 该触发）。
+
+    ## 为什么只用 `decided=True` 的裁定来裁剪
+
+    `writable_here()` 有"已裁定"与"待裁定"两态。**待裁定的不能拿来关作业** ——
+    那等于让一个没人拍过板的口径悄悄停掉生产任务（`writer: main` 的那批共享
+    存储还没有归属裁定，硬拒会让它们当场失去写者）。所以：
+
+      · `allowed=False` **且** `decided=True` → 裁剪（口径已定，就该拒）；
+      · `allowed=False` 但 `decided=False` → **照跑**，只在 `/health` 里如实展示
+        "它其实不该写"（这正是审计项 A7 的诚实表达）。
+    """
+    spec = JOB_REGISTRY.get(name)
+    if spec is None:
+        return ""
+    if name in _denied_by_env():
+        return f"{SCHEDULER_DENY_ENV} 手工禁用"
+    if not spec.updates:
+        return ""
+    from src.infrastructure.catalog.data_stores import writable_here
+
+    blocked: list[str] = []
+    for store in spec.updates:
+        try:
+            decision = writable_here(store)
+        except Exception as exc:  # noqa: BLE001 登记表读不到不该炸调度器
+            logger.warning("作业%s的更新目标 %r 写权限判定失败：%s", name, store, exc)
+            continue
+        if not decision.allowed and decision.decided:
+            blocked.append(decision.reason)
+    if not blocked:
+        return ""
+    return (f"本作业更新 {'/'.join(spec.updates)}，而本实例没有写权限："
+            + "；".join(blocked))
+
+
+def schedulable_jobs() -> dict[str, JobSpec]:
+    """本实例**实际可触发**的作业（= 全表 − 派生裁剪 − 手工禁用）。
+
+    单一入口：`SchedulerService` 的 `start()` 与 `_tick()` 都从这里取，
+    所以"启动时打印的条数"与"每分钟真正遍历的条数"**不可能不一致**
+    （原来 `start()` 打 `len(JOB_REGISTRY)`，`_tick()` 自己也遍历全表 ——
+    两处各自为政，任何裁剪都只会在其中一处生效）。
+    """
+    out: dict[str, JobSpec] = {}
+    for name, spec in JOB_REGISTRY.items():
+        if job_deny_reason(name):
+            continue
+        out[name] = spec
+    return out
+
+
+def scheduler_scope_report() -> dict[str, Any]:
+    """本实例的调度视图（`/health` / 启动日志 / 排障用）。
+
+    返回 `total` / `active` / `pruned`（每项带**人话理由**）。
+    """
+    pruned = []
+    for name in JOB_REGISTRY:
+        reason = job_deny_reason(name)
+        if reason:
+            pruned.append({"job": name, "reason": reason})
+    return {
+        "env": (os.environ.get("MOSS_ENV") or "dev").strip().lower() or "dev",
+        "total": len(JOB_REGISTRY),
+        "active": len(JOB_REGISTRY) - len(pruned),
+        "pruned": pruned,
+        "unknown_denied": list(unknown_denied_names()),
+    }
 
 
 def _expand_cron_field(field: str, lo: int, hi: int) -> list[int]:

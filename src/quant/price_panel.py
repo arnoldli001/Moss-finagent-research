@@ -30,6 +30,8 @@ from src.core.errors import (
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel as _store_rel  # noqa: E402
+
 #: 单只标的日线表的列。
 #:
 #: ⚠️ 量列名是 `volume`（**股**，来自 `DataPoint.extra`），与
@@ -37,7 +39,7 @@ logger = logging.getLogger(__name__)
 #: **不是同一套** —— 两者曾同名 `BAR_PRICE_FIELDS`，import 错一个就会在很远的地方
 #: 抛 KeyError，故按数据源显式区分命名。
 BAR_PRICE_FIELDS = ("open", "high", "low", "close", "volume", "amount")
-DEFAULT_ROOT = "data/quant/prices"
+DEFAULT_ROOT = _store_rel("quant_prices")
 _MANIFEST = "_manifest.json"
 
 

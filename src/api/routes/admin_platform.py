@@ -52,10 +52,14 @@ from src.domain.platform.config import (
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel  # noqa: E402
+
 router = APIRouter(prefix="/api/v1/admin/platform", tags=["admin-platform"])
 
 #: 审计日志默认位置（与 `tenancy_middleware._default_audit_dir` 同一约定）
-DEFAULT_AUDIT_DIR = "data/audit"
+#: 访问审计目录默认值 —— 从 registry 取（CHG-0071）。
+#: 主实例 = `data/audit`（与改动前逐字一致），隔离档 = `data/<env>/access_audit`。
+DEFAULT_AUDIT_DIR = store_rel("access_audit")
 AUDIT_FILE = "access_audit.jsonl"
 #: 最多读多少行（防止日志涨到几百 MB 时把内存吃光）
 MAX_AUDIT_LINES = 200_000
@@ -326,6 +330,10 @@ def _empty_cost_block() -> dict[str, Any]:
     return {
         "total_cny": 0.0, "calls": 0, "tokens_in": 0, "tokens_out": 0,
         "paid_calls": 0, "free_calls": 0, "unknown_provider_calls": 0,
+        # ★ 与 `aggregate_llm_cost` 的返回**逐字段对齐**：前端读不到
+        #   `cached_calls` / `avoided_cny` 会当成 0（"缓存一次都没命中"），
+        #   而真实情况是"读不到审计"—— 两者含义相反（同 `readable` 那条注释）。
+        "cached_calls": 0, "avoided_cny": 0.0,
         "unpriced_calls": 0, "unpriced_models": [], "prices_loaded": [],
         "fallback_price": {"input_cache_miss": 0.0, "output": 0.0},
         "by_feature": [], "by_tenant": [], "by_day": [],

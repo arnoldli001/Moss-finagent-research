@@ -55,8 +55,11 @@ from src.mainline.warehouse import open_warehouse
 
 logger = logging.getLogger(__name__)
 
-CACHE_DB = "data/mainline_cache.db"
-WAREHOUSE = "data/quant/warehouse.db"
+# 两条路径都从 registry 取（原先在这里各写一份，CHG-0069）。
+from src.infrastructure.catalog.data_stores import store_rel as _store_rel
+
+CACHE_DB = _store_rel("mainline_cache")
+WAREHOUSE = _store_rel("warehouse")
 
 #: 与 `RelevanceConfig` 保持一致：走势 60% / 主营 40%
 CORR_WEIGHT = 0.6

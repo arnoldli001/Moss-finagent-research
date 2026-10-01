@@ -28,7 +28,11 @@ def _record_hash(seq: int, prev_hash: str, entry: dict[str, Any], ts: str) -> st
 class AuditChainWriter:
     """追加写哈希链（线程安全，跨进程按文件末尾续链）。"""
 
-    def __init__(self, chain_path: str = "data/audit/audit_chain.jsonl") -> None:
+    def __init__(self, chain_path: str | None = None) -> None:
+        if chain_path is None:     # 默认从 registry 取（CHG-0071）
+            from src.infrastructure.catalog.data_stores import store_rel
+
+            chain_path = store_rel("llm_audit") + "/audit_chain.jsonl"
         self._path = Path(chain_path)
         self._lock = threading.Lock()
         self._seq = 0

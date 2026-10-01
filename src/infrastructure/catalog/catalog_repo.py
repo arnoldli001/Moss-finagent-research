@@ -382,13 +382,39 @@ class CatalogRepository:
         # 事实表里的指标若未在 YAML 登记 → 也补一条（category=other）
         known = {m.indicator for m in metas}
         for ind in existing:
-            if ind not in known:
+            if ind in known:
+                continue
+            # ★★ 2026-09-30：先试**基名继承**，再谈兜底。
+            #
+            # 实测缺陷：`商誉占净资产比:000001` 这类具体 id 在 YAML 里**只登记了
+            # 基名**（`商誉占净资产比`，notes 写明"模板：实际指标带 6 位代码后缀"），
+            # 而 `get()` 的精确/通配都要求段数相同 ⇒ 查不到 ⇒ 兜底 `daily/24h`
+            # ⇒ 维护审计拿**日频**宽限（3 天）去判**季频**数据（92 天）
+            # ⇒ 报 `freq_mismatch`（实测 3+5+3 = 11 条），而且它们只有 1 期数据，
+            # 频率推断按纪律"证据不足不猜"（n<2）⇒ **永远修不好**。
+            base = registry.get_by_base(ind)
+            if base is not None:
                 self._upsert_meta_sync(IndicatorMeta(
-                    indicator=ind, category="other", frequency="daily",
-                    freshness_hours=24, primary_source="", source_url="",
+                    indicator=ind, category=base.category,
+                    frequency=base.frequency,
+                    freshness_hours=base.freshness_hours,
+                    primary_source=base.primary_source,
+                    source_url=base.source_url, enabled=base.enabled,
+                    ttl_days=base.ttl_days, units=base.units, notes=base.notes,
+                ))
+            else:
+                # ★ 兜底从 `daily/24h` 改成 `monthly/720h`（用户 2026-09-30 口径：
+                #   「没登记更新周期的数据都触发**月频**更新一次」）。
+                #   为什么不能继续用 daily：daily 意味着"每天该更新"，于是
+                #   ① 审计用 3 天宽限判它 ⇒ 一片 `stale` 假告警；
+                #   ② 补采按日重试 ⇒ 对一个其实没人登记周期的指标每天花一次取数。
+                #   monthly 是**诚实的下限**：我不知道它该多久更新，那就至少每月试一次。
+                self._upsert_meta_sync(IndicatorMeta(
+                    indicator=ind, category="other", frequency="monthly",
+                    freshness_hours=720, primary_source="", source_url="",
                     enabled=True, ttl_days=365,
                 ))
-                stats["metas_synced"] += 1
+            stats["metas_synced"] += 1
         if existing:
             stats["indicators_backfilled"] = self._refresh_stats_from_facts_sync(
                 existing)
@@ -571,6 +597,7 @@ class CatalogRepository:
         placeholders = ",".join("?" for _ in indicators)
         now_ms = int(time.time() * 1000)
         updated = 0
+        inserted = 0
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
@@ -583,7 +610,38 @@ class CatalogRepository:
                 """,
                 list(indicators),
             ).fetchall()
+            # ★★ 2026-09-30：索引里**没有行**的指标要**补建**，不能只 UPDATE。
+            #
+            # 实测缺陷（本轮 FRED 补采时抓到）：本函数原先**只有 UPDATE** ⇒
+            # 一个"新登记 + 新采集 + 事实表已 943 行"的指标（`fred:UNRATE`）
+            # 在 `indicator_catalog` 里**依然没有行**（实测该表零行）⇒
+            #   ① 维护审计永远把它报成 `missing`（理由写着"从未采到"，
+            #      与事实**相反**）；
+            #   ② "补采 → 回填索引"这条闭环（`catalog_collection` 与
+            #      `gap_drain` 都调本函数）对**任何新指标**静默无效 ——
+            #      正是本项目登记过的"落库了但索引没更 = 白落库"。
+            # 补建的行 `primary_source` 取默认空串 ⇒ 紧随其后的
+            # `_infer_frequencies_sync` 会用**真实期间间隔**推断频率
+            # （而不是硬编码 daily）。
+            existing = {r["indicator"] for r in conn.execute(
+                f"SELECT indicator FROM indicator_catalog "
+                f"WHERE indicator IN ({placeholders})",
+                list(indicators)).fetchall()}
             for row in rows:
+                if row["indicator"] not in existing:
+                    conn.execute(
+                        """
+                        INSERT INTO indicator_catalog (
+                            indicator, row_count, last_period_date,
+                            last_fetch_time_ms, first_seen_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (row["indicator"], int(row["n"]),
+                         (row["max_pd"] or None), now_ms, now_ms, now_ms),
+                    )
+                    inserted += 1
+                    updated += 1
+                    continue
                 conn.execute(
                     """
                     UPDATE indicator_catalog SET
@@ -621,6 +679,10 @@ class CatalogRepository:
 
         if infer_unknown:
             updated += self._infer_frequencies_sync(indicators)
+        if inserted:
+            logger.info("索引补建：%d 个指标原先在 indicator_catalog 里没有行"
+                        "（只有 UPDATE 的旧实现会让它们永远被报成 missing）",
+                        inserted)
         return updated
 
     def _infer_frequencies_sync(self, indicators: list[str]) -> int:

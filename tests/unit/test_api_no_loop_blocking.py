@@ -51,12 +51,21 @@ SRC = Path(__file__).resolve().parents[2] / "src"
 QUANT = SRC / "api" / "routes" / "quant.py"
 
 #: 已知的同步阻塞调用：出现在 `async def` 路由**自己的语句**里就是事故
+#:
+#: ★ `CHG-0146` 补入后 5 个：它们各自都在 `async def` 里堵过事件循环
+#: （实测 3,056.8 / 3,766.7 / 679.1 / 179.7 / 116 ms，见文件末尾那条判据的说明）。
 BLOCKING_CALLS = frozenset({
     "warehouse_status",
     "coverage",
     "iterdir",
     "glob",
     "keys",
+    # ↓ `CHG-0146`：本轮实测定罪的四个 + 顺带修掉的一个
+    "build_cycle",          # 情绪周期：同步读行情仓做聚合
+    "_data_status",         # 主线本地仓：多表行数 + 同步台账
+    "_relevance_stats_sync",  # 提纯状态：同步 SQLite JOIN + 聚合
+    "get_preheat",          # 竞价预热摘要：取数/落库
+    "data_watermark",       # 主线数据水位线：同步 SQL MAX（面板首个请求会走）
 })
 
 
@@ -109,6 +118,47 @@ def _own_body(node: ast.AST) -> list[ast.stmt]:
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
         body = body[1:]
     return body
+
+
+#: 豁免标记：放在**出事那一行**（或它上一行）即跳过该调用。
+#:
+#: ## 为什么需要它（`CHG-0146` 扩范围时当场出现）
+#:
+#: 判据是**按名字**匹配的，而名字会撞车：`snapshot.keys()`（字典键，O(1)）
+#: 与 `store.keys()`（扫目录，阻塞）同名。第一版扩到全部路由文件后，
+#: `fundflow.py::search` 立刻被误报。把 `keys` 从表里删掉是**更糟**的解法
+#: （那正是当年 `quant.py` 事故的那个调用）——所以给一个**必须带理由**的豁免：
+#: 写 `# loop-blocking-ok: <理由>`，判据看得到这行注释、并在报告里留痕。
+LOOP_BLOCKING_OK = "# loop-blocking-ok"
+
+
+def _own_calls_with_lines(node: ast.AST, source: str) -> dict[str, int]:
+    """函数自己语句里调用的名字 → 行号（供豁免标记按行判定）。"""
+    lines = source.splitlines()
+    found: dict[str, int] = {}
+
+    def visit(current: ast.AST) -> None:
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.Lambda, ast.ClassDef)):
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                name = func.id if isinstance(func, ast.Name) else (
+                    func.attr if isinstance(func, ast.Attribute) else None)
+                if name:
+                    lineno = getattr(child, "lineno", 0)
+                    text = lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+                    prev = lines[lineno - 2] if lineno >= 2 else ""
+                    if LOOP_BLOCKING_OK not in text and LOOP_BLOCKING_OK not in prev:
+                        found.setdefault(name, lineno)
+            visit(child)
+
+    for statement in _own_body(node):
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        visit(statement)
+    return found
 
 
 def _own_names(node: ast.AST) -> set[str]:
@@ -204,13 +254,49 @@ def test_quant_ic_also_offloads_directory_scan():
 
 
 def test_no_async_route_calls_blocking_helpers_directly():
-    """全局扫描：任何 `async def` 路由都不许在自己的语句里调阻塞函数。"""
+    """全局扫描：**全部路由文件**里，任何 `async def` 路由都不许直接调阻塞函数。
+
+    ## ★ `CHG-0146`：这条判据的**范围**曾经是它的漏洞
+
+    第一版只 `ast.parse(routes/quant.py)` + 5 个名字（`warehouse_status`/`coverage`/
+    `iterdir`/`glob`/`keys`）⇒ 它守着 `quant.py`，而同一类缺陷在别的路由文件里
+    **长驱直入**。实测（2026-09-30，进程内 harness 定罪）：
+
+      · `routes/auction_select.py::sentiment_cycle` → `build_cycle()` 同步读行情仓
+        ⇒ **堵事件循环 3,056.8 ms**；
+      · `routes/mainline.py::data_status` → `_data_status()` 同步读本地仓
+        ⇒ 冷路径 **3,766.7 ms**；
+      · `routes/mainline.py::relevance_stats` → 同步 SQLite（JOIN + 聚合）**679.1 ms**；
+      · `routes/auction_select.py::preheat` → `scheduler.get_preheat()` **179.7 ms**。
+
+    四个全在 `quant.py` 之外 ⇒ **判据守的那一格，恰好不是出事的那一格**。
+
+    ## 名字表只能挡已知的，行为判据才兜底
+
+    这份清单是"已知阻塞函数名"，写不进表里的（比如某个新的同步取数函数）
+    它抓不到 —— 真正兜底的是 `tests/integration/test_no_loop_blocking_endpoints.py`
+    的**行为**判据（20 ms 心跳直接量"谁把循环按住了"，与名字无关）。
+    两条一起才完整：**这条便宜、能指认名字；那条贵、但能抓没见过的**。
+    """
+    files = sorted((SRC / "api" / "routes").glob("*.py"))
+    assert len(files) >= 10, (
+        f"只扫到 {len(files)} 个路由文件 —— 扫描范围又缩回去了（本条判据的全部价值在范围）")
     offenders: list[str] = []
-    for name, node in _functions(_module()).items():
-        if not isinstance(node, ast.AsyncFunctionDef):
+    for path in files:
+        text = path.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:      # 语法错误由别的判据报，这里不重复
+            offenders.append(f"{path.name}: 解析失败 {exc.msg}")
             continue
-        bad = sorted(_own_calls(node).intersection(BLOCKING_CALLS))
-        if bad:
-            offenders.append(f"{name}: {bad}")
+        for name, node in _functions(tree).items():
+            if not isinstance(node, ast.AsyncFunctionDef):
+                continue
+            hits = _own_calls_with_lines(node, text)
+            bad = sorted(n for n in hits if n in BLOCKING_CALLS)
+            if bad:
+                where = ", ".join(f"{n}@{hits[n]}" for n in bad)
+                offenders.append(f"{path.name}::{name}: [{where}]")
     assert not offenders, (
-        "这些 async 路由在事件循环上直接调用同步阻塞函数：" + "；".join(offenders))
+        "这些 async 路由在事件循环上直接调用同步阻塞函数（要丢进 "
+        "`await asyncio.to_thread(...)`）：" + "；".join(offenders))

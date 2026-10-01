@@ -46,11 +46,15 @@ CONFIG_PATH = Path(os.environ.get(
 
 @dataclass
 class DatabaseConfig:
-    path: str = "data/moss_finagent.db"
-    warehouse_path: str = "data/quant/warehouse.db"
+    #: 三个路径的**默认值来自 registry**（`configs/data_stores.yaml`），
+    #: 不在本文件里重复写一遍 —— 重复写就是"同一个 key 写在 N 处"，
+    #: 而这里的 N 处曾经**全部绕过环境隔离**（见 `_store_rel` 的说明）。
+    #: YAML 显式给了值就以 YAML 为准（行为不变），但会过 `_warn_if_drifted`。
+    path: str = field(default_factory=lambda: _store_rel("legacy_main"))
+    warehouse_path: str = field(default_factory=lambda: _store_rel("warehouse"))
     #: 主线挖掘缓存库（只读）。拥挤度从这里取**提纯后**的成分股
     #: （`ml_member_pure`），保证两个子系统用的是同一份名单。
-    mainline_cache_path: str = "data/mainline_cache.db"
+    mainline_cache_path: str = field(default_factory=lambda: _store_rel("mainline_cache"))
 
 
 @dataclass
@@ -264,6 +268,47 @@ def _resolve(value: str) -> Path:
     return target if target.is_absolute() else (PROJECT_ROOT / target)
 
 
+def _store_rel(name: str) -> str:
+    """从 registry 取存储路径（相对仓库根）；registry 不可用时返回空串。
+
+    ## 为什么本模块不再写死路径（`CHG-0069`）
+
+    本模块原先把三个库路径**写死在默认值里**
+    （`data/moss_finagent.db` / `data/quant/warehouse.db` / `data/mainline_cache.db`），
+    于是它**绕过了三档环境隔离**：`--env dev/test/pilot` 三个实例都会去
+    读写**同一个遗留主库**，而 `assert_environment_consistency` 只检查
+    `settings.sqlite_path`，对这条路径**一无所知**。
+
+    这正是"数据分散"里最危险的一类：**同一个库被多个环境同时写，
+    而且没有任何一处声明过这件事**。
+
+    ⚠️ **本轮只去掉重复定义，不改写者归属**：YAML 里仍显式写着路径，
+    所以行为不变 —— "拥挤度该写哪个库"是运维口径决策（PRD §16.3 / §18.4 A7），
+    须由用户裁定。为此加了 `_warn_if_drifted()`：**偏移要看得见**，
+    而不是靠下一轮再猜一遍。
+    """
+    from src.infrastructure.catalog.data_stores import store_rel
+
+    return store_rel(name)
+
+
+def _warn_if_drifted(where: str, value: str, store: str) -> None:
+    """YAML 写的路径与 registry 声明的**不是同一条**时记警告。
+
+    判据用"解析后的绝对路径"比较，不用字符串 —— `data\\x` 与 `data/x`
+    在 Windows 上同一条路径，字符串比较会误报。
+    """
+    declared = _store_rel(store)
+    if not declared or not str(value or "").strip():
+        return
+    if _resolve(str(value)).resolve() == _resolve(declared).resolve():
+        return
+    logger.warning(
+        "%s 的路径 %r 与 registry 里 %s 声明的 %r **不是同一条** —— "
+        "该模块因此绕过了环境隔离（PRD §18.4 A7 待裁定）",
+        where, value, store, declared)
+
+
 def _build(raw: dict[str, Any]) -> SectorCrowdingConfig:
     def section(name: str) -> dict[str, Any]:
         value = raw.get(name) or {}
@@ -277,10 +322,10 @@ def _build(raw: dict[str, Any]) -> SectorCrowdingConfig:
     log = section("logging")
     return SectorCrowdingConfig(
         database=DatabaseConfig(
-            path=str(db.get("path", "data/moss_finagent.db")),
-            warehouse_path=str(db.get("warehouse_path", "data/quant/warehouse.db")),
+            path=str(db.get("path") or _store_rel("legacy_main")),
+            warehouse_path=str(db.get("warehouse_path") or _store_rel("warehouse")),
             mainline_cache_path=str(
-                db.get("mainline_cache_path", "data/mainline_cache.db")),
+                db.get("mainline_cache_path") or _store_rel("mainline_cache")),
         ),
         window=WindowConfig(
             max_lookback_years=int(window.get("max_lookback_years", 6)),
@@ -349,6 +394,14 @@ def load_config() -> SectorCrowdingConfig:
         logger.warning("拥挤度配置读取失败（用默认值）：%s", brief(exc, BRIEF_DEFAULT))
         raw = {}
     config = _build(raw if isinstance(raw, dict) else {})
+    # 偏移要看得见：YAML 里的路径与 registry 声明不一致时记警告。
+    # 这条不改行为（"拥挤度该写哪个库"待用户裁定，见 PRD §18.4 A7），
+    # 只是让"本模块绕过了环境隔离"这件事**在启动日志里就有据可查**。
+    _warn_if_drifted("拥挤度 database.path", config.database.path, "legacy_main")
+    _warn_if_drifted("拥挤度 database.warehouse_path",
+                     config.database.warehouse_path, "warehouse")
+    _warn_if_drifted("拥挤度 database.mainline_cache_path",
+                     config.database.mainline_cache_path, "mainline_cache")
     _ensure_logger(config)
     return config
 

@@ -254,14 +254,44 @@ def test_unpublished_script_requires_skip_guard() -> None:
 
 
 @pytest.mark.skipif(not _is_git_repo(), reason="不在 git 仓库内")
-def test_documented_script_commands_exist() -> None:
-    """判据 3：文档里写的**可执行命令**，文件必须存在。
+def _missing_documented_commands() -> dict[str, list[str]]:
+    """判据 3 的计算：文档里的**命令**指向不存在（且**应当存在**）的脚本。
 
-    只认 `python scripts/x.py` 这类**真实调用**，不认普通提及 ——
-    文档写「**新增** `scripts/x.py`」是待办提案，不是"不存在的命令"。
-    否则文档在教人跑一条跑不通的命令，比没写更糟。
+    ## 为什么这里也要 `_tracked()` 豁免（2026-09-29，与判据 1 同款）
+
+    判据 1 早在 CHG-0049 就补了这条豁免（"未发布 ⇒ 克隆里本就不存在"），
+    但判据 3 当时漏了 —— 于是**同一类缺陷从另一条缝里长回来**：
+    PRD §19.15/§19.16/§19.17 与 `AGENTS.md` 把
+    `scripts/_e2e_query_acceptance.py` 这类**本机探针**当**复跑命令**引用
+    （政策上 `scripts/*` 不入库），本地文件在、判据绿；**克隆/CI 里那句命令
+    指向一个不存在的文件** ⇒ 判据 3 必红。
+
+    豁免的边界与判据 1 **逐字相同**（且**自带过期语义**）：
+      · `_tracked() is False`（未发布）→ 不按存在性报 —— 这类脚本在克隆里
+        本就不存在，报它等于让判据在克隆必红；
+      · `_tracked() is True`（已发布）→ **必须存在**，缺了就报
+        （改名/打错字的现场照样抓得住）；
+      · 非 git 环境（`None`）→ 保持原语义，要求存在。
+    自证：`test_documented_command_exemption_is_not_a_permanent_green`。
     """
     missing: dict[str, list[str]] = {}
+    for name, docs in _documented_calls().items():
+        path = f"scripts/{name}.py"
+        if (ROOT / path).exists():
+            continue
+        if _tracked(path) is False:
+            continue                          # 未发布 ⇒ 克隆里本就不存在
+        missing[name] = sorted(docs)
+    return missing
+
+
+def _documented_calls() -> dict[str, list[str]]:
+    """`{脚本名: [引用它的文档]}`（**只看真实调用语法**，不看普通提及）。
+
+    这一段单独成函数是为了给自证留一个注入口 —— 与判据 1 的
+    `_referenced_scripts()` 对称（自证不该去改真文档或真脚本）。
+    """
+    out: dict[str, list[str]] = {}
     docs = ["AGENTS.md", *sorted(
         p.relative_to(ROOT).as_posix() for p in ROOT.glob("docs/*.md"))]
     for doc in docs:
@@ -274,11 +304,46 @@ def test_documented_script_commands_exist() -> None:
                 continue                      # 文档里的占位符示例，不是命令
             if name in _KNOWN_DANGLING_CALLS:
                 continue                      # 已登记的历史悬空引用
-            if not (ROOT / "scripts" / f"{name}.py").exists():
-                missing.setdefault(name, []).append(doc)
+            out.setdefault(name, []).append(doc)
+    return out
+
+
+def test_documented_script_commands_exist() -> None:
+    """判据 3：文档里写的**可执行命令**，文件必须存在。
+
+    只认 `python scripts/x.py` 这类**真实调用**，不认普通提及 ——
+    文档写「**新增** `scripts/x.py`」是待办提案，不是"不存在的命令"。
+    否则文档在教人跑一条跑不通的命令，比没写更糟。
+
+    ⚠️ 未发布的脚本按 `_tracked()` 豁免（理由与自证见
+    `_missing_documented_commands`）—— 这条豁免在 2026-09-29 才补，
+    补之前 PRD/AGENTS.md 里那些**本机探针命令**会让判据在克隆里必红，
+    而开发机上**永远看不见**（本项目最容易漏的一类缺陷）。
+    """
+    missing = _missing_documented_commands()
     assert not missing, (
         f"文档里的**命令**指向不存在的脚本：{missing}\n"
         "修法：改名对齐真实脚本，或加进 _KNOWN_DANGLING_CALLS 并写清原因")
+
+
+def test_documented_command_exemption_is_not_a_permanent_green(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ 自证：豁免不能把判据 3 变成"永远绿"（与判据 1 的同名自证对称）。
+
+    与判据 1 的自证同一手法：**注入文档扫描的输入**（不去改真文档/真脚本）。
+    · 未跟踪脚本缺失 → 豁免（克隆里本就不存在，不该报）
+    · 已跟踪脚本缺失 → **必须报**（文档与文件改名不同步的现场靠这一条抓）
+    """
+    monkeypatch.setattr(
+        sys.modules[__name__], "_documented_calls",
+        lambda: {"ghost_command_zzz": ["docs/PRD.md"]})
+    monkeypatch.setattr(sys.modules[__name__], "_tracked", lambda _p: False)
+    assert _missing_documented_commands() == {}, \
+        "未发布脚本不该按存在性报错（否则克隆必红）"
+
+    monkeypatch.setattr(sys.modules[__name__], "_tracked", lambda _p: True)
+    assert "ghost_command_zzz" in _missing_documented_commands(), \
+        "已发布脚本缺失必须报出来 —— 否则判据 3 恒绿（假绿）"
 
 
 #: `.gitignore` 里 `/scripts/*` 的白名单行（`!/scripts/x.py`）。

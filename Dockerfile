@@ -50,8 +50,13 @@ RUN mkdir -p data/audit data/llm_cache data/repos \
 
 EXPOSE 8100
 
+# ★ `2026-09-30`（`CHG-0128`）修正探针路径：这里原来打的是 `/health` ——
+#   **那不是路由**（真实路径是 `/api/v1/health`），而且即便写对了也不该当存活探针：
+#   它会连 Ollama（2s 超时）、校验审计链、聚合数据源健康度，实测最坏 142.8s，
+#   还会在开启鉴权后返回 401。`urlopen` 遇 4xx 直接抛异常 ⇒ **容器永远 unhealthy**。
+#   改用根级 0 I/O 探针 `/healthz`（免鉴权、不含 pid/环境名/版本号）。
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD .venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')" || exit 1
+  CMD .venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/healthz')" || exit 1
 
 # 生产启动（ASGI 多 worker，比同步 FastAPI 更能扛）
 # --no-access-log 减小日志体积，生产日志走 JSON

@@ -124,6 +124,13 @@ _INTRADAY_DAYS = 6
 # 但自选池每分钟会给每只票各跑一次快照，不缓存就是 N 次 SQLite 读。
 _PROFILE_CACHE_TTL = 5.0
 
+#: 「最近点开过的日K标的」保留多少只（`CHG-0099`）。
+#:
+#: 取值 20 的依据：预热一轮的墙钟预算 90 s、并发 3 时实测约 1.06 s/只
+#: ⇒ 自选池 50 只 + 20 只最近 ≈ 74 s，仍在预算内。取更大（如 50）会和
+#: 自选池抢预算，反而让"最该热的"排在后面被截断。
+RECENT_DAILY_LIMIT = 20
+
 _SESSION_LABELS = SESSION_LABELS
 
 
@@ -468,6 +475,12 @@ class IntradayService:
         }
         # 日K快照的进程内缓存（键=标的）：前端按「数据源周期×3」轮询时避免重复计算
         self._daily_cache: dict[str, tuple[float, Any]] = {}
+        # 最近被**点开过**的日K标的（有界 LRU，最近在前）。
+        # 为什么要记它（`CHG-0099`）：日K预热的覆盖原先只有自选池，而用户点开的票
+        # 可能来自搜索 / 量化选股 / 板块入口 —— 那些票第一次仍然是冷加载（实测
+        # 4.19 s），之后就**应该**被预热。记"点开"行为是最便宜的信号：
+        # 零配置、不需要枚举全市场，也不猜"用户会看什么"。
+        self._recent_daily: dict[str, float] = {}
         # 上次关停前的自选概览快照（热加载）：文件路径 + 已加载标记。
         # 冷启动首个 /watchlist 要 59.8 秒（26~39 只票全量取数），热加载让首屏
         # 0 秒出数据、新鲜度交给后台重算 —— 详见 src/intraday/hot_cache.py。
@@ -3313,6 +3326,29 @@ class IntradayService:
 
     # ==================== 日K级别做T ====================
 
+    def _remember_daily_view(self, code: str) -> None:
+        """记一次"用户点开了这只票的日K"（有界，最近在前）。
+
+        ⚠️ 记在**缓存判断之前**：命中缓存也是一次"点开"，也该刷新它的新鲜度
+        （否则常看的票会因为"总是命中缓存"而永远排不进最近列表 —— LRU 的语义）。
+        """
+        key = str(code).strip()
+        if not key:
+            return
+        # 重新插入 = 移到"最近"（dict 保序，Python 3.7+）
+        self._recent_daily.pop(key, None)
+        self._recent_daily[key] = time.monotonic()
+        while len(self._recent_daily) > RECENT_DAILY_LIMIT:
+            oldest = next(iter(self._recent_daily))
+            self._recent_daily.pop(oldest, None)
+
+    def recent_daily_codes(self, limit: int | None = None) -> list[str]:
+        """最近点开过的日K标的（**最近在前**）。供日K预热扩覆盖用。"""
+        codes = list(reversed(self._recent_daily.keys()))
+        if limit is None:
+            return codes
+        return codes[:max(0, int(limit))]
+
     async def daily(self, code: str, *, refresh: bool = False,
                     config_patch: IntradayConfig | None = None) -> Any:
         """日K级别做T（量价体系：量柱/高量柱攻防/16形态/B1-B15/S1-S6）。
@@ -3329,6 +3365,8 @@ class IntradayService:
         """
         from src.intraday.daily import fetch_daily_snapshot
 
+        # 点开即记（含命中缓存的那次）：日K预热的覆盖靠它扩到"非自选但看过"的票
+        self._remember_daily_view(code)
         ttl = self._config.data.daily_snapshot_ttl
         now = time.monotonic()
         hit = self._daily_cache.get(code)

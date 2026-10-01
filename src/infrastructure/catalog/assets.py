@@ -163,12 +163,88 @@ TABLE_FREQUENCY: dict[str, tuple[str, float, str]] = {
 }
 
 #: 文件目录的更新周期
+#:
+#: ⚠️ 键是**相对仓库根的路径**（与 registry 的 `path` 同形），所以
+#: 目录的"在哪里"由 `configs/data_stores.yaml` 决定、这里只声明"多久更新一次" ——
+#: 两者职责分开，不再各存一份路径清单（`CHG-0066`）。
 DIR_FREQUENCY: dict[str, tuple[str, float, str]] = {
-    "data/quant/prices": ("daily", 26, "全市场前复权日线（PriceStore 落盘）"),
-    "data/quant": ("daily", 26, "量化数据集（parquet/因子/中间产物）"),
-    "data/llm_cache": ("realtime", 0.5, "LLM 响应缓存"),
-    "data/dynamic_connectors": ("monthly", 720, "自修复生成的动态连接器"),
+    # 键 = **registry 里的存储名**（不再是路径）—— 路径由
+    # `configs/data_stores.yaml` 一处说了算，这里只声明"多久更新一次"（`CHG-0069`）。
+    "quant_prices": ("daily", 26, "全市场前复权日线（PriceStore 落盘）"),
+    "quant_fundamentals": ("daily", 26, "财务指标分区（季报快照）"),
+    "tushare_partitions": ("daily", 26, "Tushare 分区（行情仓的上游）"),
+    "auction_hist": ("daily", 26, "竞价冻结录像带（逐日 tick）"),
+    "llm_cache": ("realtime", 0.5, "LLM 响应缓存"),
+    "intel_cache": ("realtime", 0.5, "情报预热状态与 feed 载荷"),
+    "run_dir": ("realtime", 0.5, "运行时目录（日志/锁/一次性产物）"),
 }
+
+def _rel(name: str) -> str:
+    """registry 里某存储的相对路径（`CHG-0071`）。registry 不可用时返回空串。
+
+    ⚠️ **必须定义在用到它的模块级字典之前** —— 本轮实测：把 helper 插在
+    `_rowid_lower_bound` 前面（而那个字典在更上面），于是模块导入直接
+    `NameError: name '_rel' is not defined`，而 `py_compile` **不报错**
+    （编译不解析名字）。教训：**改了引用就要实测名字可用**。
+    """
+    from src.infrastructure.catalog.data_stores import store_rel
+
+    return store_rel(name)
+
+
+def _parent_rel(name: str) -> str:
+    """某存储的**父目录**相对路径（`data/quant/tushare` → `data/quant`）。"""
+    from src.infrastructure.catalog.data_stores import PROJECT_ROOT, resolve_store
+
+    return resolve_store(name).parent.relative_to(PROJECT_ROOT).as_posix()
+
+
+#: 旧口径：按**路径**索引的兜底（registry 不可用或传入字面量时才会用到）。
+#: 键从 registry 现算 —— 否则这里又是一份会漂移的路径清单（`CHG-0071`）。
+DIR_FREQUENCY_BY_PATH: dict[str, tuple[str, float, str]] = {
+    _rel("quant_prices"): ("daily", 26, "全市场前复权日线（PriceStore 落盘）"),
+    _parent_rel("tushare_partitions"): ("daily", 26,
+                                        "量化数据集（parquet/因子/中间产物）"),
+}
+
+
+def dir_frequency(*, store: str = "", rel: str = "") -> tuple[str, float, str]:
+    """目录的新鲜度口径：**先按存储名，再按路径**。
+
+    两套键并存是刻意的：`store` 是主路径（与 registry 同源），
+    `rel` 只服务"registry 不可用 / 传了字面量"的老调用方 ——
+    删掉它会让兜底路径失去周期声明（那正是"没量到 vs 量到 0"要分开的地方）。
+    """
+    if store and store in DIR_FREQUENCY:
+        return DIR_FREQUENCY[store]
+    if rel and rel in DIR_FREQUENCY_BY_PATH:
+        return DIR_FREQUENCY_BY_PATH[rel]
+    return ("unknown", 24.0, "")
+
+#: 行数**精确 COUNT 太贵**的表（千万行级）。
+#:
+#: 用 `MAX(rowid)` 作下界 —— 与 `data/quant/warehouse_stats.json` 的
+#: `count_mode: "rowid"` **同一口径**（本项目写入为原地 upsert 且从不删行，
+#: 所以 `MAX(rowid)` 等于 `COUNT(*)`）。判据不一致会让同一个数字在两处不等，
+#: 那比慢更糟。
+_LARGE_TABLES: frozenset[str] = frozenset({
+    "quant_daily", "quant_daily_basic", "quant_adj_factor", "quant_moneyflow",
+    "quant_stk_limit", "quant_bak_daily", "quant_suspend_d",
+    "fact_data_points", "sector_crowding_daily", "sector_member",
+    "ml_margin", "ml_board_bar", "ml_future", "ml_company_segment",
+    "ml_northbound", "ml_member", "ml_member_clean", "ml_member_pure",
+})
+
+
+def _rowid_lower_bound(conn: sqlite3.Connection, table: str,
+                       time_col: str) -> tuple[int, str]:
+    """大表的行数下界 + 最新时间（不扫全表，实测 15M 行表毫秒级）。"""
+    n = conn.execute(f'SELECT MAX(rowid) FROM "{table}"').fetchone()[0] or 0
+    mx = ""
+    if time_col:
+        mx = str(conn.execute(
+            f'SELECT MAX("{time_col}") FROM "{table}"').fetchone()[0] or "")
+    return int(n), mx
 
 
 @dataclass
@@ -297,12 +373,18 @@ class DataAssetCatalog:
 
     # ---------- 扫描：SQLite ----------
 
-    def _scan_sqlite_sync(self) -> list[DataAsset]:
-        """扫描主库的**全部**表（排除 sqlite_ 内部表）。"""
+    def _scan_sqlite_sync(self, db_path: str | None = None) -> list[DataAsset]:
+        """扫描**一个** SQLite 库的全部表（排除 sqlite_ 内部表）。
+
+        `db_path` 默认仍是应用库（`settings.sqlite_path`），但
+        `_scan_all_sync()` 会对 registry 里**每一个** sqlite 存储各调一次 ——
+        这修掉了"资产登记表只认识一个库"的缺陷（`CHG-0066`）。
+        """
         assets: list[DataAsset] = []
-        db_name = Path(self._db_path).name
+        target = db_path or self._db_path
+        db_name = Path(target).name
         now_ms = int(time.time() * 1000)
-        with connect_sqlite(self._db_path) as conn:
+        with connect_sqlite(target) as conn:
             conn.row_factory = sqlite3.Row
             tables = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
@@ -314,8 +396,12 @@ class DataAssetCatalog:
                 # 选时间列
                 time_col = next(
                     (c for c in _TIME_COLUMN_CANDIDATES if c in cols), "")
+                # 大表不精确 COUNT（15M 行表的 COUNT(*) 冷缓存下是秒级）
+                big = name in _LARGE_TABLES
                 try:
-                    if time_col:
+                    if big:
+                        n, mx = _rowid_lower_bound(conn, name, time_col)
+                    elif time_col:
                         row = conn.execute(
                             f'SELECT COUNT(*) AS n, MAX("{time_col}") AS mx '
                             f'FROM "{name}"').fetchone()
@@ -340,15 +426,35 @@ class DataAssetCatalog:
                     freshness_hours=fresh_h,
                     last_scanned_at=now_ms,
                     extras={"column_count": len(cols),
-                            "columns": cols[:40]},
+                            "columns": cols[:40],
+                            "count_mode": "rowid" if big else "exact"},
                 ))
         return assets
 
     # ---------- 扫描：文件目录 ----------
 
-    def _scan_dir_sync(self, rel: str, *, max_files: int = 60_000) -> DataAsset | None:
-        """扫描一个目录（文件数 / 体积 / 扩展名分布 / 最新 mtime）。"""
-        path = self._root / rel
+    def _scan_dir_sync(self, rel: str | None = None, *, store: Any = None,
+                       max_files: int = 60_000) -> DataAsset | None:
+        """扫描一个目录（文件数 / 体积 / 扩展名分布 / 最新 mtime）。
+
+        两种调用方式：`rel`（相对仓库根的字面量，旧行为）或 `store`
+        （registry 条目，`CHG-0066` 起的主路径）。传 store 时路径、角色、
+        新鲜度周期都从 registry 取，**不再有字面量**。
+        """
+        if store is not None:
+            path = store.resolved()
+            try:
+                rel = path.relative_to(self._root).as_posix()
+            except ValueError:
+                rel = path.as_posix()
+            declared_role = store.role
+            declared_desc = store.note.split("。")[0][:80] if store.note else ""
+        else:
+            if not rel:
+                return None
+            path = self._root / rel
+            declared_role = ""
+            declared_desc = ""
         if not path.exists():
             return None
         n, total, latest = 0, 0, 0.0
@@ -366,7 +472,8 @@ class DataAssetCatalog:
             exts[f.suffix] = exts.get(f.suffix, 0) + 1
             if n >= max_files:
                 break
-        freq, fresh_h, desc = DIR_FREQUENCY.get(rel, ("unknown", 24.0, ""))
+        freq, fresh_h, desc = dir_frequency(
+            store=(store.name if store is not None else ""), rel=rel)
         latest_iso = ""
         if latest:
             from datetime import datetime
@@ -376,9 +483,10 @@ class DataAssetCatalog:
             asset_id=f"file:{rel}",
             kind="file_dir", location=rel,
             category="quant" if "quant" in rel else classify(rel),
-            # 目录类默认 source（落盘行情是采集目标）；LLM 缓存属运维
-            role=("ops" if "cache" in rel or "connector" in rel else "source"),
-            description=desc or f"目录 {rel}",
+            # 角色优先取 registry 声明（那是唯一事实源）；没有才退回旧启发式。
+            role=declared_role or (
+                "ops" if "cache" in rel or "connector" in rel else "source"),
+            description=desc or declared_desc or f"目录 {rel}",
             size_bytes=total, file_count=n,
             time_column="mtime", latest_time=latest_iso,
             frequency=freq, freshness_hours=fresh_h,
@@ -390,11 +498,67 @@ class DataAssetCatalog:
     # ---------- 全量扫描 + 落库 ----------
 
     def _scan_all_sync(self) -> list[DataAsset]:
-        assets = self._scan_sqlite_sync()
-        for rel in DIR_FREQUENCY:
-            a = self._scan_dir_sync(rel)
-            if a is not None:
-                assets.append(a)
+        """全量扫描：**范围由 registry 决定**（`CHG-0066`）。
+
+        ## 修掉了什么
+
+        原先这里只有一句 `self._scan_sqlite_sync()` —— 它扫的是
+        `self._db_path`（= `settings.sqlite_path`）**一个库**，而
+        `"主库的全部表"` 这句 docstring 让"一个库"看起来像"全部本地数据"。
+        后果（真实报障）：
+
+        | 存储 | 是否进过资产登记表 |
+        |---|---|
+        | 应用库（dev/test/pilot 各一份） | ✅ 唯一被扫的 |
+        | **共享行情仓**（14.36 GiB / 1,542 万行） | ❌ **从未** |
+        | 遗留主库（756 指标 / 199.8 万行） | ❌ **从未** |
+        | 主线缓存（906 MiB） | ❌ **从未** |
+        | 归档库（3.4 GiB） | ❌ **从未** |
+        | 所有目录型存储 | 只有 `DIR_FREQUENCY` 手写的那 4 个 |
+
+        于是"本地到底有哪些数据"这个问题，答案永远是
+        "dev/pilot 那一份应用库" —— 而投资研究要用的行情、宏观、
+        逐股估值全在**没被扫到的库里**。
+        """
+        assets: list[DataAsset] = []
+        try:
+            from src.infrastructure.catalog.data_stores import all_stores
+
+            stores = all_stores()
+        except Exception as exc:  # noqa: BLE001 registry 不可用 → 退回旧行为
+            logger.warning("registry 不可用（%s），资产扫描退回单库 + 手写目录",
+                           exc)
+            assets.extend(self._scan_sqlite_sync())
+            for rel in DIR_FREQUENCY_BY_PATH:
+                a = self._scan_dir_sync(rel)
+                if a is not None:
+                    assets.append(a)
+            return assets
+
+        for s in stores:
+            try:
+                if s.kind == "sqlite":
+                    if not s.exists:
+                        logger.info("资产扫描跳过（库不存在）：%s", s.name)
+                        continue
+                    assets.extend(self._scan_sqlite_sync(str(s.resolved())))
+                elif s.kind == "dir":
+                    a = self._scan_dir_sync(store=s)
+                    if a is not None:
+                        assets.append(a)
+                else:  # file
+                    p = s.resolved()
+                    if p.exists():
+                        assets.append(DataAsset(
+                            asset_id=f"file:{s.name}", kind="file",
+                            location=p.name, category=classify(p.name),
+                            role=s.role, description=s.note[:120],
+                            size_bytes=p.stat().st_size, file_count=1,
+                            frequency="unknown", freshness_hours=24.0,
+                            last_scanned_at=int(time.time() * 1000),
+                            extras={"store": s.name}))
+            except Exception as exc:  # noqa: BLE001 单个存储坏了不阻断其余
+                logger.warning("资产扫描失败 store=%s: %s", s.name, exc)
         return assets
 
     def _upsert_assets_sync(self, assets: list[DataAsset]) -> int:

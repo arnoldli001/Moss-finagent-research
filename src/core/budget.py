@@ -44,10 +44,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -150,7 +152,7 @@ def model_is_priced(model: str,
 
 
 def call_cost_cny(*, provider: str, model: str, tokens_in: int,
-                  tokens_out: int, cache_hit: bool = False,
+                  tokens_out: int, provider_cache_hit: bool = False,
                   prices: dict[str, tuple[float, float, float]] | None = None
                   ) -> float:
     """一次调用的费用（元）。**唯一的计价实现**。
@@ -162,12 +164,35 @@ def call_cost_cny(*, provider: str, model: str, tokens_in: int,
     `CostBudget.record`（在线账本）与运维页的费用统计都调它 ——
     两份计价实现迟早会分叉，而"账本说 3 元、监控页说 5 元"这种矛盾
     会让所有金额都失去可信度。
+
+    ## ★ 参数名为什么是 `provider_cache_hit` 而不是 `cache_hit`（2026-09-30）
+
+    这个参数说的是「**提供商的上下文缓存**命中 ⇒ 输入 token 按更便宜的
+    `input_cache_hit` 单价计」。
+
+    而 LLM 审计（`src/infrastructure/llm/audit.py` @145）里那个**同名字段**
+    `cache_hit` 说的是完全不同的一件事：「**本地响应缓存**命中，这次
+    **根本没有调用提供商**」（`gateway.py` @463–469 命中即 return）。
+
+    两个语义的**代价差一个数量级**：前者是"便宜一点"，后者是"一分钱没花"。
+    原先两边都叫 `cache_hit`，于是运维页把审计字段直接喂进这个参数
+    （`llm_cost.py` 旧版 @189），把**31,233 次没花钱的调用计成了 ¥408.75**，
+    运维页总额因此虚高 65.5% —— 而**两边各自都是对的**，错在名字。
+
+    所以这里**刻意改名**：名字不同，误传就变成 `TypeError`（调用点立刻炸），
+    而不是一个静默偏高的账单。判据
+    `tests/unit/test_llm_cost_accounting.py::test_pricing_cannot_be_fed_the_audit_field`
+    钉住这一点。
+
+    ⚠️ 生产上目前**没有任何调用点**传 `provider_cache_hit=True`：提供商侧
+    缓存命中数还没有被采集。它保留为**扩展点**（DeepSeek 的用法统计里有
+    `prompt_cache_hit_tokens`，接入后在此传入），而不是一个等着被误用的坑。
     """
     if str(provider) != "deepseek":
         return 0.0
     table = model_prices() if prices is None else prices
     hit_rate, miss_rate, out_rate = table.get(str(model), _FALLBACK_PRICE)
-    in_rate = hit_rate if cache_hit else miss_rate
+    in_rate = hit_rate if provider_cache_hit else miss_rate
     return ((int(tokens_in or 0) * in_rate
              + int(tokens_out or 0) * out_rate) / 1_000_000.0)
 
@@ -181,12 +206,20 @@ class CostBudget:
         daily_budget: float,
         model_config_path: str = "configs/models.yaml",
         task_reserve: float = DEFAULT_TASK_RESERVE,
+        ledger_dir: str | Path | None = None,
+        hard_cap_cny: float | None = None,
     ) -> None:
         self._daily = max(0.0, float(daily_budget))
         self._model_config_path = model_config_path
         self._prices = model_prices(model_config_path)
         self._fallback_used = False
         self._task_reserve = max(0.0, float(task_reserve))
+        #: 跨进程当日花费账本。默认**关闭**（直接 `CostBudget(...)` 的形态保持
+        #: 原样，测试与临时实例不受真实账本影响）；生产单例由 `get_budget()`
+        #: 显式传入 `resolve_ledger_dir()` 打开。
+        self._spend = DaySpendLedger(ledger_dir) if ledger_dir else None
+        self._hard_cap = (resolve_hard_cap(self._daily)
+                          if hard_cap_cny is None else max(0.0, float(hard_cap_cny)))
         self._lock = threading.Lock()
         self._ledger = _DayLedger(day=self._today())
 
@@ -213,11 +246,17 @@ class CostBudget:
 
     def record(
         self, *, provider: str, model: str, tokens_in: int, tokens_out: int,
-        cache_hit: bool = False, source: str = "other",
+        provider_cache_hit: bool = False, source: str = "other",
     ) -> float:
-        """记一次真实调用，返回到目前为止的当日累计消耗（元）。
+        """记一次**真实调用**，返回到目前为止的当日累计消耗（元）。
 
         本地模型（ollama）不产生费用，直接返回当前累计。
+
+        ⚠️ 这里**只应该在真的调用了提供商之后**调用 ——
+        本地响应缓存命中（`gateway.py` @463–469 命中即 return）不该进账本，
+        因为它没有产生任何费用。参数名与 `call_cost_cny` 一致地叫
+        `provider_cache_hit`（见那边的说明：它与审计字段 `cache_hit`
+        **不是**同一个东西）。
         """
         if str(provider) != "deepseek":
             return self.used
@@ -226,7 +265,8 @@ class CostBudget:
             logger.debug("模型 %s 未登记价格，使用兜底价", model)
         cost = call_cost_cny(provider=provider, model=model,
                              tokens_in=tokens_in, tokens_out=tokens_out,
-                             cache_hit=cache_hit, prices=self._prices)
+                             provider_cache_hit=provider_cache_hit,
+                             prices=self._prices)
         with self._lock:
             self._rollover_locked()
             self._ledger.spent += cost
@@ -235,12 +275,53 @@ class CostBudget:
             self._ledger.calls += 1
             self._ledger.tokens += int(tokens_in or 0) + int(tokens_out or 0)
             used = self._ledger.used
+        # 跨进程账本：写失败不抛（护栏不是业务前置条件）
+        if self._spend is not None and cost > 0:
+            self._spend.add(cost, source)
         if used >= self._daily > 0:
             logger.warning(
                 "LLM 日预算已用尽：%.4f/%.2f 元（今日 %d 次调用）。"
                 "后续付费调用将被准入层拒绝。分账：%s",
                 used, self._daily, self._ledger.calls, self.snapshot()["by_source"])
         return used
+
+    # ---------- 跨进程硬闸 ----------
+
+    @property
+    def hard_cap(self) -> float:
+        """全局日硬上限（元）；`<=0` = 不限。"""
+        return self._hard_cap
+
+    def day_total(self) -> float:
+        """**全局**（所有进程 + 本进程）当日花费（元）。
+
+        账本没开时退回本进程的 `spent` —— 这个退化必须能被看见，
+        所以 `snapshot()` 里有 `ledger_enabled` 字段（避免把"本进程"读成"全局"）。
+        """
+        own = self.used
+        if self._spend is None:
+            return own
+        return max(own, self._spend.total())
+
+    def hard_cap_exceeded(self) -> bool:
+        return bool(self._hard_cap > 0 and self.day_total() >= self._hard_cap)
+
+    def check_hard_cap(self, source: str = "") -> None:
+        """当日花费达硬上限就抛 `BudgetExhaustedError`。
+
+        与 `reserve_task` 的分工：那个管**在线请求准入**（预扣，防突发）；
+        这个管**批处理/脚本**（它们只记账不拦截，原设计就如此）。
+        所以硬闸必须由批处理入口显式调用 —— `ScriptCostGuard.check_entry`
+        已经接了，新的批处理入口也应照做。
+        """
+        if not self.hard_cap_exceeded():
+            return
+        raise BudgetExhaustedError(
+            f"当日 LLM 花费已达硬上限：{self.day_total():.4f}/"
+            f"{self._hard_cap:.2f} 元（全局，含其它进程）"
+            + (f"，来源={source}" if source else "")
+            + "。\n    · 等跨日自动归零；或调高 MOSS_LLM_DAILY_BUDGET_CNY / "
+              "MOSS_LLM_HARD_CAP_CNY（请确认这是你要的）。")
 
     # ---------- 准入 ----------
 
@@ -256,9 +337,18 @@ class CostBudget:
 
     @property
     def remaining(self) -> float:
+        """还剩多少（元）。**以全局当日花费为准**（账本开着时跨进程）。
+
+        为什么不是 `daily - self.used`：那样 api 进程花的钱 worker 看不到，
+        于是"全局预算"在每个新进程里都变成"整份额度"（见 `DaySpendLedger`）。
+        """
         if self._daily <= 0:
             return float("inf")  # 0 = 不限预算
-        return max(0.0, self._daily - self.used)
+        with self._lock:
+            self._rollover_locked()
+            reserved = self._ledger.reserved
+        spent = self.day_total()
+        return max(0.0, self._daily - spent - reserved)
 
     def can_afford(self, amount: float) -> bool:
         """额度是否够（amount<=0 表示不限预算时恒真）。"""
@@ -271,13 +361,17 @@ class CostBudget:
 
         预扣而不是"事后记账"：并发突发时所有任务都还没产生 token 消耗，
         只看 spent 会集体放行、集体超额（TOCTOU）。预扣把这个窗口关掉。
+
+        ★ 判据用的是**全局**当日花费（含其它进程）：否则 api 进程今天花掉的
+        额度，worker 进程完全看不到（见 `DaySpendLedger`）。
         """
         if self._daily <= 0:
             return True
         need = self._task_reserve
+        global_spent = self.day_total()      # 锁外取：day_total 自己要拿这把锁
         with self._lock:
             self._rollover_locked()
-            if self._ledger.used + need > self._daily:
+            if global_spent + self._ledger.reserved + need > self._daily:
                 return False
             self._ledger.reserved += need
         return True
@@ -303,21 +397,33 @@ class CostBudget:
 
     def snapshot(self) -> dict[str, Any]:
         """当日预算快照（供 /health 与运维页）。"""
+        day_total = self.day_total()
+        hard_cap_exceeded = self.hard_cap_exceeded()
         with self._lock:
             self._rollover_locked()
             led = self._ledger
             by_source = {k: round(v, 4) for k, v in led.by_source.items()}
+            reserved = led.reserved
             return {
                 "day": led.day,
                 "budget_cny": self._daily,
                 "spent_cny": round(led.spent, 4),
                 "reserved_cny": round(led.reserved, 4),
+                # ★ 新增：**全局**当日花费（所有进程）与硬闸状态。
+                #   没有这两个字段，运维页会把"本进程花的"读成"今天花的"。
+                "day_total_cny": round(day_total, 4),
+                "hard_cap_cny": (None if self._hard_cap <= 0
+                                 else round(self._hard_cap, 4)),
+                "hard_cap_exceeded": hard_cap_exceeded,
+                "ledger_enabled": self._spend is not None,
+                "ledger_path": (str(self._spend.path) if self._spend else ""),
+                "ledger_calls": (self._spend.calls() if self._spend else led.calls),
                 "remaining_cny": (
                     None if self._daily <= 0
-                    else round(max(0.0, self._daily - led.used), 4)),
+                    else round(max(0.0, self._daily - day_total - reserved), 4)),
                 "used_pct": (
                     None if self._daily <= 0
-                    else round(min(100.0, led.used / self._daily * 100), 1)),
+                    else round(min(100.0, day_total / self._daily * 100), 1)),
                 "calls": led.calls,
                 "tokens": led.tokens,
                 "by_source": dict(sorted(by_source.items(),
@@ -325,6 +431,183 @@ class CostBudget:
                 "task_reserve_cny": self._task_reserve,
                 "prices_loaded": sorted(self._prices.keys()),
             }
+
+
+# ---------------------------------------------------------------- 跨进程账本
+
+#: 落盘账本目录（覆盖用）。**显式置空字符串 = 关闭落盘**（只有测试/极端隔离才这么用）。
+LEDGER_DIR_ENV = "MOSS_LLM_LEDGER_DIR"
+
+#: 全局日硬上限（元）。不设则等于日预算；`<=0` = 不限。
+HARD_CAP_ENV = "MOSS_LLM_HARD_CAP_CNY"
+
+#: 重新读盘的最小间隔（秒）。见 `DaySpendLedger` 的刷新策略。
+LEDGER_REFRESH_SEC = 5.0
+
+
+class BudgetExhaustedError(RuntimeError):
+    """当日 LLM 花费已达**硬上限**：批处理/脚本必须停下（在线请求另有准入层）。"""
+
+
+class DaySpendLedger:
+    r"""跨进程的**当日** LLM 花费账本（append-only JSONL，一天一个文件）。
+
+    ## 为什么需要它（本轮补的短板）
+
+    `CostBudget` 的账本是**进程内**的（`__init__` 开一个空账本，不落盘也不回读）。
+    后果不是"数字略不准"，而是**"全局日预算硬闸"在跨进程时根本不存在**：
+
+      · api 进程今天已经花了 18/20 元；
+      · worker 进程（跑 4 个重作业）与任何本地脚本**看到的都是 0** ⇒
+        `remaining` = 完整的 20 元 ⇒ 该拦的一个都没拦；
+      · `ScriptCostGuard.check_entry` 那条"日预算剩余不够就拒绝启动"
+        只在**同一进程内先花过钱**时才起作用（原 docstring 就如实写了这点）。
+
+    这一步把"当日花费"变成**一份所有进程共享的事实**。
+
+    ## 形态与取舍
+
+    * 一行一次**真实**调用：`{"ts","day","cny","source","pid"}`，追加写、从不改写；
+    * 只读**当天**那一个文件 ⇒ 跨日自动归零，**不需要清理任务**（旧文件留着当历史）；
+    * 刷新策略：首次读 + **文件大小变化且距上次刷新 ≥ `LEDGER_REFRESH_SEC`**
+      ⇒ 既拿到跨进程可见性，又不会"每次调用都读一遍文件"
+      （监控页是 10 秒刷新的，这里 5 秒足够；`record()` 自己写的那部分直接进内存，
+      不依赖下一次读盘）；
+    * **写失败绝不抛给调用方**：账本是观测与护栏，不是业务前置条件
+      （与 `audit.record` 同一条纪律：钱已经花了，记不下来也不能让调用失败）。
+    """
+
+    def __init__(self, directory: str | Path, *, refresh_sec: float = LEDGER_REFRESH_SEC
+                 ) -> None:
+        self.dir = Path(directory)
+        self.refresh_sec = float(refresh_sec)
+        self._lock = threading.Lock()
+        self._total = 0.0
+        self._calls = 0
+        self._day = ""
+        self._size = -1
+        self._read_at = 0.0
+
+    # ---------- 路径 ----------
+
+    def path_for(self, day: str) -> Path:
+        return self.dir / f"llm_spend-{day}.jsonl"
+
+    @property
+    def path(self) -> Path:
+        return self.path_for(date.today().isoformat())
+
+    # ---------- 读 ----------
+
+    def _read_locked(self, *, force: bool = False) -> None:
+        import time
+
+        day = date.today().isoformat()
+        path = self.path_for(day)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+        fresh_enough = (time.time() - self._read_at) < self.refresh_sec
+        if not force and day == self._day and size == self._size and fresh_enough:
+            return
+        total = 0.0
+        calls = 0
+        if size > 0:
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue            # 单行损坏只跳过它（账本要能自愈）
+                        if str(row.get("day") or day) != day:
+                            continue            # 跨日残留行不算今天
+                        total += float(row.get("cny") or 0.0)
+                        calls += 1
+            except OSError:
+                logger.debug("LLM 花费落盘账本读取失败（按已缓存值继续）", exc_info=True)
+        self._day = day
+        self._size = size
+        self._read_at = time.time()
+        self._total = total
+        self._calls = calls
+
+    def total(self) -> float:
+        """当日**全局**花费（元，所有进程累计）。"""
+        with self._lock:
+            self._read_locked()
+            return self._total
+
+    def calls(self) -> int:
+        with self._lock:
+            self._read_locked()
+            return self._calls
+
+    def add(self, cny: float, source: str = "other") -> float:
+        """追加一条（返回追加后的当日全局累计）。**失败不抛。**"""
+        amount = float(cny)
+        day = date.today().isoformat()
+        line = json.dumps({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "day": day, "cny": round(amount, 6), "source": str(source),
+            "pid": os.getpid(),
+        }, ensure_ascii=False)
+        with self._lock:
+            try:
+                self.dir.mkdir(parents=True, exist_ok=True)
+                with self.path_for(day).open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                logger.debug("LLM 花费落盘账本写入失败（本次只在内存计）", exc_info=True)
+                return self._total
+            # 自己写的部分直接进内存：不等下一次读盘
+            if day != self._day:
+                self._day = day
+                self._total = 0.0
+                self._calls = 0
+            self._total += amount
+            self._calls += 1
+            try:
+                self._size = self.path_for(day).stat().st_size
+            except OSError:
+                self._size = -1
+            return self._total
+
+
+def resolve_ledger_dir() -> Path | None:
+    """落盘账本目录：环境变量优先，否则用数据登记表的 `run_dir`。
+
+    显式设成空串 = **关闭**（返回 None）—— 只有在"必须与真实账本隔离"的
+    测试里才这么做，正常路径不该关。
+    """
+    raw = os.environ.get(LEDGER_DIR_ENV)
+    if raw is not None and not raw.strip():
+        return None
+    if raw:
+        return Path(raw)
+    try:
+        from src.infrastructure.catalog.data_stores import store_rel
+
+        return Path(store_rel("run_dir"))
+    except Exception:  # noqa: BLE001 登记表读不到不该拦住预算护栏
+        logger.debug("run_dir 解析失败，落盘账本关闭", exc_info=True)
+        return None
+
+
+def resolve_hard_cap(daily_budget: float) -> float:
+    """全局日硬上限：环境变量优先，否则等于日预算；`<=0` = 不限。"""
+    raw = os.environ.get(HARD_CAP_ENV)
+    if raw is None or not str(raw).strip():
+        return float(daily_budget)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r 不是数字，按日预算处理", HARD_CAP_ENV, raw)
+        return float(daily_budget)
 
 
 # ---------------------------------------------------------------- 进程单例
@@ -355,10 +638,17 @@ def get_budget() -> CostBudget:
                     model_config_path=getattr(
                         settings, "model_config_path", "configs/models.yaml"),
                     task_reserve=reserve,
+                    # ★ 生产路径**打开**跨进程账本：这是"全局日预算"成立的前提。
+                    #   解析不出来（登记表异常）时退回 None = 关闭，
+                    #   而 `snapshot()["ledger_enabled"]` 会让这件事可见。
+                    ledger_dir=resolve_ledger_dir(),
                 )
+                snap = _budget.snapshot()
                 logger.info(
-                    "LLM 日预算护栏已启用：%.2f 元/天，单任务预扣 %.2f 元",
-                    daily, reserve)
+                    "LLM 日预算护栏已启用：%.2f 元/天，单任务预扣 %.2f 元；"
+                    "全局硬上限 %.2f 元；跨进程账本=%s",
+                    daily, reserve, _budget.hard_cap,
+                    snap["ledger_path"] or "关闭")
     return _budget
 
 
@@ -448,6 +738,17 @@ class ScriptCostGuard:
     用增量而不是绝对额还有个好处：跨日（账本 `_rollover_locked` 重置）
     不会出现负数或误判。
 
+    ## ★ 2026-10-01：跨进程那一半补上了（`DaySpendLedger`）
+
+    上面那段"别指望它去查 Web 进程的账"**已经不再成立**：
+    `CostBudget` 现在带一份落盘的**当日全局**花费账本（生产单例由
+    `get_budget()` 打开），所以：
+
+    - `check_entry` 的日预算那条看的是**全局**剩余（api / worker / 其它脚本
+      一起算）；
+    - 新增 `BudgetExhaustedError` 硬闸：全局花费达 `hard_cap` 时**入口直接拒绝**；
+    - `spent()` 仍然是本进程增量（它回答的是"本次跑了多少"，语义不变）。
+
     ## 用法
 
         guard = ScriptCostGuard("mainline_relevance")
@@ -497,7 +798,13 @@ class ScriptCostGuard:
     # ---------- 判 ----------
 
     def check_entry(self, estimate_cny: float) -> None:
-        """入口检查；不通过抛 `ScriptCostError`（调用方打印后非零退出）。"""
+        """入口检查；不通过抛 `ScriptCostError`（调用方打印后非零退出）。
+
+        ★ 2026-10-01：日预算那一条现在看的是**全局**当日花费（含 api/worker
+        进程与其它脚本）—— 原先只看本进程，新起的脚本看到的是"整份额度"，
+        于是"全局日预算"在脚本入口等于不存在（见 `DaySpendLedger`）。
+        另有 `BudgetExhaustedError` 的硬闸：已达 `hard_cap` 直接拒绝。
+        """
         if not self.enabled:
             return
         estimate = max(0.0, float(estimate_cny))
@@ -510,11 +817,16 @@ class ScriptCostGuard:
                 f"    · 确实要跑全量：显式设 "
                 f"MOSS_SCRIPT_COST_CAP_CNY={estimate:.0f} 再执行"
                 f"（这会把上限抬到 {estimate:.0f} 元，请确认这是你要的）。")
+        self._budget.check_hard_cap(self.name)      # 全局硬闸（跨进程）
         remaining = float(self._budget.remaining)
         if remaining < estimate:
+            total = self._budget.day_total()
             raise ScriptCostError(
                 f"{self.name}：本次预计 {estimate:.2f} 元 > 今日 LLM 预算剩余 "
                 f"{remaining:.2f} 元 —— 已拒绝启动。\n"
+                f"    · 今日**全局**已花 {total:.4f} 元"
+                f"（含 api / worker 进程与其它脚本；账本="
+                f"{'开' if self._budget.snapshot()['ledger_enabled'] else '关'}）；\n"
                 f"    · 等账本跨日重置（本地日期）后重跑；或调高 "
                 f"MOSS_LLM_DAILY_BUDGET_CNY。")
 
@@ -530,8 +842,12 @@ class ScriptCostGuard:
 
 
 __all__ = [
+    "HARD_CAP_ENV",
+    "LEDGER_DIR_ENV",
+    "BudgetExhaustedError",
     "CostBudget",
     "DEFAULT_TASK_RESERVE",
+    "DaySpendLedger",
     "PER_CALL_ESTIMATE_CNY",
     "SCRIPT_COST_CAP_CNY",
     "ScriptCostError",
@@ -543,5 +859,7 @@ __all__ = [
     "model_prices",
     "reset_budget_for_test",
     "reset_prices_cache",
+    "resolve_hard_cap",
+    "resolve_ledger_dir",
     "script_cost_cap",
 ]

@@ -51,6 +51,10 @@ from typing import Any, Final
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import (  # noqa: E402
+    store_rel,
+)
+
 #: 单任务云端 token 预算（输入+输出）。超了降级本地。
 CLOUD_TOKEN_BUDGET_PER_TASK: Final = 8000
 
@@ -152,7 +156,7 @@ def _cloud_calls_today() -> int:
         import json
         from pathlib import Path
 
-        p = Path("data/audit/llm_audit.jsonl")
+        p = Path(store_rel("llm_audit") + "/llm_audit.jsonl")
         if not p.exists():
             return 0
         from datetime import datetime

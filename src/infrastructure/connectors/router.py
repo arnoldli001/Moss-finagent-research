@@ -45,7 +45,12 @@ logger = logging.getLogger(__name__)
 # 指标前缀→TTL 秒（不匹配任何前缀的指标不缓存）：
 _TTL_BY_PREFIX: list[tuple[tuple[str, ...], int]] = [
     # 月频宏观（含美国月频/FOMC利率）：24h
-    (("CPI", "PPI", "M2", "社融",
+    #
+    # ★ 2026-09-29：补入 `PMI` / `GDP`（含 `PMI:制造业` / `PMI:非制造业` / `GDP:同比`）。
+    #   新采的指标若只补了连接器、不补这张表，`_cache_ttl()` 返回 None →
+    #   **同进程内每次都重新打网络**：PMI/GDP 一次分析要 5 个 id × ~0.15s。
+    #   两张表（TTL 与 `_DB_QUERY_PREFIXES`）是**成对**的，缺一张就少一层短路。
+    (("CPI", "PPI", "M2", "社融", "PMI", "GDP",
       "us_cpi", "us_core", "us_nonfarm", "us_fed_rate",
       "us_pce", "us_unemployment"), 24 * 3600),
     # 估值/行业PE/双创板块估值：日频盘后拉取，12h
@@ -94,6 +99,10 @@ _DB_SKIP_PREFIXES: tuple[str, ...] = (
 # 这些指标查 DB + 过期判定，避免重复拉网络
 _DB_QUERY_PREFIXES: tuple[str, ...] = (
     "CPI", "PPI", "M2", "社融",
+    # ★ 2026-09-29 补入：与上面 `_TTL_BY_PREFIX` 的月频宏观那条**成对**。
+    #   不补的后果：`_should_query_db()` 判 False → 库里明明有上一季/上一月的
+    #   官方值，每次分析仍要穿透去联网（并多付一次 0.15s × 5 个 id）。
+    "PMI", "GDP",
     "US_CPI", "US_CORE", "US_NONFARM",
     "us_fed_rate", "us_pce", "us_unemployment",  # FOMC月频/美国月频，补齐缺口
     # FedWatch/FRED 政策利率：日频且**外网受限**，查库收益最大 ——
@@ -230,6 +239,42 @@ def _is_db_fresh(points: list[DataPoint], indicator: str,
     return fe.confidence >= 0.4  # lagging 以上（含）都可用
 
 
+#: 错误消息里「已注册」清单最多显示几条（见 `_registered_hint`）。
+_KNOWN_HINT_MAX = 12
+
+
+def _registered_hint(known: Any) -> str:
+    """错误消息里的「已注册」清单 —— **去重 + 截断**。
+
+    为什么必须截断（2026-09-29 用户报障）：完整清单实测 **~150 条**，
+    被整份贴进「部分节点异常」面板 ⇒ 用户看到的是一屏**注册表**，
+    而真正的原因（"这个指标名没有被任何连接器支持"）被淹没在里面 ——
+    **报错的价值是让人一眼定性，不是把内部结构倒出来**。
+
+    同时**去重**：原先清单里有重复项（`stock_close` 出现 4 次、
+    `fed:rate_prob:next` 2 次），会让人误以为"注册了很多东西"。
+    """
+    items = list(dict.fromkeys(str(x) for x in known or ()))
+    head = items[:_KNOWN_HINT_MAX]
+    tail = (f" …（还有 {len(items) - len(head)} 条，共 {len(items)} 条；"
+            "完整清单见连接器 `get_capabilities()['indicators']`）"
+            if len(items) > len(head) else "")
+    return ", ".join(head) + tail
+
+
+def _no_support_error(indicator: str, known: Any) -> DataFetchError:
+    """「无连接器支持这个指标名」的**统一**报错（两处调用共用一份文案）。
+
+    文案里点明**下一步动作**：指标名要么拼错了、要么缺后缀
+    （个股类要 `:{code}`、行业类要 `:{行业名}`）——
+    否则用户只看到"取不到数据"，而真相是**契约不满足**。
+    """
+    return DataFetchError(
+        f"无连接器支持指标 {indicator}；已注册: {_registered_hint(known)}"
+        f"（提示：个股类指标要带 6 位代码后缀如 `PE(TTM):600036`，"
+        f"行业类要带行业名如 `行业拥挤度:银行`）")
+
+
 class ConnectorRouter(BaseConnector):
     """有序路由：supports命中者按顺序尝试，DataFetchError触发故障转移。
 
@@ -289,19 +334,36 @@ class ConnectorRouter(BaseConnector):
         return [connector for connector, supports in self._routes
                 if supports(indicator)]
 
+    def supports(self, indicator: str) -> bool:
+        """★ 聚合判据：链上**有没有连接器认这个指标**（单一实现 = `_matched`）。
+
+        为什么要有这个公开方法：`gap_queue.route_gap()` 要回答"取数侧有没有人
+        接得住它"，才能决定一条缺口该交给**既有 `catalog_*` 批采作业**，
+        还是交给 **A19（LLM 生成连接器）**。判据必须在**一处**实现 ——
+        本项目实测过"同一个判断两份实现"的后果（白名单写三处、只改一处
+        ⇒ 情报 5 个端点对所有人 403）。
+
+        ⚠️ 与 `fetch()` 的区别：这里只问"认不认"，**不试网络、不花时间、
+        不产生冷却**（所以适合在队列消费前批量调用）。
+        """
+        return bool(self._matched(str(indicator or "").strip()))
+
+    def _known_indicators(self) -> list[str]:
+        """所有连接器声明的指标模板（**唯一**来源：`get_capabilities()`）。
+
+        抽出来是为了让两处报错（`_resolve` 与 `fetch`）**共用一份口径**：
+        原先两处各写一遍列表推导，改一处漏一处必然漂移
+        （本项目登记过多次"同一个判断两份实现"的后果）。
+        """
+        return [ind for connector, _ in self._routes
+                for ind in connector.get_capabilities().get("indicators", [])]
+
     def _resolve(self, indicator: str) -> BaseConnector:
         """首个命中连接器（测试/诊断用；取数请走fetch以获得故障转移）。"""
         matched = self._matched(indicator)
         if matched:
             return matched[0]
-        known = [
-            ind
-            for connector, _ in self._routes
-            for ind in connector.get_capabilities().get("indicators", [])
-        ]
-        raise DataFetchError(
-            f"无连接器支持指标 {indicator}；已注册: {', '.join(map(str, known))}"
-        )
+        raise _no_support_error(indicator, self._known_indicators())
 
     def _cache_ttl(self, indicator: str) -> int | None:
         """该指标应该缓存多少秒；返回 None 表示不缓存。"""
@@ -339,6 +401,7 @@ class ConnectorRouter(BaseConnector):
         end_date: str | None,
         *,
         min_date: str | None = None,
+        deadline_sec: float | None = None,
     ) -> list[DataPoint]:
         """三级短路：TTL 缓存 → 本地 DB → connector 链。
 
@@ -445,7 +508,8 @@ class ConnectorRouter(BaseConnector):
                 points = await self._fetch_uncached(
                     indicator, start_date, end_date,
                     min_expected_date=_later_date(
-                        db_newest if ranged else None, demanded))
+                        db_newest if ranged else None, demanded),
+                    deadline_sec=deadline_sec)
             except DataFetchError:
                 # 网络全挂时用本地 DB 兜底（有数据总比让面板整块缺口强）。
                 # `demanded` 也要走这条：调用方点名要更新的数据、而网络又挂了，
@@ -548,15 +612,23 @@ class ConnectorRouter(BaseConnector):
         end_date: str | None = None,
         *,
         min_date: str | None = None,
+        deadline_sec: float | None = None,
     ) -> list[DataPoint]:
         """取数（TTL 缓存 → 本地 DB → connector 链，见 `_cached_fetch`）。
 
         `min_date`：调用方声明的**新鲜度下限**（`YYYY-MM-DD`）——
         "最新一根不得早于这一天"。日K做T链路用它表达"盘中我要的是**当天**的
         形成中bar，只到昨天的源不算数"。不传时行为与原来完全一致。
+
+        `deadline_sec`：**防撞钟**（用户 2026-09-29 口径：「10 秒找不到就自动终止，
+        防止撞钟过度等待」）。**只有交互路径传它**（A01 采集 / A17 的 `query_data`）；
+        定时作业与预热路径**不传** ⇒ 行为与原来逐字一致 ——
+        重活正是要在那里做，掐掉它们会让"预热养缓存"永远养不起来。
+        取值依据见 `src/core/intel_limits.py::QUERY_DEADLINE_SEC` 的实测表。
         """
         return await self._cached_fetch(
-            indicator, start_date, end_date, min_date=min_date)
+            indicator, start_date, end_date, min_date=min_date,
+            deadline_sec=deadline_sec)
 
     async def _fetch_uncached(
         self,
@@ -565,6 +637,7 @@ class ConnectorRouter(BaseConnector):
         end_date: str | None,
         *,
         min_expected_date: str | None = None,
+        deadline_sec: float | None = None,
     ) -> list[DataPoint]:
         """按顺序尝试命中的连接器。
 
@@ -599,16 +672,35 @@ class ConnectorRouter(BaseConnector):
         """
         matched = self._matched(indicator)
         if not matched:
-            known = [
-                ind
-                for connector, _ in self._routes
-                for ind in connector.get_capabilities().get("indicators", [])
-            ]
-            raise DataFetchError(
-                f"无连接器支持指标 {indicator}；已注册: {', '.join(map(str, known))}"
+            raise _no_support_error(indicator, self._known_indicators())
+
+        # ★★ 2026-09-30：**换源覆盖层优先**（用户口径：「找到后就**更新数据源地址**」）。
+        #   换源流水线（`catalog/source_reroute.py`）在"联网兜底也找不到"时探测替代源，
+        #   口径校验通过后把 `promoted` 的源写进覆盖层；这里让它**排在链首**。
+        #   三条约束（都不是洁癖）：
+        #     ① 只对 `promoted` 生效 —— `shadow` 是观察期，改顺序就等于直接切换，
+        #        影子期那套纪律（先并行比对再切）就白写了；
+        #     ② **纯重排，不新增也不删除** —— 覆盖层里指定的源若不在 `matched` 里，
+        #        顺序不变（绝不把"指定的源"当成"唯一可用的源"，否则一次误判就会
+        #        把本来能用的源全挡掉）；
+        #     ③ 覆盖层读失败 ⇒ 按空处理（增强坏了不该拖垮取数）。
+        try:
+            from src.infrastructure.catalog.source_reroute import (
+                preferred_source,
             )
 
+            pref = preferred_source(indicator)
+            if pref:
+                matched.sort(key=lambda c: 0 if type(c).__name__ == pref else 1)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("换源覆盖层不可用（按原顺序取数）: %s", exc)
+
         now_mono = time.monotonic()
+        #: 防撞钟：整条指标查询的墙钟预算（`None` = 不限时，定时作业/预热路径走这支）
+        deadline_at = (
+            now_mono + float(deadline_sec)
+            if deadline_sec is not None and float(deadline_sec) > 0 else None)
+        timed_out = False
         errors: list[str] = []
         real_attempted = False
         all_in_cooldown = True  # 是否所有匹配连接器都在冷却期
@@ -657,9 +749,41 @@ class ConnectorRouter(BaseConnector):
                     self._stale_floor.pop(connector.source_name, None)
 
             all_in_cooldown = False
+            # ★ 防撞钟：本跳只剩这么多时间（用户口径：10 秒找不到就别再等）
+            if deadline_at is not None:
+                remaining = deadline_at - time.monotonic()
+                if remaining <= 0:
+                    from src.core.intel_limits import deadline_reason
+
+                    reason = deadline_reason(indicator, float(deadline_sec or 0))
+                    logger.warning("%s（%s 未试）", reason, connector.source_name)
+                    errors.append(f"[防撞钟] {reason}")
+                    timed_out = True
+                    break
+            else:
+                remaining = None
             try:
-                points = await connector.fetch(
-                    indicator, start_date, end_date)
+                if remaining is not None:
+                    points = await asyncio.wait_for(
+                        connector.fetch(indicator, start_date, end_date),
+                        timeout=remaining)
+                else:
+                    points = await connector.fetch(
+                        indicator, start_date, end_date)
+            except (asyncio.TimeoutError, TimeoutError):
+                from src.core.intel_limits import deadline_reason
+
+                reason = deadline_reason(indicator, float(deadline_sec or 0))
+                logger.warning("指标 %s 在源 %s 上触发防撞钟（本跳预算 %.1fs）：%s",
+                               indicator, connector.source_name, remaining or 0, reason)
+                errors.append(f"[{connector.source_name}] {reason}")
+                # ⚠️ **不记失败冷却**：超时是"这次太慢"，不是"这个源坏了"；
+                #    记冷却会把一个只是慢的源永久踢出链（那就成了"修一个坏一个"）。
+                #    但要**终止本指标的剩余尝试** —— 预算已经用完，再试也只是继续等。
+                if not simulated:
+                    real_attempted = True
+                timed_out = True
+                break
             except DataFetchError as exc:
                 errors.append(f"[{connector.source_name}] {exc}")
                 # 记录失败冷却
@@ -723,7 +847,7 @@ class ConnectorRouter(BaseConnector):
             return points
 
         # 所有源都失败或在冷却中
-        if all_in_cooldown and not real_attempted:
+        if all_in_cooldown and not real_attempted and not timed_out:
             # 全部在冷却期 → 返回空列表而非 raise（让 _storage_fallback 接管）
             logger.info(
                 "指标 %s 所有匹配源均在失败冷却中，跳过网络请求",

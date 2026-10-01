@@ -635,7 +635,12 @@ def _default_db_path() -> Path | None:
         configured = os.environ.get("MOSS_DB_PATH", "").strip()
         if configured:
             return Path(configured)
-        return Path("data/moss_finagent.db")
+        # 路径从 registry 取（同一个 key 不再写两处）。
+        # ⚠️ **行为与原先一致**：仍指遗留主库 —— "概念池该写哪个库"属
+        # A7 类口径决策（PRD §18.4），不由本轮单方面改（CHG-0069）。
+        from src.infrastructure.catalog.data_stores import store_rel
+
+        return Path(store_rel("legacy_main"))
     except Exception:  # noqa: BLE001
         return None
 

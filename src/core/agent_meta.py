@@ -36,6 +36,10 @@ _FALLBACK: dict[str, dict[str, str]] = {
     "A14_consumer": {"name": "消费行业Agent", "layer": "industry"},
     "A15_cyclical": {"name": "周期行业Agent", "layer": "industry"},
     "A16_pharma": {"name": "医药行业Agent", "layer": "industry"},
+    # ★ 2026-09-29：兜底行业 Agent（用户要求「做个兜底行业的 agent」）。
+    #   名字里必须带"兜底"，否则用户看到它输出"银行行业"结论时会以为
+    #   系统有一个专门的银行 Agent，而实际是这一个在服务任意行业。
+    "A20_generic_industry": {"name": "兜底行业Agent", "layer": "industry"},
     "A17_recommend": {"name": "投研建议Agent", "layer": "decision"},
     "A18_audit": {"name": "逻辑审计Agent", "layer": "audit"},
 }

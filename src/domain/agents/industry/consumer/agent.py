@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.domain.agents.analysis.unlock_teaching import render_unlock_teaching
 from src.domain.agents.industry.base import IndustryAgentBase
 
 
@@ -16,6 +17,10 @@ class ConsumerIndustryAgent(IndustryAgentBase):
     capabilities_names = ("consumer_demand_analysis", "channel_inventory_tracking")
 
     system_prompt = (
+
+        render_unlock_teaching("A14_consumer")
+
+        +
         "资深消费行业分析师，熟悉食品饮料/家电/零售/可选消费。"
         "区分必选/可选需求韧性；关注渠道去库存进度与品牌提价能力。"
     )

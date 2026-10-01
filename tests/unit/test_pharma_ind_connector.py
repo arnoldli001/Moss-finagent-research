@@ -195,7 +195,11 @@ async def test_fetch_point_metadata(monkeypatch):
     assert p.extra["frequency"] == "monthly"
     assert p.extra["count_basis"] == "acceptance_number"
     assert "受理号件数" in p.extra["count_note"]
+    # ★ 口径与局限必须出现在 **source_name** 上（LLM 上下文只拼 source_name、
+    # 不展开 extra）：既要说明是"受理号件数"，也要提示"当月不满月"。
     assert "CDE" in p.source_name
+    assert "受理号件数" in p.source_name
+    assert "不满月" in p.source_name
 
 
 async def test_snapshot_fallback_when_api_fails(monkeypatch):

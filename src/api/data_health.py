@@ -28,6 +28,10 @@ from src.intraday.source_health import SOURCE_CAPABILITIES
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import (  # noqa: E402
+    store_rel,
+)
+
 # 健康度缓存：这份内容是分钟级信息，而组装它要遍历 3.5 万个分区清单 + 查仓库九表。
 # 缓存 5 分钟 → 连续打开页面/多标签页不再重复付这份成本（实测首次 4.5 秒、命中 0ms）。
 _CACHE_TTL = 300.0
@@ -43,7 +47,10 @@ _CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 #: 就会在接下来 10 分钟里把本地 14GB 的 SQLite 仓库报成"MySQL 不可用"，
 #: 而选股/健康度/同步判定全都据此降级 —— 静默、且看起来像环境坏了。
 #: 现在 `tests/conftest.py` 有一条 autouse fixture 把它指到临时目录。
-_HEALTH_CACHE_DIR = os.environ.get("MOSS_HEALTH_CACHE_DIR", "data/quant")
+#: 健康度缓存的落盘目录。默认 = **分区根的父目录**（从 registry 现算，
+#: 不再写字面量）—— 它同时也是 `warehouse_stats.json` 的落点（`CHG-0071`）。
+_HEALTH_CACHE_DIR = os.environ.get("MOSS_HEALTH_CACHE_DIR") or (
+    Path(store_rel("tushare_partitions")).parent.as_posix())
 
 
 def _warehouse_stats_file() -> Path:
@@ -65,9 +72,12 @@ _TUSHARE_TTL = 1800.0
 _TUSHARE_REFRESHING = False
 
 
-def _tushare_health(root: str = "data/quant/tushare",
+def _tushare_health(root: str | None = None,
                     universe: str = "a_share",
                     *, force: bool = False) -> dict[str, Any]:
+    # 默认从 registry 取（CHG-0071）；签名改成 `None` 后**必须补回落**。
+    if root is None:
+        root = store_rel("tushare_partitions")
     """Tushare 健康度：token 可用性 + 各数据集覆盖 + 新鲜度（滞后交易日数）。
 
     ## 为什么要落盘缓存 + 后台刷新（2026-09-17 实测）
@@ -198,8 +208,11 @@ def _intraday_source_health(runtime: Any) -> dict[str, Any]:
     return snapshot
 
 
-def _warehouse_health(root: str = "data/quant/tushare",
+def _warehouse_health(root: str | None = None,
                       *, force: bool = False) -> dict[str, Any]:
+    # 默认从 registry 取（CHG-0071）；签名改成 `None` 后**必须补回落**。
+    if root is None:
+        root = store_rel("tushare_partitions")
     """本地数据仓库健康度：方言、连接、各表行数/时间跨度。
 
     单独列出来是因为它和"数据源"不是一回事：Tushare 是**采集**入口，
@@ -420,9 +433,11 @@ def _build_data_health_uncached(runtime: Any, *, force: bool = False) -> dict[st
             "且短期内无法恢复，放在任何位置之前都只会贡献一次必然失败的 xtquant "
             "连接等待（实测 4~5s）。将来权限恢复时置 QMT_ENABLED=1 并把 "
             "configs/intraday.yaml 的 data.qmt_enabled 设为 true 即可在链尾兜底。",
-            "日线链：AkShare → 腾讯 → Tushare → baostock → 本地CSV → [QMT开关]。"
-            "停更的本地 QMT 导出 CSV 已退到在线源之后（它停在 2026-08-31，"
-            "排在前面会把更新的在线源挡在门外）；QMT 在**全链最末**。",
+            "日线链：AkShare → 腾讯 → Tushare → baostock → [本地CSV开关] → [QMT开关]。"
+            "后两跳**默认都关闭**：LOCAL_QUOTE_DIR 已留空（2026-09-28，原指向的目录是"
+            "本机 MariaDB datadir，其 SH/SZ 两个 QMT CSV 子目录已删除），"
+            "QMT_ENABLED=0。所以**当前实际生效的是前四跳（全在线）**；"
+            "将来重新导出 QMT CSV 时把 LOCAL_QUOTE_DIR 指向专用导出目录即可恢复第五跳。",
             "Tushare 只有 EOD 数据（当日 15:00~16:00 后入库），"
             "盘中调用返回空表，因此不参与做T实时链路，仅作盘后校验与因子源。",
             "回测取数优先走本地仓库（索引命中 5~20ms/截面），"

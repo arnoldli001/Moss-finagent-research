@@ -144,10 +144,14 @@ class LLMCache:
 
     def __init__(
         self,
-        cache_dir: str = "data/llm_cache",
+        cache_dir: str | None = None,
         ttl_hours: float = 24.0,
         semantic_threshold: float = 0.85,
     ) -> None:
+        if cache_dir is None:      # 默认从 registry 取（CHG-0071）
+            from src.infrastructure.catalog.data_stores import store_rel
+
+            cache_dir = store_rel("llm_cache")
         self._dir = Path(cache_dir)
         self._ttl_seconds = ttl_hours * 3600
         self._threshold = semantic_threshold

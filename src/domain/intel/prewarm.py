@@ -70,7 +70,22 @@ logger = logging.getLogger(__name__)
 #: 而进程重启会让内存里那份归零 —— 于是每次重启都立刻重抓一次，2 小时的
 #: 间隔形同虚设（本仓的"内存态节流"已经因为这个原因踩过坑，见
 #: `intraday/notify_dedup` 的模块 docstring）。
-DEFAULT_STATE_PATH = Path("data/cache/intel/prewarm_state.json")
+# 路径从 registry 取（`CHG-0069`）：下面三条都落在已声明的 `intel_cache` 之下，
+# 原先各自写死一遍 —— 同一个目录三个定义，改一处必漏两处。
+def _cache_file(name: str) -> Path:
+    """`intel_cache` 下的一个文件（registry 是唯一事实源）。
+
+    ⚠️ **返回的是相对仓库根的路径**（与改动前的字面量逐字一致）：
+    换成绝对路径虽然更"稳"，但会把"忘记隔离就写到生产"的概率**提高** ——
+    相对路径至少还依赖 CWD，绝对路径永远命中真实仓库。
+    本项目已因这两个文件的生产污染写过专门的夹具（见 `tests/conftest.py`）。
+    """
+    from src.infrastructure.catalog.data_stores import PROJECT_ROOT, resolve_store
+
+    return (resolve_store("intel_cache") / name).relative_to(PROJECT_ROOT)
+
+
+DEFAULT_STATE_PATH = _cache_file("prewarm_state.json")
 
 #: 上次成功重建的 **payload 快照**（落盘），供**下次启动**热加载。
 #:
@@ -85,7 +100,7 @@ DEFAULT_STATE_PATH = Path("data/cache/intel/prewarm_state.json")
 #
 # 尺寸实测 **~220 KB**（60 条 items + heat），一次原子写，代价可忽略。
 # 这与做T自选池的 `hot_cache`、主线热快照是同一套"落盘热加载"范式。
-DEFAULT_PAYLOAD_PATH = Path("data/cache/intel/feed_payload.json")
+DEFAULT_PAYLOAD_PATH = _cache_file("feed_payload.json")
 
 _ISO = "%Y-%m-%dT%H:%M:%S"
 
@@ -294,7 +309,7 @@ def is_weekday(moment: datetime | None = None) -> bool:
 # ======================================================================
 
 #: 慢聚合的落盘位置（按名字分文件；两份互不覆盖）。
-DEFAULT_SLOW_DIR = Path("data/cache/intel")
+DEFAULT_SLOW_DIR = _cache_file("")
 
 #: 这批缓存的**版本号**。改了 payload 结构就 +1 —— 否则启动时会热加载
 #: 一份旧结构，前端读到缺字段后在渲染期才炸（比"没有缓存"难查得多）。

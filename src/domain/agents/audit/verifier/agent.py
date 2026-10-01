@@ -13,13 +13,29 @@ from src.core.schemas import Confidence, TraceStep
 from src.infrastructure.repositories.audit_chain import AuditChainWriter, ChainVerifier
 
 
+def _audit_file(name: str) -> str:
+    """审计文件路径 —— 从 registry 的 `llm_audit` 派生（`CHG-0071`）。
+
+    原先这里是两条写死的相对路径（`data/audit/llm_audit.jsonl` /
+    `data/audit/audit_chain.jsonl`）—— 主实例与隔离档本来该落在**不同**目录，
+    写死等于让隔离档的审计混进主实例的哈希链。
+    """
+    from src.infrastructure.catalog.data_stores import store_rel
+
+    return store_rel("llm_audit") + "/" + name
+
+
 class AuditPayload(BaseModel):
     """A18输入：本次投研任务的产出摘要。"""
 
     trace_id: str = ""
     agent_outputs: list[dict[str, Any]] = Field(default_factory=list)
-    llm_audit_path: str = "data/audit/llm_audit.jsonl"
-    chain_path: str = "data/audit/audit_chain.jsonl"
+    # 两条默认路径都从 registry 取（CHG-0071）。用 `default_factory` 而不是
+    # 字面量：默认值必须在**实例化时**求值，否则隔离档会静默用主实例布局。
+    llm_audit_path: str = Field(
+        default_factory=lambda: _audit_file("llm_audit.jsonl"))
+    chain_path: str = Field(
+        default_factory=lambda: _audit_file("audit_chain.jsonl"))
     seal_report: bool = True
     """是否把本次审计结论追加进哈希链（封存）"""
 

@@ -277,8 +277,29 @@ def iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
-def iso_in(seconds: float) -> str:
-    return iso(utc_now() + timedelta(seconds=seconds))
+def iso_in(seconds: float, *, now: datetime | None = None) -> str:
+    """`now + seconds` 的 ISO 串。
+
+    ## ★ 为什么必须能传 `now`（2026-10-01 修，缺陷类别：同一逻辑时刻被采样多次）
+
+    原实现**每次调用都自己取一次当前时间**。看起来无害，但凡是"一行数据里
+    有多个由当前时间派生的列"的地方，它就让**同一行内部可能来自不同的时刻**：
+
+      · `create_session`：INSERT 用的 `idle_expires_at` 与**返回给调用方**的
+        `SessionRecord.idle_expires_at` 是**两次独立采样** ⇒ 跨秒时会差 1 秒，
+        于是"刚写进去的那一行"与"函数返回的对象"**对不上**（违反读己之写）；
+      · `touch_session`：`last_seen_at` 与 `idle_expires_at` 两次采样 ⇒
+        极端情况下 `idle_expires_at` 会落在 `last_seen_at` **之前**（自相矛盾的行）；
+      · 更早的症状是**判据在满载下偶发红灯**（`test_session_slides_but_absolute_cap_
+        never_extends`）：产品行为是对的，但"返回对象"与"库里的值"跨了秒。
+
+    所以入口改成"**一次采样、处处派生**"：调用方先 `base = utc_now()`，
+    再把同一个 `base` 传给所有派生列。判据
+    `tests/unit/test_single_clock_sample.py` 用一个**每调用一次就前进一秒**的
+    充气时钟把这个类钉死 —— 不需要 sleep、不依赖负载，
+    原来的实现必然红。
+    """
+    return iso((now or utc_now()) + timedelta(seconds=seconds))
 
 
 def parse_iso(value: str | None) -> datetime | None:
@@ -602,8 +623,13 @@ class AuthSqliteRepository:
     因此不需要跨线程共享连接；WAL 由主库统一开启。
     """
 
-    def __init__(self, db_path: str = "data/moss_finagent.db") -> None:
-        self._db_path = db_path
+    def __init__(self, db_path: str | None = None) -> None:
+        # 默认取**本环境**的应用库 —— `AGENTS.md`：默认值即护栏，安全的一侧做成默认。
+        # 原先写死 `data/moss_finagent.db`（三档隔离**共用**的遗留主库）：
+        # 一次漏传 `db_path` 就让隔离档写到共享库上，而没有任何地方声明过（CHG-0069）。
+        from src.infrastructure.catalog.data_stores import default_app_db
+
+        self._db_path = db_path or default_app_db()
         self._cache = _Cache()
 
     # ---------------- 连接与建表 ----------------
@@ -980,26 +1006,31 @@ class AuthSqliteRepository:
         （IP 维度的限流另有一层，两者互补）。
         """
         self._ready()
+        # 一次采样：`locked_until` / `last_failed_at`（必要时还有
+        # `password_updated_at`）必须是同一时刻 ⇒ 锁定时长与"最后一次失败"
+        # 不会互相矛盾（见 `iso_in` 的 docstring）。
+        base = utc_now()
+        now = iso(base)
         with self._connect() as conn:
             row = conn.execute(
                 f"SELECT failed_attempts FROM {TABLE_CREDENTIAL} WHERE user_id = ?",
                 (user_id,)).fetchone()
             current = int(row["failed_attempts"]) + 1 if row is not None else 1
-            locked = iso_in(lock_seconds) if current >= threshold else None
+            locked = iso_in(lock_seconds, now=base) if current >= threshold else None
             if row is None:
                 conn.execute(
                     f"INSERT INTO {TABLE_CREDENTIAL} "
                     f"(user_id, password_hash, password_updated_at, failed_attempts,"
                     f" locked_until, last_failed_at, last_failed_ip) "
                     f"VALUES (?, '', ?, ?, ?, ?, ?)",
-                    (user_id, iso(utc_now()), current, locked,
-                     iso(utc_now()), ip))
+                    (user_id, now, current, locked,
+                     now, ip))
             else:
                 conn.execute(
                     f"UPDATE {TABLE_CREDENTIAL} SET failed_attempts = ?, "
                     f"locked_until = ?, last_failed_at = ?, last_failed_ip = ? "
                     f"WHERE user_id = ?",
-                    (current, locked, iso(utc_now()), ip, user_id))
+                    (current, locked, now, ip, user_id))
         return current
 
     def clear_login_failures(self, user_id: str) -> None:
@@ -1120,7 +1151,13 @@ class AuthSqliteRepository:
         device_label: str = "", device_id: str = "", user_agent: str = "",
         ip: str = "",
     ) -> SessionRecord:
-        now = iso(utc_now())
+        # ★ 一次采样：`created_at` / `last_seen_at` / `idle_expires_at` /
+        #   `absolute_expires_at` **必须来自同一个时刻**，否则"刚写入的行"
+        #   与"返回给调用方的对象"会跨秒对不上（见 `iso_in` 的 docstring）。
+        base = utc_now()
+        now = iso(base)
+        idle_at = iso_in(idle_seconds, now=base)
+        absolute_at = iso_in(absolute_seconds, now=base)
         self._ready()
         with self._connect() as conn:
             conn.execute(
@@ -1130,14 +1167,14 @@ class AuthSqliteRepository:
                 f" absolute_expires_at, device_label, device_id, user_agent, ip) "
                 f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (session_id, user_id, tenant_id, console, access_jti,
-                 refresh_hash, now, now, iso_in(idle_seconds),
-                 iso_in(absolute_seconds), device_label, device_id,
+                 refresh_hash, now, now, idle_at,
+                 absolute_at, device_label, device_id,
                  user_agent, ip))
         return SessionRecord(
             session_id=session_id, user_id=user_id, tenant_id=tenant_id,
             access_jti=access_jti, created_at=now, last_seen_at=now,
-            idle_expires_at=iso_in(idle_seconds),
-            absolute_expires_at=iso_in(absolute_seconds),
+            idle_expires_at=idle_at,
+            absolute_expires_at=absolute_at,
             console=console, device_label=device_label, ip=ip)
 
     def get_session(self, session_id: str) -> SessionRecord | None:
@@ -1154,13 +1191,18 @@ class AuthSqliteRepository:
         """滑动续期：**只推 `idle_expires_at`，绝不延长 `absolute_expires_at`**。
 
         这一条是"会话永不失效"与"用户每 30 分钟被踢"之间的分界线（§8.6.11.3）。
+
+        ⚠️ `last_seen_at` 与 `idle_expires_at` 必须来自**同一个时刻**：
+        两次独立采样会让 `idle_expires_at` 有可能落在 `last_seen_at` 之前
+        （一行自相矛盾的会话），跨秒即可复现（见 `iso_in` 的 docstring）。
         """
         self._ready()
+        base = utc_now()
         with self._connect() as conn:
             conn.execute(
                 f"UPDATE {TABLE_SESSION} SET last_seen_at = ?, "
                 f"idle_expires_at = ? WHERE session_id = ? AND revoked_at IS NULL",
-                (iso(utc_now()), iso_in(idle_seconds), session_id))
+                (iso(base), iso_in(idle_seconds, now=base), session_id))
         return self.get_session(session_id)
 
     def revoke_session(self, session_id: str, reason: str) -> bool:
@@ -1218,7 +1260,9 @@ class AuthSqliteRepository:
         """落一条验证码（**存哈希**）。同一 (scene,target) 的旧码立即作废。"""
         digest = sha256_hex(f"{scene}:{target}")
         self._ready()
-        now = iso(utc_now())
+        # 一次采样：作废旧码的 `used_at` 与新码的 `sent_at` 是同一个时刻
+        base = utc_now()
+        now = iso(base)
         with self._connect() as conn:
             conn.execute(
                 f"UPDATE {TABLE_VCODE} SET used_at = ? "
@@ -1230,7 +1274,7 @@ class AuthSqliteRepository:
                 f" max_attempts, sent_at, expires_at, request_ip, send_channel) "
                 f"VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
                 (scene, digest, sha256_hex(code), purpose_user, max_attempts,
-                 now, iso_in(ttl_seconds), request_ip, channel))
+                 now, iso_in(ttl_seconds, now=base), request_ip, channel))
             return int(cursor.lastrowid or 0)
 
     def latest_code(self, scene: str, target: str) -> VerifyCodeRecord | None:
@@ -1303,14 +1347,17 @@ class AuthSqliteRepository:
         token = new_token()
         family = family_id or new_token(8)
         self._ready()
+        # 一次采样：`issued_at` 与 `expires_at` 必须是同一个时刻派生的
+        # （否则 `expires_at` 可能比 `issued_at + days` 早/晚 1 秒）
+        base = utc_now()
         with self._connect() as conn:
             conn.execute(
                 f"INSERT INTO {TABLE_REMEMBER} "
                 f"(family_id, token_hash, user_id, tenant_id, issued_at, "
                 f" expires_at, rotated_from, device_label, user_agent, ip) "
                 f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (family, sha256_hex(token), user_id, tenant_id, iso(utc_now()),
-                 iso_in(days * 86400), rotated_from or None, device_label,
+                (family, sha256_hex(token), user_id, tenant_id, iso(base),
+                 iso_in(days * 86400, now=base), rotated_from or None, device_label,
                  user_agent, ip))
         return token, family
 
@@ -1387,17 +1434,21 @@ class AuthSqliteRepository:
         """发一次性重置令牌（**必须先过验证码** —— `verified_at` 是必填语义）。"""
         token = new_token()
         self._ready()
+        # 一次采样：作废旧令牌的 `used_at`、新令牌的 `verified_at` 与
+        # `expires_at` 三者必须是同一个时刻（否则 TTL 会漂 1 秒）
+        base = utc_now()
+        now = iso(base)
         with self._connect() as conn:
             conn.execute(
                 f"UPDATE {TABLE_RESET} SET used_at = ? "
                 f"WHERE user_id = ? AND used_at IS NULL",
-                (iso(utc_now()), user_id))
+                (now, user_id))
             conn.execute(
                 f"INSERT INTO {TABLE_RESET} "
                 f"(user_id, token_hash, channel, verified_at, expires_at, "
                 f" request_ip) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, sha256_hex(token), channel, iso(utc_now()),
-                 iso_in(ttl_seconds), request_ip))
+                (user_id, sha256_hex(token), channel, now,
+                 iso_in(ttl_seconds, now=base), request_ip))
         return token
 
     def consume_reset(self, token: str) -> tuple[str | None, str]:

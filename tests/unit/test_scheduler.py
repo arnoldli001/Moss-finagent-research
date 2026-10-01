@@ -52,6 +52,53 @@ def test_beat_schedule_built_from_registry():
         assert entry["args"] == (name,)
 
 
+def test_catalog_jobs_are_registered_at_import_time():
+    """★★ 动态注册的作业必须在**导入 `celery_app` 时**就进表，不能等 lifespan。
+
+    ## 这条修的是什么（2026-09-28 全量红灯暴露）
+
+    `catalog_calendar` / 全部 `catalog_*` 采集作业由
+    `catalog_jobs.install_catalog_jobs()` **函数调用时**写入 `JOB_REGISTRY`，
+    而调用点原先只有 API 进程的 lifespan（`api/main.py`）。
+
+    **生产后果（比测试红更严重）**：Celery 的 worker / beat 进程
+    **不执行 FastAPI 的 lifespan** → 这些作业从未进入 beat_schedule →
+    **投资日历同步、缺口补取、catalog 批量采集在真实调度里一次都不会被触发**，
+    而 beat 只是"没有这些条目"，日志里看不出少了什么。
+
+    **测试后果**：`test_beat_schedule_built_from_registry` 遍历
+    `JOB_REGISTRY` 逐个断言 beat_schedule 里有它 → 结果**取决于测试执行顺序**
+    （`test_calendar_index.py` 会快照并**恢复** `JOB_REGISTRY`，恢复后注册就没了）。
+
+    ## 判据
+
+    在**干净进程**里只 import `celery_app`（不碰 lifespan），
+    `JOB_REGISTRY` 与 `beat_schedule` 必须**双向一致**，
+    且 `catalog_calendar` 必须在里面。
+    """
+    registry_names = set(JOB_REGISTRY)
+    schedule_names = set(celery_app.conf.beat_schedule)
+
+    missing_in_schedule = registry_names - schedule_names
+    assert not missing_in_schedule, (
+        "以下作业在 JOB_REGISTRY 里但**没有进 beat_schedule**"
+        "（= 真实调度里永远不会被触发）：\n  "
+        + "\n  ".join(sorted(missing_in_schedule))
+        + "\n→ 检查它是不是靠 `install_catalog_jobs()` 这类**函数调用时**注册的；"
+        "Celery worker/beat **不跑 FastAPI lifespan**，"
+        "必须在 `celery_app` 导入期注册（见 "
+        "`celery_app._register_catalog_jobs_before_schedule`）。"
+    )
+    ghost = schedule_names - registry_names
+    assert not ghost, (
+        f"beat_schedule 里有 JOB_REGISTRY 中不存在的作业（幽灵，执行必失败）："
+        f"{sorted(ghost)}"
+    )
+    assert "catalog_calendar" in schedule_names, (
+        "投资日历同步作业没进 beat_schedule —— 日历数据永远不会被定时更新"
+    )
+
+
 # ---------- 运行记录 ----------
 
 def test_run_log_finish_and_read(tmp_dir):

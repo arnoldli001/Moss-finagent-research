@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from src.domain.agents.analysis.unlock_teaching import render_unlock_teaching
 from src.domain.agents.industry.base import IndustryAgentBase
 
 
@@ -16,6 +17,10 @@ class CyclicalIndustryAgent(IndustryAgentBase):
     capabilities_names = ("inventory_cycle_analysis", "supply_gap_pricing")
 
     system_prompt = (
+
+        render_unlock_teaching("A15_cyclical")
+
+        +
         "资深周期行业分析师，熟悉煤炭/有色/钢铁/化工/建材。"
         "库存四阶段定位须结合PPI与库存方向交叉验证；警惕估值反身性："
         "高盈利低PE常为周期顶部，勿以低PE论便宜。"

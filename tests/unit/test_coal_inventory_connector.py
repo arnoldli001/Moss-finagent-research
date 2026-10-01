@@ -120,7 +120,9 @@ async def test_fetch_builds_verified_real_points(monkeypatch):
     assert "发电企业" in p.extra["scope"]
     # 样本口径 ≠ 全国统调/重点电厂，必须随数据披露
     assert "样本" in p.extra["scope_note"]
-    assert "CECI" in p.source_name or "中电联" in p.source_name
+    # ★ 而且必须出现在 **source_name** 上：行业 Agent 的 `_format_with_fresh`
+    # 只把 source_name 拼进 LLM 上下文、不展开 extra —— 口径只写 extra 等于没披露。
+    assert "中电联" in p.source_name and "样本" in p.source_name
 
 
 async def test_fetch_respects_date_bounds(monkeypatch):

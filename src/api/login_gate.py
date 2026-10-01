@@ -61,14 +61,19 @@ logger = logging.getLogger(__name__)
 #: `"/"` 必须在里面：前端是单页应用，登录页本身就是 `/` 这一份 HTML
 #: —— 把它拦掉会变成"要登录才能打开登录页"的死锁。
 #: `/index.html` 同理（有些浏览器会显式请求它）。
+#:
+#: ★ **2026-09-30 更正（`CHG-0128`）**：这里曾写着
+#: ~~`/api/v1/metrics/health`~~（注释："既有公开探针，保持兼容"）与
+#: ~~`/api/v1/metrics/ready`~~ —— **两者都没有路由**（实测 404）。
+#: "既有"是不成立的：它们只存在于设计文档的计划里。已删除。
+#: 免登录白名单与 `tenancy_middleware._PUBLIC_PATHS` **必须是同一套事实**，
+#: 现在有一致性判据盯着（`tests/unit/test_public_path_contract.py`）。
 PUBLIC_EXACT: frozenset[str] = frozenset({
     "/",
     "/index.html",
     "/favicon.ico",
     "/healthz",
     "/api/v1/health/live",      # 0 I/O 存活探针：登录页的连接状态条要用
-    "/api/v1/metrics/health",   # 既有公开探针，保持兼容
-    "/api/v1/metrics/ready",
 })
 
 #: 免登录路径前缀。

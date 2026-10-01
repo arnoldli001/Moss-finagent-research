@@ -4,7 +4,10 @@ import json
 
 from src.core.models import AgentInput
 from src.domain.agents.analysis import ComplianceAnalysisAgent
-from src.domain.agents.analysis.compliance.logic import evaluate_compliance
+from src.domain.agents.analysis.compliance.logic import (
+    FLAG_UNMEASURED,
+    evaluate_compliance,
+)
 from src.orchestration.supervisor import plan_run
 
 
@@ -51,10 +54,29 @@ REPLY = {
 
 # ---------- 规则引擎 ----------
 
-def test_no_signals_level_none():
+def test_no_rule_input_is_unmeasured_not_none():
+    """★ 2026-09-29 语义修正：一个规则族都没量到 → 「未量到」，**不是**「无」。
+
+    旧断言是 `compliance_level_calc == "无"` +
+    `compliance_flags == ["未见明显合规风险信号"]` —— 那是把「什么都不知道」
+    渲染成一张体检合格证。而实测当时 6 个族**一个生产者都没有**，
+    也就是线上一直走的就是这支：`PE` 这种非合规指标**不构成合规判据的输入**。
+
+    新的正反面分别由本函数与 `test_measured_clean_still_reports_none` 覆盖。
+    """
     r = evaluate_compliance([_dp("PE", 18.0)])
-    assert r["compliance_level_calc"] == "无"
+    assert r["compliance_level_calc"] == "未量到"
     assert r["severe_flag_count"] == 0
+    assert r["compliance_measured"] is False
+    assert "未见明显合规风险信号" not in r["compliance_flags"]
+    assert r["compliance_flags"] == [FLAG_UNMEASURED]
+
+
+def test_measured_clean_still_reports_none():
+    """★ 反面：真的量到了、值没超阈值 → 仍然报「无」（别把假绿换成假红）。"""
+    r = evaluate_compliance([_dp("商誉占净资产", 1.0)])
+    assert r["compliance_level_calc"] == "无"
+    assert r["compliance_measured"] is True
     assert r["compliance_flags"] == ["未见明显合规风险信号"]
 
 
@@ -111,10 +133,17 @@ def test_ordinary_litigation_moderate():
 
 
 def test_non_litigation_events_ignored():
+    """非诉讼/监管事件对合规判定没有信息量 → 等级是「未量到」，不是「无」。
+
+    旧断言写的是「无」：一条"发布新品/正面"事件既不是合规旗标，
+    也不构成合规判据的输入 —— 把它算成输入会让合格证从新地方长出来。
+    """
     events = [{"event_type": "product", "direction": "positive",
                "evidence_quote": "发布新品", "confidence": 0.9}]
     r = evaluate_compliance([], events=events)
-    assert r["compliance_level_calc"] == "无"
+    assert r["compliance_level_calc"] == "未量到"
+    assert r["compliance_measured"] is False
+    assert r["compliance_flags"] == [FLAG_UNMEASURED]
 
 
 def test_three_normal_flags_escalate_to_high():
@@ -172,20 +201,23 @@ async def test_agent_empty_data_skips_llm():
     assert out.result["model_used"] == "rule-only"  # 标记来自规则
 
 
-async def test_agent_calc_fields_attached_even_clean():
-    """★ 2026-09-27 第八轮：合规规则给出「无风险」时不再调 LLM（纯规则）。
+async def test_agent_calc_fields_attached_even_unmeasured():
+    """★ 2026-09-29 语义修正：规则**未获得输入**时走纯规则路径，但输出是「未量到」。
 
-    旧测试有 `_dp("PE", 12.0)` + REPLY，期望 LLM 被调 + 合规等级"无"。
-    新行为：合规规则已能判定「无」，直接走纯规则路径（更省 token）。
-    期望 result 仍含 `compliance_level_calc == "无"` 与占位 flag 列表。
+    旧测试名 `..._even_clean`、断言 `compliance_level_calc == "无"` +
+    `compliance_flags_calc == ["未见明显合规风险信号"]`。而 `PE` 不是合规判据的输入，
+    所以那一版实际上在断言"用 PE 推出没有合规风险" —— 一张伪造的合格证。
+    仍不调 LLM（两条分支都省 18,500 tokens/轮），但结果与溯源字段必须分开。
     """
     gw = FakeGateway(REPLY)
     out = await ComplianceAnalysisAgent(gw).execute(_make_input({
-        "data_points": [_dp("PE", 12.0)],  # 非合规指标，规则给出"无"
+        "data_points": [_dp("PE", 12.0)],  # 非合规指标 → 规则未获得输入
     }))
-    assert gw.calls == []  # ★ 新行为：纯规则不调 LLM
-    assert out.result["compliance_level_calc"] == "无"
-    assert out.result["compliance_flags_calc"] == ["未见明显合规风险信号"]
+    assert gw.calls == []  # ★ 纯规则不调 LLM
+    assert out.result["compliance_level_calc"] == "未量到"
+    assert out.result["compliance_flags_calc"] == [FLAG_UNMEASURED]
+    assert out.result["compliance_measured"] is False
+    assert out.result["_rule_only_reason"] == "no_input"
     assert out.result["model_used"] == "rule-only"
 
 

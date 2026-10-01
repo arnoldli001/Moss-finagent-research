@@ -26,6 +26,10 @@ from src.core.errors import (
 )
 from src.quant.dataset_store import DEFAULT_ROOT, DatasetStore
 
+from src.infrastructure.catalog.data_stores import (  # noqa: E402
+    store_rel,
+)
+
 router = APIRouter(prefix="/api/v1/quant", tags=["quant"])
 
 # 仓库根目录（子进程执行器的 cwd，保证 `-m src.quant.screen_runner` 可导入）
@@ -172,10 +176,10 @@ def _collect_data_status(universe: str, root: str) -> dict:
                 "first": coverage["first"],
                 "last": coverage["last"],
             })
-    fundamentals = Path("data/quant/fundamentals")
+    fundamentals = Path(store_rel("quant_fundamentals"))
     ak_share_periods = (len(list(fundamentals.glob("performance_*.csv.gz")))
                         if fundamentals.exists() else 0)
-    prices = Path("data/quant/prices")
+    prices = Path(store_rel("quant_prices"))
     qmt_codes = len(list(prices.glob("*.csv.gz"))) if prices.exists() else 0
     # 仓库层（回测实际读的那一层）：与 CSV 缓存分开报，否则"数据有多少"
     # 会混成两个数说不清 —— CSV 分区是采集落地，库是查询层。

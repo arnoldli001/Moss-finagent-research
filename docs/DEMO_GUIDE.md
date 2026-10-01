@@ -25,7 +25,7 @@ start http://127.0.0.1:8100
 
 | 检查 | 命令 | 期望 |
 |---|---|---|
-| 服务活着 | `curl http://127.0.0.1:8100/api/v1/metrics/health` | 200 |
+| 服务活着 | `curl http://127.0.0.1:8100/healthz` | 200 |
 | 数据源状态 | 工作台左上「数据源健康」 | 至少 2 个源绿 |
 | 有选股结果 | `curl "http://127.0.0.1:8100/api/v1/auction_select/today?trade_date=20260918"` | 有 `picked` |
 

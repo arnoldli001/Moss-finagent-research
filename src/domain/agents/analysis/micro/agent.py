@@ -5,6 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from src.domain.agents.analysis.base import AnalysisAgentBase, AnalysisPayload
+from src.domain.agents.analysis.platform_data_teaching import (
+    render_platform_data_teaching,
+)
+from src.domain.agents.analysis.unlock_teaching import render_unlock_teaching
 
 
 def _find_value(payload: AnalysisPayload, keyword: str) -> float | None:
@@ -52,8 +56,16 @@ class MicroAnalysisAgent(AnalysisAgentBase):
     context_max_periods = 60
 
     system_prompt = (
+
+        render_unlock_teaching("A10_micro")
+
+        +
         "资深股票分析师。依据个股数据点与本地估值参考做个股深度研究。估值以本地计算为准，"
         "禁止另编数值。护城河须逐项覆盖品牌/技术/成本/网络效应/转换成本五维并打分(0-10)。"
+        # ★ 2026-09-29：平台自有数据八族的**使用口径**（估值水位/概念拥挤度/
+        #   主线告警/个股告警/解禁计划）。缺这一块 = 数据进了上下文但模型不知道
+        #   那是信号（AGENTS.md 那条"最后一层"）。
+        + render_platform_data_teaching("A10_micro")
     )
 
     def __init__(self, gateway, agent_id: str = "A10_micro",

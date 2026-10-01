@@ -6,7 +6,7 @@
   - `src/infrastructure/llm/audit.py`（随行落盘 `path` / `tenant_source`）
   - `src/domain/platform/llm_cost.py`（归属映射 + 聚合）
 
-## 要钉死的五件事
+## 要钉死的六件事
 
 1. **归属精确优先**：有 `path` 就按路径映射（事实）；没有才按 agent 名推断，
    并且**必须把"这是推断"标出来** —— 不然管理员会把估算当账单。
@@ -14,9 +14,17 @@
 3. **按租户**：会话身份优先于 tenancy Principal（后者生产上是
    `local/local-dev` 的 dev-bypass 假身份 —— 实测 50764 条访问审计全是它）。
 4. **计价只有一份实现**：在线账本（`CostBudget`）与事后统计共用
-   `call_cost_cny`，两处金额不会对不上。
+   `call_cost_cny`。
+   ⚠️ **但"共用同一个函数"不等于"口径一致"**（2026-09-30 实测推翻）：
+   账本只在**真的调用了提供商之后**记账，而运维页遍历的是**审计行**，
+   里面混着"本地缓存命中、根本没调提供商"的那些。两者同名不同义 ⇒ 见第 6 条。
 5. **未登记价格的模型要能看见**：`deepseek-v4-flash`（旧名）实测 309 次，
    金额只能估算，面板必须显示这一点。
+6. **★ 两个 `cache_hit` 必须分开**：审计字段 `cache_hit` = **本地响应缓存**命中
+   （没有请求提供商 ⇒ **¥0**）；计价参数（现名 `provider_cache_hit`）=
+   **提供商的上下文缓存**命中（便宜一点，但**不是免费**）。
+   实测 53,354 行审计里 31,233 行（58.5%）是前者，旧实现把它们计成 ¥408.75，
+   运维页总额虚高 65.5%。修法 = 参数改名（误配变 `TypeError`）+ 聚合按语义分流。
 """
 
 from __future__ import annotations
@@ -46,13 +54,16 @@ from src.domain.platform.llm_cost import (
 def _row(*, ts: str = "", path: str = "", agent_id: str = "A17_recommend",
          provider: str = "deepseek", model: str = "deepseek-flash",
          tokens_in: int = 0, tokens_out: int = 0, tenant: str = "",
-         user: str = "", source: str = "session") -> dict:
+         user: str = "", source: str = "session", cached: bool = False) -> dict:
     return {
         "ts": ts or datetime.now().isoformat(timespec="seconds"),
         "agent_id": agent_id, "provider": provider, "model": model,
         "tokens_in": tokens_in, "tokens_out": tokens_out,
         "tenant_id": tenant, "user_id": user, "tenant_source": source,
         "path": path,
+        # `cache_hit` 是**审计字段**：本地响应缓存命中（没有请求提供商）。
+        "cache_hit": cached,
+        "cache_kind": "exact" if cached else None,
     }
 
 
@@ -132,6 +143,113 @@ def test_call_cost_matches_the_budget_ledger() -> None:
 def test_local_models_are_free_not_cheap() -> None:
     assert call_cost_cny(provider="ollama", model="qwen3:8b",
                          tokens_in=10_000, tokens_out=10_000) == 0.0
+
+
+# ======================================================================
+# 二之二、★★ 两个 `cache_hit`：本地缓存命中不产生费用（2026-09-30 收口）
+# ======================================================================
+
+def test_cached_rows_are_not_charged() -> None:
+    """★★ 本地响应缓存命中 = **没有请求提供商** ⇒ 金额必须是 0。
+
+    现场：`gateway.py` @463–469 命中即 `return`，既不请求提供商、
+    也不执行 @655 的 `get_budget().record(...)` —— 所以账本记 ¥0 是**对的**。
+    错的是运维页：它遍历审计行，把审计字段 `cache_hit` 喂给了计价参数的
+    `cache_hit`（语义 = 提供商上下文缓存命中，便宜但**不免费**）。
+    实测 31,233 行被计 ¥408.75 ⇒ 总额虚高 65.5%。
+    """
+    heavy = _row(tokens_in=1_000_000, tokens_out=2_000_000, cached=True)
+    cost = aggregate_llm_cost([heavy])
+    assert cost["calls"] == 1, "用量要照记（它确实被请求过一次）"
+    assert cost["cached_calls"] == 1
+    assert cost["paid_calls"] == 0, "没花钱的调用不该计进「计费调用」"
+    assert cost["total_cny"] == 0.0
+    assert cost["by_feature"][0]["cny"] == 0.0
+    assert cost["by_tenant"][0]["cny"] == 0.0
+    assert cost["by_day"][-1]["cny"] == 0.0
+
+
+def test_avoided_cost_is_a_counterfactual_not_a_bill() -> None:
+    """省下的钱要**单列**，不能混进"花了多少"（否则把好事记成坏事）。"""
+    hit, miss, out = model_prices()["deepseek-flash"]
+    row = _row(tokens_in=1_000_000, tokens_out=2_000_000, cached=True)
+    cost = aggregate_llm_cost([row])
+    assert cost["avoided_cny"] == pytest.approx(
+        1_000_000 * miss / 1e6 + 2_000_000 * out / 1e6)
+    assert cost["total_cny"] == 0.0, "反事实金额**绝不**能进账单"
+    notes = " ".join(cost_basis_notes(cost))
+    assert "缓存" in notes and "反事实" in notes, "口径说明必须讲清它不是账单"
+    _ = hit
+
+
+def test_cached_and_real_calls_are_counted_separately() -> None:
+    """同一批行里，真调用照价计、缓存命中计 0 —— 两者的钱不能互相污染。"""
+    real = _row(tokens_in=1000, tokens_out=2000)
+    cached = _row(tokens_in=1_000_000, tokens_out=2_000_000, cached=True)
+    cost = aggregate_llm_cost([real, cached])
+    assert cost["calls"] == 2 and cost["paid_calls"] == 1
+    assert cost["cached_calls"] == 1
+    assert cost["total_cny"] == pytest.approx(
+        call_cost_cny(provider="deepseek", model="deepseek-flash",
+                      tokens_in=1000, tokens_out=2000))
+
+
+def test_aggregate_total_matches_the_ledger_for_real_calls() -> None:
+    """★ 真调用上账本与运维页必须一致 —— 这才是"共用同一个函数"的真正含义。
+
+    这条与上面两条合起来才完整：**同一批行**里，缓存行两边都是 0，
+    真调用行两边逐分相同。只测其中一半，正是这个缺陷当初漏网的原因。
+    """
+    rows = [_row(tokens_in=1200, tokens_out=3400),
+            _row(tokens_in=10, tokens_out=20, model="deepseek-v4-pro"),
+            _row(tokens_in=1_000_000, tokens_out=2_000_000, cached=True)]
+    cost = aggregate_llm_cost(rows)
+
+    budget = CostBudget(daily_budget=1000.0)
+    ledger = 0.0
+    for r in rows:
+        if r["cache_hit"]:
+            continue          # 本地缓存命中：gateway 根本走不到记账那一步
+        before = budget.used
+        budget.record(provider=r["provider"], model=r["model"],
+                      tokens_in=r["tokens_in"], tokens_out=r["tokens_out"])
+        ledger += budget.used - before
+    # ★ 唯一的允许差异是**显示取整**：`aggregate_llm_cost` 对金额做 4 位小数
+    #   取整（0.0001 元 = 0.01 分，`llm_cost.rnd()`）。所以判据写成
+    #   「运维页 == 账本按同一精度取整」而不是给一个宽容差 ——
+    #   容差会掩盖语义错配，而这里要抓的错配量级是 65%。
+    assert cost["total_cny"] == round(ledger, 4)
+    assert ledger > 0, "这条自证要求样本真的产生了费用（否则等于没测）"
+
+
+def test_pricing_cannot_be_fed_the_audit_field() -> None:
+    """★★ 参数改名**就是判据**：旧的 `cache_hit=` 必须传不进去。
+
+    这类缺陷（"同名不同义 ⇒ 静默错配"）光修一次是不够的 ——
+    下一个人看到 `cache_hit` 还会再传一次。把参数改名为
+    `provider_cache_hit` 之后，误配会立刻变成 `TypeError`：
+    **把静默错误升级成显式崩溃，是能被机器强制的部分。**
+    """
+    with pytest.raises(TypeError):
+        call_cost_cny(provider="deepseek", model="deepseek-flash",
+                      tokens_in=1, tokens_out=1,
+                      cache_hit=True)  # type: ignore[call-arg]
+
+
+def test_the_cache_judge_can_actually_detect_the_defect() -> None:
+    """★★ 判据自证：把**旧的错算法**就地重现，它必须给出不同的答案。
+
+    没有这一条，上面几条断言在"`aggregate_llm_cost` 恰好对缓存行也返回 0"
+    的实现下会**假绿**（本项目纪律：一条从没红过的判据要先怀疑它坏了）。
+    """
+    row = _row(tokens_in=1_000_000, tokens_out=2_000_000, cached=True)
+    buggy = call_cost_cny(provider=row["provider"], model=row["model"],
+                          tokens_in=row["tokens_in"],
+                          tokens_out=row["tokens_out"],
+                          provider_cache_hit=True)   # ← 旧实现喂的就是这个语义
+    assert buggy > 0, "旧算法连这个都算不出钱的话，这条自证本身没意义"
+    assert aggregate_llm_cost([row])["total_cny"] == 0.0
+    assert buggy != aggregate_llm_cost([row])["total_cny"]
 
 
 def test_unpriced_model_is_estimated_and_flagged() -> None:

@@ -130,15 +130,27 @@ class CachedNewsFetcher:
 
     async def fetch_news(self, code: str, limit: int | None = None
                          ) -> list[dict[str, Any]]:
+        """`limit=None` = **用被包装者的默认值**，**不要**把 None 透传下去。
+
+        ★ 2026-09-30（`CHG-0135`）实测线上：
+        `TypeError: '>' not supported between instances of 'NoneType' and 'int'`
+        —— 就在这条透传上。`None` 一路传到 `stock_news._build_url` 的
+        `max(1, limit)`，而 `max(1, None)` 在 Python 里是**比较**，直接抛；
+        表现是"个股新闻整条取不到"，而根因只是**一个参数的默认值语义**。
+        所以这里显式区分"没给"与"给了具体值"（`**kwargs` 省略 vs 传入）。
+        """
         key = self.stock_key(code)
+        kwargs = {} if limit is None else {"limit": limit}
         return await self._fetch(
             key, "stock",
-            lambda: self._primary.fetch_news(code, limit=limit))
+            lambda: self._primary.fetch_news(code, **kwargs))
 
     async def fetch_topic_news(
         self, keywords: list[str], limit: int | None = None
     ) -> list[dict[str, Any]]:
+        """同上（`CHG-0135`）：`None` 不透传。"""
         key = self.topic_key(keywords)
+        kwargs = {} if limit is None else {"limit": limit}
         return await self._fetch(
             key, "topic",
-            lambda: self._primary.fetch_topic_news(keywords, limit=limit))
+            lambda: self._primary.fetch_topic_news(keywords, **kwargs))

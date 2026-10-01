@@ -57,8 +57,25 @@ from src.core.errors import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATABASE = "moss_quant"
-DEFAULT_ROOT = "data/quant/tushare"
-DEFAULT_SQLITE_PATH = "data/quant/warehouse.db"
+def _rel(name: str, fallback_is_missing: bool = True) -> str:
+    """从 registry 取相对路径（`CHG-0069`）。registry 不可用时返回空串。"""
+    from src.infrastructure.catalog.data_stores import store_rel
+
+    return store_rel(name)
+
+
+DEFAULT_ROOT = _rel("tushare_partitions")
+DEFAULT_SQLITE_PATH = _rel("warehouse")
+
+
+def _warehouse_writer() -> str:
+    """登记表里行情仓的写者环境（错误消息里要给出**可照抄**的命令）。"""
+    try:
+        from src.infrastructure.catalog.data_stores import get_store
+
+        return get_store("warehouse").writer
+    except Exception:  # noqa: BLE001 登记表不可用不该影响报错本身
+        return "main"
 
 # 数据集 → (表名, 去重键, 日期列)
 DATASET_TABLES: dict[str, tuple[str, tuple[str, ...], str]] = {
@@ -310,6 +327,84 @@ class QuantWarehouse:
         self.universe = universe
         self._engine: Any = None
         self._tables: dict[str, Any] = {}
+        #: 写权限裁决缓存（`write_decision()`）。哨兵值而不是 `None`：
+        #: `None` 是"与登记表无关的路径"这个**有效结论**，不能被当成"还没算"。
+        self._write_decision: Any = "unset"
+
+    # ---------- 写权限归属（CHG-0087） ----------
+
+    def _registered_store(self) -> str:
+        """本实例指向的是哪条**登记过的**存储（`""` = 与登记表无关的路径）。
+
+        ## 为什么必须比对路径，而不是无条件套用生产口径
+
+        `WarehouseConfig.from_env(root=...)` 会**跟着 root 走**（自定义 root 时
+        用同级目录的库）—— 测试、回测、脚本都用这条路径造自己的临时仓库。
+        如果无条件按"本环境能不能写 `warehouse`"裁决，那些临时库会一起被拒，
+        等于用一个生产口径误伤所有隔离场景。
+
+        所以只在**确实指向登记表里那条 `warehouse`** 时才裁决。
+        """
+        if self.config.dialect != "sqlite":
+            # MySQL/PG 走环境变量显式配置，不存在"两个实例共用一个文件"的问题；
+            # 那边的写权限由账号本身表达（且本项目的行情仓就是 SQLite）。
+            return ""
+        prefix = "sqlite:///"
+        url = self.config.url or ""
+        if not url.startswith(prefix):
+            return ""
+        try:
+            from src.infrastructure.catalog.data_stores import store_path
+
+            mine = Path(url[len(prefix):]).resolve()
+            theirs = Path(store_path("warehouse")).resolve()
+        except Exception as exc:  # noqa: BLE001 registry 读不到不该让查询失败
+            logger.debug("写权限归属判定跳过（登记表不可用）：%s",
+                         brief(exc, BRIEF_TIGHT))
+            return ""
+        return "warehouse" if mine == theirs else ""
+
+    def write_decision(self) -> Any:
+        """本实例写这个仓库的裁决（`None` = 与登记表无关的路径）。**结果缓存**。"""
+        if getattr(self, "_write_decision", "unset") != "unset":
+            return self._write_decision
+        name = self._registered_store()
+        decision = None
+        if name:
+            from src.infrastructure.catalog.data_stores import writable_here
+
+            decision = writable_here(name)
+        self._write_decision = decision
+        return decision
+
+    def writable_here(self) -> bool:
+        """本实例**能否写**这个仓库（口径未裁定时按"能"= 保持原行为）。"""
+        decision = self.write_decision()
+        return True if decision is None else (decision.allowed or not decision.decided)
+
+    def assert_writable(self) -> None:
+        """不能写就**立刻拒**，并说清"为什么、谁是写者、去哪改"。
+
+        ⚠️ 这道显式检查的价值是**消息**，不是**拦截力度** ——
+        真正的拦截在 `engine()` 里（`PRAGMA query_only=1`，覆盖全部写路径，
+        包括 `StrategyArchive` / `StrategyCaseStore` 那些我没逐个加判断的地方）。
+        SQLite 自己那句 `attempt to write a readonly database`
+        **不会告诉你谁是写者、也不会告诉你去哪改**，那正是本项目最怕的
+        "看得见失败、看不出原因"。
+        """
+        decision = self.write_decision()
+        if decision is None or decision.allowed or not decision.decided:
+            return
+        from src.infrastructure.catalog.data_stores import store_rel
+
+        raise WarehouseError(
+            f"本实例没有行情仓（{store_rel('warehouse')}）的写权限，已拒绝写入。"
+            f"原因：{decision.reason}。"
+            "只读是**有意**的（同一个 SQLite 文件只允许一个写者）；读取不受影响。"
+            "确实需要在这里写（手工补数 / 离线脚本）时，让本进程**声明自己是"
+            "写者**再跑，例如："
+            f"  MOSS_ENV={_warehouse_writer()} uv run python <脚本>"
+            "（改长期归属则改 configs/data_stores.yaml 的 warehouse.writer）")
 
     # ---------- 连接 ----------
 
@@ -349,11 +444,12 @@ class QuantWarehouse:
         self._engine = create_engine(self.config.url, future=True,
                                      pool_pre_ping=True)
         if self.config.dialect == "sqlite":
-            self._tune_sqlite(self._engine, event)
+            self._tune_sqlite(self._engine, event,
+                              read_only=not self.writable_here())
         return self._engine
 
     @staticmethod
-    def _tune_sqlite(engine: Any, event: Any) -> None:
+    def _tune_sqlite(engine: Any, event: Any, *, read_only: bool = False) -> None:
         """SQLite 连接调优（实测宽表扫描快 ~12%）。
 
         - `cache_size=-200000`：200MB 页缓存（默认仅 2MB，全量历史放不下）；
@@ -361,10 +457,31 @@ class QuantWarehouse:
         - `journal_mode=WAL` + `synchronous=NORMAL`：**允许入库时并发查询**
           （做T/回测在跑而数据在补的场景），代价是断电时可能丢最后一个事务
           —— 数据可从 CSV 分区完整重放，这个代价可接受。
+        - `query_only=1`（仅当本实例无写权限，`CHG-0087`）：**连接级只读闸门**。
+
+        ## 为什么把写闸门放在这一层，而不是在 5 个写入口各加一次判断
+
+        `QuantWarehouse` 里开写事务的地方有 5 处（`upsert`、策略档案落库、
+        策略档案水位、策略案例 upsert、案例去重清理），而且**以后还会有第 6 处**。
+        逐个加判断的失败模式是"新写路径忘了加"—— 而这个失败**不报错**，
+        它表现为"dev 又在偷偷写共享行情仓"。
+
+        `query_only` 是 SQLite 自己的开关，对**该连接的一切写操作**生效，
+        所以它覆盖我还没枚举到的路径。实测（`scripts/_probe_query_only_pragma.py`）：
+        **先调优、后 query_only** 的顺序下 `journal_mode=WAL` 仍能生效
+        （`cache_size`/`mmap_size`/`journal_mode` 都不受它影响），
+        读取照常、四种写操作全被拒 —— 所以这个组合既挡得住写，也不会把只读实例打死。
+
+        ⚠️ 只对 SQLite 生效。MySQL/PG 的仓库由**账号权限**表达写权限，
+        本函数管不到（而本项目的行情仓就是 SQLite）。
         """
         statements = ("PRAGMA cache_size=-200000", "PRAGMA mmap_size=1073741824",
                       "PRAGMA temp_store=MEMORY", "PRAGMA journal_mode=WAL",
                       "PRAGMA synchronous=NORMAL")
+        if read_only:
+            # 放最后：调优语句里 journal_mode 在库还不是 WAL 时是一次真写，
+            # 排在它前面会让连接直接建不起来（连读都读不了）。
+            statements = statements + ("PRAGMA query_only=1",)
 
         @event.listens_for(engine, "connect")
         def _apply(dbapi_connection: Any, _record: Any) -> None:  # pragma: no cover
@@ -537,6 +654,8 @@ class QuantWarehouse:
         """把 CSV 分区缓存灌入库（幂等：重复导入靠唯一键去重）。"""
         from src.quant.dataset_store import DatasetStore
 
+        # 先拒再读分区：否则要读完所有分区才在第一次写时失败（十几 GiB 的白读）
+        self.assert_writable()
         if dataset not in DATASET_TABLES:
             raise WarehouseError(f"数据集 {dataset!r} 未登记仓库表结构")
         store = DatasetStore(dataset, root=self.root, universe=self.universe)
@@ -567,6 +686,10 @@ class QuantWarehouse:
         """方言原生 UPSERT：重复唯一键覆盖 → 重复导入不产生重复行。"""
         from sqlalchemy import text
 
+        # ★ 写权限的**唯一咽喉**（`CHG-0087`）：所有数据集入库都经过这里。
+        #   显式拒一次是为了给出"谁是写者、去哪改"的人话理由；
+        #   `engine()` 里的 `query_only=1` 是覆盖其余写路径的结构性兜底。
+        self.assert_writable()
         table_name, dedup_keys, _date = DATASET_TABLES[dataset]
         data = frame.copy()
         if "code" not in data.columns and "ts_code" in data.columns:

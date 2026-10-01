@@ -68,8 +68,21 @@ def repo(tmp_path):
     return r
 
 
-async def _seed(repo, days_ago_list: tuple[int, ...]) -> None:
-    """按"N 天前触发"造事件+告警各一条。"""
+async def _seed(repo, days_ago_list: tuple[int, ...]) -> datetime:
+    """按"N 天前触发"造事件+告警各一条。
+
+    ★ 2026-09-28 修复测试 flake：**返回本次使用的 `now`**，让调用方基于
+    同一个 `now` 算 cutoff。
+
+    原实现（调用方各自 `datetime.now()`）有一个跨秒边界就会翻的 bug：
+      · `_seed` 内部 `now = T1`，3 天前告警的 `trigger_time = (T1-3d)` 截断到秒
+      · 调用方 `cutoff = (T2-3d)` 截断到秒
+      · `T1` 与 `T2` 之间隔着 3 次 DB 写入（ensure_schema + 2 次 upsert）。
+        一旦跨过整秒 → `cutoff > trigger_time` → **3 天前那条被 `<` 判为过期删掉**
+        → 断言"应删 2 条"实得 3 条。
+    全量套件（8 分钟、负载高）会放大这个窗口，所以它只在全量跑时红、
+    单文件跑 20 次都不红 —— 典型的"测试自身的时间竞态"，不是被测逻辑错。
+    """
     now = datetime.now()
     events, alerts = [], []
     for i, days in enumerate(days_ago_list):
@@ -79,6 +92,7 @@ async def _seed(repo, days_ago_list: tuple[int, ...]) -> None:
     await repo.ensure_schema()
     await repo.upsert_events(events)
     await repo.upsert_alerts(alerts)
+    return now
 
 
 async def _counts(repo) -> tuple[int, int]:
@@ -92,11 +106,13 @@ async def _counts(repo) -> tuple[int, int]:
 
 async def test_prunes_alerts_older_than_cutoff(repo):
     """超过保留期的告警必须被**真正删除**（不是只置 expired）。"""
-    await _seed(repo, (5, 4, 3, 2, 1))
+    seeded_now = await _seed(repo, (5, 4, 3, 2, 1))
     before_alerts, _ = await _counts(repo)
     assert before_alerts == 5
 
-    cutoff = _iso(datetime.now() - timedelta(days=3))
+    # ★ cutoff 基于 `_seed` 返回的同一个 now —— 不再各自取 datetime.now()，
+    # 消除"seed 的 DB 写入跨过整秒 → 边界那行被误删"的 flake。
+    cutoff = _iso(seeded_now - timedelta(days=3))
     result = await repo.prune_alerts_before(cutoff)
 
     assert result["alerts"] == 2, f"应删掉 5 天前/4 天前两条，实际 {result}"

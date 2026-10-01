@@ -102,6 +102,49 @@ def _env_field(name: str, default: str) -> Any:
                  validation_alias=AliasChoices(name, name.upper(), name.lower()))
 
 
+def _store_rel_default(name: str) -> str:
+    """registry 里某存储的**相对仓库根**路径（`CHG-0071`）。
+
+    ## 为什么需要它（把最后 31 处字面量从代码里挪进 registry）
+
+    路径默认值原先写在字段上（`sqlite_path` / `llm_audit_dir` / `llm_cache_dir` /
+    `scheduler_dir` / `sqlite_dsn`），而它们**不是同一套布局**：`SharedPath` 类
+    （行情仓等）三档共用，而审计/缓存/调度是**主实例走 `data/`、隔离档走
+    `data/<env>/`**。registry 原先只能表达后者，于是主实例那一套只能留在代码里。
+
+    现在 registry 用 `main_path` 同时表达两套（见 `Store.main_path`），
+    本函数就只是**读它**。
+
+    ## 三条实现约束
+
+    1. **返回相对路径**（不是绝对）—— 与旧字面量逐字一致；换成绝对路径会把
+       "忘记隔离就写到生产"的概率提高（`CHG-0069` 的教训）。
+    2. **必须用 `default_factory`**（`_env_field_factory`），不能用 `Field(default=...)`：
+       后者在**类体求值**（模块导入时）就定死，而 `manage.py --env` 是在
+       导入之后才注入环境变量的 —— 那样会永远按"主实例"布局解析，隔离档静默失效。
+    3. registry 读不到时**如实抛错**（fail-closed），不退回某个字面量：
+       退回就等于把刚删掉的重复定义又请回来。
+    """
+    from src.infrastructure.catalog.data_stores import PROJECT_ROOT, resolve_store
+
+    p = resolve_store(name)
+    try:
+        return p.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        # 不在仓库根下 —— 单测会把 `MOSS_SQLITE_PATH` 指到 `tmp_path`（仓库外），
+        # 于是 `env_root()` 推出来的路径也在仓库外。此时只能给绝对路径，
+        # 而且**这比旧的"写死相对路径"更安全**：旧写法下"把库隔离到 tmp"的
+        # 测试仍然会把审计/缓存写进**真实仓库**（实测：抛异常会让
+        # `test_login_gate.py` 12 个用例 ERROR，见 CHG-0071）。
+        return p.as_posix()
+
+
+def _env_field_factory(factory: Any, name: str) -> Any:
+    """`_env_field` 的 `default_factory` 版本（默认值**在实例化时**才求值）。"""
+    return Field(default_factory=factory,
+                 validation_alias=AliasChoices(name, name.upper(), name.lower()))
+
+
 class Settings(BaseSettings):
     """全局配置（.env / 环境变量自动加载）。"""
 
@@ -150,6 +193,22 @@ class Settings(BaseSettings):
     #   不注入进程环境）。本项目已在 `eastmoney_direct.py` 踩过同一个坑：
     #   「`.env` 里明明写着，`install()` 却报未启用」。
     zhipu_api_key: str = _env_field("MOSS_ZHIPU_API_KEY", "")
+    # 博查 Web Search（`CHG-0113`，2026-09-30）：**本仓库第一个搜索引擎能力**，
+    # 供 `source_reroute` 的 path C（真搜索引擎找候选数据源网址）使用。
+    # ⚠️ 名字就是用户写进环境变量的那个（小写 `bocha_search`），别改名 ——
+    #   改名等于让用户已经配好的凭据静默失效。
+    # ⚠️ 额度是**免费 1000 次总量**，闸门在 `infrastructure/search/bocha.py`
+    #   的 `MAX_CALLS_TOTAL / MAX_CALLS_PER_DAY`（上限写进代码，不留在注释里）。
+    bocha_search_api_key: str = _env_field("bocha_search", "")
+    # 百度千帆「智能搜索」（`CHG-0117`，2026-09-30）：**搜索源的第二家（备用）**。
+    # 实测形态：`POST https://qianfan.baidubce.com/v2/ai_search/web_search`
+    #   body `{"messages":[{"role":"user","content":Q}],
+    #          "search_source":"baidu_search_v2",
+    #          "resource_type_filter":[{"type":"web","top_k":N}]}`
+    #   → `{"references":[{url,title,content,snippet,...}]}`
+    # 额度是**每天 100 次**（与博查的"总量 1000"是**两种不同**的闸门）。
+    # ⚠️ 名字就是用户写进环境变量的那个（小写 `baidusearch`），别改名。
+    baidu_search_api_key: str = _env_field("baidusearch", "")
     zhipu_base_url: str = _env_field(
         "MOSS_ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
 
@@ -179,10 +238,40 @@ class Settings(BaseSettings):
     model_config_path: str = "configs/models.yaml"
     llm_timeout_seconds: float = 120.0
     llm_cache_enabled: bool = True
-    llm_cache_dir: str = "data/llm_cache"
+    #: LLM 响应缓存目录。**必须按环境隔离**（规则文档 §1「缓存必须隔离」、
+    #: §6「dev 和 prod 共用缓存」列为反模式）。
+    #:
+    #: ★ 2026-09-28（CHG-0063）：原先它是裸字面量、没有环境开关，三个实例
+    #: 共用 `data/llm_cache`。而本项目的缓存 scope **不含 provider/model**
+    #: （见 AGENTS.md「优化前后对比必须先清测量路径」——实测"换模型对比"
+    #: 三个模型输出逐字节相同），共用会让跨环境的对比直接失真。
+    #: 三档隔离实例现在各自注入 `LLM_CACHE_DIR`（`manage.py` 的
+    #: dev/test/pilot `*_isolation_env`）。
+    llm_cache_dir: str = _env_field_factory(
+        lambda: _store_rel_default("llm_cache"), "LLM_CACHE_DIR")
     llm_cache_ttl_hours: float = 24.0
     llm_semantic_threshold: float = 0.85  # n-gram余弦≥该值判语义命中
-    llm_audit_dir: str = "data/audit"
+    #: LLM 调用审计目录。默认值来自 registry 的 `llm_audit` ——
+    #: 主实例解析为 `data/audit`（**与改动前逐字一致**），隔离档为 `data/<env>/audit`。
+    llm_audit_dir: str = _env_field_factory(
+        lambda: _store_rel_default("llm_audit"), "LLM_AUDIT_DIR")
+    #: 联网兜底的**源白名单**（逗号分隔的连接器类名；空 = fail-closed 全拒）。
+    #:
+    #: ## 为什么必须登记进 Settings（而不是只读 `os.environ`）
+    #:
+    #: 2026-09-29 实测的一个"配置≠生效"陷阱：`network_fallback.allowlist_from_env()`
+    #: 读的是 **`os.environ`**，而 pydantic-settings 只把 `.env` 读进 **Settings 对象**、
+    #: **不写回 `os.environ`** ⇒ 我在 `.env` 里写了
+    #: `MOSS_NETWORK_FALLBACK_ALLOWLIST=...`，实际生效值仍然是**空**（全拒），
+    #: 而日志里只会出现"联网兜底被拒绝：[ALLOWLIST_EMPTY]" ——
+    #: **看起来像"护栏正常工作"，实际是"开关压根没接上"**。
+    #: 所以把它登记成正式字段（`_env_field` 会同时认环境变量与 `.env`），
+    #: 由 `network_fallback` 在 `os.environ` 缺值时回落到这里。
+    network_fallback_allowlist: str = _env_field(
+        "MOSS_NETWORK_FALLBACK_ALLOWLIST", "")
+    #: 交互路径**防撞钟**秒数（`src/core/intel_limits.py` 的默认是 10.0）。
+    #: 同上：登记进 Settings 才能被 `.env` 覆盖。
+    query_deadline_sec: str = _env_field("MOSS_QUERY_DEADLINE_SEC", "")
     # Token预算：单任务DeepSeek调用累计token上限，超过则拒绝后续调用（防超支）
     #
     # 200000 而不是原来的 30000。实测依据（data/audit/llm_audit.jsonl 里 85 个任务）：
@@ -232,10 +321,21 @@ class Settings(BaseSettings):
     # 那个写法让本字段**读不到环境变量**，而它是"测试用临时库"的唯一开关 ——
     # 后果是**测试直接读写生产库**（`tests/unit/test_auth_routes.py` 的
     # `clear_all()` 真的清过 `data/moss_finagent.db` 的认证表）。
-    sqlite_path: str = _env_field("MOSS_SQLITE_PATH", "data/moss_finagent.db")
+    sqlite_path: str = _env_field_factory(
+        lambda: _store_rel_default("app_db"), "MOSS_SQLITE_PATH")
     postgres_dsn: str = "postgresql+asyncpg://moss_finagent:moss_finagent@localhost:5432/moss_finagent"
-    sqlite_dsn: str = "sqlite:///data/moss_finagent.db"
-    # 本地QMT导出CSV行情目录（如 D:/quantTrader/data，含SH/SZ子目录）；空则不启用
+    sqlite_dsn: str = _env_field_factory(
+        lambda: "sqlite:///" + _store_rel_default("app_db"), "SQLITE_DSN")
+    # 本地QMT导出CSV行情目录（含 SH/SZ 两个子目录）；**空则不启用**（两个日线链都不注册
+    # `LocalCsvConnector`，见 `src/api/runtime.py` 两处 `if settings.local_quote_dir:`）。
+    #
+    # ⚠️ **2026-09-28 起默认留空，且这里曾指向过一个数据库目录**（CHG-0061）：
+    # 原值 `D:/quantTrader/data` 看起来像"QMT 导出目录"，实际是**本机 MariaDB 的
+    # datadir**（mysqld 的 `--defaults-file` 指向的 `my.ini` 里写着
+    # `datadir=D:/quantTrader/data`，同目录下还有 `ibdata1` / `undo*` / `wucai_trade`）。
+    # 那句 `.env` 本身就在诱导"这是导出目录，可以清" —— 而清掉它会毁掉一个**正在运行**的
+    # 数据库实例。其 `SH/`+`SZ/` 两个 CSV 子目录已于当日删除（约 1.13 GiB，停在 2026-08-31），
+    # 本跳随之从链上移除。**将来要恢复，必须指向专用导出目录，不得指向任何数据库 datadir。**
     local_quote_dir: str = _env_field("LOCAL_QUOTE_DIR", "")
     # 迅投QMT终端是否纳入日线采集链（默认**关闭**）
     #
@@ -267,7 +367,8 @@ class Settings(BaseSettings):
     redis_cache_enabled: bool = False  # 开启后query_points走Redis缓存（Redis不可达自动降级）
     data_cache_ttl_seconds: int = 300
     celery_broker_url: str = "redis://localhost:6379/1"
-    scheduler_dir: str = "data/scheduler"  # 定时作业运行记录（runs.jsonl）
+    scheduler_dir: str = _env_field_factory(
+        lambda: _store_rel_default("scheduler_dir"), "SCHEDULER_DIR")
     scheduler_run_log_ttl_days: int = 90  # 运行记录保留天数（audit_cleanup作业清理）
 
     # 数据保留与新闻缓存（性能优化）
@@ -700,6 +801,24 @@ def assert_environment_consistency(
             problems.append(
                 f"非公网环境（{settings.env}）的 SQLite 路径含 'prod'，拒绝启动")
 
+    # ---- ⑤ test 环境必须真的隔离（CHG-0063，2026-09-28 补） --------------
+    #
+    # 规则文档《数据库管理》§6 把「同库同账号，靠 `env` 字段区分」列为**反模式第一条**。
+    # 本项目原先比它更糟：`manage.py start --env test` **没有任何隔离分支**，
+    # 直接落 `MOSS_SQLITE_PATH` 的默认值 `data/moss_finagent.db`（标注"生产用"），
+    # 而 `manage.py test` 却走 `build_test_env()` 的临时目录 —— **同一个 `test`
+    # 两套语义**。这条断言把它变成机器判据：路径里必须自带 `test` 字样。
+    #
+    # 为什么用"路径含 env 名"而不是维护一份白名单：与 pilot 那条同源同理由 ——
+    # 自证式的路径命名是**可读、可迁移**的（换机器不用改代码），而白名单必然腐烂。
+    if settings.env == "test" and "test" not in str(settings.sqlite_path).lower():
+        problems.append(
+            f"test 环境必须真的隔离：SQLite 路径里应含 'test' 字样"
+            f"（当前 {settings.sqlite_path!r}）——"
+            "否则会落回默认主库 data/moss_finagent.db 与 dev/pilot 共用，"
+            "变成「同库同账号、只靠 env 字段区分」。"
+            "用 `manage.py start --env test` 启动会自动注入隔离路径")
+
     return problems
 
 
@@ -720,7 +839,11 @@ def describe_environment(settings: Settings) -> str:
     if settings.is_dev:
         return ("dev（本机开发：**鉴权默认不强制**、通知可能打日志、库可丢 "
                 "—— 绝不可对外）")
-    return f"{settings.env}（测试）"
+    if settings.env == "test":
+        return ("test（测试实例：数据/审计/缓存已改道 `data/test/`，"
+                "**与 dev / pilot / 主库分开**；不对外、不承诺持久性 "
+                "—— 单测请用 `manage.py test` 的临时库，不要连本档）")
+    return f"{settings.env}（未登记的环境档 —— 请补 `describe_environment`）"
 
 
 def _is_console_notifier(environ: dict[str, str]) -> bool:

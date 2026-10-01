@@ -229,7 +229,9 @@ async def test_sentiment_happy_path():
     assert out.result["sentiment_metrics"]["weighted_sentiment"] == 1.0  # 单事件方向即情绪
     assert out.result["narrative"] == "官方数据驱动情绪回暖"
     call = gw.calls[0]
-    assert call["task_tier"] == "reasoning"
+    # A07 的 tier 是 `light`：2026-09-28 第九轮**有意**从 reasoning 降档
+    # （见 sentiment/agent.py 顶部注释），测试原先断言 reasoning 属未跟进。
+    assert call["task_tier"] == "light"
     assert "0.9" in call["prompt"]  # 本地指标注入prompt
 
 

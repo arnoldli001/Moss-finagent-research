@@ -136,6 +136,7 @@ class ReActExecutor:
         self, system: str, prompt: str, *,
         agent_id: str, trace_id: str, json_mode: bool = True,
         cancel_token: CancellationToken | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """执行ReAct循环，返回final_answer的JSON内容。
 
@@ -143,6 +144,10 @@ class ReActExecutor:
             prompt: 第 1 步使用的完整 prompt（已由调用方压缩）。
                     第 2+ 步会被丢弃，改为"上次 LLM 输出摘要 + 新 observation"。
             system: 系统提示（每一步都会带上，包含工具描述）。
+            reasoning_effort: ★ 第十轮新增 —— 覆盖该次调用的思维链强度。
+                    A17 step 1 默认 "high"（decision 层级映射），但合成类任务
+                    砍到 "low" 可省 30-50% 输出 token + 墙钟（详见
+                    `INTERVIEW_FAQ_SESSION_20260926.md` §4）。
         """
         tool_descs = self._tools.describe_all()
         full_system = (
@@ -208,6 +213,7 @@ class ReActExecutor:
                 self._task_tier, full_system, current_prompt,
                 agent_id=agent_id, trace_id=trace_id, json_mode=json_mode,
                 use_cache=(step == 0),
+                reasoning_effort=reasoning_effort,  # ★ 第十轮：透传给网关
             )
             try:
                 data = parse_llm_json(agent_id, response.content)

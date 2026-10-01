@@ -42,7 +42,18 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 #: 默认行情仓路径（与 `sources.WarehouseSource` 的默认值一致）
-DEFAULT_WAREHOUSE = "data/quant/warehouse.db"
+def _default_warehouse() -> str:
+    """行情仓路径 —— 从 registry 取（`CHG-0069`）。
+
+    原先在这里写死一份，`member_pure` / `sources` / `WarehouseConfig`
+    各又写一份：同一个 key 四处，改一处必漏三处。
+    """
+    from src.infrastructure.catalog.data_stores import store_rel
+
+    return store_rel("warehouse")
+
+
+DEFAULT_WAREHOUSE = _default_warehouse()
 #: 只读打开失败后是否改用 `immutable=1`（进程级记忆）
 _IMMUTABLE = False
 _IMMUTABLE_LOCK = threading.Lock()

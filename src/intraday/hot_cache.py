@@ -59,11 +59,13 @@ from src.core.errors import (
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel  # noqa: E402
+
 #: 快照格式版本：字段语义变化时 +1，旧文件直接丢弃（不做迁移）
 SNAPSHOT_VERSION = 1
 
 #: 默认缓存目录（与资金流的 `data/cache/fundflow/` 同级，便于统一清理）
-DEFAULT_CACHE_DIR = "data/cache/intraday"
+DEFAULT_CACHE_DIR = store_rel("cache_root") + "/intraday"
 
 #: 默认最长可用时长：超过就不加载热缓存（宁可等一次重算，也不展示隔夜旧值）
 DEFAULT_MAX_AGE_SECONDS = 24 * 3600

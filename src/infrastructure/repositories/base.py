@@ -31,6 +31,32 @@ class DataPointRepository(ABC):
     ) -> list[DataPoint]:
         """按指标+期间区间查询，按period_date升序。"""
 
+    async def query_points_batch(
+        self, indicators: list[str], *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        limit_per_indicator: int | None = None,
+    ) -> dict[str, list[DataPoint]]:
+        """批量查询多指标，一次 SELECT 返回 `{indicator: [DataPoint...]}`。
+
+        ★ 设计目的（2026-09-28）：SmartFetcher 一次性拿全 freshness，
+        避免 N 次 query_points() 的 N 次 SELECT+fetch+反序列化。
+
+        实现：默认回退到多次 query_points（各后端无一致 SQL 模板）。
+        子类可在有更高效原生批量查询时覆盖（如 `IN (...)`）。
+
+        Args:
+            indicators: 指标 id 列表
+            limit_per_indicator: 单指标返回条数上限（None=全量；用于"只看最新 N 条"）
+        """
+        result: dict[str, list[DataPoint]] = {}
+        for ind in indicators:
+            rows = await self.query_points(ind, start_date, end_date)
+            if limit_per_indicator is not None and len(rows) > limit_per_indicator:
+                rows = rows[-limit_per_indicator:]
+            result[ind] = rows
+        return result
+
     @abstractmethod
     async def count_by_indicator(self) -> dict[str, int]:
         """各指标行数统计（健康检查/冒烟用）。"""

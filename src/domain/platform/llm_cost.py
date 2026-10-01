@@ -30,6 +30,30 @@
 实测 309 次调用用的 `deepseek-v4-flash` 是 `deepseek-flash` 的**旧名**，
 不在 `configs/models.yaml` 里。计价会退回兜底价（约 1 元量级），
 但**"我们是在估算"这件事必须显示出来** —— 否则管理员会以为这是账单。
+
+## ★ 两个 `cache_hit`：同名不同义，差一个数量级（2026-09-30 修）
+
+这个词在本仓库里有**两种完全不同的含义**，而它们曾经共用一个名字：
+
+| 出处 | 含义 | 真实代价 |
+|---|---|---|
+| 审计字段 `row["cache_hit"]`（`audit.py` @145，值来自 `gateway.py` @463–469 的 `cached=True`） | **本地响应缓存**命中：这次**根本没有请求提供商** | **¥0** |
+| 计价参数（现名 `provider_cache_hit`，`budget.py::call_cost_cny`） | **提供商的上下文缓存**命中：输入 token 按更便宜的单价计 | 便宜一点，但**不是免费** |
+
+旧版把前者直接喂给后者 ⇒ 实测 **31,233 行（58.5%）被计 ¥408.75**，
+运维页总额虚高 **65.5%**（真实 ¥214.87 / 虚高后 ¥623.62）。
+
+**修法**（两件，缺一不可）：
+
+1. **计价参数改名**为 `provider_cache_hit` ⇒ 误配从"静默偏高"变成
+   **`TypeError`**（调用点立刻炸）；
+2. **聚合里按语义分流**：`cache_hit` 的行一律计 0 元，单独计数
+   （`cached_calls`），并另给一个**反事实**字段 `avoided_cny`
+   —— 缓存省下的钱体现在这里，而不是体现在"花了多少"里。
+
+**为什么这条坑值钱**：计价**函数**确实只有一份（这正是本文档开头强调的），
+但**输入的语义**有两份 —— 于是"共用同一个函数"这句保证**并不足以**
+保证两处金额一致。**函数共用 ≠ 口径一致。**
 """
 
 from __future__ import annotations
@@ -155,8 +179,16 @@ def aggregate_llm_cost(
     `rows` 应当已经按时间窗过滤过（例如"本月"）。参数 `days` 只影响
     `by_day` 趋势保留多少天。
 
-    返回的费用口径与 `CostBudget.record` **共用同一个 `call_cost_cny`**，
-    所以"在线账本"与"事后统计"不会对不上。
+    返回的费用口径与 `CostBudget.record` **共用同一个 `call_cost_cny`**。
+    ⚠️ 但"共用同一个函数"**不等于**"口径一致"：`record` 只在**真的调用了
+    提供商之后**执行，而本函数遍历的是**审计行**（里面包含"本地缓存命中、
+    根本没调提供商"的那些）。所以本函数必须先按 `cache_hit` 分流，
+    再决定要不要计价 —— 详见模块头「两个 `cache_hit`」那一节。
+
+    计数口径（三者在语义上互不重叠，且 `calls` 是它们的**并集**的规模）：
+      · `paid_calls`  —— 真的调用了**付费**提供商的次数（不含缓存命中）；
+      · `free_calls`  —— 本地模型（Ollama 等）的次数；
+      · `cached_calls`—— 本地响应缓存命中的次数（**0 元**，另给 `avoided_cny`）。
     """
     table = model_prices() if prices is None else prices
 
@@ -164,6 +196,13 @@ def aggregate_llm_cost(
     calls = 0
     paid_calls = 0
     free_calls = 0            # 本地模型（0 元）
+    #: ★ 本地响应缓存命中（`cache_kind` = exact/semantic）：**这次调用没有发生**
+    #: —— `gateway.py` @463–469 命中即 return，既不请求提供商也不进账本。
+    #: 所以它们计 0 元，单独计数（详见 `aggregate_llm_cost` 的 docstring）。
+    cached_calls = 0
+    #: ★ 反事实估算：缓存命中的这些 token 若真去请求、按**未命中价**约需多少。
+    #: **不是账单**（一分钱没花），是"缓存省了多少"的度量，界面上必须这么标。
+    avoided_cny = 0.0
     unknown_provider = 0      # 审计里没有 provider 字段（老行/测试造的行）
     unpriced_calls = 0
     unpriced_models: dict[str, int] = {}
@@ -183,16 +222,34 @@ def aggregate_llm_cost(
         tokens_in += tin
         tokens_out += tout
 
+        # ★★ 2026-09-30 修一个**静默多计**：审计字段 `cache_hit`（= 本地响应
+        #    缓存命中）原先被直接喂给 `call_cost_cny(cache_hit=...)`，而那个参数
+        #    说的是「**提供商的上下文缓存**命中输入单价」（便宜一点，但不是免费）。
+        #    同名不同义 ⇒ 实测 31,233 行（58.5%）被计 ¥408.75，运维页总额
+        #    虚高 65.5%。现在：命中行**一律 0 元**，并单独计数 + 给反事实估算。
+        #    `call_cost_cny` 的参数已改名为 `provider_cache_hit`，
+        #    所以这种误配**不能再静默发生**（传旧名会 TypeError）。
+        cached = bool(row.get("cache_hit"))
+        if cached:
+            cached_calls += 1
+            if provider == "deepseek":
+                avoided_cny += call_cost_cny(
+                    provider=provider, model=model, tokens_in=tin,
+                    tokens_out=tout, provider_cache_hit=False, prices=table)
+
         if provider == "deepseek":
-            cost = call_cost_cny(provider=provider, model=model,
-                                 tokens_in=tin, tokens_out=tout,
-                                 cache_hit=bool(row.get("cache_hit")),
-                                 prices=table)
-            paid_calls += 1
-            if model not in table:
-                unpriced_calls += 1
-                unpriced_models[model or "(空)"] = \
-                    unpriced_models.get(model or "(空)", 0) + 1
+            if cached:
+                cost = 0.0        # 没有调用提供商 ⇒ 没有费用
+            else:
+                cost = call_cost_cny(provider=provider, model=model,
+                                     tokens_in=tin, tokens_out=tout,
+                                     provider_cache_hit=False,
+                                     prices=table)
+                paid_calls += 1
+                if model not in table:
+                    unpriced_calls += 1
+                    unpriced_models[model or "(空)"] = \
+                        unpriced_models.get(model or "(空)", 0) + 1
         elif provider:
             cost = 0.0        # ollama 等本地提供方
             free_calls += 1
@@ -269,6 +326,10 @@ def aggregate_llm_cost(
         "tokens_out": tokens_out,
         "paid_calls": paid_calls,
         "free_calls": free_calls,
+        # ★ 缓存命中：计 0 元的调用数，以及"若未命中约需多少"（反事实，非账单）。
+        #   名字带上 `avoided` 就是为了让人一眼看出它不是花掉的钱。
+        "cached_calls": cached_calls,
+        "avoided_cny": rnd(avoided_cny),
         "unknown_provider_calls": unknown_provider,
         "unpriced_calls": unpriced_calls,
         "unpriced_models": sorted(unpriced_models.items(),
@@ -297,6 +358,16 @@ def cost_basis_notes(cost: Mapping[str, Any]) -> list[str]:
         "只统计审计文件的**尾部**（超出窗口时金额偏低），"
         "它是**用量视图**而不是财务账单；对账请以云厂商账单为准。",
     ]
+    if cost.get("cached_calls"):
+        notes.append(
+            f"ℹ️ 本次窗口内有 **{cost['cached_calls']} 次调用命中了本地响应缓存**"
+            f"（`cache_kind` = exact / semantic）—— 这类调用**根本没有请求提供商**，"
+            f"因此金额按 **0** 计。若不命中缓存，同样这些 token 按未命中价约需 "
+            f"**¥{cost.get('avoided_cny', 0.0)}**（**反事实估算，不是账单**；"
+            f"缓存省下的钱体现在这里，而不是体现在'花了多少'里）。"
+            f"★ 这一项曾长期被多计：审计字段 `cache_hit`（本地缓存命中）"
+            f"被误当成计价参数 `provider_cache_hit`（提供商上下文缓存命中），"
+            f"两者语义差一个数量级（'一分钱没花' vs '便宜一点'）。")
     if cost.get("unpriced_calls"):
         models = "、".join(f"{m}×{n}" for m, n in cost["unpriced_models"])
         notes.append(

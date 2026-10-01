@@ -41,6 +41,8 @@ from src.quant.pit import PitPanel
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel as _store_rel  # noqa: E402
+
 
 class MissingPanelField(RuntimeError):
     """严格模式下取了一个**没有按需加载**的面板字段。
@@ -331,7 +333,7 @@ def load_fundamental_panel(*, root: str | Path = DEFAULT_ROOT,
         notes.append("Tushare 财务分区存在但内容为空")
 
     try:
-        panel = FundamentalStore("data/quant/fundamentals",
+        panel = FundamentalStore(_store_rel("quant_fundamentals"),
                                  universe=universe).load_panel()
     except Exception as exc:  # noqa: BLE001 缺财务不该让整条链路失败
         notes.append(f"基本面面板装配失败：{brief(exc, BRIEF_TIGHT)}")

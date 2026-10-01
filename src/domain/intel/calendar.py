@@ -381,6 +381,15 @@ def fetch_unlock_schedule(*, horizon_days: int = DEFAULT_HORIZON_DAYS
                 "pct_of_float": (None if ratio is None
                                  else round(ratio * 100, 4)),
                 "share_type": str(row.get("限售股类型") or "").strip(),
+                # ★ 2026-09-29：源里本来就有这几列，原先**没取**（只取 5 列）。
+                #   用户要求解禁表落"**解禁数量**"，且逐股查表要能给出
+                #   "占流通市值多少 / 解禁前后涨跌"，所以在这里一并带出来。
+                #   纯增量：`calendar_store` 只读它要的键，多带键不影响既有消费方。
+                "shares": _num(row.get("解禁数量")),
+                "actual_shares": _num(row.get("实际解禁数量")),
+                "close_before": _num(row.get("解禁前一交易日收盘价")),
+                "chg_before_20d": _num(row.get("解禁前20日涨跌幅")),
+                "chg_after_20d": _num(row.get("解禁后20日涨跌幅")),
             })
 
         for d in sorted(by_day):

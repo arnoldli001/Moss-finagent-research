@@ -11,6 +11,12 @@ venv/
 
 # 环境与密钥（禁止提交真实值）
 .env
+# ★ 2026-09-30（CHG-0124）：`frpc.toml` **含真实隧道 token**（`auth.token = …`），
+# 而它此前**既不在 .gitignore 里、也未被跟踪** ⇒ 一句 `git add -A` 就会把凭据
+# 提交进仓库（而且提交后再删，历史里**永远还在**）。
+# 与本文件第 12 行那条是同一个理由：带凭据的本地配置一律不得入库。
+# 需要它的人照着 `scripts/frp_ssh_tunnel.py` 的说明自己生成一份。
+frpc.toml
 
 # 测试与工具缓存
 .pytest_cache/
@@ -107,6 +113,20 @@ node_modules/
 # 测试经济性（AGENTS.md《测试运行经济性》点名"日常只跑本次改动相关的测试"）：
 # 没有它，克隆环境只能靠跑全量兜底 —— 而这条规则正是为取消"全量当默认"而立的。
 !/scripts/affected_tests.py
+# 外部联网源体检（AGENTS.md《环境配置》点名"接线前必须先过一条命令"）：
+# 博查搜索 + 东财 Choice EMQuantAPI 的**真实通路**。没有它，克隆环境里就只剩
+# "文档说接了、没人验过"—— 而本仓库已四次踩"备用只声明未走通"（CHG-0113 / §19.33）。
+!/scripts/check_external_sources.py
+# 拥挤度自动定时刷新（`CHG-0144`）：**两个必须一起发布** ——
+#   · `setup_crowding_refresh_task.py` 是"在开发机上装这个计划任务"的唯一入口；
+#   · `crowding_refresh.ps1` 是任务的动作目标（`Action.Arguments` 里按绝对路径引用它）。
+# 只发其中一个 = 另一个永远缺：装机入口在、动作脚本缺失（任务每次 LastTaskResult=1），
+# 或动作在、没人知道怎么装。这与既有计划任务包装（pilot_watchdog.ps1 /
+# tunnel_watchdog.ps1 / pilot_autostart.ps1 / frp_watchdog.ps1）**同类且同样入库**。
+# 判据：tests/unit/test_crowding_refresh_schedule.py（读它们的内容）+
+# tests/unit/test_shipped_deps.py（白名单必须真的被跟踪，空头支票报红）。
+!/scripts/crowding_refresh.ps1
+!/scripts/setup_crowding_refresh_task.py
 !/scripts/quant_cases.py
 !/scripts/quant_stocks.py
 !/scripts/quant_strategy_scan.py

@@ -125,7 +125,10 @@ def _month_floor(months_back: int) -> str:
 class PharmaIndConnector(BaseConnector):
     """1类创新药 IND 申报件数（CDE 受理品种信息，月度，默认近13个月）。"""
 
-    source_name = "CDE药审中心(受理品种信息)"
+    #: 口径落在 source_name 里（原因同 coal/liquor 连接器）：行业 Agent 的
+    #: `_format_with_fresh` 只拼 source_name、不展开 extra，所以"受理号件数"与
+    #: "当月不满月"这两个关键局限必须出现在名字上，否则会被当成完整月度值用。
+    source_name = "CDE药审中心(1类IND受理号件数·当月不满月)"
     source_url = _PAGE_URL
 
     def get_capabilities(self) -> dict[str, Any]:

@@ -19,7 +19,12 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
-from src.scheduler.registry import JOB_REGISTRY
+from src.scheduler.registry import (
+    JOB_REGISTRY,
+    SCHEDULER_DENY_ENV,
+    schedulable_jobs,
+    scheduler_scope_report,
+)
 from src.scheduler.run_log import RunLog
 
 logger = logging.getLogger(__name__)
@@ -90,7 +95,28 @@ class CronScheduler:
         if self._task is None:
             self._stop.clear()
             self._task = asyncio.create_task(self._loop(), name="cron-scheduler")
-            logger.info("进程内Cron调度器已启动（%d个作业）", len(JOB_REGISTRY))
+            # ★ 启动横幅与 `_tick()` **同源**（`schedulable_jobs()`），
+            #   所以"打印 24 个"与"真正遍历 24 个"不可能不一致。
+            #
+            # ⚠️ 但**别指望这几行 logger.info 被人看到**（`CHG-0087` 实测）：
+            #   全仓库没有 `logging.basicConfig()` / `dictConfig()`，root logger
+            #   没有 handler ⇒ INFO 被直接丢弃（last-resort handler 只兜 WARNING）。
+            #   逐字节搜 `data/run/*.log` 里的「调度器已启动」= **0 处**。
+            #   真正可见的面有两个，都已在本条改动里落实：
+            #     · `manage.py` 启动横幅的 `_scheduler_scope_line()`（stderr，给人看）；
+            #     · `/health` → `data_sources.schedule`（给机器/前端看，20 秒轮询）。
+            #   保留 logger.info 是为了**测试与前台运行**（有人配了 logging 时可见）。
+            scope = scheduler_scope_report()
+            logger.info("进程内Cron调度器已启动（%d/%d个作业，环境=%s）",
+                        scope["active"], scope["total"], scope["env"])
+            for item in scope["pruned"]:
+                logger.info("调度裁剪：跳过作业%s —— %s",
+                            item["job"], item["reason"])
+            if scope["unknown_denied"]:
+                logger.warning(
+                    "%s 里有拼错的作业名 %s（不会禁用任何东西），可用名字见 "
+                    "JOB_REGISTRY",
+                    SCHEDULER_DENY_ENV, "、".join(scope["unknown_denied"]))
 
     async def stop(self) -> None:
         if self._task is not None:
@@ -116,8 +142,27 @@ class CronScheduler:
         ⚠️ 并发安全靠 `execute_job` 内部的 `_lock_for(job_name)`：
         自检与定时撞上时后者会串行等待，不会双跑（下载/灌库都是幂等的，
         但串行能避免两份下载互相抢带宽）。
+
+        ## ★ 也必须过写权限那一关（`CHG-0087`，堵一条**绕过 `_tick` 的路**）
+
+        本函数是**不在 `_tick()` 里**的第二条触发路径（启动自检的补偿、
+        事件告警的盘中补扫）。如果它不过同一道判据，就会出现：
+        定时路径已按写权限裁掉了 `quant_data_sync`，而启动自检发现"行情有缺口"
+        又把它**直接拉起来** → 撞写闸门 → 记一条 `failed`。
+        运维看到的是故障，实际是"这台机器不负责写"。
+
+        所以这里返回一条 `skipped` 记录（**不写 failed、不执行**），
+        并在理由里说清为什么、去哪改 —— 与 `_tick()` **同源同判据**。
         """
         from src.scheduler.jobs import execute_job
+        from src.scheduler.registry import job_deny_reason
+
+        reason = job_deny_reason(name)
+        if reason:
+            logger.warning("作业%s被跳过（非本实例职责）：%s", name, reason)
+            return {"status": "skipped", "job_name": name, "trigger": source,
+                    "records_processed": 0, "reason": reason,
+                    "detail": "本实例没有该作业的写权限，未执行（不是失败）"}
 
         fn = self._execute or execute_job
         self._running.add(name)
@@ -141,7 +186,9 @@ class CronScheduler:
     async def _tick(self) -> None:
         now = self._now()
         minute_key = now.strftime("%Y-%m-%d %H:%M")
-        for name, spec in JOB_REGISTRY.items():
+        # ★ 遍历 `schedulable_jobs()` 而**不是** `JOB_REGISTRY`：更新作业在
+        #   只读实例上不该被触发（理由与派生方式见 `registry.job_deny_reason`）。
+        for name, spec in schedulable_jobs().items():
             key = (name, minute_key)
             if key in self._fired:
                 continue

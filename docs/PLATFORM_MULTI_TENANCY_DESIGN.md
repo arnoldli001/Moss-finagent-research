@@ -1057,7 +1057,7 @@ CREATE POLICY u_isolation ON dim_user_watchlist
 |---|---|
 | `GET /scheduler/jobs` | `scheduler.read`（默认 admin + risk/compliance/auditor） |
 | `POST /scheduler/jobs/{name}/run` | `scheduler.job.run`（**默认仅 admin**）+ 四眼 |
-| `GET /metrics/*` | `metrics.read`；`/healthz` 保持公开（探针需要） |
+| `GET /metrics/*` | `metrics.read`；`/healthz` 保持公开（探针需要）—— ★ **2026-09-30 起 `/healthz` 才真有路由**（此前只写在本表与白名单里，实测 404，见 `CHG-0128`） |
 | 告警设置/已读 | `dim_user_alert_pref` + `fact_alert_state` |
 | `POST /alerts/scan` | `alerts.scan.run`（花钱：两阶段 LLM）+ 租户配额 |
 | `POST /events/import` | `platform.source.manage`（四眼） |
@@ -3230,7 +3230,7 @@ Cloudflare Tunnel ──► Caddy :8100 ──┬─► api-blue  :8102
 | **会话** | 令牌无状态（JWT/HMAC）+ `fact_session` 记录 `jti` 用于吊销；**不依赖粘性会话** | §8.5.2 第 9 条 |
 | **计算** | 接入无状态可水平扩；**计算按标的收敛**（活跃宇宙是全局单例） | §7.2 |
 | **配额** | 按 `(tenant, user)` 限流（§4.6）+ 域名级令牌桶（§7.2.6） | moss 的 `rbac_policy.json` 每角色带 `rate_limit_per_min` / `max_rows_per_query`，**直接借鉴这个"权限 + 限流写在同一张表"的形式** |
-| **健康检查** | `/healthz` 公开（探针）；`/ready` 检查 DB/Redis/数据源可达性；**不健康先摘流量再重启** | 现有 `/api/v1/metrics/ready` |
+| **健康检查** | `/healthz` 公开（探针）；`/ready` 检查 DB/Redis/数据源可达性；**不健康先摘流量再重启** | ~~现有 `/api/v1/metrics/ready`~~ —— ★ **该路径从来没有路由**（`CHG-0128` 实测 404，已从两处白名单删除）。**现状**：存活探针 = `/healthz`（根级）+ `/api/v1/health/live`，共用 0 I/O 实现；**就绪探针 `/ready` 尚未实现**，而聚合 `/api/v1/health` 需要登录且最坏上百秒，**不能当就绪探针用** |
 
 #### 8.8.2 容灾分级（按 RTO 排，不追求"全都高可用"）
 

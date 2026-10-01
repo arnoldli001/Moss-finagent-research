@@ -25,6 +25,43 @@ class DataFetchError(FinAgentError):
     """数据源获取失败。"""
 
 
+class NoApplicableData(DataFetchError):
+    """该口径对该主体**不适用**、或**未被该专题收录** —— **不是取数失败，也不是 0**。
+
+    ## 为什么必须与"取数失败"分开（用户 2026-09-30 报障）
+
+    用户面板上，三种完全不同的情形原来**长得一模一样**（都是
+    「未获取到 X 数据」+ 置信度低），而处置相反：
+
+    | 情形 | `kind` | 该怎么办 |
+    |---|---|---|
+    | 语义上不适用（银行没有"流动比率"） | `not_applicable` | **不用管**，且**不要联网硬试**（烧钱） |
+    | 专题表未收录该主体（招行窗口内无质押/担保公告） | `not_covered` | 承认覆盖不到，**别去补**（表里本来就没有它） |
+    | 真的取数失败 | （普通 `DataFetchError`） | 去修取数链 |
+
+    ## 为什么文本里带**标准标记**
+
+    `supervisor.NOT_APPLICABLE_MARKERS` 认的就是这些字面标记 —— 那是
+    **取数侧自己写下的结论**（机器可读标识），不是拿自然语言猜语义；
+    猜语义正是把"不适用"误报成"故障"的原因（该常量处有说明）。
+    标记同时是**跨层可读**的：异常经路由器聚合后类型会丢，标记不会。
+    """
+
+    #: 与 `supervisor.NOT_APPLICABLE_MARKERS` 逐字一致（判据会核对两边相同）。
+    MARKER_NOT_APPLICABLE = "不适用（非缺陷）"
+    MARKER_NOT_COVERED = "未收录该主体（非缺陷）"
+
+    KINDS = ("not_applicable", "not_covered")
+
+    def __init__(self, message: str = "", *, kind: str = "not_applicable") -> None:
+        if kind not in self.KINDS:
+            raise ValueError(f"kind 必须是 {self.KINDS} 之一，实际 {kind!r}")
+        marker = (self.MARKER_NOT_COVERED if kind == "not_covered"
+                  else self.MARKER_NOT_APPLICABLE)
+        super().__init__(f"{message} —— {marker}")
+        self.kind = kind
+
+
 class DataValidationError(FinAgentError):
     """数据校验不通过。"""
 

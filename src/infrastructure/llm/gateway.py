@@ -22,7 +22,10 @@ from src.core.config import Settings, get_settings
 from src.core.exceptions import ConfigError, LLMGatewayError
 from src.infrastructure.llm.audit import LLMAuditLog
 from src.infrastructure.llm.cache import LLMCache, cache_key
-from src.infrastructure.llm.circuit_breaker import get_circuit_registry
+from src.infrastructure.llm.circuit_breaker import (
+    caller_tenant_id,
+    get_circuit_registry,
+)
 from src.infrastructure.llm.models import LLMResponse, ModelSpec, TaskTier
 from src.infrastructure.llm.providers import BaseProvider, build_providers
 from src.infrastructure.llm.rate_limit_guard import (
@@ -507,8 +510,15 @@ class LLMGateway:
                 logger.info("跳过限流锁定的 %s（剩余 %ss）",
                             model_name, snap.get("remaining_s"))
                 continue
-            # 熔断器准入检查：熔断中直接跳过该provider，降级到备模型
-            cb = get_circuit_registry().get_or_create(spec.provider)
+            # 熔断器准入检查：熔断中直接跳过该provider，降级到备模型。
+            # ★ 桶按 `provider × 租户` 隔离（2026-09-30）：修复前这里是
+            #   `get_or_create(spec.provider)`，**一个租户**的突发流量把
+            #   所有租户一起打到 circuit_open（见 `routes/research.py`
+            #   @107-109 的实测记录）。`for_call` 是唯一建 key 的地方；
+            #   取不到租户身份 ⇒ 退回 provider 级全局桶（**仍然熔断**，
+            #   取舍写在 `circuit_breaker` 模块 docstring 里）。
+            cb = get_circuit_registry().for_call(
+                spec.provider, caller_tenant_id())
             if not cb.allow_request():
                 last_error = LLMGatewayError(
                     f"提供商{spec.provider}熔断中({cb.snapshot()['state']})，"
@@ -521,7 +531,11 @@ class LLMGateway:
                         prompt_hash=cache_key(system, prompt),
                         latency_ms=0, provider_chain=tried,
                     ),
-                    cached=False, error=f"circuit_open: {spec.provider}",
+                    cached=False,
+                    # 记**桶 key**而不是只记 provider：租户桶被拒与全局桶被拒
+                    # 是两件事，而这条审计行是排障时唯一的逐次记录。
+                    # 无租户时 `cb.name` 就是 provider，字符串与改动前一致。
+                    error=f"circuit_open: {cb.name}",
                 )
                 continue
             # 输出预算统一解析：调用显式覆盖 > 层级默认预算；统一夹到全局硬上限。
@@ -634,7 +648,10 @@ class LLMGateway:
                 resp.cost_yuan = call_cost_cny(
                     provider=spec.provider, model=spec.model_name,
                     tokens_in=resp.tokens_in, tokens_out=resp.tokens_out,
-                    cache_hit=False,
+                    # 真的调用了提供商 ⇒ 输入按**未命中价**计。
+                    # 参数名不叫 `cache_hit`，理由见 `call_cost_cny` 的 docstring：
+                    # 审计里的 `cache_hit` 是**本地**缓存命中（那种调用根本走不到这里）。
+                    provider_cache_hit=False,
                 )
             except Exception:  # noqa: BLE001 计价失败不影响调用结果
                 logger.debug("cost_yuan 计价失败（忽略）", exc_info=True)
@@ -655,7 +672,7 @@ class LLMGateway:
                 get_budget().record(
                     provider=spec.provider, model=spec.model_name,
                     tokens_in=resp.tokens_in, tokens_out=resp.tokens_out,
-                    cache_hit=False, source=agent_id or task_tier,
+                    provider_cache_hit=False, source=agent_id or task_tier,
                 )
             except Exception:  # noqa: BLE001 记账失败绝不能影响调用结果
                 logger.debug("LLM 成本记账失败（忽略）", exc_info=True)

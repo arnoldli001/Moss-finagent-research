@@ -169,7 +169,10 @@ def parse_cec_inventory(html: str, pub_date: date) -> tuple[str, float, str] | N
 class CoalInventoryConnector(BaseConnector):
     """电厂煤炭库存（中电联 CECI 周报「发电企业煤炭库存」，周频，约最近11期）。"""
 
-    source_name = "中电联CECI周报(发电企业煤炭库存)"
+    #: 口径必须落在 source_name 里：行业 Agent 的 `_format_with_fresh` 只把
+    #: indicator/期间/值/confidence/**source_name** 拼进 LLM 上下文，**不展开 extra**
+    #: —— 把"样本口径"只写进 extra 等于没披露（同 liquor_price_connector 的说明）。
+    source_name = "中电联CECI周报(发电企业样本库存)"
     source_url = "https://www.cec.org.cn/"
 
     def get_capabilities(self) -> dict[str, Any]:

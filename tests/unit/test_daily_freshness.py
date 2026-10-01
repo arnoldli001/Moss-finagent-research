@@ -188,6 +188,43 @@ def _daily_points(days: int = 80) -> list:
     return points
 
 
+def test_daily_compute_runs_off_the_event_loop(monkeypatch) -> None:
+    """★ 日K的**计算段必须离开事件循环**（`CHG-0099`）。
+
+    判据是"这次计算发生在哪个线程"，**不是**"耗时多少毫秒" —— 毫秒换个负载、
+    换台机器就不成立，而线程归属是个布尔判据：把 `asyncio.to_thread` 改回直接
+    `await`，这条必红。
+
+    实测背景（2026-09-29）：`analyse_daily` 在循环线程里同步跑一次 =
+    **547 ms 的循环停顿**；预热轮并发 2~3 只时 akshare 线程与 pandas 纯 Python
+    段互挤 GIL，停顿被放大到 **~1.9 s**（>1s 停顿 11~12 次）。而
+    `/api/v1/health/live`（前端「后端服务当前不可达」红条的探针）超时是 **4 s**、
+    连续两次失败即亮 —— 停顿成片出现，用户看到的就是"断网"。
+    """
+    import threading
+
+    from src.intraday import daily as daily_module
+    from src.intraday.config import IntradayConfig
+    from src.intraday.daily import fetch_daily_snapshot
+
+    seen: dict[str, str] = {}
+    real = daily_module.analyse_daily
+
+    def spy(*args, **kwargs):  # noqa: ANN002, ANN003
+        seen["thread"] = threading.current_thread().name
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(daily_module, "analyse_daily", spy)
+    asyncio_run(fetch_daily_snapshot(
+        "600036", "招商银行", IntradayConfig(),
+        _RecordingBackend(_daily_points())))
+
+    assert seen.get("thread"), "analyse_daily 压根没被调到（判据会因此假绿）"
+    assert "MainThread" not in seen["thread"], (
+        "日K计算段跑在事件循环线程上 —— 它会按住循环，让 /health/live 与所有"
+        f"在途请求排队（实测 547 ms，并发下 ~1.9 s）；实际线程={seen['thread']}")
+
+
 def test_daily_snapshot_requests_explicit_range() -> None:
     """必须给显式 start/end：路由在指定区间时跳过 TTL 与 DB 短路。
 

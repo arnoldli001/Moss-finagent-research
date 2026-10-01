@@ -33,8 +33,10 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel as _store_rel  # noqa: E402
+
 KEY_COLUMNS = ("code", "name", "report_period", "ann_date")
-DEFAULT_ROOT = "data/quant/fundamentals"
+DEFAULT_ROOT = _store_rel("quant_fundamentals")
 # 去重键：同一标的、同一报告期、**同一公告日**视为重复（重复抓取/重复文件）。
 # 刻意不含"只保留最新公告" —— 修正公告（业绩快报→正式财报、财报更正）是**不同版本**，
 # PIT 要求"当时能看到哪一版就返回哪一版"：若只留最新版，修正公告发布之前的

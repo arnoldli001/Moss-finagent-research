@@ -1677,6 +1677,7 @@ export async function pingServer(timeoutMs = 3000): Promise<boolean> {
                             { signal: ac.signal, cache: "no-store" });
       clearTimeout(timer);
       ok = r.ok;
+      if (ok) noteApiOk();
     } catch {
       ok = false;
     } finally {
@@ -1770,7 +1771,39 @@ async function request<T>(url: string, init?: RetryInit): Promise<T> {
     const bodyText = await resp.text();
     throw apiErrorFromResponse(resp.status, bodyText);
   }
+  noteApiOk();
   return resp.json() as Promise<T>;
+}
+
+
+/** 最近一次**任何 API 请求成功**的时刻（`CHG-0138`）。
+ *
+ * ## 为什么需要它
+ *
+ * 可达性横幅原来只会说一句「**后端服务当前不可达**」—— 而前端**从没测过"后端"**：
+ * 它测的是"这条链路 + 这个浏览器"，而且在浏览器自认离线时**连测都不测**
+ * （`pingServer` 短路）。于是三种完全不同的情况被同一句话盖住：
+ *
+ * | 真实情况 | 原来显示 | 应该显示 |
+ * |---|---|---|
+ * | 用户自己的网络断了 | 后端服务当前不可达 | **你的网络已断开**（与服务无关） |
+ * | 服务活着、被重型任务占住（探针 4s 超时但别的请求最终 200） | 后端服务当前不可达 | **服务响应很慢**（附"最近一次成功时刻"） |
+ * | 真的连不上 | 后端服务当前不可达 | **连不上服务** |
+ *
+ * 2026-09-30 实测：13:54 探针超时的那几分钟里，`/mainline/refresh_status`、
+ * `/alerts/bootstrap` 等请求**最终全部 200**（最长 **64.3 秒**）⇒ 服务是活着、
+ * 在排队。**"最近一次成功时刻"就是区分这三种情况唯一的客观证据**。
+ */
+let lastApiOkAt = 0;
+
+/** 任何 API 请求成功时调用（`request()` 与探针内部都会调）。 */
+export function noteApiOk(): void {
+  lastApiOkAt = Date.now();
+}
+
+/** 距最近一次成功请求多少毫秒；`Infinity` = 本次会话还没有过成功请求。 */
+export function lastApiOkAgeMs(): number {
+  return lastApiOkAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - lastApiOkAt;
 }
 
 
@@ -2226,6 +2259,15 @@ export type MonitorCost = {
   paid_calls: number;
   free_calls: number;
   unknown_provider_calls: number;
+  /**
+   * 命中**本地响应缓存**的调用次数 —— 这类调用**根本没有请求提供商**，
+   * 因此金额按 0 计（`cache_kind` = exact / semantic）。
+   * ⚠️ 它与后端的计价参数 `provider_cache_hit`（**提供商的**上下文缓存命中、
+   * 只是便宜一点）**不是**同一件事：同名不同义曾导致总额虚高 65.5%。
+   */
+  cached_calls?: number;
+  /** 反事实估算：这些缓存命中的 token 若未命中约需多少元。**不是账单。** */
+  avoided_cny?: number;
   /** 用了**未登记价格**的模型名的调用次数（金额按兜底价估算）。 */
   unpriced_calls: number;
   unpriced_models: Array<[string, number]>;
@@ -2444,6 +2486,22 @@ export const api = {
   llmMetrics: (limit = 1000) =>
     request<{ limit: number; slow_call_threshold_ms: number;
               metrics: LlmMetrics }>(`/api/v1/metrics?limit=${limit}`),
+  /**
+   * ★ 数据采集异常（管理员「运行指标」的数据采集异常展示区，2026-09-30）。
+   *
+   * 口径随数据下发：`window_hours` / `by_kind` / `kinds` / `kind_labels`
+   * 都由后端给，前端不自己写死文案（文案会被"优化得更友好"，
+   * 而判据只认机器可读的 kind）。
+   */
+  collectionAnomalies: (limit = 100, sinceHours = 72) =>
+    request<{
+      total: number; by_kind: Record<string, number>; window_hours: number;
+      file: string; bad_lines: number; kinds: string[];
+      kind_labels: Record<string, string>;
+      items: Array<{ ts: number; kind: string; indicator: string;
+                     reason: string; task_id?: string; source?: string }>;
+    }>(`/api/v1/metrics/collection_anomalies?limit=${limit}`
+       + `&since_hours=${sinceHours}`),
   backtestRun: (body: BacktestRequest) =>
     request<BacktestJobStarted>("/api/v1/backtest/run", {
       method: "POST", body: JSON.stringify(body),

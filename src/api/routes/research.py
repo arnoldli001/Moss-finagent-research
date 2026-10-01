@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import time
+from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -23,7 +25,7 @@ from src.core.errors import (
 )
 from src.core.executors import run_infra
 from src.infrastructure.connectors.security_resolver import resolve_stock
-from src.orchestration.supervisor import plan_run
+from src.orchestration.supervisor import plan_run, query_needs_stock_resolution
 from src.scheduler.registry import alert_scan_schedule
 
 logger = logging.getLogger(__name__)
@@ -205,6 +207,102 @@ def _runtime(request: Request) -> Runtime:
     return request.app.state.runtime
 
 
+@dataclass(frozen=True)
+class AnalysisSubject:
+    """一次请求的「分析谁」：`target` 进规划 prompt，`focus_*` 是顺带看的标的。"""
+
+    target: str = ""
+    target_display: str = ""
+    focus_stock_code: str = ""
+    focus_stock_name: str = ""
+    #: 人话说明：解析结果或**冲突改判**（空 = 无需说明）。
+    note: str = ""
+
+
+async def resolve_analysis_subject(
+    target: str, query: str, analysis_type: str,
+) -> AnalysisSubject:
+    """把「输入标的 + 问句」解析成这一轮真正要分析的标的。
+
+    ## ★★★ 2026-09-28 第二十三轮：不再只在 `analysis_type == "stock"` 时解析
+
+    【报障现场】用户问：「…以及AI应用加速失业率增加对消费的影响节奏…
+      未来半年能否持有高股息的**招商银行**？」规划器把它判成 `macro`，
+      于是原先那句 `if analysis_type == "stock"` 直接跳过 →
+      **"招商银行"永远没被解析成 600036** → A10 无从取数 →
+      A17 只能在 `data_gaps` 里写「招商银行个股财务明细…未提供」。
+
+    【判据】由 `query_needs_stock_resolution()` 回答"问句里有没有一只具体个股"
+      （与 supervisor 的信号判据**同源**、同一份关键词表）。
+      有 → 解析；解析出的代码**单独放 `focus_stock_code`**，
+      **不写进 `target`** —— 否则宏观问的分析焦点会被这只股票顶掉
+      （A08 的 prompt 会变成"分析焦点：招商银行"）。
+
+    ## ★★ 2026-09-29：问句点名的股票优先于输入框里的代码
+
+    【报障现场】同一条问句，请求里的 `target` 是 **300068**（输入框残留/误填）：
+      `candidate = target or query` ⇒ 解析出 300068(ST南都)，
+      于是**整条链路分析的是另一只票** —— A01 去取
+      `股息率:300068`/`商誉占净资产比:300068`/`fed:effr:300068`…，
+      A10/A11/A12 也全按它算；而用户读到的是"招商银行的数据没取到"。
+      **不报错、答错标的**，比缺数据更危险。
+
+    【判据】只在**两个条件同时成立**时才改（否则原样返回，保持既有行为）：
+      ① 输入标的是**裸 6 位代码**（说明是"顺手填的代码"，不是主题词）；
+      ② 问句能解析出一只**不同的**股票。
+      这时以问句为准，**且 `target` 一起改** —— `target` 是规划 prompt 的
+      「用户指定标的」与 `sanitize_indicators` 的补后缀依据，只改 `focus`
+      会让 LLM 继续按旧代码生成指标（实测就是这个形态）。
+
+    解析失败/名称表不可用 → 保持原值，下游按缺口如实处理（不阻断任务）。
+    """
+    target = (target or "").strip()
+    subject = AnalysisSubject(target=target, target_display=target)
+    if not (analysis_type == "stock"
+            or query_needs_stock_resolution(query, target)):
+        return subject
+    try:
+        resolved = await resolve_stock(target or query)
+    except Exception as exc:  # noqa: BLE001 名称解析为增强能力，失败不阻断
+        logger.warning("证券名称解析失败(%s): %s", (target or query)[:40], exc)
+        return subject
+    if not resolved:
+        return subject
+
+    note = ""
+    if target and re.fullmatch(r"\d{6}", target) and resolved[0] == target:
+        try:
+            named = await resolve_stock(query)
+        except Exception as exc:  # noqa: BLE001 解析失败就沿用输入标的
+            logger.warning("问句标的解析失败(%s): %s", query[:40], exc)
+            named = None
+        if named and named[0] and named[0] != resolved[0]:
+            logger.warning(
+                "输入标的 %s(%s) 与问句点名的 %s(%s) 冲突 → 以问句为准",
+                target, resolved[1], named[0], named[1])
+            note = (f"输入标的 {target}({resolved[1]}) 与问句点名的 "
+                    f"{named[1]}({named[0]}) 不一致 → 已按问句分析 {named[1]}")
+            resolved = named
+            target = named[0]
+
+    if analysis_type == "stock" or note:
+        # 个股任务：`target` 必须是这只股票的**代码**（既有行为不变）；
+        # 冲突改判时同理（此时 target 已等于 resolved[0]，赋值是幂等的）。
+        # ⚠️ 这两行是**行为契约**：`target` 会进规划 prompt，
+        #    留着中文名会让 LLM 按名字拼指标（`PE(TTM):招商银行`）。
+        target = resolved[0]
+        target_display = resolved[1] or subject.target_display or target
+    else:
+        target_display = subject.target_display
+    return AnalysisSubject(
+        target=target,
+        target_display=target_display,
+        focus_stock_code=resolved[0],
+        focus_stock_name=resolved[1],
+        note=note,
+    )
+
+
 @router.post("/research/analyze", status_code=202)
 async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
     """提交投研分析任务（异步执行，返回task_id供轮询）。
@@ -296,18 +394,31 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
     try:
         # 个股标的解析：中文简称/问句中的名称 → 6位代码（如"中际旭创"→300308）。
         # 解析失败保留原值，由下游按"数据不足"诚实处理，不阻断任务。
+        #
+        # ★★★ 2026-09-28 第二十三轮：**不再只在 `analysis_type == "stock"` 时解析**
+        #
+        # 【报障现场】用户问：「…以及AI应用加速失业率增加对消费的影响节奏…
+        #   未来半年能否持有高股息的**招商银行**？」规划器把它判成 `macro`，
+        #   于是原先这行 `if body.analysis_type == "stock"` 直接跳过 →
+        #   **"招商银行"永远没被解析成 600036** → A10 无从取数 →
+        #   A17 只能在 `data_gaps` 里写「招商银行个股财务明细…未提供」。
+        #
+        # 【新判据】由 `query_needs_stock_resolution()` 回答"问句里有没有一只
+        #   具体个股"（与 supervisor 的信号判据**同源**、同一份关键词表）。
+        #   有 → 解析；解析出的代码**单独放 `focus_stock_code`**，
+        #   **不写进 `target`** —— 否则宏观问的分析焦点会被这只股票顶掉
+        #   （A08 的 prompt 会变成"分析焦点：招商银行"）。
+        #
+        # 解析失败/名称表不可用 → 保持空串，下游按缺口如实处理（不阻断任务）。
         target = (body.target or "").strip()
         target_display = target
-        if body.analysis_type == "stock":
-            try:
-                candidate = target or body.query
-                resolved = await resolve_stock(candidate)
-            except Exception as exc:  # noqa: BLE001 名称解析为增强能力，失败不阻断
-                logger.warning("证券名称解析失败(%s): %s", candidate[:40], exc)
-                resolved = None
-            if resolved:
-                target = resolved[0]
-                target_display = resolved[1] or target_display or target
+        focus_stock_code = ""
+        focus_stock_name = ""
+        subject = await resolve_analysis_subject(
+            target, body.query, body.analysis_type)
+        target, target_display = subject.target, subject.target_display
+        focus_stock_code, focus_stock_name = (
+            subject.focus_stock_code, subject.focus_stock_name)
 
         plan = plan_run(body.analysis_type, target, body.info_items, query=body.query)
 
@@ -328,11 +439,29 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
             "task_id": task_id, "tenant_id": body.tenant_id,
             "user_query": body.query, "analysis_type": plan["analysis_type"],
             "target": target, "target_display": target_display,
+            # ★ 第二十三轮：复合问里夹带的个股代码（宏观/行业问也可能有）。
+            #   与 `target` **分开**：target 表达"这次分析的主题"，
+            #   focus_stock_code 表达"顺带要看的标的"，两者语义不同。
+            "focus_stock_code": focus_stock_code,
+            "focus_stock_name": focus_stock_name,
             "plan": [], "raw_points": [], "cleaned_points": [],
+            # ★ 2026-09-29：必须在这里也给出初值。
+            #   `_planned_indicators` 是 supervisor 写入、采集节点读取的 channel；
+            #   它**必须声明在 `ResearchState`**（否则 LangGraph 会静默丢弃，
+            #   见 `tests/unit/test_planned_indicators_channel.py` 的现场说明）。
+            #   这里给空列表是让"键一定存在"成为契约的一部分 ——
+            #   采集节点读 `None` 会回退到 `plan_run()`（**不做问句增补**），
+            #   那正是"招商银行无任何个股数据"那个缺陷的形态。
+            "_planned_indicators": [],
             "validated_points": [], "validation_report": {}, "storage_stats": {},
             "info_items": body.info_items, "verified_items": {}, "extracted_events": {},
             "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
-            "final_report": None, "progress": [],
+            "final_report": None,
+            # ★ 2026-09-29：标的**改判说明**作为第一条进度下发（`progress` 是
+            #   `operator.add` 聚合通道 ⇒ 预置项会保留在最前面）。
+            #   为什么必须让用户看见：`target=300068` + 问句问"招商银行"时，
+            #   系统按问句分析 600036 —— 若只写日志，用户会以为系统答错了票。
+            "progress": ([subject.note] if subject.note else []),
             "cancellation_token": cancel_token,
         }
         # 暴露state引用，running时前端可轮询agent_messages
@@ -356,7 +485,12 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
         raise
 
     return {"task_id": task_id, "trace_id": task_id, "status": "queued",
-            "plan": plan["agents"]}
+            "plan": plan["agents"],
+            # ★ 改判说明（空串 = 输入标的与问句一致）：前端可直接显示，
+            #   避免"我填了 300068，为什么分析的是招商银行"的困惑。
+            "target": target, "target_display": target_display,
+            "focus_stock_code": focus_stock_code,
+            "subject_note": subject.note}
 
 
 async def _run(task_id: str, qhash: str, body: AnalyzeRequest, plan: dict,
@@ -565,6 +699,18 @@ async def debug_plan(analysis_type: str = "full", target: str = "") -> dict:
     return plan_run(analysis_type, target) | {"agents_health_note": "see /api/v1/health"}
 
 
+def liveness_payload() -> dict:
+    """存活探针的**唯一**返回体实现。
+
+    `/api/v1/health/live`（带版本，前端用）与根级 `/healthz`（不带版本，
+    Dockerfile / Cloudflare / k8s 探针用）**共用这一份**，`CHG-0128`。
+    两份拷贝迟早会漂移 —— 而漂移的后果是"两个探针一个说活一个说死"。
+    """
+    import time
+
+    return {"ok": True, "ts": time.time()}
+
+
 @router.get("/health/live")
 async def health_live() -> dict:
     """**极轻**存活探针：不做任何 I/O，只回答"进程还在服务请求吗"。
@@ -596,10 +742,24 @@ async def health_live() -> dict:
 
     免鉴权是**必须**的：存活探针在登录页就要能用（那时还没有会话），
     而且 k8s/负载均衡的 liveness probe 本来就不该带凭证。
-    """
-    import time
 
-    return {"ok": True, "ts": time.time()}
+    ⚠️ 根级别名 `/healthz` **曾经只写在白名单和设计文档里、没有路由**
+    （实测 404），见 `CHG-0128`；现在由 `src/api/main.py` 提供，
+    并返回**同一个** `liveness_payload()`。
+
+    `CHG-0137`：顺带做一次计数打点（内存累加；它测不到"循环被阻塞"，
+    那件事的仪器是 `src/core/loop_lag.py` 的 1 Hz 采样）。
+    """
+    import time as _time
+
+    t0 = _time.perf_counter()
+    try:
+        from src.core import loop_lag
+
+        loop_lag.note_probe((_time.perf_counter() - t0) * 1000.0)
+    except Exception:  # noqa: BLE001 打点失败绝不影响探针
+        pass
+    return liveness_payload()
 
 
 @router.get("/health")
@@ -612,6 +772,32 @@ async def health(request: Request) -> dict:
         try:
             return build_data_health(runtime_obj)
         except Exception as exc:  # noqa: BLE001 健康检查本身不能崩
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
+
+    def _search_sources() -> dict:
+        """外部**搜索源**（博查=主 / 百度=备）的闸门状态（`CHG-0122`）。
+
+        ## 两条纪律
+
+        1. **失败只降级为空，绝不让 /health 500** —— 与 `_data_health` 同一条。
+           搜索源是"锦上添花"的兜底能力，它坏了不该把整个健康检查打挂。
+        2. ★ **这里只读本地额度账本，绝不发网络请求。** `/health` 是前端
+           「数据源健康度」面板 **20 秒轮询**的热路径，本项目实测过"在请求路径上
+           做真探测"的代价（对 14GB 库做 COUNT(*) ⇒ `/health` 卡到 **300 秒**超时，
+           同一时间做T面板一起卡死）。
+           **"现在到底能不能用"的真探测在 `scripts/check_external_sources.py`**，
+           不在请求路径上 —— 那个是要花钱的（每次真搜一次）。
+
+        所以这里给的判据是"**额度还剩多少、凭据配没配**"这类**本地就能答**的问题；
+        它足以支撑"要不要去开通/充值"的维护决策，而不会把面板拖慢。
+        """
+        try:
+            from src.infrastructure.search import router as _search_router
+
+            return {"available": True,
+                    "order": list(_search_router.PROVIDER_ORDER),
+                    "providers": _search_router.providers_status()}
+        except Exception as exc:  # noqa: BLE001 同 _data_health
             return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
 
     def _sync_probes() -> dict:
@@ -652,7 +838,119 @@ async def health(request: Request) -> dict:
                 "simulated": bool(cap.get("simulated", False)),
                 "indicators": cap.get("indicators", []),
             })
-        return {"chain": chain, "connectors": connectors}
+        # 本地存储家底 + 调度作用域：与上面两段**同一趟线程**（不多一次往返）
+        stores = _local_stores()
+        schedule = _schedule_scope()
+        return {"chain": chain, "connectors": connectors, "stores": stores,
+                "schedule": schedule}
+
+    def _schedule_scope() -> dict:
+        """本实例**实际会触发**哪些作业（`CHG-0087`）—— 唯一能看见"被裁了什么"的面。
+
+        ## 为什么不放在日志里（这是实测结论，不是偏好）
+
+        我最初把"哪些作业因写权限归属被裁"写在 `SchedulerService.start()` 的
+        `logger.info` 里。**实测那行字谁也看不到**：全仓库没有
+        `logging.basicConfig()` / `dictConfig()`，root logger 没有 handler
+        ⇒ INFO 被直接丢弃（Python 的 last-resort handler 只兜 WARNING 及以上）。
+        逐字节搜 `data/run/*.log` 里的「调度器已启动」= **0 处**
+        （对照：同文件里 WARNING 级的「作业…上一轮未结束，跳过本轮」在）。
+
+        这与本项目记过的那道门是同一道：**"我改了" → "有没有人看到"**。
+        所以改挂在这里 —— `/health` 是前端 20 秒轮询的既有响应，
+        不新增往返、不新增磁盘 IO（`schedulable_jobs()` 只读 registry 与 YAML）。
+
+        ⚠️ 语义边界：`pruned` 里的每一项都**不是故障**，而是"这台机器本来就不负责
+        这件事"（写权限归属决定）。真故障看 `scheduler/runs.jsonl` 的 status。
+        """
+        try:
+            from src.scheduler.registry import (
+                SCHEDULER_DENY_ENV,
+                scheduler_scope_report,
+            )
+
+            scope = scheduler_scope_report()
+        except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
+        return {
+            "available": True,
+            "env": scope["env"],
+            "total": scope["total"],
+            "active": scope["active"],
+            # 逐条给人话理由：只说"部分作业已跳过"会让运维以为作业丢了
+            "pruned": scope["pruned"],
+            "unknown_denied": scope["unknown_denied"],
+            "deny_env": SCHEDULER_DENY_ENV,
+            # ★ `CHG-0139`：角色 + **重作业有没有人在跑**。
+            #   把 4 个重作业移出 API 进程之后，"它们此刻跑不跑"就不再由本进程
+            #   的状态决定了 —— 本进程一切正常、health 全绿，而重作业可能
+            #   因为 worker 没起/挂了**一直不执行**。这个字段就是那个答案，
+            #   且它只有**十几个字节**的增量（`worker` 段是固定几项）。
+            "role": scope.get("role"),
+            "out_of_role": scope.get("out_of_role", []),
+            "worker": scope.get("worker", {}),
+        }
+
+    def _local_stores() -> dict:
+        """本地存储家底 + **写权限归属**（`CHG-0087`，用户要求"现在就接"）。
+
+        接的是 `data_stores.describe(want_sizes=False)` —— registry 是
+        "库在哪、谁能写、能不能删"的**单一事实源**（`configs/data_stores.yaml`），
+        此前它零个生产调用方，于是"dev 与 pilot 同时写同一个 14 GiB 行情仓"
+        只能靠翻日志发现。
+
+        ## 为什么只接摘要（用字节数决定的，不是感觉）
+
+        实测三种接法对 `/health` 体积的增量（基线 15,650 字节，前端 20 秒轮询）：
+
+        | 接法 | 增量 | /health 变成 |
+        |---|---|---|
+        | 全量（含每条 `note`） | +11.46 KB | 26.7 KB（+75%） |
+        | 去掉 `note` | +6.36 KB | 21.6 KB（+42%） |
+        | **摘要（本节）** | **+1.58 KB** | **16.9 KB（+10%）** |
+
+        `note` 合计 2,532 字符，是给人读 registry 的，不是给轮询接口的；
+        全量家底另有出口（`data_asset_catalog` / 离线审计脚本调
+        `describe(want_sizes=True)`）。
+
+        ## 为什么放这里而不是新起一趟请求
+
+        `_sync_probes()` 已经跑在**关键路径专用线程池**里，且
+        `describe(want_sizes=False)` 实测 **11.0 ms**（对照 `want_sizes=True`
+        要 walk 3.5 万个文件 = 3,288.9 ms，306 倍）—— 不新增串行往返、
+        不递归磁盘，符合「首屏串行往返上限 = 1」。
+
+        ⚠️ `want_sizes=False` 时 `size_mb` 一律是 `None`（**未量到**），
+        不是 0 —— 后者会被读成"这个库是空的"。
+        """
+        try:
+            from src.infrastructure.catalog.data_stores import describe
+
+            full = describe(want_sizes=False)
+        except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
+        return {
+            "available": True,
+            "env": full["env"],
+            "env_root": full["env_root"],
+            "registry": full["registry"],
+            "count": full["count"],
+            "protected": full["protected"],
+            "sizes_measured": full["sizes_measured"],
+            # 写权限裁决逐条给（**含待裁定项**）：`decided=False` 表示口径还没
+            # 拍板、当前只报告不阻断 —— 两者混在一起看会把"还没定"读成"已经管住"。
+            "sqlite": [
+                {"name": s["name"], "path": s["path"], "exists": s["exists"],
+                 "role": s["role"], "size_mb": s["size_mb"], "write": s.get("write")}
+                for s in full["stores"] if s["kind"] == "sqlite"
+            ],
+            # 文件/目录类存储只给名字与存在性，体积要递归目录（留给离线审计）。
+            "dirs": [
+                {"name": s["name"], "path": s["path"], "exists": s["exists"],
+                 "role": s["role"]}
+                for s in full["stores"] if s["kind"] != "sqlite"
+            ],
+        }
 
     def _rate_limit_guard() -> dict:
         """免费档限流熔断状态（**唯一能看见"siliconflow 被限流"的面**）。
@@ -672,6 +970,64 @@ async def health(request: Request) -> dict:
         except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
             return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
 
+    def _query_data_hops() -> dict:
+        """四跳取数的**跳级命中计数**（`src/core/hop_stats.py` 是唯一事实源）。
+
+        ## 为什么运维需要它
+
+        `query_data_for_agent` 是一条四跳优先级链（已采集点 → 本地库 → 连接器 →
+        联网兜底），而"每一跳到底命中多少"此前**一个数都没有** ——
+        于是「本地优先」这条策略改对了还是改坏了、联网兜底该不该扩白名单，
+        都只能靠感觉。`counters` 给逐跳命中数，`total` 是分母（一次四跳路径算一次），
+        `misses` 是缺口（**不是任何一跳的命中**：四跳全空）。
+
+        ## 两条纪律
+
+        1. **失败只降级为空，绝不让 /health 500** —— 与 `_search_sources` 同一条。
+        2. **纯内存读**：只读进程内几个整数，0 I/O、不发网络请求，符合
+           `/health` 是 20 秒轮询热路径这条硬约束。
+
+        ⚠️ 判据区分「还没量到」与「量到 0」（AGENTS.md 硬约束）：
+        冷启动时各项都是**有意义的 0**，而 `latest_hop` 会给「未量到」——
+        用 0 假装"最近一跳是第 0 跳"会让冷启动看起来像故障。
+        """
+        try:
+            from src.core.hop_stats import snapshot as _hop_snapshot
+
+            return {"available": True, **_hop_snapshot()}
+        except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
+
+    def _llm_circuit_breakers() -> dict:
+        """LLM 熔断器的**逐桶状态**（provider × 租户，`circuit_breaker.py` 是唯一事实源）。
+
+        ## 为什么必须暴露它（2026-10-01）
+
+        熔断从"按 provider 一桶"改成"provider × 租户"之后，**谁能看到分桶**就成了
+        这条修复能否运维的前提：一个租户的突发把**它自己**的桶打到 OPEN，
+        运维必须能一眼看出"是哪个桶、被拒了多少次"，否则
+        「一个用户把所有人打挂」这个老症状会以"某租户无声变慢"的新形态回来。
+
+        契约：`{"available": bool, "counters": {桶 key: 快照}, "open": [开着的桶],
+        "unmeasured": "未量到"}`。空态用 **`unmeasured`** 而不是 0 ——
+        「一个桶都还没建」与「建了但都是 CLOSED」含义不同（AGENTS.md 硬约束）。
+
+        两条纪律同 `_query_data_hops`：**失败只降级为空**、**纯内存读**
+        （`snapshot_all()` 只读进程内字典，0 I/O）。
+        """
+        try:
+            from src.infrastructure.llm.circuit_breaker import (
+                get_circuit_registry,
+            )
+
+            snap = get_circuit_registry().snapshot_all()
+            open_keys = sorted(k for k, v in snap.items()
+                               if str(v.get("state")) == "OPEN")
+            return {"available": True, "counters": snap, "open": open_keys,
+                    "unmeasured": "未量到"}
+        except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
+
     runtime = _runtime(request)
     settings = get_settings()
     agents = agent_health(runtime.agents)
@@ -682,6 +1038,8 @@ async def health(request: Request) -> dict:
     probes = await run_infra(_sync_probes)
     chain = probes["chain"]
     connectors = probes["connectors"]
+    local_stores = probes["stores"]
+    schedule_scope = probes["schedule"]
 
     try:
         counts = await runtime.repo.count_by_indicator()
@@ -719,6 +1077,20 @@ async def health(request: Request) -> dict:
             "connectors": connectors,
             "storage": storage,
             "redis_cache": redis_cache,
+            # ★ 本地存储家底 + **谁能写**（`configs/data_stores.yaml` 是单一事实源）。
+            # 有了它，"这台实例能不能写行情仓"不用再去翻调度日志比对时间戳：
+            # `sqlite[].write.decided=True` 且 `write_allowed=False` = 口径已定且拒绝；
+            # `decided=False` = 口径待裁定、当前只报告不阻断（两者不可混看）。
+            "local_stores": local_stores,
+            # ★ 外部搜索源（博查主 / 百度备）的闸门状态（`CHG-0122`）。
+            # 加它的理由：这两个源的**额度/凭据**属于"要维护的东西"，而运维看的是
+            # 面板。放在这里 ⇒ 复用既有的 20 秒轮询面，**不新增任何请求**。
+            # ⚠️ 只读本地账本、不发网络请求（见 `_search_sources` 的说明）。
+            "search_sources": _search_sources(),
+            # ★ 本实例**实际会触发**哪些定时作业（`pruned` = 因写权限归属被裁的）。
+            # 这是"哪些作业被裁"唯一可见的面：进程内 INFO 日志没有 handler，
+            # 写在 `logger.info` 里的裁剪理由**谁也看不到**（实测逐字节 0 处）。
+            "schedule": schedule_scope,
             # 数据源健康度：能力矩阵 + 实测延迟（做T模块的真实调用记录）+ Tushare 覆盖。
             # **必须放到线程里**：它要遍历 3.5 万个分区清单 + 查仓库九表（首次约 5 秒），
             # 而这是 CPU/IO 密集的同步代码 —— 直接在事件循环里跑会阻塞**所有**并发请求
@@ -738,6 +1110,16 @@ async def health(request: Request) -> dict:
             "rate_limit_guard": _rate_limit_guard(),
         },
         "audit_chain": {"valid": chain["valid"], "records": chain["count"]},
+        # ★ 四跳取数的**跳级命中计数**（哪一跳答出来的 / 缺口多少）。
+        # 为什么挂在这里而不是新开端点：`/health` 是前端 20 秒轮询的**既有**响应，
+        # 计数器是纯内存读（0 I/O、几个整数），既不新增往返也不拖慢热路径；
+        # 而"我们有一条四跳优先级链"这句话，此前**没有任何数据**能证明每跳命中多少
+        # （见 `src/core/hop_stats.py` 的说明）。
+        "query_data_hops": _query_data_hops(),
+        # ★ LLM 熔断器逐桶状态（provider × 租户）。为什么挂这里：
+        # 熔断改成按租户分桶之后，"哪个桶开着、被拒了多少次"必须**看得见** ——
+        # 否则「一个用户把所有人打挂」会变成「某个租户无声变慢」。
+        "llm_circuit_breakers": _llm_circuit_breakers(),
         # 并发容量与背压（详见 /research/capacity 的说明）：
         # 放这里是为了让运维页一眼看到"闸门是否打满、任务表有没有涨"。
         "capacity": {

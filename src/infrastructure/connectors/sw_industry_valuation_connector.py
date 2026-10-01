@@ -63,17 +63,35 @@ class SWIndustryValuationConnector(BaseConnector):
     source_url = "https://akshare.akfamily.xyz"
 
     def get_capabilities(self) -> dict[str, Any]:
+        """★ 2026-09-30（`CHG-0136`）：**补登一级/二级的"按行业点名"形式**。
+
+        报障现场：用户问"未来半年能否持有高股息的招商银行"，报告却写
+        「银行 PE-PB-股息率标签…在本节全部缺失」。实测根因**不是取不到**：
+
+        * `supports("ind:sw_first_dividend_yield:银行")` → **True**，且**真取到**
+          （实测 2026-09-30 银行行业股息率 **5.1%**、PE-TTM **7.34**）；
+        * 但本方法原来只登记了 **三级**的 `{行业名}` 形式 ⇒ **规划侧看不到**
+          一级行业的按行业路径 ⇒ 只采 `:all` **无行业标签的截面** ⇒
+          Agent 拿着一张全市场截面，**没法把"银行"单独挑出来** ⇒ 报"缺失"。
+
+        所以这里把 `first`/`second` 的 `{行业名}` 形式一并登记（含 `dividend_yield`：
+        原列表连**三级**的股息率 `:all` 都没登记，只有 `:all` 的 pe/pb）。
+        `supports()` 本来就接受这些形式（正则 `_INDICATOR_RE` 覆盖四级指标 ×
+        three levels），**登记的漏项才是根因** —— 这是"能力存在但没人知道"的
+        又一个实例（与 `supervisor.py` 里那些"数据到了、Agent 看不见"同源）。
+        """
+        levels = ("first", "second", "third")
+        metrics = ("pe_ttm", "pe_static", "pb", "dividend_yield")
+        indicators = [f"ind:sw_{lv}_{mt}:all" for lv in levels for mt in metrics]
+        indicators += [f"ind:sw_{lv}_{mt}:{{行业名}}"
+                       for lv in levels for mt in metrics]
         return {
             "name": self.source_name,
             "source_type": DataSourceType.API.value,
-            "indicators": [
-                "ind:sw_first_pe_ttm:all", "ind:sw_first_pb:all",
-                "ind:sw_second_pe_ttm:all", "ind:sw_second_pb:all",
-                "ind:sw_third_pe_ttm:all", "ind:sw_third_pb:all",
-                "ind:sw_third_pe_ttm:{行业名}", "ind:sw_third_pb:{行业名}",
-                "ind:sw_third_dividend_yield:{行业名}",
-            ],
-            "notes": "申万一级/二级/三级行业截面估值，每日收盘后更新",
+            "indicators": indicators,
+            "notes": ("申万一级/二级/三级行业截面估值与股息率，每日收盘后更新；"
+                      "`:all` 为全市场截面（**不带行业标签**，无法定位单个行业），"
+                      "要某个行业请用 `:{行业名}` 形式（如 `ind:sw_first_dividend_yield:银行`）"),
         }
 
     @staticmethod

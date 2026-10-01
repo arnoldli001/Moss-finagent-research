@@ -337,10 +337,30 @@ def assess_liquidity(points: Sequence[Any]) -> dict[str, Any]:
             },
         }
     else:
-        result["fedwatch"] = {"status": "unavailable"}
-        result["data_gaps"].append(
-            "CME FedWatch利率概率（当前环境无法访问CME/FRED，仅能依据美联储"
-            "当前目标区间做方向性判断）")
+        # ★ 2026-09-30（`CHG-0135`）：这里原来往 `data_gaps` 里写
+        #   「CME FedWatch利率概率（当前环境无法访问CME/FRED，仅能依据…）」——
+        #   两个问题，都会直接误导客户：
+        #   ① **FRED 是可达的**：`fedwatch_connector` 自己就写着
+        #      「CME FedWatch 主机 TCP 预检不可达，跳过调用（省去 ~21s 超时等待）；
+        #        政策利率请用 fed:policy_range（FRED 源，**实测可达**）」，
+        #      直连 `api.stlouisfed.org` 也有响应（400 = 缺 key，主机可达）。
+        #      把"CME 不可达"写成"CME/FRED 都不可达"，是**把两个源混成一句**。
+        #   ② 它正面违反 `decision/capabilities.py` 的明令：
+        #      **禁止**在 `data_gaps` 里写「无法访问 CME/FRED」。
+        #   现在：**不写进 data_gaps**（CME 不可达是环境限制、补不到，
+        #   进缺口队列只会让 A19 白跑一次），只在 `fedwatch` 字段里如实说，
+        #   并指向真正可用的替代口径 —— 不再声明 FRED 不可达。
+        result["fedwatch"] = {
+            # ⚠️ `status` 保持 `"unavailable"`：**这个状态是真的**
+            #   （我们确实没有 FedWatch 概率），它是既有契约
+            #   （`test_liquidity_cycle_skill.py::test_empty_points_only_gaps` 断言它）。
+            #   错的只是下面那句 `data_gaps` 文案 —— 别把状态一起改掉。
+            "status": "unavailable",
+            "note": "CME FedWatch 主机本机不可达（已按 TCP 预检跳过调用，"
+                    "省去约 21s 超时等待）；利率路径请用 FRED 源的"
+                    "联邦基金目标区间（`fed:policy_range`，实测可达）",
+            "alternative": "fed:policy_range",
+        }
 
     result["summary_text"] = render_liquidity_hint(result)
     return result

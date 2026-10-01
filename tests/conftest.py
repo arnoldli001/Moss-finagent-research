@@ -256,6 +256,147 @@ def _isolate_intraday_notify_throttle(tmp_dir, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_settings_cache():
+    """每个用例前后清掉 `get_settings()` 的**进程级缓存**（autouse，全局）。
+
+    ## 为什么必须是 autouse（2026-09-30 实测：一个用例把后面的用例全弄红）
+
+    `get_settings()` 是 `@lru_cache` 的**进程内单例**。于是任何用例只要在
+    "别人的环境变量"下构建过一次 `Settings`，那份**属于另一个环境**的配置
+    就会留在进程里，直到有人手工 `cache_clear()` —— 而以前只有**部分文件**
+    在自己的 fixture 里记得清（实测 14 个文件有，其余没有）。
+
+    现场：`test_scheduler_role_split.py` 的夹具把 `MOSS_ENV` 设成 `pilot`（那是
+    它必须锚定的环境），而 `worker_heartbeat.heartbeat_path()` 在没有
+    `SCHEDULER_DIR` 时会回落到 `get_settings()` ⇒ 一份 **pilot** 的 `Settings`
+    被缓存住 ⇒ 之后 `test_warehouse_write_ownership.py` 的四个 `/health` 用例
+    被当成**公网实例**（`LoginGateMiddleware` 按 `is_public` 强制登录）
+    ⇒ 全部返回 **401**、四条判据同时红，而它们**单独跑全绿**。
+    复现命令（一跑就红，修好后必须绿）：
+
+        python -m pytest tests/unit/test_scheduler_role_split.py \
+                         tests/unit/test_warehouse_write_ownership.py -q
+
+    ## 为什么修在 conftest 而不是只修那个夹具
+
+    "记得清缓存"与"记得 patch 生产进程"是**同一类**纪律（见
+    `_forbid_real_process_signals`）：写在文档里会被忽略，写成判据的不会。
+    做成 autouse 之后，**任何**用例（含以后新增的）都不可能把环境泄漏给下一个。
+
+    判据：`tests/unit/test_test_harness_isolation.py`。
+    """
+    from src.core.config import get_settings
+
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_llm_spend_ledger(tmp_path_factory, monkeypatch):
+    """把**跨进程 LLM 花费账本**指到临时目录（autouse，全局）。
+
+    ## 为什么必须 autouse（2026-10-01，与 `_reset_settings_cache` 同一类）
+
+    生产单例 `get_budget()` 会打开 `data/run/llm_spend-YYYY-MM-DD.jsonl`
+    作为"当日全局花费"的事实源（`DaySpendLedger`）。测试若不去隔离：
+
+      · 跑测试的机器上**真实花过的钱**会进到 `remaining` / 硬闸判断里
+        ⇒ 判据的通过与否取决于"今天线上花了多少"，那是**不可复现**的红/绿；
+      · 反向也危险：测试写进真实账本 ⇒ 污染线上运维页的当日花费。
+
+    所以每个用例都给一个**独立临时目录**。判据
+    `tests/unit/test_test_harness_isolation.py`（与 settings 缓存同一条纪律：
+    "记得隔离"写在文档里会被忽略，写成 autouse 的不会）。
+
+    显式设成目录（而不是空串）：空串在实现里表示"关闭账本"，
+    而这里要的是"换一个地方"，两者语义不同 —— 混用会让
+    `ledger_enabled` 这类可见性字段在测试里失去意义。
+    """
+    from src.core import budget as budget_mod
+
+    monkeypatch.setenv(
+        budget_mod.LEDGER_DIR_ENV,
+        str(tmp_path_factory.mktemp("llm_spend_ledger")))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_circuit_registry():
+    """每个用例给一份**全新的熔断注册表**（autouse，全局）。
+
+    ## 为什么必须 autouse（2026-10-01，与 `_reset_settings_cache` 同一类）
+
+    注册表是进程级单例、承载**可变熔断状态**。于是"先打满阈值、再断言被拒"
+    这类判据的**前提**依赖"这个桶此刻是 CLOSED 初始态" —— 一旦同进程里
+    别的用例或应用后台线程碰过同一个桶，那条断言测的就是**用例执行顺序**：
+
+        现场：`test_fallback_wiring.py::test_circuit_breaker_open_refuses`
+              合并跑时红过一次（断言「熔断器没有打开 —— 测试前提不成立」），
+              单独跑 6 次 + 同命令重跑 5 次全绿。
+
+    这种"合并偶发红"最容易被当成抖动忽略，而它掩盖的是**共享可变单例**
+    这一类真问题。做法与账本/设置缓存那两条一致：**结构性隔离，不靠多跑几次**。
+
+    判据：`tests/unit/test_test_harness_isolation.py`。
+    """
+    from src.infrastructure.llm import circuit_breaker as cb_mod
+
+    cb_mod.reset_circuit_registry_for_test()
+    yield
+    cb_mod.reset_circuit_registry_for_test()
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_process_signals(monkeypatch):
+    """测试**绝不允许**向活着的进程发信号（autouse，所有测试生效）。
+
+    ## 为什么必须是 autouse（2026-09-30 实测，差一步停掉线上 worker）
+
+    `stop_backend_processes` 为 `CHG-0141` 加上了"并上 worker 枚举"之后，
+    四条**只 patch 了后端枚举**的既有用例，在本机真有一个 worker 在跑时
+    把 **PID 18880（线上那个 worker）** 当成了停止目标：
+    断言先红了，但代码路径**已经走到** `request_graceful_stop(18880)`。
+
+    也就是说：**跑一次单测就可能把线上的重作业进程停掉** —— 而 worker
+    没有端口、前端不会报不可达，症状要等到"某个数据不再更新"才浮现
+    （正是 `CHG-0141` 加心跳要消灭的那类静默失效）。
+    这与本项目反复记的"测试与生产跑在同一台机器上"是同一个根：
+    **不能靠"记得 patch"，要靠机器拦。**
+
+    ## 为什么只拦"真的活着"的 PID
+
+    有些用例**故意**要验证真实实现（例如 `request_graceful_stop` 对不存在的
+    PID 必须返回 False 而不是抛异常），它们传的是假 PID ⇒ 应当继续走真实分支。
+    一律拦住会把那些判据变成"测一个替身"，看起来绿、实际什么都没证明。
+    """
+    import manage
+
+    orig_kill = manage.kill_pid_tree
+    orig_grace = manage.request_graceful_stop
+
+    def _guard(name, orig):
+        def _wrapped(pid, *args, **kwargs):
+            try:
+                alive = manage._pid_alive(int(pid))
+            except Exception:  # noqa: BLE001 判不出来就按"危险"处理
+                alive = True
+            if alive:
+                print(f"[测试安全闸] 拒绝对活着的进程发信号：{name}({pid})"
+                      " —— 用例应当 monkeypatch 掉这个函数，"
+                      "而不是对真实进程下手")
+                return False
+            return orig(pid, *args, **kwargs)
+
+        return _wrapped
+
+    monkeypatch.setattr(manage, "kill_pid_tree", _guard("kill_pid_tree", orig_kill))
+    monkeypatch.setattr(manage, "request_graceful_stop",
+                        _guard("request_graceful_stop", orig_grace))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _reset_auth_singletons():
     """每个用例前后重置认证相关的**进程级单例**：图形码 + IP 限流。
 
@@ -284,3 +425,41 @@ def _reset_auth_singletons():
     yield
     reset_challenge_service()
     reset_ip_rate_limiter()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_collection_anomalies(tmp_dir, monkeypatch):
+    """把**采集异常库**重定向到临时目录（autouse，所有测试生效）。
+
+    ## 为什么必须是 autouse（2026-09-30 实测）
+
+    管理员界面「运行指标 → 数据采集异常」区读的就是
+    `<run_dir>/collection_anomalies.jsonl`，而 `run_dir` 在
+    `configs/data_stores.yaml` 里登记为 **shared**（dev / pilot / test 共用同一个
+    目录）。于是**集成测试里故意抛的假错误会被写进生产文件**：
+
+        tests/integration/test_supervisor_graph.py:262
+            raise RuntimeError("网络炸了")
+
+    实测后果：那个文件当时 **34 行里有 32 行**是这句假错误产生的 ——
+    也就是说**这个面板 94% 是假数据**，而它存在的意义恰恰是"方便维护"。
+    (`AGENTS.md`：宁可不显示，也不显示假绿 —— 这里是更糟的一种：
+    显示的是**测试的幻觉**，而且看不出是假的。)
+
+    做成 autouse 而不是去修那一个用例：**将来任何新增测试**只要经过
+    Supervisor 的采集链就会再污染一次，而它**不报错**（与上面几条 autouse
+    同一个理由 —— 逐个文件修是治不住的）。
+
+    ⚠️ 同时清掉进程内去重表 `_SEEN`（`DEDUP_WINDOW_S=1800`）：
+    不清的话，用例 A 记过的 `(kind, indicator, reason[:60])`
+    会让用例 B 的同一条**静默不写** —— 表现为"我明明记了却没落盘"，
+    同一进程跑整个套件时最容易出现。
+    """
+    import pathlib as _pathlib
+
+    from src.core import collection_anomalies as _ca
+
+    monkeypatch.setattr(_ca, "_path",
+                        lambda root=None: _pathlib.Path(tmp_dir) / _ca.FILE_NAME)
+    monkeypatch.setattr(_ca, "_SEEN", {})
+    monkeypatch.setattr(_ca, "_WARNED_UNKNOWN_KINDS", set())

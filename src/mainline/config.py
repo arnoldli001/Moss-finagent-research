@@ -78,6 +78,8 @@ from src.core.errors import BRIEF_TIGHT, brief
 
 logger = logging.getLogger(__name__)
 
+from src.infrastructure.catalog.data_stores import store_rel as _store_rel  # noqa: E402
+
 #: 仓库根（configs/ 与 src/ 同级）
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -1130,7 +1132,8 @@ class DataConfig:
     """数据源与本地缓存的运行参数。"""
 
     #: 本地主线数据仓（**独立于 15 GiB 行情仓**，见 datastore.py）
-    cache_path: str = "data/mainline_cache.db"
+    cache_path: str = field(
+        default_factory=lambda: _store_rel("mainline_cache"))
     eastmoney_min_interval: float = 1.05
     eastmoney_timeout: float = 15.0
     catalog_ttl_hours: float = 24.0

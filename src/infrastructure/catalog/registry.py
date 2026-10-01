@@ -350,6 +350,39 @@ class IndicatorRegistry:
 
         return None
 
+    def get_by_base(self, indicator: str) -> IndicatorMeta | None:
+        """按「基名」查元数据：`商誉占净资产比:600036` → 登记在册的 `商誉占净资产比`。
+
+        ## 为什么需要它（2026-09-30，实测 11 条 `freq_mismatch` 的根因）
+
+        一批指标在 YAML 里**只能登记基名**（`notes` 写着"模板：实际指标带 6 位
+        代码后缀"，如 `商誉占净资产比` / `货币资金占总资产比` / `有息负债占总资产比`），
+        而落库的是**带后缀的具体 id**。`get()` 的精确与通配都要求**段数相同**
+        （`商誉占净资产比` 是 1 段、`商誉占净资产比:000001` 是 2 段）⇒ 查不到
+        ⇒ 索引把它当"自动登记"给了兜底 `daily/24h`
+        ⇒ 维护审计用**日频**宽限（3 天）去判**季频**数据（92 天）⇒ 报
+        `freq_mismatch`（实测 3+5+3=11 条）。
+        而且它们只有 1 期数据 ⇒ `_infer_frequencies_sync` 按纪律"证据不足不猜"
+        （`n < 2`）不修 ⇒ **永远修不好**。本方法让**基名的登记口径对具体 id 生效**。
+
+        ## 判据（刻意严格）
+
+        只认「已登记的 id 是本 id 的**前缀**，且紧随其后就是 `:`」——**最长者胜**。
+        不许模糊/相似匹配：`PE(TTM)` 与 `PE(TTM):同比` 这类必须由更长者胜出，
+        否则会把"同比"口径的周期套到水平值上。
+        """
+        self._ensure_loaded()
+        if not indicator or ":" not in indicator:
+            return None
+        best: IndicatorMeta | None = None
+        best_len = -1
+        for base, meta in self._by_id.items():
+            if not base or len(base) <= best_len:
+                continue
+            if indicator.startswith(base) and indicator[len(base)] == ":":
+                best, best_len = meta, len(base)
+        return best
+
     @staticmethod
     def _materialize(meta: IndicatorMeta, indicator: str) -> IndicatorMeta:
         """命中模板后，把模板元数据的具体 indicator 换成查询值。"""

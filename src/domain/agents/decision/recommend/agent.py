@@ -31,12 +31,37 @@ class RecommendationAgent(BaseAgent):
     """综合宏观/中观/微观/财务风险四维分析，仲裁冲突，输出投研建议（PRD A17，P0）。"""
 
     system_prompt = (
-        "投研委员会主席，综合四维分析生成投研建议。\n"
+        "投研委员会主席，综合多维分析生成投研建议。\n"
         "- 冲突时显式仲裁并给取舍依据，每条逻辑可回溯到分析维度；\n"
         "- 立场与证据强度一致，高风险禁看多；\n"
         "- 有market_liquidity按「总量→三市分项→双创宽度PE分位→结论」引用，"
         "缩量(<2.5万亿)回踩不追高，缺口如实声明不杜撰数字；\n"
-        "- 问收益预期给乐观/中性/悲观三档情景+核心假设+证伪信号。"
+        "- 问收益预期给乐观/中性/悲观三档情景+核心假设+证伪信号。\n"
+        "\n"
+        "★★★ 输出长度硬约束（2026-09-28 第十轮 · 由审计实证钉死）：\n"
+        "  审计实测 A17 输出 3168 tokens、墙钟 32.7s（占端到端最大单点）；\n"
+        "  conclusion / position_advice / stance 等字段无显式长度上限时，\n"
+        "  模型倾向于写满 max_tokens，导致延迟随 token 线性膨胀。\n"
+        "  下列上限 = 经过审计 + 实测效果最佳的折中；超出部分会被 audit 标'越界'\n"
+        "  但不会截断（截断会丢结论）。\n"
+        "  · conclusion: ≤ 500 字（中文算字）；先答问后展开\n"
+        "  · key_logic / catalysts / risks: 每条 ≤ 80 字，合计 ≤ 5 条\n"
+        "  · position_advice: ≤ 120 字；买卖问题才填，否则 null\n"
+        "  · expected_return_3_6m: 三档情景各 ≤ 50 字，assumptions ≤ 3 条\n"
+        "  · conflicts_resolved: ≤ 3 条；只有真冲突时才填\n"
+        "  · monitoring_points: ≤ 3 条\n"
+        "  ⚠️ 严禁为凑长度扩写 —— 质量靠密度不靠字数。\n"
+        "\n"
+        "★★★ 数据缺口声明（2026-09-28 第十三轮 · 由三档实测钉死）：\n"
+        "  三档对比实测发现：只有 high 档在结论里声明了数据缺口\n"
+        "  （「[数据缺口：三市分项成交额未提供]」），low/none 都没写 ——\n"
+        "  而 prompt 的规则段已经要求了。**说明自然语言规则会被长 prompt 稀释。**\n"
+        "  所以缺口声明已提升为**必填 JSON 字段 `data_gaps`**：\n"
+        "  · 凡上游分析或本地量化参考中「未提供」、而你的结论又需要的口径\n"
+        "    （三市分项成交额、北向资金、行业分项估值、个股财务明细…），\n"
+        "    必须逐条列入 `data_gaps`；\n"
+        "  · 确认无缺口时填空数组 `[]`（**不要省略该字段**）；\n"
+        "  · 严禁用训练记忆里的数值填补缺口 —— 缺就写缺。"
     )
 
     def __init__(self, gateway: LLMGateway, agent_id: str = "A17_recommend") -> None:
@@ -161,9 +186,23 @@ class RecommendationAgent(BaseAgent):
                 '"stance": "...", "key_logic": [...], "catalysts": [...], '
                 '"risks": [...], "monitoring_points": [...], '
                 '"conflicts_resolved": [...], '
+                # ★ 2026-09-28 第十三轮：把"数据缺口声明"从**规则**提升为
+                # **必填 schema 字段**。
+                #
+                # 为什么：实测三档对比发现 —— 只有 `high` 档在 conclusion 里
+                # 写了 `[数据缺口：三市分项成交额未提供]`，`low`/`none` 都没写。
+                # 而 prompt 的 `rules` 第 2 条与 `grounding` 段都要求了缺口声明
+                # —— **规则被长 prompt 稀释了**，靠自然语言约束不可靠。
+                #
+                # schema 字段不会被稀释：模型为了填满 JSON 必须给出这个字段。
+                '"data_gaps": ["本次分析缺失的关键数据，逐条列出；'
+                '确实无缺口则填空数组"], '
                 '"position_advice": "仓位区间+节奏", '
                 '"expected_return_3_6m": {"bull":"...", "base":"...", '
                 '"bear":"...", "assumptions":[...], "invalid_signals":[...]}}}\n'
+                '   ★ data_gaps **必填且不得省略**：凡上游分析或本地量化参考中'
+                '"未提供"而结论又需要的口径（如三市分项成交额、北向资金、'
+                '行业分项估值），必须在此逐条列出。无缺口填空数组 []。\n'
                 '   买卖/仓位问题position_advice必填；收益预期问题expected_return_3_6m必填；'
                 '其余给null。\n'
             )
@@ -171,8 +210,10 @@ class RecommendationAgent(BaseAgent):
             output_spec = (
                 "输出JSON：conclusion, confidence, stance, key_logic, catalysts, "
                 "risks, monitoring_points, conflicts_resolved(冲突仲裁说明), "
+                "data_gaps(数据缺口声明，必填，无则[]), "
                 "position_advice, expected_return_3_6m{bull,base,bear,assumptions,"
-                "invalid_signals}。买卖问题position_advice必填；收益问题"
+                "invalid_signals}。★ data_gaps 必填：上游未提供而结论需要的口径"
+                "必须逐条列出。买卖问题position_advice必填；收益问题"
                 "expected_return_3_6m必填(三档情景+假设+证伪信号)；其余给null。"
                 "可选action调工具追问(最多2轮)。\n"
             )

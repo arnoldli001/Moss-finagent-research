@@ -1,0 +1,1511 @@
+# 数据指标索引清单（Indicator Catalog）
+#
+# 设计目标：
+#  1. 给所有投研/中观/量化指标一份"权威元数据"——含数据源、更新频率、新鲜度阈值、来源 URL 模板。
+#  2. SmartFetcher 据此决定"哪些走 DB、哪些走网络、按周期表判断 fresh/stale"。
+#  3. Scheduler 据 `update_frequency` 自动生成 cron 作业（无需手写 yaml/job）。
+#  4. 缺数据的指标在 `_HEAL_BLACKLIST` 之外的，自动触发连接器自修复（沿用现有 A19）。
+#
+# 字段语义：
+#   id            : 唯一 ID（与 supervisor plan_run / LLM planner INDICATOR_CATALOG 对齐）
+#   category      : cn_macro / us_macro / mkt_liquidity / cn_industry / individual / fed / ...
+#   frequency     : realtime | intraday | daily | weekly | monthly | quarterly | yearly
+#   freshness_hours: 在 DB 内未超过此值视为"新鲜"，不再联网；超出即视为 stale 触发 fetch
+#                    realtime=0.5, intraday=4, daily=26, weekly=168, monthly=720, quarterly=2160
+#   primary_source: 主数据源（显示名，与 Connector.source_name 对齐；运行时不强校验）
+#   source_url    : 数据源参考 URL（写审计用）
+#   enabled       : 是否启用（False 时 SmartFetcher 不联网、不报错但也不返回数据）
+#   ttl_days      : 保留天数（数据库保留策略，prune_before 用）
+#   units         : 数值单位（% / 亿元 / 元/吨 ...）
+#
+# ★ 存储位置（2026-09-28 新增，回答"记录每个数据所在库表"）：
+#   storage_backend : 后端类型 + 标识，格式 "<kind>:<name>"
+#                     · sqlite:fact_data_points   —— 主事实表（默认，MacroRepository）
+#                     · sqlite:<table>            —— 同一 SQLite 文件的其它表
+#                     · file:<相对路径>            —— 落盘文件（parquet/csv）
+#                     · mysql:<db>.<table>        —— 量化数仓（scripts/quant_warehouse.py）
+#                     · postgres:<db>.<table>     —— 可选 PG 后端
+#   storage_location: 具体位置（表名 / 文件 glob）。
+#                     省略时默认 `fact_data_points`（sqlite 后端）。
+#   storage_note    : 人话说明（"这个数据到底在哪"）—— 给运维排查用。
+#
+#   为什么需要它：投研数据散落在**三种物理位置**（SQLite 事实表 / quant parquet /
+#   量化数仓），运维问"这个指标的数据在哪"时，旧版只能靠 grep 代码。
+#   索引表把"指标 → 物理位置"变成一次 SELECT。
+#
+#   未声明 storage_backend 的指标 → 默认 `sqlite:fact_data_points`。
+#
+# ★ 修改本文件后**必须**:
+#   1) 重启后端或跑 `python scripts/rebuild_indicator_catalog.py` 让 DB 索引表同步
+#   2) 让 Scheduler 重新生成作业：见 `src/scheduler/catalog_jobs.py`
+#   3) 加新指标时同时在 `supervisor.py:INDICATOR_CATALOG`(planner 系统提示) 同步
+
+indicators:
+  # ============ 中国宏观（月度）============
+  - id: CPI
+    category: cn_macro
+    frequency: monthly
+    freshness_hours: 720         # 30 天
+    primary_source: "国家统计局"
+    source_url: "http://www.stats.gov.cn/"
+    ttl_days: 1825               # 5 年
+    units: "%"
+    notes: "中国居民消费价格指数同比"
+
+  - id: PPI
+    category: cn_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "国家统计局"
+    source_url: "http://www.stats.gov.cn/"
+    ttl_days: 1825
+    units: "%"
+    notes: "中国工业生产者出厂价格指数同比"
+
+  - id: M2
+    category: cn_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "中国人民银行"
+    source_url: "http://www.pbc.gov.cn/"
+    ttl_days: 1825
+    units: "%"
+
+  - id: 社融
+    category: cn_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "中国人民银行"
+    source_url: "http://www.pbc.gov.cn/"
+    ttl_days: 1825
+    units: "亿元"
+
+  # ★★★ 2026-09-29 第二十五轮：`PMI` / `GDP` 补登记（**生产者到位后才允许登记**）。
+  #
+  # 【本文件为什么之前没有它们】这两个 id 在系统里有 ≥3 处独立契约当真实指标对待，
+  #   却**没有任何连接器实现** —— 那时登记会立刻红在
+  #   `test_contract_consistency.py::test_registered_indicators_are_obtainable_or_registered_unobtainable`
+  #   （②→①：登记了却取不到）。当时的结论是"真缺口，不许假装修好"。
+  #
+  # 【现在的实测事实（2026-09-29）】`src/infrastructure/connectors/macro_extra_connector.py`
+  #   提供了生产者，`supports()` 全认：
+  #     supports('PMI')      -> ['MacroExtraConnector']
+  #     supports('GDP')      -> ['MacroExtraConnector']
+  #     supports('GDP:同比')  -> ['MacroExtraConnector']
+  #   → 缺口已从"没人生产"变成"**没登记**"（与 planner 目录那 6 条同一类），
+  #     所以按 `test_contract_consistency.py` 的过期规则**必须补登记、删豁免**。
+  #
+  # 【族一起登记的理由】`MacroExtraConnector._SPECS` 是一个族：
+  #   `PMI` / `PMI:制造业` / `PMI:非制造业` / `GDP` / `GDP:同比`。
+  #   只登记 `PMI`/`GDP` 会让下一次报障从"非制造业 PMI 取不到"重新长出来
+  #   —— 与 `quant_daily_basic` 列族、渗透率赛道族同一条纪律。
+  #
+  # 【口径诚实边界（随数据一起下发，别丢）】
+  #   · `PMI` 取**制造业**口径（扩散指数，50=荣枯线），不是综合 PMI 产出指数；
+  #   · `GDP` 是**累计值**（现价，年内累计，亿元），不是单季值；
+  #   · `GDP:同比` 是**累计同比**（不变价，%）—— 金十的 `macro_china_gdp_yearly`
+  #     实测是**单季同比**，口径不同，**故意不接为备源**（东财失败即如实报错）。
+  - id: PMI
+    category: cn_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "国家统计局 / 中采联（东财口径；备源 NBS-国家统计局，逐值对拍一致）"
+    source_url: "https://data.eastmoney.com/cjsj/pmi.html"
+    ttl_days: 1825
+    units: "指数"
+    enabled: true
+    notes: "官方**制造业** PMI（扩散指数，50=荣枯线）。⚠️ 不是综合 PMI 产出指数；该口径实测只有 NBS 一个源，要登记请先在 `_SPECS` 加行"
+
+  - id: "PMI:制造业"
+    category: cn_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "国家统计局 / 中采联"
+    source_url: "https://data.eastmoney.com/cjsj/pmi.html"
+    ttl_days: 1825
+    units: "指数"
+    enabled: true
+    notes: "与 `PMI` **同一序列**的显式口径别名（便于按口径点名）"
+
+  - id: "PMI:非制造业"
+    category: cn_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "国家统计局 / 中采联"
+    source_url: "https://data.eastmoney.com/cjsj/pmi.html"
+    ttl_days: 1825
+    units: "指数"
+    enabled: true
+    notes: "官方非制造业商务活动指数（扩散指数）"
+
+  - id: GDP
+    category: cn_macro
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "国家统计局（东财口径）"
+    source_url: "https://data.eastmoney.com/cjsj/gdp.html"
+    ttl_days: 3650
+    units: "亿元"
+    enabled: true
+    notes: "国内生产总值**累计值**（现价，年内累计）。⚠️ 不是单季值；季节性与节奏判断请配 `GDP:同比`"
+
+  - id: "GDP:同比"
+    category: cn_macro
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "国家统计局（东财口径）"
+    source_url: "https://data.eastmoney.com/cjsj/gdp.html"
+    ttl_days: 3650
+    units: "%"
+    enabled: true
+    notes: "GDP **累计同比**（不变价）。⚠️ 与金十 `macro_china_gdp_yearly` 的单季同比**不是同一口径**，故当前无同口径备源"
+
+  # ============ 美国宏观（月度）============
+  - id: us_cpi_yoy
+    category: us_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "AkShare / FRED"
+    source_url: "https://fred.stlouisfed.org/"
+    ttl_days: 1825
+    units: "%"
+
+  # ===== ⚠️ 以下是**已停产**的旧登记（2026-09-29 标注，CHG-0104）=====
+  # 停产理由（实测，不是"看着像"）：**AkShare 东财 `macro_usa_*` 接口本身停更**
+  #   `us_unemployment` / `us_nonfarm` 最新行 **2025-09-05 且值为 `nan`**、
+  #   `us_core_cpi` 2025-09-11 `nan`、`us_fed_rate` 2025-10-30 `nan`、
+  #   `us_pce` 2025-08-29（最后有效值）。**不是我们没跑作业**
+  #   （同批 `us_cpi_yoy` 到 2026-08，证明作业在跑）。
+  # 后果（为什么必须停产而不是留着）：它们每月被 `catalog_monthly` 白取一次、
+  #   每次失败、并在维护审计里持续报 stale ⇒ **噪音淹掉真缺口**。
+  # 替代（已实测补到最新，见同文件 `fred:` 族）：`fred:UNRATE` / `fred:PAYEMS`
+  #   / `fred:CPILFESL` / `fred:PCEPILFE` / `fred:DGS10`。
+  # ⚠️ **不改 id、不删条目**：库里历史点仍可用，且"改口径要留废止痕迹"——
+  #   下一个人看到 `us_unemployment` 时能查到"它为什么死了、去哪儿找替代"。
+  - id: us_core_cpi
+    category: us_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "AkShare / FRED"
+    source_url: "https://fred.stlouisfed.org/"
+    ttl_days: 1825
+    units: "%"
+    enabled: false            # 停产：源已停更 ⇒ 见上面注释与 `fred:CPILFESL`
+
+  - id: us_nonfarm
+    category: us_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "AkShare"
+    ttl_days: 1825
+    units: "万人"
+    notes: "非农就业新增"
+    enabled: false            # 停产：源已停更 ⇒ 替代 `fred:PAYEMS`（水平值，新增需派生）
+
+  - id: us_unemployment
+    category: us_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "AkShare"
+    ttl_days: 1825
+    units: "%"
+    enabled: false            # 停产：源已停更 ⇒ 替代 `fred:UNRATE`
+
+  - id: us_pce
+    category: us_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "AkShare / FRED"
+    ttl_days: 1825
+    units: "%"
+    enabled: false            # 停产：源已停更 ⇒ 替代 `fred:PCEPILFE`（指数，同比需派生）
+
+  - id: us_fed_rate
+    category: us_macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "AkShare"
+    ttl_days: 1825
+    units: "%"
+    notes: "FOMC 联邦基金利率目标区间"
+    enabled: false            # 停产：源已停更 ⇒ 替代 `fed:target_upper` / `fed:effr`
+
+  # ============ 美联储/CME（更高频）============
+  - id: fed:policy_range
+    category: fed
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "FRED (CME 443 不通时降级)"
+    source_url: "https://fred.stlouisfed.org/"
+    ttl_days: 365
+    enabled: true
+    notes: "⚠️ 旧混合口径：同一 period_date 会有 3 条点（上限/下限/有效利率），**不是单值序列**。判断政策利率请用 fed:effr / fed:target_upper / fed:target_lower（2026-09-28 第二十三轮拆出）"
+
+  # ★★★ 2026-09-28 第二十三轮：把混合口径拆成三个**独立单值序列**
+  #
+  # 【为什么必须拆】`fed:policy_range` 同日产 3 条点
+  # （DFEDTARU 4.00 / DFEDTARL 3.75 / DFF 3.88），read 侧 `_latest_numeric`
+  # 取"最新一条" → 挑中上限或下限之一 → A08 输出
+  # 「目标区间 3.75%（FRED 口径）」，**把区间下限当成政策利率**报出去。
+  # 数字看着有据，语义是错的 —— 比"缺数据"更危险。
+  #
+  # 【拆完的读法】方向判断用 `fed:effr`；区间必须
+  # `fed:target_lower` + `fed:target_upper` **成对**读。
+  - id: fed:target_upper
+    category: fed
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "FRED DFEDTARU"
+    source_url: "https://fred.stlouisfed.org/series/DFEDTARU"
+    ttl_days: 365
+    enabled: true
+    units: "%"
+    notes: "目标区间**上限**（单值序列）；与 fed:target_lower 成对读才是区间"
+
+  - id: fed:target_lower
+    category: fed
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "FRED DFEDTARL"
+    source_url: "https://fred.stlouisfed.org/series/DFEDTARL"
+    ttl_days: 365
+    enabled: true
+    units: "%"
+    notes: "目标区间**下限**（单值序列）；单独用会被误当成利率，必须与 fed:target_upper 成对"
+
+  - id: fed:effr
+    category: fed
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "FRED DFF"
+    source_url: "https://fred.stlouisfed.org/series/DFF"
+    ttl_days: 365
+    enabled: true
+    units: "%"
+    notes: "**有效联邦基金利率**（单值序列）—— 判断鹰派/鸽派方向应该用它，而不是目标区间的某一边"
+
+  - id: fed:rate_prob:next
+    category: fed
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "CME FedWatch"
+    source_url: "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"
+    ttl_days: 30
+    enabled: true
+    notes: "本机网络 TCP 443 不通 → 实测 25s timeout；应纳入懒批后台跑（supervisor._LAZY_INDICATORS）"
+
+  # ============ A 股大盘流动性 ============
+  - id: mkt:turnover:total
+    category: mkt_liquidity
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "腾讯财经"
+    source_url: "https://qt.gtimg.cn/"
+    ttl_days: 90
+    notes: "两市合计成交额（亿元），盘中实时"
+
+  - id: mkt:turnover:hist
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "腾讯财经 / AkShare"
+    ttl_days: 365
+    notes: "两市成交额 60 交易日序列"
+
+  - id: mkt:turnover_rate:all_a
+    category: mkt_liquidity
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "东财"
+    ttl_days: 30
+
+  - id: mkt:margin_balance
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "交易所 T+1"
+    ttl_days: 365
+    notes: "两融余额"
+
+  - id: mkt:margin_balance:hist
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "交易所 T+1"
+    ttl_days: 365
+    notes: "两融 10 日序列"
+
+  # ★ 2026-09-30 补登记：`MarginTradingConnector.get_capabilities()` 里**声明了**
+  #   这一条，但登记表里一直没有它 —— 于是"连接器能取"与"平台有这个指标"
+  #   对不上（A17 报「两融」缺口时，可展开的目标就少一个）。
+  #   判据见 `tests/unit/test_prose_gap_mapping.py::test_mapped_targets_are_reachable`
+  #   （散文映射表的每个目标都必须登记在册，正是这条护栏把它抓出来的）。
+  - id: mkt:margin_net_buy
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "交易所 T+1"
+    ttl_days: 365
+    notes: "融资买入额（两融口径的「净买」侧）"
+
+  - id: mkt:north_flow
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "港交所"
+    ttl_days: 365
+    notes: "北向资金日度净买额（2024-08 起停披，诚实返回停披前值）"
+
+  - id: idx_val:snapshot:all
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "乐咕 / 中证"
+    ttl_days: 365
+    notes: "6 只核心宽基 PE/PB + 分位"
+
+  # ★ 2026-09-28 第二十五轮：按指数名查询的**单指数入口**补登记。
+  #
+  # 【为什么漏】`IndexValuationConnector.get_capabilities()` 与 `supports()`
+  #   早就认 `idx_val:pe_ttm:{指数名}` / `idx_val:pb:{指数名}`（见
+  #   `index_valuation_connector.py` 第 55~56 行的正则），登记表里却只有
+  #   **聚合口径** `idx_val:snapshot:all`（6 只宽基一把取）。
+  #   旧豁免写的理由是"落库口径走 snapshot 聚合，所以不需要单独登记" ——
+  #   但它**自身就会产出以自己为名的 DataPoint**（`fetch()` 里
+  #   `indicator=indicator`），所以走单指数入口取到的数据"取到了也无处引用"。
+  #
+  # 【漏了会怎样】不是报错：SmartFetcher 判"未登记" → 走 daily/24h 兜底 →
+  #   **每次都联网**（最差路径），且新鲜度/保留策略都管不到它。
+  - id: "idx_val:pe_ttm:{指数名}"
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "乐咕乐股（科创50 走中证指数官网 XLS 兜底）"
+    source_url: "https://legulegu.com/"
+    ttl_days: 365
+    enabled: true
+    units: "倍"
+    notes: "模板：实际指标带指数名后缀（如 idx_val:pe_ttm:沪深300）；extra 含 PB 与 1/3/5 年/全历史分位"
+
+  - id: "idx_val:pb:{指数名}"
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "乐咕乐股"
+    source_url: "https://legulegu.com/"
+    ttl_days: 365
+    enabled: true
+    units: "倍"
+    notes: "模板：实际指标带指数名后缀（如 idx_val:pb:沪深300）；PB 失败只置空并标注，不影响 PE 与分位"
+
+  - id: mkt:cybkcb:turnover:all
+    category: mkt_liquidity
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "腾讯 / 东财双源"
+    ttl_days: 90
+    # ★★ 聚合展开：请求 `turnover:all` 时连接器返回 3 条**子指标**，
+    #    "all" 这个名字本身不入库 → 索引 row_count 恒为 0 → 每次都联网。
+    #    声明展开关系让 SmartFetcher 能正确判新鲜度。
+    expands_to:
+      - mkt:cybkcb:turnover:cyb
+      - mkt:cybkcb:turnover:kcb
+      - mkt:cybkcb:turnover:kcb_all
+
+  - id: mkt:cybkcb:turnover_hist
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "腾讯 / 东财"
+    ttl_days: 365
+
+  - id: mkt:cybkcb:val:all
+    category: mkt_liquidity
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "乐咕 / 中证"
+    ttl_days: 365
+    expands_to:
+      - mkt:cybkcb:val:cyb_pe
+      - mkt:cybkcb:val:kcb_pe
+
+  - id: mkt:cybkcb:spot_summary
+    category: mkt_liquidity
+    frequency: realtime
+    freshness_hours: 0.5
+    primary_source: "东财"
+    ttl_days: 7
+    notes: "★ 慢源：双创全量分页 ~12s；supervisor._LAZY_INDICATORS 已纳入"
+
+  # ============ 个股/行业估值 ============
+  - id: "stock_close:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare / 腾讯 / Tushare"
+    source_url: "scripts/download_market_data.py 全量预取"
+    storage_backend: "file:data/quant/prices"
+    storage_location: "{code}.parquet（一日一行前复权 OHLCV + manifest）"
+    storage_note: "全市场行情主存于 PriceStore 落盘；事实表只存按需采集的单点"
+    ttl_days: 1825
+    notes: "模板：实际指标带 6 位代码后缀（如 stock_close:300308）"
+
+  - id: "PE(TTM):{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare"
+    ttl_days: 1825
+    notes: "模板：实际指标带 6 位代码后缀"
+
+  - id: "PB:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare"
+    ttl_days: 1825
+
+  - id: "stock_open:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare / 腾讯"
+    ttl_days: 1825
+
+  - id: "stock_high:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare"
+    ttl_days: 1825
+
+  - id: "stock_low:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare"
+    ttl_days: 1825
+
+  - id: "stock_volume:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare"
+    ttl_days: 365
+
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 产权比率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: >
+      个股产权比率（负债/股东权益，%）；模板：实际指标带 6 位代码后缀。
+      ⚠️ **银行股会返回 0.0，那是源里的 0，不是"负债为零"** ——
+      实测（2026-09-29）新浪财务分析指标模板对 600036/000001 的
+      `产权比率(%)` 列**逐期都是 0**（列非空率 10/10、值 [0,0,0]），
+      而 600519 = 17.7969。即**列存在、值被源写成 0**，连接器照实透出。
+      判据与证据：`scripts/_probe_chanquan_zero.py`。
+      **消费方必须把它当"量到 0 但口径不适用"，不许当成低杠杆** ——
+      这与 §19 的「量到 0 ≠ 没量到」是同一条纪律的**第三种情形**：
+      「源给了 0，但该 0 在语义上不成立」。修法候选（尚未实施，见 PRD §19.13）：
+      银行类实体对这些列登记 `not_applicable`，或按实体类型改用别的杠杆口径。
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: ROE
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股净资产收益率（%，ROE）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: ROE加权
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股加权净资产收益率（%）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: ROA
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股总资产净利润率（%，ROA）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 销售净利率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股销售净利率（%）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 成本费用利润率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股成本费用利润率（%）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 存货周转率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股存货周转率（次）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 应收账款周转率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股应收账款周转率（次）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 总资产周转率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股总资产周转率（次）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 净利润增长率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股净利润增长率（%）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 总资产增长率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股总资产增长率（%）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 净资产增长率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股净资产增长率（%）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 营收增长率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股主营业务收入增长率（%）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: EPS
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股摊薄每股收益（元）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: EPS加权
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股加权每股收益（元）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 每股净资产
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股每股净资产（元，BPS）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 每股经营现金流
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股每股经营性现金流（元）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 每股未分配利润
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股每股未分配利润（元）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 每股资本公积
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股每股资本公积金（元）；模板：实际指标带 6 位代码后缀"
+  # ★ 2026-09-28 第二十四轮：连接器已实现取数，此处补登记（此前"连接器有、登记无"
+  #   → planner 选不出 → 用户永远看到"缺数据"，而数据源完全可达）
+  - id: 股息率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务分析指标"
+    ttl_days: 1825
+    enabled: true
+    notes: "个股股息率（%，最近实施每股派息/收盘价，自行计算）；模板：实际指标带 6 位代码后缀"
+
+  # ★★★ 2026-09-28 第二十五轮：`quant_daily_basic` **列族**补登记。
+  #
+  # 【作废一条错误事实 —— 请不要再引用它】
+  #   旧豁免（`tests/unit/test_contract_consistency.py` 的
+  #   `_UNREGISTERED_CONNECTOR_PREFIXES`）曾写：
+  #       「⚠️ 该表实测停在 2023-11-10（历史截面可查、当前值不可信）」
+  #   **这句是错的**（同 `CHG-0059` 的更正）：停在 2023-11-10 的是
+  #   `data/dev/moss_dev.db` 里的一份**化石副本**（2026-09-23 之前行情仓
+  #   也认 `MOSS_SQLITE_PATH` 时留下的）。**权威副本在共享行情仓。**
+  #
+  #   实测（as-of 2026-09-28）：
+  #     data/quant/warehouse.db::quant_daily_basic
+  #       rows       = 15,426,153
+  #       trade_date = 20060104 .. 20260928      ← 最新就是当天，**不是僵尸表**
+  #       600036 最新一条：dv_ttm=4.9606  total_mv=1024934525184  turnover_rate=0.2637
+  #   ⚠️ 行数与最新日期**一律现算**，不许当常量抄进代码/注释 ——
+  #      `akshare_connector._QUANT_COLUMN_INDICATORS` 上方那段写过代价：
+  #      写死的行数曾被抄到 6 处，其中一处据此决定"不走本地、改走网络自算股息率"，
+  #      为一个不成立的前提长期付网络成本。现算入口：
+  #      `src/infrastructure/catalog/data_stores.py`（存储视图）。
+  #
+  # 【为什么之前没登记】旧理由把它当成"僵尸表"→"该不该登记需要人判断"。
+  #   事实更正后判据很清楚：连接器 `supports()` 全认、分析层白名单
+  #   （A10/A11）真的会放行 → **应当正式登记**。
+  #
+  # 【漏了会怎样】不是报错：SmartFetcher 判"未登记" → 每次联网；
+  #   且分析层拿到的会是"取到了也无处引用"的点。
+  #
+  # ⚠️ 这 6 条**同属一个列族**（`akshare_connector._QUANT_COLUMN_INDICATORS`），
+  #    要么一起登记、要么一起不登记 —— 只登记其中几条会让下一次报障
+  #    从"另一个列名"重新长出来。
+  - id: "股息率TTM:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "共享行情仓 quant_daily_basic（Tushare daily_basic 导入）"
+    storage_backend: "sqlite:quant_daily_basic"
+    storage_location: "data/quant/warehouse.db::quant_daily_basic.dv_ttm"
+    storage_note: "★ 行情仓**不是**应用库：权威副本只在 data/quant/warehouse.db；data/dev/moss_dev.db 那份停在 2023-11-10（化石副本），data/pilot 根本没有这张表。库路径单点解析见 akshare_connector._quant_basic_db_path()"
+    ttl_days: 1825
+    enabled: true
+    units: "%"
+    notes: "个股股息率(TTM)（dv_ttm，滚动十二个月）；模板：实际指标带 6 位代码后缀"
+
+  - id: "总市值:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "共享行情仓 quant_daily_basic（Tushare daily_basic 导入）"
+    storage_backend: "sqlite:quant_daily_basic"
+    storage_location: "data/quant/warehouse.db::quant_daily_basic.total_mv"
+    ttl_days: 1825
+    enabled: true
+    units: "元"
+    notes: "个股市值（total_mv，单位为元 —— Tushare 原始万元已 ×1e4）；模板：实际指标带 6 位代码后缀"
+
+  - id: "流通市值:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "共享行情仓 quant_daily_basic（Tushare daily_basic 导入）"
+    storage_backend: "sqlite:quant_daily_basic"
+    storage_location: "data/quant/warehouse.db::quant_daily_basic.circ_mv"
+    ttl_days: 1825
+    enabled: true
+    units: "元"
+    notes: "个股流通市值（circ_mv，单位为元）；解禁冲击的分母；模板：实际指标带 6 位代码后缀"
+
+  - id: "换手率:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "共享行情仓 quant_daily_basic（Tushare daily_basic 导入）"
+    storage_backend: "sqlite:quant_daily_basic"
+    storage_location: "data/quant/warehouse.db::quant_daily_basic.turnover_rate"
+    ttl_days: 1825
+    enabled: true
+    units: "%"
+    notes: "个股换手率（turnover_rate）；模板：实际指标带 6 位代码后缀"
+
+  - id: "量比:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "共享行情仓 quant_daily_basic（Tushare daily_basic 导入）"
+    storage_backend: "sqlite:quant_daily_basic"
+    storage_location: "data/quant/warehouse.db::quant_daily_basic.volume_ratio"
+    ttl_days: 1825
+    enabled: true
+    units: "倍"
+    notes: "个股量比（volume_ratio）；模板：实际指标带 6 位代码后缀"
+
+  - id: "市销率:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "共享行情仓 quant_daily_basic（Tushare daily_basic 导入）"
+    storage_backend: "sqlite:quant_daily_basic"
+    storage_location: "data/quant/warehouse.db::quant_daily_basic.ps_ttm"
+    ttl_days: 1825
+    enabled: true
+    units: "倍"
+    notes: "个股市销率(TTM)（ps_ttm）；模板：实际指标带 6 位代码后缀"
+
+  - id: 资产负债率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 财务"
+    ttl_days: 1825
+    notes: "模板：实际指标带 6 位代码后缀"
+
+  - id: 流动比率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "AkShare 财务"
+    ttl_days: 1825
+
+  - id: 速动比率
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "AkShare 财务"
+    ttl_days: 1825
+
+  - id: 存货周转
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "AkShare 财务"
+    ttl_days: 1825
+
+  # ============ A12 合规规则的比率族（消费者：compliance/logic.py）============
+  #
+  # 为什么必须登记：这 6 个族被 `src/domain/agents/analysis/compliance/logic.py`
+  # 的 4 条比率规则 + 存贷双高**直接消费**（阈值 30/50/80/100 都是百分数口径）。
+  # 实测（2026-09-29）在生产者落地前它们**零生产者**，规则永不触发，
+  # 而 `compliance_level_calc` 照样给结论 —— 表现为「未见明显合规风险」。
+  # 现在 `ComplianceFinConnector` 提供其中 5 族（`关联交易` 见下方说明）。
+  #
+  # ⚠️ **每族只产窗口内最新一期一个点** —— 规则取"首个命中"，多期会让
+  #   「用哪一期」依赖上游排序（与 `fed:policy_range` 同日多值那次事故同类）。
+  # ⚠️ **名字必须与真实口径一致**：指标名会被规则按**子串**匹配取值，
+  #   名字说谎 = 阈值被用在错误的口径上。口径写在各自 notes 里。
+  - id: 商誉占净资产比
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160         # 90 天
+    primary_source: "AkShare 新浪三大报表-资产负债表"
+    ttl_days: 1825
+    units: "%"
+    notes: >
+      商誉 ÷ 归属于母公司股东权益 × 100。模板：实际指标带 6 位代码后缀。
+      分子或分母缺失（如无商誉科目）时**不产点** —— 于是该族对这只票是「未量到」，
+      不是「0 风险」。银行/无商誉公司常年如此，属正常。
+  - id: 货币资金占总资产比
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "AkShare 新浪三大报表-资产负债表"
+    ttl_days: 1825
+    units: "%"
+    notes: >
+      货币资金 ÷ 资产总计 × 100。**银行模板无「货币资金」科目** → 对该类实体
+      口径不适用、不产点（连接器在 extra.not_applicable 里显式登记）。
+  - id: 有息负债占总资产比
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "AkShare 新浪三大报表-资产负债表"
+    ttl_days: 1825
+    units: "%"
+    notes: >
+      (短期借款+长期借款+应付债券+一年内到期的非流动负债) ÷ 资产总计 × 100。
+      与「货币资金占总资产比」同为存贷双高判据的两个输入（阈值各 40%）。
+      模板列为空的项按 0 计入，逐项值在 extra.components 里可对账；
+      模板里根本没有的列名登记在 extra.components_not_in_template。
+  - id: 大股东质押比例
+    category: individual
+    # ★ 2026-09-29 修正：`daily` → `weekly`。
+    #   源（东财-股权质押-全部A股质押比例）是**周频快照**，下面那行注释自己就写着
+    #   「源为周频快照，留 7 天」—— 所以错的是 `frequency`，不是 `freshness_hours`。
+    #   判据 `test_catalog_registry.py::test_registry_freshness_matches_frequency_band`
+    #   的频段是 `weekly: (100, 200)`，`168` 正好落在里面 ⇒ 断言红。
+    #   ⚠️ **不许反过来把 `freshness_hours` 改成 30 去迁就 `daily`** ——
+    #   那会让"7 天前的周频快照"被判成过期 → SmartFetcher 每轮都去联网补采
+    #   （而它本来就是周频，补也补不出新值）。**判据是对的，配置是错的。**
+    frequency: weekly
+    freshness_hours: 168          # 源为周频快照，留 7 天
+    primary_source: "AkShare 东财股权质押明细(股东粒度)"
+    ttl_days: 365
+    units: "%"
+    notes: >
+      出质股东维度：未解押记录按出质股东聚合后 `占所持股份比例` 的 **max**
+      （= 该股东质押股数 ÷ **该股东持股数**），与规则 50%/80% 两档的分母一致。
+      ★ 2026-09-29 口径更正：初版接的是**全股东口径**（质押股数÷总股本）——
+      **那是错的**：实测全市场该口径 `max=78.74%`，**80% 档永不触发**
+      （等于又接一条永远不开火的防线，与刚修掉的"伪造体检合格证"同类）。
+      改股东粒度后实测 **828 条 / 564 只**超 80%、957 只超 50%，
+      `603657` 实测 64.29% ⇒ **50% 档第一次真的开火**。
+      ⚠️ **实质性未过滤**：取 max 会纳入微量股东 —— >80% 的 828 条里，
+      "质押股数占总股本"中位数 4.98% / p05 0.31%；额外限定 ≥1% 总股本则
+      564→520（**44 只 / 7.8% 仅由微量股东贡献**）。**不设阈值**（无数据支撑的
+      阈值就是假精度），改为随数据下发 `top_holder_pct_of_total` + `materiality_note`。
+      ⚠️ **成本**：该接口无日期/个股参数，整表拉 ≈254 分页 / 75~240s；已用
+      **7 天 TTL（与 weekly 采集周期对齐）+ 单飞锁 + 15min 失败冷却**兜住。
+      ⚠️ **两源不一致**：`600036` 在市场截面里有（0.34%/31 笔）、在股东明细里 0 行。
+  - id: 对外担保占净资产比
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "AkShare 巨潮公司治理-对外担保"
+    ttl_days: 365
+    units: "%"
+    notes: >
+      统计区间（最近 12 个月）内累计担保金额 ÷ 归属于母公司所有者权益 × 100。
+      **空结果 = 该窗口内没有担保公告**（真结论），不是取数失败；
+      连接器对取数失败一律抛错、不吞成空。
+  #: ★ `关联交易占营收比` **刻意不登记**：免费源只能给公告标题/日期/网址、
+  #: 没有金额字段，算不出比率口径；且**不许退化成计数口径** ——
+  #: 规则按子串匹配取值，`关联交易公告数:{code}` 会被当成百分数去比 `> 30`
+  #: （31 条公告 → 假旗标）。理由与证据在连接器的 `_UNSUPPORTED_FAMILIES`。
+
+  # ============ 平台自有后端数据（消费者：A10 微观 / A11 财务风险 / A20 兜底行业）============
+  #
+  # 为什么必须登记：这 5 族是**平台自己算出来**的数据（前端看板/主线挖掘/投资日历
+  # 早就在用），但采集侧此前**一个连接器都没接** → Agent 侧完全看不到，
+  # 用户看到的是"缺数据"（与 `fed:policy_range` 那条报障**同一形状**：
+  # 数据在库里，Agent 看不见，且**不报错**）。
+  # 生产者：`src/infrastructure/connectors/platform_data_connector.py::PlatformDataConnector`。
+  #
+  # ★ **id 用模板形态 `X:{code}`，不用裸名字**（与上面 `商誉占净资产比` 那几条不同）：
+  #   `catalog/registry.py` 的模板匹配是**按 `:` 分段**的（`_segments()`），
+  #   裸名字的 key 是 `(1, ("估值水位",))`，查 `估值水位:600036` 时
+  #   两个模板候选键 `(2,("\x00","600036"))` / `(2,("估值水位","\x00"))` **都查不到**
+  #   ⇒ 判"未登记" ⇒ SmartFetcher 走 daily/24h 兜底、新鲜度与保留策略全管不到。
+  #   ⚠️ 顺带登记一个**已存在的同类缺口**：上面那批裸名字（`商誉占净资产比` /
+  #   `资产负债率` / `ROE` …）同样解析不到带代码后缀的查询 —— 属既有问题，
+  #   本轮**不动**（不在本次改动范围内），但别照抄那个形状。
+  #   ✅ 模板形态同时让 `catalog_jobs.plan_jobs()` 的 `meta.is_template()` 跳过它
+  #   —— 裸名字会进批量作业，而作业按裸名取数必然失败（`supports()` 不认裸名）。
+  - id: "估值水位:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26         # 底层 PE/PB 序列日频更新（行情仓最新交易日口径）
+    primary_source: "平台 intraday 估值链(PE/PB 序列) + 共享行情仓 quant_daily_basic"
+    ttl_days: 365
+    notes: >
+      估值空间分 ∈[-1,1] + 五档结论。**档位/标签/合成分的唯一来源是
+      `src/intraday/valuation.py`**（`compute_headroom_score` / `headroom_bucket` /
+      `HEADROOM_LABELS` / `ValuationProvider`）—— 本平台前端「估值透支 /
+      估值合理偏贵 / 上涨空间充足」就是它给的，**不许有第二份实现**
+      （两份的后果是界面与 Agent 同一天给出不同结论）。
+      注入采集链时走 `ValuationProvider`（个股分位 + 同业 + 行业中位数，与前端逐字段一致）；
+      未注入时退化到行情仓序列，`extra.components_missing` 会明写"未含同业/行业中位数"。
+      `extra.sample` / `extra.full_history` 给两个口径的样本区间与样本数
+      （**近三年分位 ≠ 全历史分位**）。
+  - id: "概念拥挤度:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26         # sector_crowding_daily 是日频表（最新交易日口径）
+    primary_source: "本地库 mainline_cache.ml_member_corr/ml_stock_theme × moss_finagent.sector_crowding_daily"
+    ttl_days: 365
+    notes: >
+      **按个股相关度排序**：相关度取 `ml_member_corr`（走势相关，以个股为键，
+      实测覆盖 5,215 只）与 `ml_stock_theme`（主营相关，`final_score` + `reason`，
+      实测覆盖 4,996 只）两条口径；`value` = **相关度最高且水位已量到**的那个
+      概念板块的 `water_level`（0~1）。
+      ⚠️ 不要用 `map_stock_concept`（只覆盖 105 只）或 `ml_member_pure`
+      （**以板块为键的候选池**，600036 只有 1 条且 `relevant=0`）——
+      两者都是"看起来对、其实答非所问"。
+      水位未量到的板块**保留在 extra.boards 里**并标 `water_level_measured=false`（不填 0）；
+      join 不到拥挤度的相关板块标 `no_crowding=true`（不丢弃）。
+  - id: "主线告警:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26         # mainline_alert 是主线挖掘的日频产物
+    primary_source: "本地库 moss_finagent.mainline_alert（主线挖掘告警）"
+    ttl_days: 365
+    notes: >
+      该股所属概念在窗口（默认最近 90 天）内的**中/高强度**主线告警
+      （`level ∈ {medium, strong}`，**weak 档被过滤**，`extra.levels_filtered` 明写）。
+      每告警一个点，`value` = 告警分（0~100），`extra.payload` 原样带主线挖掘自己的
+      告警载荷（含 `reasons` / `triggered_dims` / `six_dim_score`）。
+      **不设 corr 阈值**（无数据支撑的阈值 = 假精度）：每条告警都带该板块与本股的 `corr`，
+      由消费方自行权衡。
+  - id: "个股告警:{code}"
+    category: individual
+    frequency: intraday
+    freshness_hours: 4          # 事件告警盘中随时新增；26h 会让 20 小时前的告警仍被判"新鲜"
+    primary_source: "本地库 moss_finagent.fact_alerts（事件告警，point 级点名个股）"
+    ttl_days: 365
+    notes: >
+      `fact_alerts.affected_stocks_json` 里**点名该 code** 的告警
+      （LIKE 预筛 + 内存精确校验，防子串假命中）。
+      `value` = 方向性分数：`impact=positive` → `opportunity_score`，
+      否则 → `risk_score`（**原样直取，不做任何合成**，`extra.value_field` 说明取的是哪个）。
+      **不按 status 过滤**：实测 main 实例 7 条全是 `expired`，
+      过滤掉会让"两周前的降准利好"整条消失；`extra.status` / `extra.expired` 随数据下发。
+  - id: "解禁计划:{code}"
+    category: individual
+    frequency: daily
+    freshness_hours: 26         # 投资日历专用作业工作日 07:20 同步（horizon 45 天）
+    primary_source: "本地库 moss_finagent.fact_data_points 的 cal:unlock:*（投资日历，东财）"
+    ttl_days: 365
+    notes: >
+      窗口（默认**未来 30 天**，即用户说的"未来一个月"）内该股的限售解禁计划。
+      ⚠️ 个股级明细装在 `fact_data_points.extra_json.top_stocks` 这个 **JSON 列**里
+      （字段 `code/name/market_cap/pct_of_float/share_type`）—— 按业务词搜列名**永远搜不到**，
+      所以此前被误判成"平台没有这个数据"。`value` = 该解禁日解禁市值合计（元）。
+      ★ **三态必须分开**：① 命中 → 产点；② 窗口内有日历行但明细里没有该标的
+      → **产 `value=0.0` 的点**（量到 0，真结论"无解禁计划"）；
+      ③ 窗口内一条 `cal:unlock:*` 都没有 → **不产点**（没量到，数据缺口，不是"无解禁"）。
+
+  # ---- 行业侧三族（用户 2026-09-29 追加的②③条需求）----
+  #
+  # 为什么是 `{行业名}` 而不是 `{板块名}`：`test_contract_consistency.py` 的
+  # `_PLACEHOLDER_SAMPLES` 只登记了 6 个占位符（含 `行业名`），用别的新占位符
+  # 会让 `test_connector_capabilities_agree_with_supports` 直接红。
+  # 板块名与行业名在这三族里本就是同一口径（都来自板块榜单/拥挤度表）。
+  - id: "行业拥挤度:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26         # 拥挤度表日频
+    primary_source: "本地库 moss_finagent.sector_crowding_daily（板块名最长匹配）"
+    ttl_days: 365
+    notes: >
+      行业名 → **最相近的所属概念板块** → 该板块 `water_level`（0~1）。
+      匹配档位：exact（归一化相等）→ contains（互为子串，取命中长度最长、
+      板块名最短者）；**归一化只做大小写与空白**（`银行(A股)` 与 `银行` 是两个板块，
+      不许合并）。候选池 = `sector_crowding_list` ∪ 最近交易日截面，
+      与 `概念拥挤度` 的 name join **同源**。
+      ★ **用户口径（2026-09-29 已变更）**：原先是「如果找不到就不提示未找到数据」，
+      当时落成"规划期不排这个指标"；现行是「**"找不到就不提示"改成
+      找不到就去联网搜索找**」⇒ **照排**，本地匹配不上时本连接器不产点，
+      由采集链的联网兜底继续找（`supervisor._network_lookup_for_collection`，
+      走 `NetworkFallback` 的白名单+预算+冷却熔断）；联网也没有才按缺口如实上报。
+      `diagnose()` 的 reason 会写"本地无相近匹配 → 已交联网兜底去找"。
+      ⚠️ 边界（诚实登记）：本指标是**平台自定义口径**，外部源没有同名实现
+      （实测 `can_fallback("行业拥挤度:X")` = `NO_SOURCE_AVAILABLE`），
+      所以联网那一跳对**别的**指标有效（实测 `CPI` 联网取到 128 条），
+      对这一族只能"试过并如实拒绝"。
+  - id: "板块资金流:{行业名}"
+    category: cn_industry
+    frequency: intraday
+    freshness_hours: 4          # 源是盘中实时截面（同花顺即时）+ 日频序列（东财）
+    primary_source: "平台 src/fundflow/provider.py::FundFlowProvider（板块截面+近N日序列）"
+    ttl_days: 365
+    notes: >
+      板块**近期资金流方向**：`value` = 近 5 个交易日主力净流入**合计**（元），
+      `extra.direction` ∈ {inflow/outflow/flat}（按合计符号判，**不设阈值**）。
+      取数**复用** `FundFlowProvider.sector_snapshot()`（截面，带 `rank`）
+      与 `sector_history()`（近 N 日序列），**没有第二个实现**；
+      单位=元；某日无读数则不计入合计（**不填 0**）。
+  - id: "行业轮动:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26         # 收盘后生成的日报
+    primary_source: "平台 src/sector_rotation（report_YYYYMMDD.json，行业轮动日报）"
+    ttl_days: 365
+    notes: >
+      「行业轮动日报」里该行业那一行（`value` = 当日涨跌幅 %）+ 全局研判
+      （`narrative.headline/body/views`）+ 热力榜（`pick_heat`）+ 指数卡与大盘资金。
+      ⚠️ 报告可能**落伍**：`extra.is_stale` / `extra.stale_days` / `extra.stale_note`
+      随数据下发，**不许当成"今天的行情"**。
+
+  # ============ 申万行业估值 ============
+  - id: ind:sw_third_pe_ttm:all
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "申万三级 335 个行业 PE-TTM 截面"
+
+  - id: ind:sw_third_pb:all
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+
+  - id: ind:sw_first_pe_ttm:all
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+
+  # ★ 2026-09-28 第二十五轮：申万估值矩阵的**缺失格**补登记。
+  #
+  # 【为什么是这两条】`SWIndustryValuationConnector.get_capabilities()` 声明了
+  #   `ind:sw_{first,second,third}_{pe_ttm,pb}:all` 六个截面，登记表里只有四个
+  #   （三级的 pe_ttm/pb + 一级的 pe_ttm + 三级的股息率）。缺的正是
+  #   `ind:sw_second_pe_ttm:all`（planner 目录**已经**会选它 → 判未登记 → 每次联网）
+  #   与 `ind:sw_third_dividend_yield:all`。
+  #   ⚠️ 只补这两条会让矩阵继续缺角（`ind:sw_first_pb:all` /
+  #      `ind:sw_second_pb:all` 仍未登记）—— 见本文件末尾"已知缺口"说明。
+  - id: ind:sw_second_pe_ttm:all
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "申万二级 131 个行业 PE-TTM 截面"
+
+  - id: ind:sw_third_dividend_yield:all
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    units: "%"
+    notes: "申万三级行业股息率截面"
+
+  # ============ 行业专向（科技/消费/周期/医药）============
+  - id: ind:半导体销售额同比
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "WSTS / 统计局"
+    ttl_days: 1825
+
+  - id: ind:芯片出货量同比
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "统计局"
+    ttl_days: 1825
+
+  - id: ind:科技行业PE(TTM)
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare"
+    ttl_days: 365
+
+  - id: ind:社会消费品零售总额同比
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "国家统计局"
+    ttl_days: 1825
+
+  - id: ind:白酒批价(元/瓶)
+    category: cn_industry
+    frequency: weekly
+    freshness_hours: 168
+    primary_source: "酒排名"
+    ttl_days: 365
+
+  - id: ind:消费行业PE(TTM)
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "中证指数"
+    ttl_days: 365
+
+  - id: ind:动力煤价格(元/吨)
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "中电联 CECI"
+    ttl_days: 365
+
+  - id: ind:重点电厂煤炭库存(万吨)
+    category: cn_industry
+    frequency: weekly
+    freshness_hours: 168
+    primary_source: "中电联 CECI"
+    ttl_days: 365
+
+  - id: ind:周期行业PE(TTM)
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "中证指数"
+    ttl_days: 365
+
+  - id: ind:创新药IND申报数量(个)
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "CDE 药审中心"
+    ttl_days: 1825
+
+  - id: ind:医药行业PE(TTM)
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "中证指数"
+    ttl_days: 365
+
+  # ============ 渗透率 ============
+  - id: ind:penetration:新能源汽车
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "中汽协"
+    ttl_days: 1825
+
+  - id: ind:penetration:AI大模型应用
+    category: cn_industry
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "IDC / Gartner"
+    ttl_days: 1825
+    notes: "频度低，DB 命中率高"
+
+  # ★ 2026-09-28 第二十五轮：`PenetrationRateConnector._STATIC_PENETRATION`
+  #   里的赛道**逐条补登记**。
+  #
+  # 【为什么漏】planner 目录（`INDICATOR_CATALOG`）里有这 4 条、连接器
+  #   `supports()` 也认、`get_capabilities()["indicators"]` 自己声明了它们，
+  #   只有登记表没有 → SmartFetcher 判"未登记" → **每次联网**。
+  #   （连接器声明里带占位符的那条 `ind:penetration:{赛道名}` 已登记；
+  #     下面这些是**具体赛道**，占位符判据覆盖不到它们。）
+  #
+  # ⚠️ 同族的 `ind:penetration:新能源商用车` / `ind:penetration:光伏发电`
+  #    同样"连接器有、登记表无"，**本次未补** —— 见文件末尾"已知缺口"。
+  - id: ind:penetration:人形机器人
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "GGII 静态基准（人工维护）"
+    ttl_days: 1825
+    units: "%"
+    notes: "商业化渗透率（极早期，预研期）；连接器输出 extra.lifecycle"
+
+  - id: ind:penetration:固态电池
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "EVTank 静态基准（人工维护）"
+    ttl_days: 1825
+    units: "%"
+    notes: "固态电池在动力电池中渗透率（导入期）"
+
+  - id: ind:penetration:半导体国产替代
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "IC Insights 静态基准（人工维护）"
+    ttl_days: 1825
+    units: "%"
+    notes: "国产芯片自给率（不含存储，成长期）"
+
+  - id: ind:penetration:HBM存储
+    category: cn_industry
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "TrendForce 静态基准（人工维护）"
+    ttl_days: 1825
+    units: "%"
+    notes: "HBM 占 DRAM 市场份额（成长期早期）"
+
+  # ============ 投资日历（★ 2026-09-28 新增）============
+  #
+  # 背景（用户指出）：
+  # > 「这个解禁规模在平台的投资日历功能块里有详细的每天解禁数据，
+  # >   不存在缺少数据，可以去对应数据库里取」
+  # > 「加入到索引清单，避免下次取解禁数据取不到」
+  #
+  # 在此之前解禁数据只能**实时调接口**，不在 fact_data_points 里 →
+  # 索引表没有它 → SmartFetcher 判"未登记" → 每次分析都现拉网络。
+  # 现在由 `src/domain/intel/calendar_store.py` 的 `sync_calendar_to_store()`
+  # 定期落库，索引表随之接管。
+  #
+  # ⚠️ 解禁日由**交易所规则**确定，不会改期 → freshness 可以宽松；
+  #    但"新增公告"会带来新日期的数据，所以按 daily 刷新。
+  - id: cal:unlock:market_cap
+    category: calendar
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "东财 stock_restricted_release_summary_em + 巨潮公告"
+    source_url: "https://data.eastmoney.com/dxf/q/"
+    ttl_days: 1825
+    units: "元"
+    notes: "当日合计解禁市值。A17 之前误报「缺解禁数据」——它在投资日历里有"
+
+  - id: cal:unlock:company_count
+    category: calendar
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "东财 + 巨潮"
+    ttl_days: 1825
+    units: "家"
+    notes: "当日解禁家数"
+
+  - id: cal:unlock:top_stock_cap
+    category: calendar
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "东财 + 巨潮"
+    ttl_days: 1825
+    units: "元"
+    notes: "当日最大单只解禁市值（识别供给冲击用）"
+
+  - id: cal:earnings:company_count
+    category: calendar
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "东财 stock_yysj_em + 巨潮 stock_report_disclosure"
+    ttl_days: 730
+    units: "家"
+    notes: "当日预约披露财报家数（certainty=scheduled，可改期）"
+
+  - id: cal:trade_day:flag
+    category: calendar
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "交易所规则 tool_trade_date_hist_sina"
+    ttl_days: 3650
+    units: "0/1"
+    notes: "是否交易日。单一来源且应当如此（交易所规则没有备源概念）"
+
+  # ★★ 2026-09-29：**银行报表口径**字段 —— 用户点名的「银行息差」的公式输入。
+  #   报障链：用户要"银行息差" → 全仓库 `grep 利息|生息资产|净息差` = **0 处**
+  #   ⇒ 派生流水线（`configs/derived_indicators.yaml` 的 `净息差:{code}`）
+  #   只能报缺口。生产者：`src/infrastructure/connectors/bank_statement_connector.py`
+  #   （新浪`财务分析`报表模板，按报告期）。
+  #   实测 600036（2026-06-30）：`利息净收入 1,120.22 亿 =
+  #   利息收入 1,727.33 亿 − 利息支出 607.11 亿` ✓ 内部自洽；`总资产 13.785 万亿`。
+  #   ⚠️ 口径三条必须随数据下发（已在连接器 extra 里）：**元** / **累计**（三季报=
+  #   前三季度累计）/ **期末值不是平均余额**（净息差分母要严格平均需在派生层做
+  #   (期初+期末)/2）。
+  - id: "利息净收入:{code}"
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "新浪财务分析 利润表（净利息收入）"
+    ttl_days: 3650
+    units: "元"
+    notes: >
+      银行/金融口径：**利息净收入 = 利息收入 − 利息支出**（实测三者自洽）。
+      一般工商企业无此科目（如实缺口，不是取数失败）。**累计口径**（三季报=前三季度累计）。
+  - id: "利息收入:{code}"
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "新浪财务分析 利润表（利息收入）"
+    ttl_days: 3650
+    units: "元"
+    notes: "银行/金融口径；累计值（同 `利息净收入` 的期间口径）"
+  - id: "利息支出:{code}"
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "新浪财务分析 利润表（利息支出）"
+    ttl_days: 3650
+    units: "元"
+    notes: "银行/金融口径；累计值"
+  - id: "总资产:{code}"
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "新浪财务分析 资产负债表（资产总计）"
+    ttl_days: 3650
+    units: "元"
+    notes: >
+      **期末总资产**（不是平均余额）。派生层用它当「生息资产平均余额」的**粗近似**
+      ⇒ 分母偏大 ⇒ 净息差**系统性偏低**，必须把 bias 随 extra 下发
+      （见 `configs/derived_indicators.yaml` 的 `净息差:{code}`）。
+
+  # ★★ 2026-09-29：**FRED 序列**（通用连接器 `fred_connector.py` 按 id 取数）。
+  #   为什么补：AkShare 东财 `macro_usa_*` **接口本身停更** —— 实测
+  #   `us_unemployment`/`us_nonfarm` 最新行 2025-09-05 且值为 `nan`、
+  #   `us_fed_rate` 2025-10-30 `nan`、`us_core_cpi` 2025-09-11 `nan`、
+  #   `us_pce` 2025-08-29（最后有效值）⇒ 库里那几条只能停在 2025-07/08。
+  #   **不是我们没跑作业**（同批 `us_cpi_yoy` 到 2026-09，证明作业在跑）。
+  #   FRED 实测补齐到最新（免费 CSV、**无需 API key**、本机可达）：
+  #   `UNRATE 2026-08-01 = 4.1` / `CPILFESL 2026-08-01 = 337.765` /
+  #   `PAYEMS 2026-08-01 = 159075` / `DGS10 2026-09-25 = 5.17`。
+  #   ⚠️ 用户口径（2026-09-29）：「尽可能**不要把任务交给 prompt 教学**，
+  #   联网查询各类问题**能否不用提示词也精准连接**」—— 加一条新序列**只加这里一行**，
+  #   不写代码、不在 prompt 里教模型（可达性由 `supports('fred:<SERIES>')` 机器判据决定）。
+  - id: "fred:UNRATE"
+    category: macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "FRED UNRATE（美国失业率）"
+    ttl_days: 3650
+    units: "%"
+    notes: "美国失业率（月度）。**替代已停更的 `us_unemployment`**（东财源 2025-09-05 后为空）。"
+  - id: "fred:CPILFESL"
+    category: macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "FRED CPILFESL（美国核心CPI指数）"
+    ttl_days: 3650
+    units: "指数"
+    notes: "**指数**不是同比；同比要在派生层算。替代已停更的 `us_core_cpi`。"
+  - id: "fred:PCEPILFE"
+    category: macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "FRED PCEPILFE（美国核心PCE指数）"
+    ttl_days: 3650
+    units: "指数"
+    notes: "**指数**；同比需派生。替代已停更的 `us_pce`。"
+  - id: "fred:PAYEMS"
+    category: macro
+    frequency: monthly
+    freshness_hours: 720
+    primary_source: "FRED PAYEMS（美国非农就业人数）"
+    ttl_days: 3650
+    units: "千人"
+    notes: "**水平值**（千人），不是「新增」；新增=本月−上月（派生层）。替代 `us_nonfarm`。"
+  - id: "fred:DGS10"
+    category: macro
+    frequency: daily
+    # ★ 2026-09-30 修正：原写 96h —— 而 `test_catalog_registry.py` 的
+    #   `test_registry_freshness_matches_frequency_band` 定的是
+    #   **daily ⇒ (12, 30]**。96 直接越界（判据红）。
+    #   为什么"容忍周末"不该靠 freshness_hours：跨周末/假期由**维护审计的宽限期**
+    #   负责（`days_since > 3 × 期望周期`），而 freshness_hours 表达的是
+    #   「这条序列多久算不新鲜」。日频序列取 26h（与 `mkt:margin_balance` 的
+    #   「交易所 T+1」同口径）。
+    freshness_hours: 26
+    primary_source: "FRED DGS10（美国10年期国债收益率）"
+    ttl_days: 3650
+    units: "%"
+    notes: "**美债收益率**（用户报障里点名要的「美债数据」）。日频，节假日空值行已跳过。"
+  - id: "fred:T10Y2Y"
+    category: macro
+    frequency: daily
+    freshness_hours: 26      # 同 fred:DGS10（daily 频段 (12,30]）
+    primary_source: "FRED T10Y2Y（10年-2年利差）"
+    ttl_days: 3650
+    units: "%"
+    notes: "期限利差（衰退信号常用）。"
+
+  # ★★ 2026-09-29：**派生指标**（不是连接器直接取列，而是按公式算出来的）。
+  #   生产者：`src/domain/indicators/derive.py` + `configs/derived_indicators.yaml`
+  #   （公式 `利息净收入 / 生息资产平均余额 * 100`，出处见该文件 `sources`）。
+  #   为什么登记在这里：按 §15 纪律「**新采一个指标 → 先问"谁看得见"**」——
+  #   登记 → 白名单（A11）→ 才能进上下文；不登记的话算出来也没人读得到。
+  #   实测（600036 / 2026-06-30）：`0.8126%`（分母退化为总资产、且是**半年累计**
+  #   未年化 ⇒ 明显低于年报口径的两倍左右，**bias 随 extra 下发**）。
+  - id: "净息差:{code}"
+    category: individual
+    frequency: quarterly
+    freshness_hours: 2160
+    primary_source: "派生：configs/derived_indicators.yaml（利息净收入 ÷ 生息资产平均余额）"
+    ttl_days: 3650
+    units: "%"
+    notes: >
+      银行口径 **净息差 NIM**。公式与出处登记在 `configs/derived_indicators.yaml`
+      （**没有出处不许加载**）。⚠️ 分母退化与累计口径必须随 extra 下发：
+      用「总资产」代替「生息资产平均余额」⇒ 分母偏大 ⇒ **系统性偏低**；
+      三季报=前三季度累计（年化需另行处理）。**该口径对非银行主体无意义**。
+
+# ============ ★ 已知缺口（诚实登记，不许省略）============
+#
+# 2026-09-28 第二十五轮实测后**明确不登记**的指标，以及原因。
+# 为什么写在这里而不是不写：不写 = 下一个人会以为"没有这一族"，
+# 然后把同一个缺口当新问题再查一遍。
+#
+# ① 「连接器已实现、但登记表不登记」—— **不该登记**（消费者在分析层之外）
+#    · index_close:{code} / etf_close:{code}
+#      消费者是 `src/intraday`（`sources.py::_daily_indicator()` 拼出
+#      `etf_close:{code}`）与 `src/mainline`（`sources.py::index_closes()`）
+#      两个**分析层之外**的子系统 —— 它们**不经** `_AGENT_DATA_WHITELIST`。
+#      登记进来会被 `tests/unit/test_whitelist_coverage.py::
+#      test_every_registered_indicator_is_visible_to_some_agent` 判成
+#      **僵尸登记**（"登记了却没有任何 Agent 看得见"）。
+#      机器判据见 `tests/unit/test_contract_consistency.py::
+#      test_out_of_analysis_layer_prefixes_still_have_consumers`。
+#
+# ② 「连接器已实现、但登记表不登记」—— **本次未补的真缺口**（同类，待办）
+#    下面这些与上面刚补的族**是同一类**（连接器 `supports()` 认、`get_capabilities()`
+#    自己声明了、就是登记表没有），只是不在 planner 目录里，所以除了下面这条
+#    复核命令之外没有护栏会主动报出来：
+#      · ind:sw_first_pb:all          （申万一级 PB 截面）
+#      · ind:sw_second_pb:all         （申万二级 PB 截面）
+#      · ind:penetration:新能源商用车 / ind:penetration:光伏发电
+#      · mkt:turnover:sh / :sz / :cyb / :kcb
+#      · mkt:turnover_rate:hist / mkt:north_flow:hist / mkt:margin_net_buy
+#    复核方式（现算，不依赖本注释）：把连接器 `get_capabilities()["indicators"]`
+#    里**不含占位符**且 `supports()` 为真的条目，与 `indicators.yaml` 的 id 集合求差。
+#    ⚠️ 求差时必须**先过滤掉 `supports()` 为假的条目** ——
+#       `StarChinextConnector` 声明的是 `turnover:all` / `val:all` 这类**相对键**
+#       （不是完整 indicator id，`supports()` 全为 False），
+#       把它们算进来会得到一份全是假告警的清单。
+#
+# ③ 与上面两条**无关**的一个事实更正（曾长期误导过判断）
+#    「`quant_daily_basic` 停在 2023-11-10」**是错的**：那是 `data/dev/moss_dev.db`
+#    里的化石副本；权威副本在共享行情仓 `data/quant/warehouse.db` 且每日更新。
+#    已被本文件「个股/行业估值」段的 `股息率TTM:{code}` 一系 6 条取代。
+#
+# ============ 配置 schema 校验说明 ============
+
+# 必须包含的字段：id, category, frequency, freshness_hours, primary_source, ttl_days
+# frequency 取值白名单：realtime | intraday | daily | weekly | monthly | quarterly | yearly
+# freshness_hours 软建议：
+#   realtime  < 1
+#   intraday  < 4
+#   daily     < 26 (含 1 个交易日缓冲)
+#   weekly    < 168 (1 周)
+#   monthly   < 720 (30 天)
+#   quarterly < 2160 (90 天)
+#   yearly    < 8760 (365 天)
+#
+# 修改频率字段时请同时更新 `frequency_to_cron_hours`（src/scheduler/catalog_jobs.py）。

@@ -12,14 +12,124 @@
 
 参考：moss-finance-assistant governance/guardrails/circuit_breaker.py
 简化：去掉Actor模型桥接（单进程Demo不需要），保留核心三态状态机。
+
+## ★ 隔离维度是 `provider × 租户`，不是 `provider`
+
+缺陷（`src/api/routes/research.py` @107-109 有实测教训注释）：桶按 provider 分，
+于是**一个用户的突发流量把所有人打到 circuit_open** —— deepseek 60s 内 3 次
+失败即 OPEN，此后**每个租户**的请求连 API 都不试、全部降级到备模型。
+失败是按**请求方**累积的，却按**提供商**生效，两边不匹配。
+
+### 取舍一：**不**做「租户桶 + 全局桶」双闸
+
+「deepseek 整体挂了，要不要让所有人都立刻快速失败」——**不**。理由都能在
+本仓库里指到：
+
+1. 双闸会**原样复现**这次缺陷：AND 语义下全局桶单独就能否决，
+   于是 A 的 3 次失败又变成所有人的快速失败 —— 等于白改。
+2. 想避开它就得给全局桶配**另一套阈值**，那是第二份熔断配置，
+   与「配置只写一遍」（`_DEFAULTS` 按 provider 取）直接冲突。
+3. 另一侧本来就有兜底，代价**有界**：真·整体故障时，每个桶各自累计
+   `failure_threshold` 次失败后同样 OPEN（deepseek 3 次/60s），差别只是
+   「**新租户要重新踩一遍坑**」—— 最多 3 次注定失败的尝试，而这几次尝试
+   本来就在降级链上（`gateway.LLMGateway.complete` 的 for 循环），
+   用户拿到的是备模型的答案，不是错误。
+4. 「提供商限流 / 额度耗尽」这个**确实是全局**的信号，已经有跨租户护栏：
+   `rate_limit_guard`（按模型名判、落盘、`is_locked` 直接跳过该跳，
+   见 `gateway.py` @502-509）。再叠一个全局熔断桶属于重复设施。
+
+代价如实登记：整体故障时**没有**「秒级全网快速失败」，而是「每个活跃租户
+各自 3 次失败后快速失败」。换来的是：一个租户的失败**永远不会**否决另一个
+租户本来会成功的请求 —— 拿备模型答案换真答案，比多试 3 次更贵。
+
+### 取舍二：取不到租户 ⇒ 退回 **provider 级**桶，不是「不熔断」
+
+没有租户身份的是后台作业 / 脚本 / 定时任务（`accounting.current()` 为空且
+`is_authenticated()` 为假）—— 它们恰恰是批量烧配额的那一类
+（`mainline_relevance` 实测 484 元），必须继续被同一条桶挡住。
+退化方向是**保守侧**：全局桶汇总所有无身份调用方的失败 ⇒ 只会更快 OPEN。
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Final
+
+logger = logging.getLogger(__name__)
+
+#: 桶 key 里 provider 与租户的分隔符。**只有 `breaker_key` / `breaker_provider`
+#: 用到它** —— 放一处定义，避免格式漂移（本项目实测过"同一 key 写在 3 处，
+#: 只改一处"的事故）。
+_KEY_SEP: Final[str] = ":"
+
+#: 无租户身份时的作用域标记。它**只进快照，不进 key** —— 理由见 `breaker_key`。
+GLOBAL_SCOPE: Final[str] = "global"
+
+
+def breaker_key(provider: str, tenant: str = "") -> str:
+    """熔断桶 key 的**唯一构造点**：`provider` 或 `provider:tenant`。
+
+    ## 为什么无租户时是裸 provider，而不是 `provider:global`
+
+    `deepseek:global` 看起来更自证，但它是**新字形**，会当场撞两处既有事实：
+
+    1. `network_fallback._sources_snapshot()` 把 `snapshot_all()` 的 key
+       原样交回 `get_or_create()`（`network_fallback.py` @1481-1489）——
+       已注册的运行期桶字形必须稳定；
+    2. 既有判据按 provider 级字形读（`tests/unit/test_circuit_breaker.py`
+       断言 `"deepseek" in snapshot_all()`）。
+
+    而且 provider 级 key 本来就是这一维缺失时**该有**的语义。
+    「这是全局桶」由快照的 `scope=global` / `tenant=""` 如实标出 ——
+    运维页与 `/health` 读的正是快照。
+
+    `tenant` 为空串 ⇒ provider 级桶（后台作业 / 脚本 / 定时任务共用）。
+    """
+    name = str(provider or "").strip()
+    scope = str(tenant or "").strip()
+    return f"{name}{_KEY_SEP}{scope}" if scope else name
+
+
+def breaker_provider(key: str) -> str:
+    """从桶 key 反解 provider —— **只用于查 `_DEFAULTS`**。
+
+    租户只多一维 key，**不改变熔断配置**：`deepseek:a` 与 `deepseek:b`
+    必须拿到同一份 deepseek 阈值。所以取默认值前要把租户那一维切掉；
+    否则每个租户一份阈值 = 配置写两遍，改一处漏一处。
+
+    ⚠️ 这里**不能**用同一招反解租户：注册表里还有 `fallback:<源名>`
+    这类 key（`network_fallback.py` @138），把 `<源名>` 当租户读是错的。
+    租户只由**调用方**如实传入（见 `for_call`）。
+    """
+    return str(key or "").split(_KEY_SEP, 1)[0]
+
+
+def caller_tenant_id() -> str:
+    """**调用发生时**的租户 id；取不到就空串（不抛、不编默认租户）。
+
+    ⚠️ 这里**不新造**取租户的方式：口径与 LLM 审计逐字一致 —— 直接复用
+    `audit._resolve_identity`（**会话身份 > tenancy Principal**，
+    见 `src/infrastructure/llm/audit.py` @53-71）。两份口径必须同源：
+    审计把一次调用记在租户 T 名下、熔断却按租户 U 分桶的话，
+    排障时两个界面会互相矛盾，而且没人能从任一侧看出问题。
+
+    为什么 catch 住异常退回空串：熔断是**护栏**，不是功能 —— 取身份失败
+    不该让"钱已经花了"的调用整体失败。退回 provider 级桶是保守侧
+    （桶更大 ⇒ 更快 OPEN），不会静默放行，见模块 docstring 取舍二。
+    """
+    try:
+        from src.core import accounting
+        from src.infrastructure.llm.audit import _resolve_identity
+
+        tenant_id, _user_id, _source = _resolve_identity(accounting.current())
+        return str(tenant_id or "")
+    except Exception:  # noqa: BLE001 护栏不因取身份失败而中断 LLM 调用
+        logger.debug("熔断器取租户身份失败（退回 provider 级桶）", exc_info=True)
+        return ""
 
 
 @dataclass
@@ -37,18 +147,28 @@ class CircuitState:
 
 
 class TimeWindowCircuitBreaker:
-    """单被保护对象的三态熔断器。"""
+    """单被保护对象的三态熔断器。
+
+    `provider` / `tenant` 是**身份元数据**（只进快照，不参与状态机）：
+    快照要能如实回答「这个桶是谁的」—— 修复前只有 provider 一个维度，
+    运维页看到 `deepseek OPEN` 时无法区分「全站 deepseek 挂了」
+    与「某个租户把额度打爆了」。
+    """
 
     def __init__(
         self,
         name: str,
         *,
+        provider: str = "",
+        tenant: str = "",
         failure_threshold: int = 3,
         failure_window_sec: float = 60.0,
         recovery_cooldown_sec: float = 30.0,
         half_open_success_needed: int = 2,
     ) -> None:
         self.name = name
+        self.provider = str(provider or "")
+        self.tenant = str(tenant or "")
         self.failure_threshold = failure_threshold
         self.failure_window_sec = failure_window_sec
         self.recovery_cooldown_sec = recovery_cooldown_sec
@@ -118,7 +238,14 @@ class TimeWindowCircuitBreaker:
             now = time.time()
             self._gc_failure_window(now)
             return {
+                # `name` **就是桶 key**（`breaker_key` 的输出：`provider`
+                # 或 `provider:tenant`）—— 现有字段与读法保持不变。
                 "name": self._state.name,
+                # ★ 新增：隔离维度，让运维页能把桶**按租户列出来**
+                #   （`tenant=""` + `scope=global` = 无身份调用方共用的全局桶）。
+                "provider": self.provider,
+                "tenant": self.tenant,
+                "scope": "tenant" if self.tenant else GLOBAL_SCOPE,
                 "state": self._state.state,
                 "failures_in_window": len(self._failure_ts),
                 "failure_threshold": self.failure_threshold,
@@ -130,7 +257,11 @@ class TimeWindowCircuitBreaker:
 
 
 class CircuitBreakerRegistry:
-    """熔断器注册中心：按 provider name 隔离。"""
+    """熔断器注册中心：按 `provider × 租户` 隔离。
+
+    key 由 `breaker_key` **唯一构造**（本类自己不拼 key，只收发 key）；
+    默认参数仍**按 provider** 取 —— 见 `get_or_create`。
+    """
 
     _DEFAULTS = {
         "deepseek": {
@@ -149,15 +280,63 @@ class CircuitBreakerRegistry:
 
     def __init__(self) -> None:
         self._breakers: dict[str, TimeWindowCircuitBreaker] = {}
+        # ★ 注册表自己也要锁（键空间变成**动态**之后就必要了）：
+        #   ① `snapshot_all()` 是在**遍历**字典，而键空间里现在每见一个新租户
+        #      就多一个键 —— 边遍历边插入会抛
+        #      `RuntimeError: dictionary changed size during iteration`，
+        #      而读快照的正是 `/health` / 运维页（在请求路径上）。
+        #   ② 两个线程同时首触同一个桶会各建一个，计数被劈成两半
+        #      ⇒ **桶永远达不到阈值**（护栏静默失效，且不报错）。
+        # 锁序：注册表锁 → 桶锁（`snapshot()` 内部），没有反向路径，不成环。
+        self._lock = threading.Lock()
 
-    def get_or_create(self, name: str) -> TimeWindowCircuitBreaker:
-        if name not in self._breakers:
-            cfg = self._DEFAULTS.get(name, self._DEFAULTS["deepseek"])
-            self._breakers[name] = TimeWindowCircuitBreaker(name=name, **cfg)
-        return self._breakers[name]
+    def get_or_create(
+        self,
+        name: str,
+        *,
+        provider: str | None = None,
+        tenant: str = "",
+    ) -> TimeWindowCircuitBreaker:
+        """按 key 取桶；不存在则**按 provider 的默认参数**建一个。
+
+        `name` 是 `breaker_key(...)` 的结果。`provider` 缺省时从 key 反解
+        （`breaker_provider`）—— 旧调用方（`network_fallback` 的
+        `fallback:<源名>`）不改一行也拿到与改动前**完全一样**的默认参数。
+
+        `tenant` **只进快照**：如实标出这是租户桶还是无身份的全局桶，
+        不进 key、也不改任何阈值。
+        """
+        key = str(name or "")
+        with self._lock:
+            cb = self._breakers.get(key)
+            if cb is None:
+                scope = provider if provider is not None else breaker_provider(key)
+                cfg = self._DEFAULTS.get(scope, self._DEFAULTS["deepseek"])
+                cb = TimeWindowCircuitBreaker(
+                    name=key, provider=scope, tenant=tenant, **cfg)
+                self._breakers[key] = cb
+            return cb
+
+    def for_call(self, provider: str, tenant: str = "") -> TimeWindowCircuitBreaker:
+        """**LLM 调用点的入口**：按 `provider × 租户` 取桶。
+
+        `tenant=""` ⇒ provider 级桶 —— 这是「取不到租户身份」时的保守退化
+        （见模块 docstring 取舍二），不是「不熔断」。
+        建 key 仍只走 `breaker_key` 一处。
+        """
+        return self.get_or_create(
+            breaker_key(provider, tenant), provider=provider, tenant=tenant)
 
     def snapshot_all(self) -> dict[str, dict[str, object]]:
-        return {n: cb.snapshot() for n, cb in self._breakers.items()}
+        """所有桶的快照：`{breaker_key: snapshot}`（各租户的桶都在里面）。
+
+        ⚠️ 在锁内**先复制键列表**再遍历：`/health`、运维页与
+        `network_fallback._sources_snapshot()` 都是在请求路径上读它，
+        而同一条路径上随时可能有新租户建桶（见 `__init__` 的锁说明）。
+        """
+        with self._lock:
+            items = list(self._breakers.items())
+        return {n: cb.snapshot() for n, cb in items}
 
 
 _registry: CircuitBreakerRegistry | None = None
@@ -168,3 +347,41 @@ def get_circuit_registry() -> CircuitBreakerRegistry:
     if _registry is None:
         _registry = CircuitBreakerRegistry()
     return _registry
+
+
+def reset_circuit_registry_for_test() -> CircuitBreakerRegistry:
+    r"""重建注册表单例（**仅测试隔离用**）。
+
+    ## 为什么必须有它（2026-10-01，与 `reset_prices_cache` / `reset_budget_for_test` 同一类）
+
+    注册表是**进程级单例**，而它承载的是**可变的熔断状态**。于是任何"先打满阈值、
+    再断言被拒"的判据，其**前提**都依赖"这个桶此刻是 CLOSED 的初始态"：
+
+        cb = get_circuit_registry().get_or_create("fallback:_ConnA")
+        for _ in range(200): cb.record_failure()
+        assert cb.allow_request() is False, "熔断器没有打开 —— 测试前提不成立"
+
+    一旦同进程里别的用例（或应用后台线程）碰过同一个桶，
+    这条断言就不是在测被测代码，而是在测**用例执行顺序** ——
+    表现为"合并跑偶发红、单独跑全绿"，而排障时最容易被当成"抖动"忽略。
+    本轮实测到过一次这种红（`test_fallback_wiring.py::test_circuit_breaker_open_refuses`
+    在合并跑时失败一次），5 次重跑未复现 —— 这正是需要**结构性隔离**而不是
+    "多跑几次看看"的信号。
+
+    用法：`tests/conftest.py` 的 autouse 夹具每个用例前后各调一次。
+    """
+    global _registry  # noqa: PLW0603
+    _registry = CircuitBreakerRegistry()
+    return _registry
+
+
+__all__ = [
+    "CircuitBreakerRegistry",
+    "CircuitState",
+    "TimeWindowCircuitBreaker",
+    "breaker_key",
+    "breaker_provider",
+    "caller_tenant_id",
+    "get_circuit_registry",
+    "reset_circuit_registry_for_test",
+]

@@ -10,6 +10,34 @@ import pytest
 from src.domain.skills.library import SkillLibrary
 
 
+# ---------- 2026-09-28 第十轮：trigger_terms_text（供 A17 prompt 过滤用） ----------
+
+
+def test_trigger_terms_text_extracts_from_l0_index():
+    """L0 dict（list_skills 返回的格式）也能抽取触发短语。"""
+    entry = {
+        "name": "summary-agent",
+        "description": "投研综合摘要助手。\n触发短语：宏观、策略、综合、十月行情",
+        "tags": ["summary"],
+    }
+    terms = SkillLibrary.trigger_terms_text(entry)
+    assert "宏观" in terms
+    assert "策略" in terms
+    assert "十月行情" in terms
+
+
+def test_trigger_terms_text_falls_back_to_name():
+    """未声明触发短语时退化为 name 本身。"""
+    entry = {"name": "portfolio-manager", "description": "纯描述无触发短语"}
+    assert SkillLibrary.trigger_terms_text(entry) == ["portfolio-manager"]
+
+
+def test_trigger_terms_text_handles_empty_dict():
+    """空 dict / None 不抛异常，返回空列表。"""
+    assert SkillLibrary.trigger_terms_text({}) == []
+    assert SkillLibrary.trigger_terms_text(None) == []
+
+
 def make_skill(
     root: Path, rel_dir: str, *,
     name: str | None = None, description: str = "当需要估值时使用，触发短语：估值、DCF。",

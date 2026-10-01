@@ -259,8 +259,13 @@ def retry_on_locked(fn: Callable[[], _T], attempts: int = 3,
 class EventSqliteStore:
     """SQLite连接与轻量schema迁移（进程内只执行一次DDL同步）。"""
 
-    def __init__(self, db_path: str = "data/moss_finagent.db") -> None:
-        self._db_path = db_path
+    def __init__(self, db_path: str | None = None) -> None:
+        # 默认取**本环境**的应用库 —— `AGENTS.md`：默认值即护栏，安全的一侧做成默认。
+        # 原先写死 `data/moss_finagent.db`（三档隔离**共用**的遗留主库）：
+        # 一次漏传 `db_path` 就让隔离档写到共享库上，而没有任何地方声明过（CHG-0069）。
+        from src.infrastructure.catalog.data_stores import default_app_db
+
+        self._db_path = db_path or default_app_db()
         self._synced = False
 
     def _connect(self) -> sqlite3.Connection:

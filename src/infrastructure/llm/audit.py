@@ -74,7 +74,13 @@ def _resolve_identity(ctx) -> tuple[str, str, str]:
 class LLMAuditLog:
     """线程安全的JSONL审计追加器。"""
 
-    def __init__(self, audit_dir: str = "data/audit") -> None:
+    def __init__(self, audit_dir: str | None = None) -> None:
+        # 默认从 registry 取（CHG-0071）；**必须补回落** —— 只把默认值改成
+        # `None` 会把 `Path(None)` 抛给所有不传参的调用方（CHG-0069 的教训）。
+        if audit_dir is None:
+            from src.infrastructure.catalog.data_stores import store_rel
+
+            audit_dir = store_rel("llm_audit")
         self._dir = Path(audit_dir)
         self._lock = threading.Lock()
 
@@ -129,6 +135,12 @@ class LLMAuditLog:
             "response_hash": response.response_hash,
             "tokens_in": response.tokens_in,
             "tokens_out": response.tokens_out,
+            # ★ 2026-09-28 第十二轮：思维链 token 占比。
+            #   让"延迟归因"可被数据回答：
+            #     reasoning_tokens / tokens_out 高 → 降 effort 见效
+            #     正文占大头                     → 只能压缩输出长度
+            #   0 表示后端未提供该字段（本地 Ollama），不是"没有思考"。
+            "reasoning_tokens": response.reasoning_tokens,
             "latency_ms": response.latency_ms,
             "cache_hit": cached,
             "cache_kind": response.cache_kind,

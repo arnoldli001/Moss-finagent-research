@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -37,6 +38,8 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from src.core.cancel import CancellationToken
+
+logger = logging.getLogger(__name__)
 
 #: 已完成任务保留条数上限（超出按最旧优先淘汰）
 _MAX_TASKS = max(16, int(os.environ.get("MOSS_TASK_KEEP", "200")))
@@ -182,19 +185,53 @@ class TaskStore:
         self._live_state.pop(task_id, None)
 
     async def cancel_task(self, task_id: str) -> bool:
-        """用户主动取消任务：触发CancellationToken + 取消asyncio Task。"""
+        """用户主动取消任务：触发CancellationToken + 取消asyncio Task。
+
+        ## ★ `CHG-0132` 补上两件事（都是"取消看起来生效了、其实没有"的形状）
+
+        1. **留痕**：原实现**一行日志都不打**。实测 824,620 行日志里搜不到任何
+           取消痕迹 ⇒ 事后只能靠 access log 反推"用户到底停过哪个任务、停的是哪个 id"
+           （本次查障就是这么干的）。现在成功/晚到/超时三种结局都记一条。
+        2. **不许覆盖已终结的状态**：原实现等句柄至多 2 秒后**无条件**写
+           `status="cancelled"`。若取消恰好晚于任务完成（或任务把取消信号吞掉后
+           跑完了），就会出现「**状态说已取消、报告却已生成并进了结果缓存**」——
+           这正是"我明明点了停止，结果还是出来了"最可能的形状。
+           现在：已经 `completed` 的**保留完成态**，并明确记一条"取消晚了一步"。
+        """
+        record = self._tasks.get(task_id)
+        before = record.status if record is not None else "missing"
         token = self._tokens.get(task_id)
-        if token:
-            token.cancel("user_requested")
         handle = self._handles.get(task_id)
-        if handle and not handle.done():
+        if token is not None:
+            token.cancel("user_requested")
+        timed_out = False
+        if handle is not None and not handle.done():
             handle.cancel()
             try:
                 await asyncio.wait_for(handle, timeout=2.0)
-            except (asyncio.CancelledError, TimeoutError, Exception):
-                pass  # 任务已终止或超时
+            except asyncio.CancelledError:
+                pass  # 句柄已按要求取消
+            except TimeoutError:
+                timed_out = True
+            except Exception:  # noqa: BLE001 取消失败不该把接口打挂
+                timed_out = not handle.done()
+            timed_out = timed_out or not handle.done()
+
+        after = self._tasks.get(task_id)
+        if after is not None and after.status == "completed":
+            logger.warning(
+                "取消晚了一步：task=%s 已完成（final_report=%s）—— 保留完成态，"
+                "不改写成 cancelled（否则会出现『状态已取消、报告已进缓存』）",
+                task_id, "有" if after.final_report else "无")
+            self.clear_live_state(task_id)
+            return True
+
         self.update(task_id, status="cancelled", error="用户主动停止任务")
         self.clear_live_state(task_id)
+        logger.info(
+            "任务已取消：task=%s 取消前状态=%s 令牌=%s 句柄=%s 等句柄超时=%s",
+            task_id, before, "有" if token is not None else "无",
+            "有" if handle is not None else "无", timed_out)
         return True
 
     async def cancel_all(self) -> int:

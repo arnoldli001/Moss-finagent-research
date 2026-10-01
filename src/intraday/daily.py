@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from typing import Any
@@ -451,10 +452,26 @@ async def fetch_daily_snapshot(
         source=SOURCE_LABELS["router"], ok=bool(points), rows=len(points or []),
         detail="日线OHLCV（复用项目QMT→本地CSV→AkShare三级采集链）",
         latency_ms=int((datetime.now() - started).total_seconds() * 1000)))
-    snapshot = analyse_daily(
-        code=code, name=name, points=points or [], config=config,
+    # ★ 计算段**必须离开事件循环**（`CHG-0099`）。
+    #
+    # 实测（2026-09-29，本机）：一个冷日K的 `analyse_daily` 在循环里同步跑完 =
+    # **547 ms 的循环停顿**；并发 2~3 只时（预热轮）akshare 的 `to_thread` 线程与
+    # pandas 纯 Python 段互挤 GIL，停顿被放大到 **~1.9 s**（>1s 的停顿 11~12 次）。
+    #
+    # 为什么这一定要修：循环线程自己算纯 Python 时**无法处理任何 I/O 回调** ——
+    # 这段时间里 `/api/v1/health/live`（前端「后端不可达」红条的探针，超时 4 s，
+    # 连续两次失败即亮）与**所有在途请求**都在排队。用户报的"断网"就是
+    # 这类停顿叠上公网入口抖动（实测该链路 max 7.5 s）被放大出来的。
+    #
+    # `analyse_daily` 自称"纯函数，便于单测"（只吃 points/config/注入上下文），
+    # 因此可以整体丢进线程池：循环线程只等结果，停顿从"一次算多久"降到
+    # **GIL 切换粒度**（`sys.getswitchinterval()` 默认 5 ms 量级）。
+    # `_attach_day_extras` 同理 —— 它是同步 SQLite 读，而 `open_warehouse`
+    # 每次调用开自己的连接（不跨线程复用连接），所以在线程里跑是安全的。
+    snapshot = await asyncio.to_thread(
+        analyse_daily, code=code, name=name, points=points or [], config=config,
         attempts=attempts, gaps=gaps, cycle=cycle, character=character)
-    return _attach_day_extras(snapshot, code)
+    return await asyncio.to_thread(_attach_day_extras, snapshot, code)
 
 
 def _attach_day_extras(snapshot: DailySnapshot, code: str) -> DailySnapshot:

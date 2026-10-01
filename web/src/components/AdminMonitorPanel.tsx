@@ -260,8 +260,10 @@ function NoteList({ items }: { items: string[] }) {
 /**
  * LLM 花费区：汇总卡 + 按前端功能 + 按天趋势 + 口径说明。
  *
- * 三个必须分开显示的量，混在一起就没法处理：
+ * 四个必须分开显示的量，混在一起就没法处理：
  *   · `paid_calls` / `free_calls` —— 本地模型是**免费**的，不是"便宜"；
+ *   · `cached_calls` —— 本地缓存命中，**没有请求提供商**，金额计 0，
+ *     省下的钱用 `avoided_cny`（反事实）单列 —— 混进"花费"就把好事记成坏事；
  *   · `unpriced_calls` —— 用了未登记价格的模型名，金额是**估算**；
  *   · `readable=false` —— 读不到审计，**不能**显示成"花了 0 元"。
  */
@@ -278,6 +280,8 @@ function CostSection({ cost }: { cost?: MonitorCost }) {
     );
   }
   const top = cost.by_feature[0];
+  const cached = cost.cached_calls ?? 0;
+  const saved = cost.avoided_cny ?? 0;
   const trendMax = Math.max(0.0001, ...cost.by_day.map((d) => d.cny));
   return (
     <>
@@ -293,7 +297,17 @@ function CostSection({ cost }: { cost?: MonitorCost }) {
         <Metric label="未定价模型的调用"
           value={cost.unpriced_calls}
           tone={cost.unpriced_calls > 0 ? "warn" : "ok"} />
+        <Metric label="缓存命中（未产生费用）"
+          value={cached > 0 ? `${cached} 次 / 省 ${fmtMoney(saved)}` : "0"}
+          tone={cached > 0 ? "ok" : ""} />
       </div>
+      {cached > 0 && (
+        <div className="account-dim" style={{ marginBottom: 8 }}>
+          其中 <b>{cached}</b> 次命中本地响应缓存（exact / semantic）——
+          这些调用<b>没有请求提供商</b>，金额按 0 计；若未命中约需
+          <b> {fmtMoney(saved)}</b>（反事实估算，<b>不是</b>账单）。
+        </div>
+      )}
 
       <table className="admin-table">
         <thead>

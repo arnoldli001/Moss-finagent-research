@@ -1,0 +1,31 @@
+---
+description: 需求 ↔ 开发 PRD 文档对账（每轮对话都要做：没有的补进去，有差异的改掉）
+globs:
+alwaysApply: true
+---
+
+# 需求 ↔ PRD 对账（转发层 · 不复制内容）
+
+**唯一事实源**：仓库根 `AGENTS.md` 的《需求—PRD 对账硬约束》段 +
+`.trae/skills/requirement-prd-sync/SKILL.md`。本文件**只转发**，不复制 ——
+复制必然漂移。
+
+## 每轮对话的动作（三步）
+
+1. **T0 抽取**：把用户输入拆成可判定条目（需求原话不得改写 + 可观察行为 + 关键词 + 命中的 PRD 章节 + 判定）。
+2. **T1 对账**：跑下面三条命令。
+3. **T2 落账**：`MISS_PRD` → 补写 `docs/PRD.md`；口径冲突 → 改写 PRD 并留 `⚠️ 已废止（CHG-xxxx）` 痕迹；
+   落不进 PRD 的只能登记 `待办`。**没走完 T2 不算交付。**
+
+```bash
+uv run python scripts/prd_sync_check.py --keyword "<关键词>"   # OK / MISS_LEDGER / MISS_PRD / TODO
+uv run python scripts/prd_sync_check.py --ledger               # 0 ERROR 才算达标
+uv run python scripts/prd_sync_check.py --self-test            # 检查器自证
+```
+
+## 两条硬判据（脚本会报 ERROR）
+
+- `类型 ∈ {新增,冲突,细化}` 且 `状态=已闭环` ⇒ `处置` 必须是 `补写PRD/改写PRD`（冲突类可 `标注废止`）；
+- `PRD 已更新=是` ⇒ `docs/PRD.md` 里**必须搜得到该 CHG 号**（"我改了 ≠ 它生效了"）。
+
+台账 `docs/REQUIREMENT_CHANGELOG.md` · 现行口径见 `docs/PRD.md` §13。

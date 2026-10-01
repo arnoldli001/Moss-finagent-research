@@ -16,8 +16,27 @@ import asyncio
 from typing import Any
 
 
-class TaskCancelledError(Exception):
-    """任务被用户主动取消时抛出，区别于普通异常。"""
+class TaskCancelledError(BaseException):
+    """任务被用户主动取消时抛出，区别于普通异常。
+
+    ## ★ 为什么继承 `BaseException` 而不是 `Exception`（`CHG-0132`）
+
+    原来是 `Exception`。而这张图里**到处都是** `except Exception` 的兜底
+    （`supervisor.py` 一个文件就有 18+ 处，注释写着"单节点失败不拖垮整图"）——
+    于是只要 `token.check()` 落在某个 `try` 里，**"用户取消"就会被降级成
+    "这个节点失败了"，图继续往下走**，取消变成"慢一点停"而不是"停"。
+
+    实测（`CHG-0132` 现场）：照搬 `supervisor.py:2901-2906` 的形状，
+    `token.check()` 被 `except Exception` 吞掉后，节点返回的是
+    `{'errors': ['意外异常 user_requested']}` —— 一次取消被记成一次节点故障。
+
+    Python 自己就是这个口径：`asyncio.CancelledError` 从 3.8 起**故意**改成
+    `BaseException`，理由完全一样（`except Exception` 不该吞掉"取消"）。
+    这里跟随它，**不是**为了少写代码，是为了让"取消"在所有兜底面前都拦不住。
+
+    代价：任何 `except Exception` 都不再吞它（这正是目的）；
+    需要收拾现场的地方用 `finally`（照常执行）。
+    """
 
 
 class CancellationToken:

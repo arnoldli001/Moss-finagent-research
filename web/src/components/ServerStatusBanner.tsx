@@ -23,16 +23,44 @@ import { isLocalDevHost } from "../errors";
  * ——后者要连 Ollama、校验审计链，正常也要 0.3~2.5 秒，
  * 拿它当探针会在服务只是"忙"的时候误报宕机。
  *
- * ## 为什么连续失败两次才报警
+ * ## ★ 抖动容忍窗口（2026-09-30 用户口径，`CHG-0133` → 阈值 `CHG-0134`）
  *
- * 单次探测失败可能只是一次瞬时抖动（比如后端正好在做热重载）。
- * 立刻弹红条会造成"明明能用却报警"的噪音，比不报还伤信任。
- * 两次失败之间隔 5 秒，真正宕机时 5 秒内就会亮，代价可接受。
+ * 用户口径两句话，**阈值以第二句为准**：
+ *   ①「如果只是几秒钟抖动，是否可以不显示这个提示？」
+ *   ②「不要 5 秒就提示，要**重试周期的 2~3 倍**再提示一次」
+ *
+ * 原来只数**次数**（连续 2 次、失败后每 5 秒一探）⇒ **5~9 秒的瞬断就会弹红条**。
+ * 而公网入口那条链有 5 跳（浏览器 → VPS nginx → frps → SSH 隧道 → frpc → 8110），
+ * 实测这种几秒级抖动**会反复出现**（`data/run/tunnel-watchdog.log` 里
+ * 09-29 22:11 / 22:41 / 09-30 09:37 都记过「主用不通但本机后端健康」）。
+ * 一次十几秒内自愈的抖动，对用户没有任何可操作性 —— 弹了只会让他以为系统坏了。
+ *
+ * ## ★★ 阈值是**推导**出来的，不是第二个魔法数
+ *
+ * `GRACE_MS = RETRY_MS × GRACE_MULTIPLIER`（5 秒 × 3 = **15 秒**）。
+ * 上一版把它写成独立的 `20000`（= 4 倍），与重试周期**没有关系** ——
+ * 那样一来"2~3 倍"这条口径就只存在于注释里，改任何一个常数都会让它失真。
+ * 现在只有一个旋钮：要"2 倍"就把 `GRACE_MULTIPLIER` 改成 2（= 10 秒）。
+ *
+ * 真实 48 秒中断（2026-09-30 10:50:05–10:50:53）**照样会显示** ——
+ * 被过滤掉的只有"十几秒内自己好了"的那一类。
+ *
+ * ⚠️ 容忍期内**仍然按 `RETRY_MS` 探**：不能为了安静而把恢复检测也拖慢。
+ * ⚠️ 浏览器 `offline` 事件**也走同一个窗口**（原来它立刻弹条）：
+ * 网卡瞬断两三秒就闪一次"后端不可达"，正是这条口径要挡的东西。
  */
+/** 失败后的重试间隔（毫秒）。 */
+const RETRY_MS = 5000;
+/** 抖动容忍窗口 = 重试周期的**倍数**（用户口径：2~3 倍）。 */
+const GRACE_MULTIPLIER = 3;
+/** 抖动容忍窗口：连续不可达不超过这个时长**不弹红条**。 */
+const GRACE_MS = RETRY_MS * GRACE_MULTIPLIER;
+
 export default function ServerStatusBanner() {
   const [down, setDown] = useState(false);
   const [checking, setChecking] = useState(false);
-  const streak = useRef(0);
+  //: 本轮"持续不可达"是从什么时候开始的（恢复即清空）。**唯一**的判据来源。
+  const downSince = useRef<number | null>(null);
   const timer = useRef<number | undefined>(undefined);
   const alive = useRef(true);
 
@@ -40,18 +68,32 @@ export default function ServerStatusBanner() {
     window.clearTimeout(timer.current);
     const ok = await pingServer(4000);
     if (!alive.current) return;
-    streak.current = ok ? 0 : streak.current + 1;
-    setDown(!ok && streak.current >= 2);
-    // 在线时 15 秒探一次（几乎无成本）；怀疑宕机时 5 秒一次，尽快恢复显示
-    timer.current = window.setTimeout(() => { void tick(); }, ok ? 15000 : 5000);
+    if (ok) {
+      downSince.current = null;
+      setDown(false);
+    } else {
+      if (downSince.current === null) downSince.current = Date.now();
+      // 只有一个判据：**持续不可达够久**（阈值 = 重试周期 × 倍数）。
+      // 不再单独数次数 —— 时长窗口本身就蕴含"失败过若干轮"，
+      // 两个判据并存等于同一个决定有两个旋钮，迟早互相打架。
+      setDown(Date.now() - downSince.current >= GRACE_MS);
+    }
+    // 在线时 15 秒探一次（几乎无成本）；怀疑宕机时按 RETRY_MS 探，尽快恢复显示
+    timer.current = window.setTimeout(() => { void tick(); }, ok ? 15000 : RETRY_MS);
   }, []);
 
   useEffect(() => {
     alive.current = true;
     void tick();
     // 系统层面的断网/恢复事件比轮询更及时
-    const onOnline = () => { streak.current = 0; void tick(); };
-    const onOffline = () => { streak.current = 99; setDown(true); };
+    const onOnline = () => { downSince.current = null; void tick(); };
+    // ⚠️ offline **不再立刻弹条**：网卡瞬断两三秒就闪"后端不可达"，
+    //    正是抖动容忍窗口要挡的。这里只**开始计时**，是否显示仍由 tick 按
+    //    同一个 GRACE_MS 判定（真断网超过窗口照样会显示）。
+    const onOffline = () => {
+      if (downSince.current === null) downSince.current = Date.now();
+      void tick();
+    };
     window.addEventListener("online", onOnline);
     window.addEventListener("offline", onOffline);
     return () => {
@@ -64,7 +106,7 @@ export default function ServerStatusBanner() {
 
   const onRetry = async () => {
     setChecking(true);
-    streak.current = 0;
+    downSince.current = null;   // 手动重试 = 重新开始计时（用户主动问了，就该立刻给答案）
     await tick();
     setChecking(false);
   };
