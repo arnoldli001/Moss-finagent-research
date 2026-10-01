@@ -1120,6 +1120,136 @@ indicators:
     units: "%"
     notes: "申万三级行业股息率截面"
 
+  # ============ 申万行业估值的**参数化模板**（`CHG-0136`：按行业点名）============
+  #
+  # 【为什么补这一整族】用户报障「为什么还是反馈股息率数据缺失？招商银行的股息率
+  #   肯定在数据库里能找到的啊」。实测根因**不是取不到**：
+  #     · `supports("ind:sw_first_dividend_yield:银行")` → True，且**真取到**
+  #       （2026-09-30 银行行业股息率 **5.1%**、PE-TTM 7.34）；
+  #     · 但**能力面只声明、登记面没有**（本文件原来只有 5 条 `:all`），
+  #       ⇒ 规划侧看不见"按行业点名"这条路 ⇒ 只采 `:all` **不带行业标签的截面**
+  #       ⇒ Agent 拿着一张全市场截面，**没法把"银行"挑出来** ⇒ 报告写"股息率缺失"。
+  #
+  # 【为什么可以整族补，成本为零】`catalog_jobs.plan_jobs()` 对模板有明确处理：
+  #     `if meta.is_template(): # 模板没有具体的 code，无法作为作业指标` → **跳过**。
+  #   即：`{行业名}` 形式的登记**不产生任何定时采集作业**（本文件里
+  #   `idx_val:pe_ttm:{指数名}` 早就是同样的用法），它只是一份"**规划目录**"。
+  #
+  # 【纪律】三面必须同时成立，缺一即"采了白采"或"登记了取不到"：
+  #   ① 能力面 `SWIndustryValuationConnector.supports()`（正则已覆盖 3 级 × 4 指标）
+  #   ② 登记面（本处）
+  #   ③ 可见面（分析层白名单，经同义词闭包匹配）
+  #   判据：`tests/unit/test_contract_consistency.py`（能力↔登记）+
+  #        `tests/unit/test_whitelist_coverage.py`（登记↔可见，反僵尸登记）。
+  - id: "ind:sw_first_pe_ttm:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按**申万一级**行业名点名取 PE-TTM（模板，不产生定时作业）"
+
+  - id: "ind:sw_first_pe_static:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万一级行业名点名取静态 PE（模板）"
+
+  - id: "ind:sw_first_pb:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万一级行业名点名取 PB（模板）"
+
+  - id: "ind:sw_first_dividend_yield:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    units: "%"
+    notes: "★ 按申万一级行业名点名取**股息率**（如 `…:银行`，实测 5.1%）。模板，不产生定时作业"
+
+  - id: "ind:sw_second_pe_ttm:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万二级行业名点名取 PE-TTM（模板）"
+
+  - id: "ind:sw_second_pe_static:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万二级行业名点名取静态 PE（模板）"
+
+  - id: "ind:sw_second_pb:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万二级行业名点名取 PB（模板）"
+
+  - id: "ind:sw_second_dividend_yield:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    units: "%"
+    notes: "按申万二级行业名点名取股息率（模板）"
+
+  - id: "ind:sw_third_pe_ttm:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万三级行业名点名取 PE-TTM（模板）"
+
+  - id: "ind:sw_third_pe_static:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万三级行业名点名取静态 PE（模板）"
+
+  - id: "ind:sw_third_pb:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    notes: "按申万三级行业名点名取 PB（模板）"
+
+  - id: "ind:sw_third_dividend_yield:{行业名}"
+    category: cn_industry
+    frequency: daily
+    freshness_hours: 26
+    primary_source: "AkShare sw_index_third_info"
+    ttl_days: 365
+    units: "%"
+    notes: "按申万三级行业名点名取股息率（模板）"
+
+  #: ⚠️ **已知缺口（诚实登记，未在本轮补）**：能力面还支持另外 7 个
+  #: `:all` **截面**（`ind:sw_first_pb:all`、`ind:sw_second_pb:all`、
+  #: `ind:sw_{first,second,third}_pe_static:all`、`ind:sw_{first,second}_dividend_yield:all`）。
+  #: **它们不是模板** ⇒ 登记就会产生**每日定时采集作业**（+7 条/天），
+  #: 那是**成本决定**、不是工程决定，故留给 owner 拍板；
+  #: 在此之前 `SWIndustryValuationConnector.get_capabilities()` **不声明它们**
+  #: （声明了却不登记，会被 `test_contract_consistency.py` 判成能力↔登记不一致）。
+  #: 而"按行业点名"这条路**不需要**它们 —— 要某个行业的股息率请用
+  #: `ind:sw_first_dividend_yield:{行业名}`（模板已登记，零作业成本）。
+
   # ============ 行业专向（科技/消费/周期/医药）============
   - id: ind:半导体销售额同比
     category: cn_industry

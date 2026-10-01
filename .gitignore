@@ -1,78 +1,76 @@
-# Python
+﻿# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 dist/
 build/
 
-# 虚拟环境
+# Virtual environments
 .venv/
 venv/
 
-# 环境与密钥（禁止提交真实值）
+# Environment variables and secrets (forbid committing real values)
 .env
-# ★ 2026-09-30（CHG-0124）：`frpc.toml` **含真实隧道 token**（`auth.token = …`），
-# 而它此前**既不在 .gitignore 里、也未被跟踪** ⇒ 一句 `git add -A` 就会把凭据
-# 提交进仓库（而且提交后再删，历史里**永远还在**）。
-# 与本文件第 12 行那条是同一个理由：带凭据的本地配置一律不得入库。
-# 需要它的人照着 `scripts/frp_ssh_tunnel.py` 的说明自己生成一份。
+# ★ 2026-09-30 (CHG-0124): frpc.toml contains real tunnel token (auth.token = …),
+# previously neither in .gitignore nor tracked ⇒ `git add -A` would commit credentials.
 frpc.toml
+# Locally downloaded FRP client executables (frpc.exe etc.): large, cross-platform binaries
+# Not tracked; obtain from fatedier/frp releases
+/bin/
+# One-time probe script directory (contains local Windows full paths, 2026-09-28 model routing forensics)
+/docs/_evidence_*/
+# 内部备忘与一次性产出（不发布）
+/docs/出售.md
+/docs/多因子选股与分层选股的意义.md
+/docs/数据获取指导.md
 
-# 测试与工具缓存
+# Test and tool caches
 .pytest_cache/
 .ruff_cache/
 .coverage
 htmlcov/
 
-# 运行时数据与日志（仅根目录；避免误伤代码中名为 data/logs/output 的包）
+# Runtime data and logs (root directory only; avoid code-named packages)
 /data/
 /logs/
 /output/
 
-# moss_selector 的运行产物（模型/面板/备份体积大，不入库；config 与代码要入库）
-moss_selector/data/
-moss_selector/models/
-moss_selector/logs/
+# moss_selector runtime artifacts (large models/panels/backups not tracked)
+/moss_selector/data/
+/moss_selector/models/
+/moss_selector/logs/
 
-# 前端（后续阶段）
+# Frontend (subsequent stages)
 node_modules/
 
-# TS构建缓存
+# TS build cache
 *.tsbuildinfo
-# 前端构建产物（web/dist 已被 dist/ 覆盖；dist-pilot 为试点构建目录）
+# Frontend build artifacts (web/dist already covered by dist/; dist-pilot is staging dir)
 /web/dist-pilot/
-
-# dist-pilot 的历史备份目录（`dist-pilot-backup-<ts>/`，`ship-frontend` 每次发布留一份）。
-# ⚠️ 2026-09-27 实测：这两个目录名**不重叠** —— `/web/dist-pilot/` 挡不住
-#    `web/dist-pilot-backup-*/`。公开线早就补了这条（它的 .gitignore 里记着
-#    "一次快照把 52 个备份构建文件带进了发布白名单"），私有线一直漏着：
-#    实测 7 个备份目录全是未跟踪状态，`git add .` 会把它们一并入库。
 /web/dist-pilot-backup-*/
 
-# 本地临时探针脚本与下载日志（根目录，勿提交）
+# Local temp probe scripts and download logs (root, do not commit)
 /_tmp_*.py
 /_*.log
-# 本地跑测试留下的日志（`pytest ... *> tests_full.log`），不是产物
 /*.log
 
-# 备份文件与下载缓存
+# Backup files and download cache
 *.bak*
 /downloads/
 
-# ==================== 私有核心资产（本地保留，不进入公开仓库） ====================
-# 竞价选股：逻辑/参数/情绪周期/综合打分私有引擎不发布。
-# 注意：其 API 路由（/src/api/routes/auction_select.py）由**自包含 stub** 接管并
-# 随仓发布，以保留接口契约与前端面板，因此这里不能再 ignore 该路由文件。
+# ==================== Private core assets (local only, not in public repo) ====================
+# Auction selection: logic/params/sentiment cycle/composite scoring private engine
+# Note: src/api/routes/auction_select.py is self-contained stub (for interface contract)
 /src/auction_select/
 /auction_select/
-# 私有核心skills（情绪周期/短线招式/卖点）
+# Private core skills (sentiment cycle / short-term patterns / sell points)
 /skills/auction-selection/
 /skills/jianmen-shortterm/
 /skills/intraday-sell-points/
-# 擒牛线公式与卖点判定
+# Niu-line formula and sell-point determination
 /src/intraday/niuline.py
 /src/intraday/sell_points.py
-# 量化选股模型/标签参数/重训/回测（仓储与API路由）
+# Quant selection model/label params/retraining/backtest (storage and API routes)
 /src/quant/quant_select_repo.py
 /src/quant/quant_select_runner.py
 /src/quant/quant_select_service.py
@@ -80,20 +78,13 @@ node_modules/
 /src/quant/model_backtest.py
 /src/quant/model_retrain_service.py
 /src/quant/stock_news.py
-# 量化选股 API 路由同理由自包含 stub 接管、随仓发布（不再 ignore 路由文件）。
-/src/backtest/shortterm.py
+# Quant selection API route replaced by self-contained stub (now tracked)
 /moss_selector/
 /config_label10_2bucket.yaml
-# QMT 侧竞价策略实现（79KB 策略核心）已从公开版删除；qmt/ 目录下仅保留
-# README.md 与 SIGNAL_CONTRACT.md（接口契约说明），故这里**不再整目录忽略 /qmt/**。
-# scripts 默认全部不发布，仅白名单以下公开脚本（研究/运维/验证脚本不入库）
-#
-# ⚠️ **进了白名单就必须入库**：白名单只表达"政策上允许发布"，git 不会替你
-# `git add`。`prd_sync_check.py` 曾经就是这样 —— 白名单里有、仓库里没有，
-# 于是 CI 的对账门禁在克隆/CI 环境里**每次都静默跳过**（只打一行
-# `::warning::`），而本机永远看不见。判据见
-# `tests/unit/test_shipped_deps.py::test_whitelisted_scripts_are_actually_tracked`
-# （它会把"白名单里的空头支票"直接报红）。
+# QMT 私有化（不再整目录忽略 /qmt/，仅 README.md 与 SIGNAL_CONTRACT.md 随仓发布）
+
+# scripts: default policy is not to publish; only whitelisted public scripts below
+# ⚠️ Whitelist entries MUST be tracked; otherwise clone/CI gaps (CI silently passes)
 /scripts/*
 !/scripts/.gitkeep
 !/scripts/_smoke_e2e.py
@@ -104,27 +95,10 @@ node_modules/
 !/scripts/download_qmt_data.py
 !/scripts/intraday_failover_check.py
 !/scripts/intraday_latency_probe.py
-# 需求—PRD 对账（2026-09-28）：AGENTS.md 硬约束要求"每轮对话跑一条命令"，
-# 脚本不发布则克隆环境下那条命令指向不存在的文件（tests/unit/test_shipped_deps.py 判据 3）
 !/scripts/prd_sync_check.py
-# 开工前置检查（AGENTS.md《需求闭环与影响半径》点名"开工前跑一条命令"）：
-# 同类现场 / 贯通点逐项状态 / 影响半径。缺了它，那条硬约束在克隆里无法执行。
 !/scripts/preflight_check.py
-# 测试经济性（AGENTS.md《测试运行经济性》点名"日常只跑本次改动相关的测试"）：
-# 没有它，克隆环境只能靠跑全量兜底 —— 而这条规则正是为取消"全量当默认"而立的。
 !/scripts/affected_tests.py
-# 外部联网源体检（AGENTS.md《环境配置》点名"接线前必须先过一条命令"）：
-# 博查搜索 + 东财 Choice EMQuantAPI 的**真实通路**。没有它，克隆环境里就只剩
-# "文档说接了、没人验过"—— 而本仓库已四次踩"备用只声明未走通"（CHG-0113 / §19.33）。
 !/scripts/check_external_sources.py
-# 拥挤度自动定时刷新（`CHG-0144`）：**两个必须一起发布** ——
-#   · `setup_crowding_refresh_task.py` 是"在开发机上装这个计划任务"的唯一入口；
-#   · `crowding_refresh.ps1` 是任务的动作目标（`Action.Arguments` 里按绝对路径引用它）。
-# 只发其中一个 = 另一个永远缺：装机入口在、动作脚本缺失（任务每次 LastTaskResult=1），
-# 或动作在、没人知道怎么装。这与既有计划任务包装（pilot_watchdog.ps1 /
-# tunnel_watchdog.ps1 / pilot_autostart.ps1 / frp_watchdog.ps1）**同类且同样入库**。
-# 判据：tests/unit/test_crowding_refresh_schedule.py（读它们的内容）+
-# tests/unit/test_shipped_deps.py（白名单必须真的被跟踪，空头支票报红）。
 !/scripts/crowding_refresh.ps1
 !/scripts/setup_crowding_refresh_task.py
 !/scripts/quant_cases.py
@@ -136,10 +110,8 @@ node_modules/
 !/scripts/scan_date_bombs.py
 !/scripts/seed_demo_data.py
 !/scripts/verify_cleanup.py
-# 前端面板 UI **随开源版发布**（保证全部子界面可见）：面板只做渲染、不含后端
-# 打分公式/阈值；配合脱敏版 stub 路由显示「结构空壳+脱敏提示」。
-# （因此这里不再 ignore AuctionSelectPanel / QuantSelectPanel / NiuLineChart / auctionApi）
-# 暴露私有逻辑/公式的文档与决策明细
+
+# Docs that expose private logic/formulas
 /docs/AUCTION_SELECT.md
 /docs/AUCTION_DATA_REDUNDANCY.md
 /docs/MODEL_BACKTEST.md
@@ -148,26 +120,36 @@ node_modules/
 /docs/SELECTOR_DAILY_K.md
 /docs/NIULINE_DAILY_CHART.md
 /docs/竞价选股_*
-# 内部 Agent/规格工作目录（不发布，含本地 file:// 链接与内部规划）
+
+# Internal Agent/spec working directory (local file:// links, internal planning)
 /.trae/
-# ⚠️ 例外（2026-09-28，CHG-0047）：需求—PRD 对账 skill **要发布** —— 否则 AGENTS.md 的
-# `@` 引用在克隆环境里指向不存在的文件（正是「交付完整性硬约束」要防的那类缺陷）。
-# gitignore 不能直接反选"被忽略目录下的子文件"，必须先逐级放开、再逐级忽略；
-# `/.trae/*` 保证**其余 skill 依旧不发布**，只放行这一条链路。
+# Exception (2026-09-28, CHG-0047): requirement-PRD sync skill IS published
 !/.trae/
 /.trae/*
 !/.trae/skills/
 /.trae/skills/*
 !/.trae/skills/requirement-prd-sync/
 !/.trae/skills/requirement-prd-sync/**
-# 研究/面试/复盘流水账：已被 docs/INTERVIEW_FINAL.md 取代，含策略明细与个人域名
+
+# Research/interview/review logs (replaced by INTERVIEW_FINAL.md)
 /docs/INTERVIEW_*.md
 /docs/面试准备_*
 /docs/MAINLINE_*
 /docs/ETF_*.md
 /docs/PLATFORM_MULTI_TENANCY_DESIGN.md
 /docs/mainline_iterations/
-# 暴露私有公式/skill的测试用例
+# Private skill copies in interview folder (formally merged to skills/, drafts not published)
+# Private skill copies and personal interview study materials in interview folder
+# (formally merged to skills/, drafts and study notes not published)
+/docs/interview/搬瓦清单与举一反三规则SKILL.md
+/docs/interview/AI开发loop规则SKILL.md
+/docs/interview/perceived-latency-triage SKILL.md
+/docs/interview/踩坑清单与举一反三规则SKILL.md
+/docs/interview/AI架构师必备知识.md
+/docs/interview/显存不足的掷硬币问题.md
+/docs/interview/链路审计*
+
+# Test cases exposing private formulas/skills
 /tests/unit/test_auction_golden.py
 /tests/unit/test_auction_rulebook.py
 /tests/unit/test_stock_news.py
@@ -182,24 +164,24 @@ node_modules/
 /tests/unit/test_auction_universe_pinning.py
 /tests/unit/test_auction_source_chain.py
 /tests/unit/test_auction_local_source.py
-# 情绪周期五线的口径与公式（出自《情绪周期表的用法》，与选股公式同属私有资产）
+# Sentiment-cycle five-line calibration (from sentiment cycle table, private)
 /tests/unit/test_sentiment_cycle.py
 /tests/unit/test_moss_selector.py
 /tests/unit/test_selector_labels_and_buckets.py
 /tests/unit/test_preheat_cache.py
-# 绑定未发布私有脚本的研究测试（目标脚本已被 scripts 白名单排除）
+# Research tests bound to unpublished private scripts (target scripts removed from whitelist)
 /tests/unit/test_daily_auction_tick.py
 /tests/unit/test_mainline_layer_scale.py
-/tests/unit/test_mainline_rank_key.py
+/tests/unit/test_mainline_layer_rank_key.py
 /tests/unit/test_rescore_purge.py
 /tests/unit/test_mainline_layer_compose.py
 /tests/unit/test_intel_alert_copy_trial.py
 /tests/unit/test_script_cost_guard.py
 /tests/unit/test_sector_crowding.py
-# alert 阈值/门控策略重构中：这 3 个测试随重构完成后的下一版一起发布，
-# 先行发布会对不上中间态（断言旧阈值 0.70 vs 代码 0.60 等），CI 必红
+# alert thresholds/gating policy refactor: these 3 tests with next release (intermediate state would fail CI)
 /tests/unit/test_alert_thresholds.py
 /tests/unit/test_alert_models.py
 /tests/unit/test_notifiers.py
-# 文档目录下的一次性勘察输出（数据源/zsxq/合规探测现场，勿发布）
+
+# Document directory one-time investigation outputs (data source/zsxq/compliance probe sites)
 /docs/_*.txt

@@ -98,8 +98,16 @@ def test_parent_of_returns_none_when_unknown(monkeypatch) -> None:
 def test_stop_backend_processes_with_no_targets_is_noop(
     monkeypatch,
 ) -> None:
-    """没有目标实例时不能误杀、不能报错。"""
+    """没有目标实例时不能误杀、不能报错。
+
+    ⚠️ `CHG-0141`：**必须同时**把 worker 枚举打成空。`stop_backend_processes`
+    现在会并上 `list_our_worker_pids()`（worker 没有端口，漏掉它就等于留一个
+    继续写行情仓的孤儿进程）；只 patch 后端那一半，本机真在跑的 worker
+    会被这条用例当成"目标" —— 实测就是这样：断言先红了，**而且差一步
+    就向线上 worker 发了停止信号**。所以这条 patch 是**安全**要求，不只是洁癖。
+    """
     monkeypatch.setattr(manage, "list_our_backend_pids", lambda: [])
+    monkeypatch.setattr(manage, "list_our_worker_pids", lambda: [])
     monkeypatch.setattr(manage, "find_listening_pid", lambda _port: None)
     killed: list[int] = []
     monkeypatch.setattr(manage, "kill_pid_tree", lambda pid: killed.append(pid) or True)
@@ -110,6 +118,7 @@ def test_stop_backend_processes_with_no_targets_is_noop(
 def test_stop_backend_processes_skips_foreign_port_owner(monkeypatch) -> None:
     """端口被别的程序占用时，绝不去停它。"""
     monkeypatch.setattr(manage, "list_our_backend_pids", lambda: [])
+    monkeypatch.setattr(manage, "list_our_worker_pids", lambda: [])
     monkeypatch.setattr(manage, "find_listening_pid", lambda _port: 4242)
     monkeypatch.setattr(manage, "diagnose_port", lambda _port: {
         "occupied": True, "pid": 4242, "is_ours": False, "cmdline": "other"})
@@ -124,6 +133,7 @@ def test_stop_backend_processes_requests_graceful_then_hard_kills(
 ) -> None:
     """先发优雅退出请求；到点仍存活才硬杀（硬杀会丢 checkpoint）。"""
     monkeypatch.setattr(manage, "list_our_backend_pids", lambda: [111, 222])
+    monkeypatch.setattr(manage, "list_our_worker_pids", lambda: [])
     graceful: list[int] = []
     hard: list[int] = []
     monkeypatch.setattr(manage, "request_graceful_stop",
@@ -140,9 +150,72 @@ def test_stop_backend_processes_requests_graceful_then_hard_kills(
     assert results == [(111, True), (222, True)]
 
 
+def test_stop_backend_processes_also_stops_workers(monkeypatch) -> None:
+    """★ `CHG-0141`：**worker 必须一起停**，否则留下孤儿写者。
+
+    现场：worker 没有端口、命令行也与后端不同。漏掉它的后果是
+    `manage.py stop` 输出"已停止"，而一个 worker 继续跑 `quant_data_sync`
+    往 14 GiB 行情仓 `upsert` —— 与 `CHG-0087`（两个实例同时写同一个库）
+    同一形状，只是这次的第二个写者是我们自己忘了停的进程。
+
+    这条判据同时钉住"优雅优先"：worker 的优雅路径是 CTRL_BREAK → SIGBREAK
+    → `scheduler.stop()` + WAL checkpoint（硬杀会让下次启动读到脏 `-wal`）。
+    """
+    monkeypatch.setattr(manage, "list_our_backend_pids", lambda: [111])
+    monkeypatch.setattr(manage, "list_our_worker_pids", lambda: [333])
+    graceful: list[int] = []
+    hard: list[int] = []
+    monkeypatch.setattr(manage, "request_graceful_stop",
+                        lambda pid: graceful.append(pid) or True)
+    monkeypatch.setattr(manage, "wait_port_closed", lambda port, timeout=12.0: True)
+    monkeypatch.setattr(manage, "_pid_alive", lambda pid: pid == 333)  # worker 赖着不走
+    monkeypatch.setattr(manage, "kill_pid_tree", lambda pid: hard.append(pid) or True)
+
+    results = manage.stop_backend_processes(8100)
+
+    assert 333 in graceful, f"worker 没收到优雅停止请求：{graceful}"
+    assert 333 in hard, f"worker 赖着不走时没有被清掉：{hard}"
+    assert (333, True) in results, f"worker 的停止结果没回报：{results}"
+
+
+def test_stop_backend_processes_hands_the_worker_a_stop_file(
+    monkeypatch, tmp_path,
+) -> None:
+    """★ worker 的优雅通道是**停止文件**（CTRL_BREAK 到不了守护进程）。
+
+    2026-09-30 实测：`request_graceful_stop` 要求调用方与目标共享控制台，
+    而所有守护进程都是 `CREATE_NO_WINDOW` 起的、值守跑在计划任务里
+    ⇒ 它**返回 False**。所以停止 worker 必须另有一条**不依赖控制台**的通道，
+    否则只能硬杀，而硬杀不 checkpoint（`sqlite_recovery.py` 开头那次
+    `disk I/O error` 的成因）。
+
+    判据同时钉两件事：**发得出去**（文件被写出来）与**收得回来**
+    （停止结束后文件必须被删掉 —— 留着会让下一次启动的 worker 一睁眼就自杀）。
+    """
+    from src.scheduler import worker as wk
+
+    monkeypatch.setenv("SCHEDULER_DIR", str(tmp_path))
+    monkeypatch.setattr(manage, "list_our_backend_pids", lambda: [])
+    monkeypatch.setattr(manage, "list_our_worker_pids", lambda: [333])
+    # ⚠️ 端口兜底也要堵住：本机真有实例在 8100 上跑时，留空枚举会退回
+    #    "按端口找监听者"，于是判据会去停**真实进程**（第一版就是这样红的）。
+    monkeypatch.setattr(manage, "find_listening_pid", lambda _port: None)
+    monkeypatch.setattr(manage, "request_graceful_stop", lambda _pid: False)
+    monkeypatch.setattr(manage, "wait_port_closed", lambda port, timeout=12.0: True)
+    monkeypatch.setattr(manage, "_pid_alive", lambda _pid: False)   # 收到就退了
+    stop_path = tmp_path / wk.STOP_FILE
+
+    results = manage.stop_backend_processes(8100)
+
+    assert results == [(333, True)]
+    assert not stop_path.exists(), (
+        "停止文件必须被清理 —— 留着会让**下一次**启动的 worker 第一轮就自杀")
+
+
 def test_stop_backend_processes_falls_back_to_port_listener(monkeypatch) -> None:
     """命令行枚举不到（权限受限等）时，退回按端口找本项目实例。"""
     monkeypatch.setattr(manage, "list_our_backend_pids", lambda: [])
+    monkeypatch.setattr(manage, "list_our_worker_pids", lambda: [])
     monkeypatch.setattr(manage, "find_listening_pid", lambda _port: 999)
     monkeypatch.setattr(manage, "diagnose_port", lambda _port: {
         "occupied": True, "pid": 999, "is_ours": True, "cmdline": "uvicorn ..."})

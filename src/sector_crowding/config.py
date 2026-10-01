@@ -50,11 +50,30 @@ class DatabaseConfig:
     #: 不在本文件里重复写一遍 —— 重复写就是"同一个 key 写在 N 处"，
     #: 而这里的 N 处曾经**全部绕过环境隔离**（见 `_store_rel` 的说明）。
     #: YAML 显式给了值就以 YAML 为准（行为不变），但会过 `_warn_if_drifted`。
-    path: str = field(default_factory=lambda: _store_rel("legacy_main"))
+    path: str = field(default_factory=lambda: _store_rel("crowding_shared"))
     warehouse_path: str = field(default_factory=lambda: _store_rel("warehouse"))
     #: 主线挖掘缓存库（只读）。拥挤度从这里取**提纯后**的成分股
     #: （`ml_member_pure`），保证两个子系统用的是同一份名单。
     mainline_cache_path: str = field(default_factory=lambda: _store_rel("mainline_cache"))
+    #: ★ **用户配置所在的库**（`CHG-0143`）。
+    #:
+    #: ## 为什么它必须是**另一个**库
+    #:
+    #: 拥挤度有两类生命周期完全不同的数据，此前被塞进同一个库：
+    #:
+    #:   · **市场参考数据**（无用户维度）→ 共享库 `path`
+    #:       `sector_crowding_daily` / `sector_meta` / `max_ma5` / `member`
+    #:   · **用户配置**（每人/每租户一份）→ 本环境库 `config_path`
+    #:       `sector_crowding_list` / `sector_crowding_watch` / `_alert`
+    #:
+    #: 原先两类都在 `path` 里，而 `path` 写死指向共享遗留主库 ⇒
+    #: **dev 与 pilot 共用同一份板块清单与告警阈值**：开发时点掉的板块，
+    #: 客户那边也消失（实测 `sector_crowding_list` 1,226 行、三个库只有一份）。
+    #:
+    #: 默认取 `app_db`（`per_env + writer: own`）—— 每个环境自己的库，
+    #: 与账号/池子/选股结果同一份，`writable_here()` 恒为"本环境私有"。
+    #: 留空（`""`）时见 `config_db_path`：**跟随 `path`**。
+    config_path: str = ""
 
 
 @dataclass
@@ -241,6 +260,33 @@ class SectorCrowdingConfig:
         return _resolve(self.database.path)
 
     @property
+    def config_db_path(self) -> Path:
+        """**用户配置**所在的库（本环境应用库，`CHG-0143`）。
+
+        与 `db_path`（共享参考数据）分开 —— 理由见 `DatabaseConfig.config_path`。
+
+        ## 两个回退（都是刻意的）
+
+        1. `config_path` 为空 → **跟随 `path`**。
+        2. `path` 是**非默认值**（单测把库指到 `tmp_path`）而 `config_path`
+           还是 registry 默认的应用库 → **也跟随 `path`**。
+
+        第 2 条防的是"半个配置"导致的**跨库污染**：单测/隔离用例只改
+        `database.path` 时，若这里仍返回真实 `data/app/moss_app.db`，
+        测试就会**读到真实应用库**（甚至写进去）—— 那正是本项目登记过的
+        "测试隔离泄漏"形状（`CHG-0067` 抓到过同款）。
+
+        ⇒ 口径：**配置库永远跟随被显式指定的参考库**；只有"参考库是默认值"
+        时才用 registry 的 `app_db`（= 生产/隔离档的真实布局）。
+        """
+        if self.database.config_path:
+            return _resolve(self.database.config_path)
+        if Path(self.database.path) != Path(_store_rel("crowding_shared")):
+            # `path` 被显式改过（单测的临时库）→ 配置库跟它同库
+            return self.db_path
+        return _resolve(_store_rel("app_db"))
+
+    @property
     def warehouse_path(self) -> Path:
         return _resolve(self.database.warehouse_path)
 
@@ -322,10 +368,18 @@ def _build(raw: dict[str, Any]) -> SectorCrowdingConfig:
     log = section("logging")
     return SectorCrowdingConfig(
         database=DatabaseConfig(
-            path=str(db.get("path") or _store_rel("legacy_main")),
+            # 共享**参考数据**库（`sector_crowding_daily` / `sector_meta` / …）。
+            # 默认从 registry 取 `crowding_shared`；YAML 显式给了值就以 YAML 为准
+            # （当前 YAML 仍是 `data/moss_finagent.db`，与 crowding_shared 同一条，
+            #  所以行为不变；`_warn_if_drifted` 会核对两者）。
+            path=str(db.get("path") or _store_rel("crowding_shared")),
             warehouse_path=str(db.get("warehouse_path") or _store_rel("warehouse")),
             mainline_cache_path=str(
                 db.get("mainline_cache_path") or _store_rel("mainline_cache")),
+            # ★ **用户配置**库（`sector_crowding_list` / `_watch` / `_alert`）。
+            # `CHG-0143`：不再跟随 `path`（共享库），而是本环境应用库 ——
+            # 否则 dev 与 pilot 共用同一份板块清单/告警阈值。
+            config_path=str(db.get("config_path") or _store_rel("app_db")),
         ),
         window=WindowConfig(
             max_lookback_years=int(window.get("max_lookback_years", 6)),
@@ -395,9 +449,17 @@ def load_config() -> SectorCrowdingConfig:
         raw = {}
     config = _build(raw if isinstance(raw, dict) else {})
     # 偏移要看得见：YAML 里的路径与 registry 声明不一致时记警告。
-    # 这条不改行为（"拥挤度该写哪个库"待用户裁定，见 PRD §18.4 A7），
-    # 只是让"本模块绕过了环境隔离"这件事**在启动日志里就有据可查**。
-    _warn_if_drifted("拥挤度 database.path", config.database.path, "legacy_main")
+    #
+    # ★ `CHG-0143` 起 `database.path` 对齐到 registry 的 `crowding_shared`
+    #   （而不是旧的 `legacy_main`）—— 两者当前指向同一个文件，所以这条警告
+    #   仍然只在"有人把 YAML 改成别的库"时才响。
+    # ★ 新增 `config_path` 的漂移检查：它是**用户配置**库，必须落在本环境
+    #   应用库上；若有人把它写死成共享库，这条警告会当场出声
+    #   —— 那正是本轮要防的失效（dev 与 pilot 共用一份板块清单）。
+    _warn_if_drifted("拥挤度 database.path", config.database.path,
+                     "crowding_shared")
+    _warn_if_drifted("拥挤度 database.config_path", config.database.config_path,
+                     "app_db")
     _warn_if_drifted("拥挤度 database.warehouse_path",
                      config.database.warehouse_path, "warehouse")
     _warn_if_drifted("拥挤度 database.mainline_cache_path",

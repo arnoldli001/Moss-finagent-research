@@ -65,15 +65,34 @@ class AuditAgent(BaseAgent):
     _REF_EXEMPT_AGENTS = {"A05_verifier", "A06_extractor", "A07_sentiment"}
 
     def _check_completeness(self, outputs: list[dict[str, Any]]) -> list[str]:
+        """完整性检查。**每条问题都必须能定位到具体产出**（`CHG-0136`）。
+
+        ⚠️ 报障现场：审计面板显示 4 条一模一样的
+        `A01_data_collector: 无数据溯源引用` —— **看不出是哪 4 条**
+        （A01 的产出里本来就有 `result["indicator"]`，只是这条消息没用它）。
+        审计的价值在于"能指向具体对象"，一条无法定位的问题等于噪音。
+
+        ⚠️ 另注：本判据**只看 `data_refs` 是否为空**，**不区分**
+        「确实没有这个数据」与「取数失败」。前者（如"这家公司不在质押表内"
+        ≠ 质押 0%）**不该算完整性缺陷**。要分开它们，需要 A01 在产出里带上
+        "为什么没有"的机器可读标记（`result["gap_kind"]`）——
+        属下一步（已登记在 `docs/PRD.md` §19.37.5 与台账）。
+        """
         issues: list[str] = []
         for a in outputs:
             aid = a.get("agent_id", "?")
+            #: 能定位就带上指标名（A01 的 result 里有）
+            ind = ""
+            res = a.get("result")
+            if isinstance(res, dict):
+                ind = str(res.get("indicator") or "")
+            where = f"{aid}[{ind}]" if ind else aid
             if not a.get("conclusion"):
-                issues.append(f"{aid}: 缺少conclusion")
+                issues.append(f"{where}: 缺少conclusion")
             if not a.get("confidence"):
-                issues.append(f"{aid}: 缺少confidence")
+                issues.append(f"{where}: 缺少confidence")
             if aid not in self._REF_EXEMPT_AGENTS and not a.get("data_refs"):
-                issues.append(f"{aid}: 无数据溯源引用")
+                issues.append(f"{where}: 无数据溯源引用")
         return issues
 
     def _count_llm_calls(self, path: str, trace_id: str) -> int:

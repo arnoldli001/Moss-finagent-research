@@ -72,6 +72,26 @@ jobs:
           uv run python -m pytest tests/unit/test_market_constants.py \
             tests/unit/test_trading_session.py -q
 
+      # 需求—PRD 对账门禁（2026-09-28，CHG-0048）：AGENTS.md「需求—PRD 对账硬约束」
+      # 要求每轮对话落地需求时"没有的补进 PRD、有差异的改 PRD"。这里把它变成
+      # 不依赖任何 AI 工具的门禁 —— 换开发工具也照样跑。
+      # `--self-test` 自证检查器本身可信（五类坏输入必须报错）；
+      # `--ledger` 验台账完整性（含"落 PRD 才算闭环"与"改了≠生效了"两条判据）。
+      # 台账未随仓库发布时**显式 warning 跳过**，绝不静默绿灯 ——
+      # 发布与否是政策（见 docs/REQUIREMENT_CHANGELOG.md §5 C17），工程只负责让它可见。
+      - name: 需求—PRD 对账门禁
+        run: |
+          if [ ! -f scripts/prd_sync_check.py ]; then
+            echo "::error::scripts/prd_sync_check.py 缺失 —— 对账门禁无法运行（它应在 .gitignore 白名单内）"
+            exit 1
+          fi
+          uv run python scripts/prd_sync_check.py --self-test
+          if [ -f docs/REQUIREMENT_CHANGELOG.md ]; then
+            uv run python scripts/prd_sync_check.py --ledger
+          else
+            echo "::warning::docs/REQUIREMENT_CHANGELOG.md 未随仓库发布，跳过台账校验（政策待定，见 REQUIREMENT_CHANGELOG §5 C17）"
+          fi
+
       - name: 敏感信息扫描（.env.example 与仓库根）
         run: |
           uv run python - <<'PY'

@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Alert, api, TaskDetail, TraceDetail } from "./api";
 import { loadAgentMeta } from "./agentMeta";
+import { visibleAnomalies } from "./collectionAnomaly";
 import { useAlertsWs } from "./hooks/useAlertsWs";
 import { readRoute, writeRoute } from "./route";
 import { useAuth } from "./hooks/useAuth";
@@ -640,8 +641,18 @@ const running = task !== null && (task.status === "queued" || task.status === "r
             {task?.status === "failed" && (
               <div className="error-box">
                 任务失败：{task.error ?? "未知原因"}
-                {task.errors.length > 0 && (
-                  <ul>{task.errors.map((e, i) => <li key={i}>{e}</li>)}</ul>
+                {/*
+                  ★★ 2026-09-30 用户口径：采集缺口/防撞钟这类信息**不显示在用户界面**
+                  （已记录到管理员「运行指标 → 数据采集异常」）。
+                  判定复用 `collectionAnomaly.ts` 的**唯一实现**，
+                  与 AgentTimeline 一致 —— 不在这里再写一份关键词。
+                */}
+                {visibleAnomalies(task.errors).length > 0 && (
+                  <ul>
+                    {visibleAnomalies(task.errors).map((e, i) => (
+                      <li key={i}>{e}</li>
+                    ))}
+                  </ul>
                 )}
               </div>
             )}

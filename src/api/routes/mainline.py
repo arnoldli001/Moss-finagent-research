@@ -255,8 +255,11 @@ async def snapshot(trade_date: str = Query(default=""),
     """
     service = _service()
     # 0 ms 的 `MAX(trade_date)`；拿不到就退化成旧行为（不按水位线判有效性）
+    # ★ `CHG-0146`：它是**同步 SQL**，实测在面板首个请求上堵循环 **116 ms**
+    #   （`data/run/_loopblock_harness.json`）—— 一次 116 ms 就够让 4 秒探针抖一下，
+    #   所以同样丢线程池。注释里那句"0 ms"是热缓存时的乐观值，不是判据。
     try:
-        watermark = service.data_watermark()
+        watermark = await asyncio.to_thread(service.data_watermark)
     except Exception as exc:  # noqa: BLE001 探针失败不该让面板打不开
         logger.warning("读数据水位线失败（本次不按水位线判缓存）：%s",
                        brief(exc, BRIEF_TIGHT))
@@ -598,7 +601,8 @@ async def alert_returns_panel(
                               description="是否计算区间领涨成分股（+5~10 秒）"),
         stock_window: int = Query(default=20, ge=1, le=120),
         top_leaders: int = Query(default=3, ge=1, le=10),
-        min_win_rate: float = Query(default=0.4, ge=0.0, le=1.0,
+        min_win_rate: float = Query(default=alert_returns.DEFAULT_MIN_WIN_RATE,
+                                    ge=0.0, le=1.0,
                                     description="板块筛选：20 日胜率门槛，**严格大于**它才显示"),
         history_only: bool = Query(default=False),
         limit: int = Query(default=0, ge=0, le=5000,
@@ -637,7 +641,8 @@ async def alert_returns_panel(
 
 @router.get("/board-win-rates")
 async def board_win_rates(
-        min_win_rate: float = Query(default=0.4, ge=0.0, le=1.0,
+        min_win_rate: float = Query(default=alert_returns.DEFAULT_MIN_WIN_RATE,
+                                    ge=0.0, le=1.0,
                                     description="20 日胜率门槛，**不大于**它的板块判为 hidden"),
         refresh: bool = Query(default=False, description="跳过缓存强制重算"),
 ) -> dict:
@@ -683,8 +688,14 @@ async def board_win_rates(
 
 @router.get("/data/status")
 async def data_status() -> dict:
-    """本地数据仓状态：路径、各表行数、同步台账。"""
-    return _data_status()
+    """本地数据仓状态：路径、各表行数、同步台账。
+
+    ★ `CHG-0146`：`_data_status()` 是**同步**读本地仓（多张表的行数/台账），
+    冷缓存时实测堵事件循环 **3,766 ms**（`data/run/_loopblock_harness.json`），
+    热的时候只要 58 ms —— 正是"平时看不出来、重启后第一次打开面板就全局卡住"
+    的那一类。所以它必须走线程池。
+    """
+    return await asyncio.to_thread(_data_status)
 
 
 def _data_status() -> dict[str, Any]:
@@ -856,6 +867,14 @@ async def relevance_stats() -> dict:
         out["gaps"].append(f"主线数据仓不存在：{path}")
         return out
 
+    # ★ `CHG-0146`：下面整段是**同步 SQLite**（含对 `ml_member` 的 JOIN + 聚合，
+    #   实测堵事件循环 **679 ms**）—— `async def` 里直接跑 = 整台服务等它。
+    #   搬进线程池（仓库既有范式）；`out` 是纯数据，跨线程返回安全。
+    return await asyncio.to_thread(_relevance_stats_sync, path, out)
+
+
+def _relevance_stats_sync(path: Path, out: dict[str, Any]) -> dict[str, Any]:
+    """`/relevance` 的同步主体（在线程池里跑；见调用点的说明）。"""
     from src.mainline.relevance import RelevanceStore
 
     store = RelevanceStore(path)

@@ -1,4 +1,4 @@
-﻿# Agent配置
+# Agent配置
 # name 字段为前端/报告展示用中文名，agent_id 为系统内部路由稳定标识，禁止混用。
 
 agents:
@@ -117,6 +117,20 @@ agents:
     priority: "P1"
     model: "deepseek-flash"
     capabilities: ["innovative_drug", "medical_devices", "procurement_policy"]
+
+  # ===== 兜底行业 A20 =====
+  #
+  # 覆盖 A13-A16 四个行业之外的**任意行业**（银行/非银金融/公用事业/交通运输/建筑…）。
+  # 与前四者的区别：行业名与关注指标**按每次请求解析**（本地名录
+  # `quant_stock_basic.industry`：600036→银行、600519→白酒），
+  # 所以它是**一个单例服务任意行业**，而不是"每个行业一个类"。
+  # 路由：`supervisor.needs_generic_industry()`（标的有明确行业、但无专属 Agent 覆盖时挂它）。
+  A20_generic_industry:
+    name: "兜底行业Agent"
+    layer: "industry"
+    priority: "P2"
+    model: "deepseek-flash"
+    capabilities: ["generic_industry_analysis", "dynamic_industry_routing"]
 
   # ===== 决策层 A17 =====
   A17_recommend:

@@ -1002,38 +1002,170 @@ def job_deny_reason(name: str) -> str:
             + "；".join(blocked))
 
 
+#: ---------- 进程角色：把"重作业"挪出在线 API 进程（`CHG-0139`）----------
+#:
+#: 环境变量：`MOSS_SCHEDULER_ROLE` ∈ {`api`, `worker`}；**不设 = 全跑**（既有行为）。
+ROLE_ENV = "MOSS_SCHEDULER_ROLE"
+ROLE_API = "api"
+ROLE_WORKER = "worker"
+
+#: ★ 与在线 API **共用同一个事件循环**、且**实测占用最大**的四个**纯后台**作业。
+#:
+#: ## 依据（`data/pilot/scheduler/runs.jsonl` 的 1847 条真实运行记录，按累计占用排序）
+#:
+#: | 作业 | 累计秒 | 轮数 | 中位 | 最大 | 性质 |
+#: |---|---|---|---|---|---|
+#: | `intel_tone_extract` | **24849** | 49 | **304s** | **2037s** | LLM 批量抽取，**零实时性要求** |
+#: | `event_alert_intraday` | 13201 | 104 | 86s | 620s | 告警扫描，时效以分钟计 |
+#: | `quant_data_sync` | 5943 | 59 | 94s | 211s | 行情仓同步（批） |
+#: | `mainline_daily` | 5894 | 2 | **2947s** | 3086s | 主线快照（**单轮 49 分钟**） |
+#:
+#: 合计 ≈ **50,000 秒** —— 是 `daily_warm`（8500s，已用硬预算治过）的 **6 倍**。
+#:
+#: ## 为什么必须挪出（2026-09-30 实测事故）
+#:
+#: 三小时内用户三次报"前端显示后端不可达"。仪器（`access_audit.latency_ms`）显示
+#: 13:54–13:59 请求延迟最高 **64.4 秒**、13:58 那分钟 **23 条里 22 条 >1 秒**，
+#: 全部最终 200（**排队，不是报错**）⇒ 事件循环被重活占住 ⇒ 前端 4 秒探针必然超时。
+#: 当时只抓到 `daily_warm` 一个；这份清单显示**真正的大头是这四个**。
+#:
+#: ## 纪律
+#:
+#: * 这四个必须是**纯后台**（产物落库/落盘，不参与任何同步请求的响应）；
+#: * 判据 `tests/unit/test_scheduler_role_split.py` 保证：名字必须在 `JOB_REGISTRY` 里
+#:   （改错名 = 该作业**永远不跑**）、`api ∪ worker` == 全表、两者**不相交**；
+#: * 角色**未设置时行为与从前逐字一致** —— 不制造"升级即静默丢作业"。
+HEAVY_JOBS: tuple[str, ...] = (
+    "intel_tone_extract",
+    "event_alert_intraday",
+    "quant_data_sync",
+    "mainline_daily",
+)
+
+
+def process_role() -> str:
+    """本进程的调度角色：`api` / `worker` / `""`（未设 = 全跑）。"""
+    return (os.environ.get(ROLE_ENV) or "").strip().lower()
+
+
+def job_out_of_role(name: str) -> str:
+    """本进程**角色**是否负责 `name`？→ 人话理由（`""` = 负责）。
+
+    ★ 它必须是一个**独立可调用**的判据，而不是只写在 `schedulable_jobs()` 里 ——
+    因为触发作业的路**不止一条**（`CHG-0087` 为同一件事付过一次代价）：
+
+        ① `SchedulerService._tick()`   每分钟的定时路径；
+        ② `SchedulerService.trigger()` **手工/启动自检补偿路径**
+           （`_check_quant_sync_at_startup` 就是这么补 `quant_data_sync` 的）。
+
+    只把角色过滤写在 ① 里，② 就会**原样绕过去**：API 进程启动自检发现"行情有缺口"
+    ⇒ 直接在**在线进程**里把 `quant_data_sync` 跑起来 ⇒ 这次拆分白做，
+    而且症状与拆分前**一模一样**（前端又报不可达），排查时却会以为"已经挪出去了"。
+    所以两条路径都调**同一个函数**（判据：`test_scheduler_role_split.py` 里
+    有一条专门盯 `trigger()`）。
+    """
+    role = process_role()
+    if role == ROLE_API and name in HEAVY_JOBS:
+        return (f"本进程角色 role={ROLE_API}（在线 API）⇒ 重作业已移出本进程，"
+                f"由独立 worker 执行（`manage.py start-worker`）")
+    if role == ROLE_WORKER and name not in HEAVY_JOBS:
+        return (f"本进程角色 role={ROLE_WORKER}（调度 worker）⇒ 只执行 "
+                f"{len(HEAVY_JOBS)} 个重作业，在线作业由 API 进程执行")
+    return ""
+
+
 def schedulable_jobs() -> dict[str, JobSpec]:
-    """本实例**实际可触发**的作业（= 全表 − 派生裁剪 − 手工禁用）。
+    """本实例**实际可触发**的作业（= 全表 − 派生裁剪 − 手工禁用 − 进程角色外）。
 
     单一入口：`SchedulerService` 的 `start()` 与 `_tick()` 都从这里取，
     所以"启动时打印的条数"与"每分钟真正遍历的条数"**不可能不一致**
     （原来 `start()` 打 `len(JOB_REGISTRY)`，`_tick()` 自己也遍历全表 ——
     两处各自为政，任何裁剪都只会在其中一处生效）。
+
+    ★ `CHG-0139`：再叠一层**进程角色**过滤 —— API 进程不跑 `HEAVY_JOBS`，
+    worker 进程只跑 `HEAVY_JOBS`（未设角色 = 全跑，保持既有行为）。
+    角色判据来自 `job_out_of_role()`（**同一个函数**也被 `trigger()` 调用）。
     """
     out: dict[str, JobSpec] = {}
     for name, spec in JOB_REGISTRY.items():
         if job_deny_reason(name):
             continue
+        if job_out_of_role(name):
+            continue
         out[name] = spec
     return out
+
+
+def worker_requirement(role: str | None = None) -> dict[str, Any]:
+    """本进程**是否需要**一个独立 worker，以及"现在到底有没有"。
+
+    ## 为什么把这两个问题放在同一个函数里
+
+    它们是同一个判断的两半：`role=api` ⇒ 那 4 个重作业被**移出本进程** ⇒
+    "有没有 worker"直接决定"它们此刻跑不跑"。分开写就会出现
+    「横幅说重作业已移出、但没人检查移出之后谁在跑」——**拆分最典型的静默失效**。
+
+    ★ 三态，不许合并成 bool（`worker_heartbeat` 的 docstring 有表）：
+    从来没有过 / 活着 / 起过但停了 —— 处置动作完全不同。
+    """
+    from src.scheduler.worker_heartbeat import INTERVAL_SEC, read_status
+
+    who = role if role is not None else process_role()
+    needed = who == ROLE_API and bool(HEAVY_JOBS)
+    hb = read_status()
+    #: ★ "活着"与"刚刚还在跳"必须分开（`CHG-0141` 上线实测踩到）：
+    #: 陈旧阈值是 90 秒，所以一个**已经死了 86 秒**的 worker 仍在阈值内 ——
+    #: 只说 `alive` 就会让横幅印出「**在跑**」这种**假绿结论**。
+    #: `fresh` 用 2 个写间隔（40 秒）当"确实在跳"的证据，且**阈值只有一处**
+    #: （`INTERVAL_SEC`，不在这里抄数字）。
+    fresh = bool(hb["alive"]) and hb["age_sec"] is not None \
+        and hb["age_sec"] <= 2 * INTERVAL_SEC
+    return {
+        "needed": needed,
+        "role": who or "all",
+        "heavy_jobs": list(HEAVY_JOBS),
+        **hb,
+        "fresh": fresh,
+        # 一句话结论：**只在需要 worker 时才提"无人执行"**，否则 dev 上会天天喊狼
+        "ok": (not needed) or bool(hb["alive"]),
+        "verdict": (
+            "本进程不需要 worker（未设角色或本身是 worker）" if not needed
+            else hb["note"]
+        ),
+    }
 
 
 def scheduler_scope_report() -> dict[str, Any]:
     """本实例的调度视图（`/health` / 启动日志 / 排障用）。
 
-    返回 `total` / `active` / `pruned`（每项带**人话理由**）。
+    返回 `total` / `active` / `pruned`（每项带**人话理由**）/ `out_of_role` /
+    `worker`（`CHG-0139`：重作业被移出本进程后，**谁在跑它们**）。
     """
     pruned = []
     for name in JOB_REGISTRY:
         reason = job_deny_reason(name)
         if reason:
             pruned.append({"job": name, "reason": reason})
+    role = process_role()
+    #: 角色外（不是"被裁"，是"由另一个进程负责"）—— 单独列出，
+    #: 否则横幅会把"worker 负责"读成"这台实例裁掉了这几个作业"。
+    #: 判据与 `schedulable_jobs()` **同源**（`job_out_of_role`）：两处各写一份
+    #: 的话，报告会与真实遍历集不一致 —— 而那正是"报告说没事、实际有作业没跑"。
+    out_of_role = [
+        name for name in JOB_REGISTRY
+        if not job_deny_reason(name) and job_out_of_role(name)
+    ]
     return {
         "env": (os.environ.get("MOSS_ENV") or "dev").strip().lower() or "dev",
+        "role": role or "all",
         "total": len(JOB_REGISTRY),
-        "active": len(JOB_REGISTRY) - len(pruned),
+        "active": len(JOB_REGISTRY) - len(pruned) - len(out_of_role),
         "pruned": pruned,
+        "out_of_role": out_of_role,
         "unknown_denied": list(unknown_denied_names()),
+        # ★ 角色外的作业**有没有人在跑**：这是拆分自带的新问题，答案必须在
+        #   **同一个报告里**（否则读者要先知道去别处查，就等于没查）。
+        "worker": worker_requirement(role),
     }
 
 

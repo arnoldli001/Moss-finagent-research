@@ -63,35 +63,55 @@ class SWIndustryValuationConnector(BaseConnector):
     source_url = "https://akshare.akfamily.xyz"
 
     def get_capabilities(self) -> dict[str, Any]:
-        """★ 2026-09-30（`CHG-0136`）：**补登一级/二级的"按行业点名"形式**。
+        """★ 2026-09-30（`CHG-0136`）：**能力面必须与登记面严格对齐**。
 
         报障现场：用户问"未来半年能否持有高股息的招商银行"，报告却写
         「银行 PE-PB-股息率标签…在本节全部缺失」。实测根因**不是取不到**：
 
         * `supports("ind:sw_first_dividend_yield:银行")` → **True**，且**真取到**
           （实测 2026-09-30 银行行业股息率 **5.1%**、PE-TTM **7.34**）；
-        * 但本方法原来只登记了 **三级**的 `{行业名}` 形式 ⇒ **规划侧看不到**
+        * 但本方法原来只声明了**三级**的 `{行业名}` 形式 ⇒ **规划侧看不见**
           一级行业的按行业路径 ⇒ 只采 `:all` **无行业标签的截面** ⇒
           Agent 拿着一张全市场截面，**没法把"银行"单独挑出来** ⇒ 报"缺失"。
 
-        所以这里把 `first`/`second` 的 `{行业名}` 形式一并登记（含 `dividend_yield`：
-        原列表连**三级**的股息率 `:all` 都没登记，只有 `:all` 的 pe/pb）。
-        `supports()` 本来就接受这些形式（正则 `_INDICATOR_RE` 覆盖四级指标 ×
-        three levels），**登记的漏项才是根因** —— 这是"能力存在但没人知道"的
-        又一个实例（与 `supervisor.py` 里那些"数据到了、Agent 看不见"同源）。
+        ## 三条纪律（本轮按它们收敛，缺一即"采了白采"或"登记了取不到"）
+
+        1. **声明 = 事实**：`supports()` 接受的形态都应能被规划侧看到；
+        2. **声明 ⊆ 登记**：声明的每一条都必须在 `configs/indicators.yaml` 登记，
+           否则 `test_contract_consistency.py` 判"能力↔登记不一致"
+           （**本轮就是被这条既有判据当场抓住的**）；
+        3. **登记 ⊆ 可见**：登记了却没有分析层 Agent 看得到 = **僵尸登记**
+           （`test_whitelist_coverage.py` 判）。
+
+        ## ⚠️ 因此这里**故意不声明** 7 个 `:all` 截面
+
+        `ind:sw_{first,second}_pb:all`、`ind:sw_{first,second,third}_pe_static:all`、
+        `ind:sw_{first,second}_dividend_yield:all` —— 连接器**确实支持**，
+        但它们**不是模板**，登记即产生**每日定时采集作业**（+7 条/天）。
+        那是**成本决定**，不该由实现者顺手替 owner 做；而"按行业点名"这条
+        （用户真正需要的那条）**不需要**它们 —— 模板已登记且**零作业成本**
+        （`catalog_jobs.plan_jobs()` 对模板明确跳过）。
+        详见 `configs/indicators.yaml` 里对应的"已知缺口"说明。
         """
+        #: `:all` 截面：**只声明已登记的那 5 条**（登记了才会被周期采集）
+        all_forms = (
+            "ind:sw_first_pe_ttm:all", "ind:sw_second_pe_ttm:all",
+            "ind:sw_third_pe_ttm:all", "ind:sw_third_pb:all",
+            "ind:sw_third_dividend_yield:all",
+        )
+        #: 参数化模板：3 级 × 4 指标，**全部已登记**（模板不产生定时作业）
         levels = ("first", "second", "third")
         metrics = ("pe_ttm", "pe_static", "pb", "dividend_yield")
-        indicators = [f"ind:sw_{lv}_{mt}:all" for lv in levels for mt in metrics]
-        indicators += [f"ind:sw_{lv}_{mt}:{{行业名}}"
-                       for lv in levels for mt in metrics]
+        templates = tuple(f"ind:sw_{lv}_{mt}:{{行业名}}"
+                          for lv in levels for mt in metrics)
         return {
             "name": self.source_name,
             "source_type": DataSourceType.API.value,
-            "indicators": indicators,
-            "notes": ("申万一级/二级/三级行业截面估值与股息率，每日收盘后更新；"
-                      "`:all` 为全市场截面（**不带行业标签**，无法定位单个行业），"
-                      "要某个行业请用 `:{行业名}` 形式（如 `ind:sw_first_dividend_yield:银行`）"),
+            "indicators": list(all_forms) + list(templates),
+            "notes": ("申万一级/二级/三级行业估值与股息率，每日收盘后更新。"
+                      "`:all` 是**全市场截面、不带行业标签**，要某个行业请用 "
+                      "`:{行业名}`（如 `ind:sw_first_dividend_yield:银行`，"
+                      "银行属**申万一级**）；模板不产生定时作业。"),
         }
 
     @staticmethod

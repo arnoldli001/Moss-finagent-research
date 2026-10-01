@@ -279,19 +279,11 @@ watchlist:
     boards: ["存储芯片"]
     peers: []
     overseas: ["usmu"]
-  - code: "002409"
-    name: "雅克科技"
-    boards: ["存储芯片"]
-    peers: []
   - code: "300308"
     name: "中际旭创"
     boards: ["通信设备", "共封装光学(CPO)"]
     peers: []
     overseas: ["usNVDA"]
-  - code: "002636"
-    name: "金安国纪"
-    boards: ["覆铜板", "PCB概念"]
-    peers: []
   - code: "002436"
     name: "兴森科技"
     boards: ["通信网络设备及器件", "F5G概念", "通信设备"]
@@ -308,11 +300,6 @@ watchlist:
     name: "招商银行"
     boards: ["银行"]
     peers: []
-  - code: "600498"
-    name: "烽火通信"
-    boards: []
-    peers: []
-    overseas: ["usNVDA"]
   - code: "300319"
     name: "麦捷科技"
     boards: []
@@ -469,6 +456,53 @@ watchlist:
   - code: "688300"
     name: "联瑞新材"
     boards: ["通信网络设备及器件", "通信设备", "同花顺金仓30"]
+    peers: []
+  - code: "603773"
+    name: "沃格光电"
+    boards: ["玻璃基板"]
+    peers: []
+    pinned: true
+  - code: "002409"
+    name: "雅克科技"
+    boards: ["存储芯片"]
+    peers: []
+    pinned: true
+  - code: "002636"
+    name: "金安国纪"
+    boards: ["覆铜板", "PCB概念"]
+    peers: []
+    pinned: true
+  - code: "002585"
+    name: "双星新材"
+    boards: []
+    peers: []
+  - code: "000503"
+    name: "国新健康"
+    boards: []
+    peers: []
+  - code: "000850"
+    name: "华茂股份"
+    boards: []
+    peers: []
+  - code: "000868"
+    name: "安凯客车"
+    boards: []
+    peers: []
+  - code: "000011"
+    name: "深物业A"
+    boards: []
+    peers: []
+  - code: "000980"
+    name: "众泰汽车"
+    boards: []
+    peers: []
+  - code: "688603"
+    name: "天承科技"
+    boards: ["印制电路板", "元件"]
+    peers: []
+  - code: "301536"
+    name: "星宸科技"
+    boards: []
     peers: []
 # <<< intraday-watchlist:end
 # ============ 信号推送（实心三角才推送；空心三角仅站内） ============

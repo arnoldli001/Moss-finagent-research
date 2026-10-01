@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   sectorCrowdingApi,
   type CrowdingAlertRow,
@@ -636,11 +637,15 @@ export default function SectorCrowdingAlertPanel({
         </div>
       )}
 
-      {/* 告警阈值编辑面板：整表只渲染一个，锚定在标题行下方 */}
+      {/* 告警阈值编辑面板：portal 挂到 body，脱离 `.crowding-alert-scroll`
+          （overflow:auto + max-height:620px）的截断。原方案是塞进滚动容器里
+          `position:relative`，点下面的行时弹窗会被截在视口外，感官上"弹不出来"。
+          挂到 body + 编辑面板改 `position:fixed` 后是真弹层，遮罩和外点关闭都按预期生效。 */
+      }
       {alertEdit !== null && (() => {
         const row = view.find((item) => item.sector_code === alertEdit);
         if (!row) return null;
-        return (
+        return createPortal(
           <>
             <div className="crowding-alert-editor-mask" />
             <SectorCrowdingAlertEditor
@@ -669,8 +674,8 @@ export default function SectorCrowdingAlertPanel({
                   setAlertEdit(null);
                 })();
               }} />
-          </>
-        );
+          </>,
+          document.body);
       })()}
 
       {rows.length > 0 && (

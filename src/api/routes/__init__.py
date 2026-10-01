@@ -3,6 +3,7 @@
 import logging
 
 from fastapi import APIRouter
+from starlette.requests import HTTPConnection
 
 from src.api.routes.admin import router as admin_router
 from src.api.routes.admin_platform import router as admin_platform_router
@@ -79,3 +80,39 @@ api_router.include_router(mainline_router)
 api_router.include_router(intel_router)
 if auction_select_router is not None:
     api_router.include_router(auction_select_router)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 在飞登记：给"谁堵住了事件循环"这件事提供**卡顿时刻**的证据（`CHG-0146`）
+#
+# 调用方：`src/api/main.py` 的 `app.include_router(api_router,
+# dependencies=[Depends(_mark_inflight)])` —— **唯一**的 API 挂载点。
+#
+# ⚠️ 不要改成"在这里 `api_router.dependencies.append(...)`"：FastAPI 的
+#    `include_router` 只应用**调用时传进来的** `dependencies=`，事后 append
+#    到父 router 的列表**不生效**（实测：请求跑完全程、登记簿里一条都没有，
+#    而"依赖在列表里"这种形状判据照样是绿的）。
+#
+# 代价：一个异步依赖 = 两次字典写（`inflight.enter/leave`），无锁、无 IO、
+# 不进线程池。登记的是"哪个路径正在本任务里执行"，供 `loop_lag` 在卡顿
+# 那一刻读（见 `src/core/loop_lag.py` 的 WARNING 分支）。
+#
+# ⚠️ 它**不改变**任何业务行为：登记失败一律吞掉（观测器的故障不许变成接口的故障）。
+#
+# ★★ 必须收 `HTTPConnection`，**不能收 `Request`**（2026-09-30 全量门禁当场抓到）：
+#    本依赖挂在**汇总 router** 上 ⇒ 它同时作用于 **WebSocket** 路由
+#    （`/api/v1/ws/intraday`、`/api/v1/ws/alerts`）。而 WS 的 scope 里**没有**
+#    `request` ⇒ 依赖解析直接抛
+#        `TypeError: _mark_inflight() missing 1 required positional argument: 'request'`
+#    ⇒ **2 个 WS 判据 + 7 个 health 契约判据一起红**（它们共用同一条 app 装配路径）。
+#    `HTTPConnection` 是 `Request` 与 `WebSocket` 的**共同基类**，两种 scope 都能注入。
+#    教训：**给"所有路由"加依赖时，先问一句"这些路由里有没有非 HTTP 的"**。
+async def _mark_inflight(connection: HTTPConnection) -> None:
+    from src.core import inflight
+
+    kind = connection.scope.get("method") or connection.scope.get("type") or "http"
+    inflight.enter(f"{kind} {connection.url.path}")
+    try:
+        yield
+    finally:
+        inflight.leave()

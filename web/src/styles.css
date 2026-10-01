@@ -2586,16 +2586,26 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
 }
 .crowding-alert-dot { font-size: 8px; line-height: 1; }
 
-/* 编辑面板：悬浮在表格上方，带遮罩避免误点后面的行 */
+/* 编辑面板：portal 挂到 body + position:fixed，作为真全屏弹层。
+   ⚠️ 旧实现把面板塞进 `.crowding-alert-scroll`（overflow:auto + max-height:620px），
+   配 `position:relative` —— 点列表底部的行时，面板会被滚动容器截在视口外，
+   感官上"弹不出来"；且因为 mask 也在容器里，外点关闭时序容易被吃掉。
+   挂到 body 后面两件事都按预期生效：永远在视口内、遮罩 = 全屏 = 关窗唯一路径。
+   z-index 设高一些，避免被行情/快讯等面板（通常 ≤ 50）的浮层盖住。 */
 .crowding-alert-editor-mask {
-  position: fixed; inset: 0; z-index: 40; background: rgba(0,0,0,0.28);
+  position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.45);
 }
 .crowding-alert-editor {
-  position: relative; z-index: 41;
-  margin: 8px 0; padding: 10px 12px;
+  position: fixed; z-index: 101;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(380px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px); overflow: auto;
+  margin: 0;
   display: flex; flex-direction: column; gap: 8px;
+  padding: 12px 14px;
   background: var(--panel, #1a2129); border: 1px solid var(--accent);
-  border-radius: var(--radius); box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+  border-radius: var(--radius); box-shadow: 0 12px 36px rgba(0,0,0,0.55);
   font-size: 12px;
 }
 .crowding-alert-editor-head { display: flex; align-items: center; gap: 8px; }

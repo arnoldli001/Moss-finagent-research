@@ -129,7 +129,10 @@ async def sentiment_cycle(
     """
     from src.auction_select.sentiment_cycle import build_cycle
 
-    return build_cycle(days=days, refresh=refresh)
+    # ★ `CHG-0146`：`build_cycle` 要读本地行情仓做聚合（实测**堵事件循环 3.06 秒**，
+    #   见 `data/run/_loopblock_harness.json`）—— `async def` 里直接调同步函数
+    #   等于把整台服务按住不放。走仓库既有的 `asyncio.to_thread` 范式。
+    return await asyncio.to_thread(build_cycle, days=days, refresh=refresh)
 
 
 @router.get("")
@@ -430,8 +433,8 @@ async def manual_run(payload: ManualRunRequest) -> dict[str, Any]:
 
     | 情形 | 整轮耗时 |
     |---|---|
-    | 预热缓存命中（常态：09:15 的预热循环已经跑过） | **2~12 秒**（实测 0917~0922 为 7.6 / 2.2 / 7.2 / 12.1 秒） |
-    | 预热缓存**完全冷**（服务刚起或跨日第一次） | **约 2 分钟**（实测冷预热 116s，其中 `theme_strength_rank` 一项 114s） |
+    | 预热缓存命中（常态：09:15 预热循环已跑过） | **2~12 秒**（实测 7.6/2.2/7.2/12.1） |
+    | 预热缓存**完全冷**（刚起或跨日第一次） | **约 2 分钟**（冷预热 116s，其中一项 114s） |
 
     原来的写法是"一轮含预热要三分钟以上" —— 那是**冷预热**的上限，被当成了常态，
     于是前端跟着写「约 6 秒」+ 8 秒后补拉一次；冷预热时 8 秒时服务端还在跑、
@@ -480,7 +483,9 @@ async def manual_run(payload: ManualRunRequest) -> dict[str, Any]:
 async def preheat(force: bool = Query(default=False)) -> dict[str, Any]:
     """预热数据摘要（前端展示"昨日涨停池/题材榜是否就绪"）。"""
     config = load_config()
-    data = scheduler.get_preheat(force=force, config=config)
+    # ★ `CHG-0146`：`get_preheat` 会取数/落库（实测堵循环 180 ms），同 `build_cycle`
+    data = await asyncio.to_thread(scheduler.get_preheat, force=force,
+                                   config=config)
     if data is None:
         raise HTTPException(status_code=503, detail="预热不可用（eltdx 未连接？）")
     return {

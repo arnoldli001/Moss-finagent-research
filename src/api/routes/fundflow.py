@@ -157,6 +157,8 @@ async def search(
         # 剔除清单里的板块**不提供搜索**。否则用户可以把它手工加回来，
         # 而加回来之后榜单/走势依然不显示它（`_build` 会再滤一次），
         # 表现为"加入了却什么都没有" —— 比直接搜不到更让人困惑。
+        # `snapshot` 是 `sector_snapshot()` 返回的**字典**，`.keys()` 是 O(1)。
+        # loop-blocking-ok: 字典键，不是仓库/目录枚举（同名的 store.keys() 才是阻塞）
         names, excluded = sector_filter.filter_names(list(snapshot.keys()))
         if keyword:
             hits = [name for name in names if keyword in name]

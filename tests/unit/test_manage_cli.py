@@ -172,14 +172,94 @@ class TestSchedulerScopeLineEvaluatesUnderTargetEnv:
     """
 
     def test_pilot_scope_is_not_pruned_and_says_pilot(self) -> None:
-        """pilot 是行情仓写者 ⇒ 42/42，且这行字必须自带 `env=pilot`。"""
+        """pilot 是行情仓写者 ⇒ 没有作业**因写权限**被裁，且这行字自带 `env=pilot`。
+
+        ★ `CHG-0141` 修正了这条判据的**取法**：原先断言 `quant_data_sync` 整行不许
+        出现，那是"用字符串当代理"。角色拆分之后，同一个作业名会因为**另一个原因**
+        （`role=api` ⇒ 由 worker 负责）出现在这行里 —— 而"写权限没裁它"这个**意图**
+        仍然成立。所以改判**原因**而不是**名字**：不许出现
+        `因**写权限归属**被裁`，反过来必须出现 `没有作业因写权限归属被裁`。
+
+        （这正是本仓库反复记的那道门：判据要盯着**要守的那件事**，
+        盯一个恰好与它同现的字符串，就会在无关变更上假红。）
+        """
         line = manage._scheduler_scope_line(manage.pilot_isolation_env())
         assert "env=pilot" in line, f"横幅必须自证档位，实际：{line!r}"
-        assert "quant_data_sync" not in line, (
+        assert "没有作业因写权限归属被裁" in line, (
             "pilot 是 warehouse 的唯一写者（data_stores.yaml: warehouse.writer=pilot），"
-            f"它的 quant_data_sync 不该被裁 —— 实际印出：{line!r}"
+            f"不该有作业**因写权限**被裁 —— 实际印出：{line!r}"
         )
-        assert "没有作业因写权限归属被裁" in line
+        assert "因**写权限归属**被裁" not in line, (
+            f"pilot 上出现了写权限裁剪的理由 —— 实际印出：{line!r}"
+        )
+
+    def test_pilot_scope_line_states_worker_status(self) -> None:
+        """★ `CHG-0141`：说了"重作业移出本进程"，就**必须**同句说清"谁在跑"。
+
+        为什么值得单独一条判据：这行字是**人类唯一会看到的**那面（`/health` 要主动去查）。
+        只说"不跑 4 个重作业（由 start-worker 负责）"，读者会读成"已经有人在跑" ——
+        而 worker 没起时那 4 个作业**根本不会执行**。半个结论比没有结论更危险。
+        """
+        line = manage._scheduler_scope_line(manage.pilot_isolation_env())
+        assert "role=api" in line and "重作业" in line, f"角色说明缺失：{line!r}"
+        assert "调度 worker" in line, (
+            f"这行字**没有说** worker 在不在 ⇒ 读者会以为那 4 个作业有人在跑：{line!r}"
+        )
+
+    def test_banner_truthfully_says_worker_missing(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """反向：worker **不在**时横幅必须说"不会执行"，不许只印一句中性说明。
+
+        与上一条是**一对**：只测"在跑"那一支的话，把文案改成永远说"在跑"
+        也能全绿 —— 那正是最坏的结果（假绿横幅）。
+        """
+        from src.scheduler import worker_heartbeat as hb
+
+        monkeypatch.setattr(hb, "read_status", lambda **_kw: {
+            "present": True, "alive": False, "age_sec": 999.0, "pid": 4242,
+            "role": "worker", "jobs": ["quant_data_sync"],
+            "beats": 3, "started_at_iso": "2026-09-30 10:00:00",
+            "path": "x", "note": "心跳已停 999 秒"})
+        line = manage._scheduler_scope_line(manage.pilot_isolation_env())
+        assert "未在运行" in line or "不会执行" in line, (
+            f"worker 不在时横幅没有如实报警：{line!r}"
+        )
+
+    def test_banner_does_not_call_a_stale_heartbeat_running(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """★★ **假绿措辞**：心跳已停 86 秒时不许印「在跑」。
+
+        现场（2026-09-30 上线实测）：陈旧阈值是 90 秒，所以一个**已经死了 86 秒**
+        的 worker 仍判 `alive=True`，横幅照旧印「调度 worker **在跑**（86 秒前心跳）」。
+        读者拿到的是一个**结论**，而证据（86 秒前）恰好就在同一句里 ——
+        这类"结论比证据强"的印法正是本项目反复付代价的那一类。
+
+        判据分两半，缺一不可：
+          ① 阈值内但已明显超出一个写周期 ⇒ 必须说"偏旧"，不许说"在跑"；
+          ② 刚刚还在跳（≤2×间隔）⇒ 必须说"在跑"（否则每次都喊狼，判据会被关掉）。
+        """
+        from src.scheduler import worker_heartbeat as hb
+
+        def _fake(age: float, alive: bool = True):
+            return lambda **_kw: {
+                "present": True, "alive": alive, "age_sec": age, "pid": 4242,
+                "role": "worker", "jobs": ["quant_data_sync"], "beats": 9,
+                "started_at_iso": "2026-09-30 10:00:00", "path": "x",
+                "note": f"心跳 {age} 秒前"}
+
+        monkeypatch.setattr(hb, "read_status", _fake(86.0))
+        stale_line = manage._scheduler_scope_line(manage.pilot_isolation_env())
+        assert "在跑" not in stale_line, (
+            f"心跳已停 86 秒却仍然印「在跑」—— 这是假绿：{stale_line!r}")
+        assert "偏旧" in stale_line and "86" in stale_line, (
+            f"偏旧时必须同时给出年龄，让人能自己判断：{stale_line!r}")
+
+        monkeypatch.setattr(hb, "read_status", _fake(5.0))
+        fresh_line = manage._scheduler_scope_line(manage.pilot_isolation_env())
+        assert "在跑" in fresh_line and "偏旧" not in fresh_line, (
+            f"刚刚还在跳（5 秒）就不该喊偏旧，否则判据会被当成噪音关掉：{fresh_line!r}")
 
     def test_dev_scope_still_prunes_quant_data_sync(self) -> None:
         """★ 反向判据：dev 按裁定是只读，修完必须**仍然**被裁。
@@ -315,7 +395,21 @@ class TestSchedulerScopeLineCountsRuntimeRegistry:
                 f"横幅的分母 {total} ≠ 运行时作业数 {runtime_total} —— "
                 f"少报的正是动态注册的那些（含 `gap_drain`）。实际印出：{line!r}"
             )
-            assert active == total, "pilot 是 warehouse 的唯一写者，不该有作业被裁"
+            # ★ `CHG-0141` 修正取法（同 `test_pilot_scope_is_not_pruned_and_says_pilot`）：
+            #   原先断 `active == total`（"pilot 不裁任何作业"）。角色拆分之后
+            #   `active = total − 写权限裁剪 − **角色外**`，而 pilot 的 API 进程
+            #   本来就该少跑那 4 个重作业 —— "没有写权限裁剪"这个**意图**仍成立，
+            #   所以改判**原因**，并顺手把算术恒等式钉住（分子 + 角色外 = 分母）。
+            assert "没有作业因写权限归属被裁" in line, (
+                f"pilot 是 warehouse 的唯一写者，不该有作业因写权限被裁：{line!r}"
+            )
+            # 文案里 `不跑` 与数字之间有 markdown 粗体标记 ⇒ 正则要容忍它
+            # （第一版写成 `不跑 (\d+)` 就取不到 —— 判据当场报红，这是它该做的）
+            role_out = re.search(r"不跑\**\s*(\d+) 个重作业", line)
+            assert role_out, f"角色外作业没有单独说明（会被读成被裁）：{line!r}"
+            assert active + int(role_out.group(1)) == total, (
+                f"分子 {active} + 角色外 {role_out.group(1)} ≠ 分母 {total}：{line!r}"
+            )
         finally:
             reg.JOB_REGISTRY.clear()
             reg.JOB_REGISTRY.update(saved)

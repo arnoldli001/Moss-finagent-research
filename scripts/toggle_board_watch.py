@@ -32,7 +32,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-MAIN_DB = ROOT / "data" / "moss_finagent.db"
+# ★ `CHG-0143`：拥挤度的**用户配置**表（`sector_crowding_list` 等）已从共享
+#   遗留主库迁到**本环境应用库**（`app_db`：dev → `data/dev/moss_dev.db`、
+#   pilot → `data/pilot/moss_pilot.db`）。所以路径**不能再写死**
+#   `data/moss_finagent.db` —— 那会读到旧库那份、而写入静默落到没人看的地方。
+#   统一走 registry 解析（与 `sector_crowding/config.py` 同一个来源）：
+#      `SECTOR_CROWDING_DB=<路径>` 可显式覆盖（离线演练/临时副本用）。
+import os as _os
+from src.sector_crowding.config import load_config as _load_crowding_config
+_CROWDING_CONFIG_DB = _os.environ.get("SECTOR_CROWDING_DB") or str(
+    _load_crowding_config().config_db_path)
+
+
+
 
 
 def main() -> int:
@@ -47,7 +59,7 @@ def main() -> int:
         print("❌ 需要 --hide / --show / --purge 之一")
         return 2
 
-    conn = sqlite3.connect(str(MAIN_DB), timeout=30.0)
+    conn = sqlite3.connect(str(_CROWDING_CONFIG_DB), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     stamp = datetime.now().astimezone().isoformat(timespec="seconds")

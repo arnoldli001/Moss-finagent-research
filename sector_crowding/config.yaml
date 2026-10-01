@@ -8,8 +8,22 @@
 
 # ---------------------------- [库] ------------------------------------------
 database:
-  # 拥挤度表建在**主库**（与做T/量化选股同库）：便于事务与复用既有连接范式
+  # **共享参考数据**库：`sector_crowding_daily` / `sector_meta` /
+  # `sector_member` / `sector_crowding_max_ma5`。
+  # 这些**没有用户维度**，三个环境读同一份是对的。
+  # 写者归属见 `configs/data_stores.yaml` 的 `crowding_shared`（当前 = dev）。
   path: "data/moss_finagent.db"
+  # ★ `CHG-0143`：**用户配置**库（`sector_crowding_list` / `_watch` / `_alert`）。
+  #   留空 = 跟随 registry 的 `app_db`（本环境应用库）——
+  #   dev → `data/dev/moss_dev.db`、pilot → `data/pilot/moss_pilot.db`。
+  #
+  #   为什么必须与上面那条分开：原先两类数据都塞在 `path` 里，而 `path` 指向
+  #   **共享**遗留主库 ⇒ dev 与 pilot 共用同一份板块清单与告警阈值，
+  #   开发时点掉的板块**客户那边也消失**（实测 list 只有 1,226 行、三个库共一份）。
+  #
+  #   ⚠️ **不要**把它写成 `data/moss_finagent.db`（那等于退回整改前）。
+  #   启动时会过 `_warn_if_drifted("…config_path", …, "app_db")`，写错会告警。
+  config_path: ""
   # 行情仓库（只读）：全A成交额、个股名录取自这里
   warehouse_path: "data/quant/warehouse.db"
 

@@ -23,9 +23,25 @@
 | 上限 | 取值 | 依据（2026-09-29 实测，自选池 50 只） |
 |---|---|---|
 | 刷新间隔 | 作业 cron `*/2` = **120 s** | 必须**小于** `daily_snapshot_ttl`(180 s)。相等或更大 = 每轮都踩在过期线上（本项目硬约束："预取的续期间隔必须小于缓存 TTL"） |
-| 单只并发 | `DAILY_WARM_CONCURRENCY = 3` | 见下表：计算段离开循环后（`CHG-0099`）并发不再放大停顿，而串行 94.5 s **已超预算** |
-| 目标总数 | `DAILY_WARM_MAX_CODES = 80` | 与预算配对：约 1.06 s/只 ⇒ 80 只 ≈ 85 s < 90 s |
-| 墙钟预算 | `DAILY_WARM_BUDGET_SEC = 90.0` | 必须**小于** tick(120 s)，否则一轮压到下一轮上；实测 50 只 53.1 s，留 37 s 余量 |
+| 单只并发 | `DAILY_WARM_CONCURRENCY = 3` | 见下表：计算段离开循环后（`CHG-0099`）并发不再放大停顿；`CHG-0137` **保持 3**（改大须先重测下表，判据会拦） |
+| 目标总数 | `DAILY_WARM_MAX_CODES = 80` | 只决定"提交多少只"；能不能跑完由**硬预算**决定（见下） |
+| 墙钟预算 | `DAILY_WARM_BUDGET_SEC = 90.0` | 必须**小于** tick(120 s)；**`CHG-0137` 起由代码强制**（`wait_for(gather, 剩余预算)`），撞了取消在飞任务 + 记 `job_budget` 异常 |
+| 单只上限 | `DAILY_WARM_PER_CODE_SEC = 12.0` | `CHG-0137`：30 s 与 90 s 预算**互相矛盾**（22 只病态 × 30 s ÷ 并发 3 ⇒ 220 s 打底）；12 s = 实测冷取 4.2 s 的 2.9 倍 |
+
+### ★ 最坏情况算术（`CHG-0137` 补上的一课）
+
+上面那张表原来只算**理想情况**："约 1.06 s/只 ⇒ 80 只 ≈ 85 s < 90 s"。
+但最坏情况是 `ceil(目标数 ÷ 并发) × 单只超时`：
+
+| 版本 | 最坏一轮 | 相对预算 | 后果 |
+|---|---|---|---|
+| 改前（并发 3 / 单只 30 s） | `ceil(80/3) × 30` = **810 s** | **9 倍** | 且**代码不强制预算**（见下）⇒ 实测 56 只跑了 **316.4 s**，占住事件循环 ⇒ 前端探针超时 ⇒ 用户报"后端不可达" |
+| 改后（并发 5 / 单只 12 s） | `ceil(80/5) × 12` = **192 s** | 2.1 倍 | **但预算被代码强制** ⇒ 一轮**不超过 90 s** + 收尾；少预热的只数如实计入 `skipped` 并记异常 |
+
+**为什么"文档写了预算"还不够**：原实现在**提交下一只之前**看预算，而
+`asyncio.create_task` 是**非阻塞**的 ⇒ 提交循环**毫秒级跑完** ⇒ 那条判据几乎永不触发，
+而 `gather` 没有任何时间上限。**"写在文档里的上限"必须同时是"代码里的强制"**，
+否则它只在一个理想世界里成立 —— 这次事故就是这句话的实证。
 
 ### 为什么并发 3（并发度是量出来的，不是拍的）
 
@@ -84,15 +100,28 @@ logger = logging.getLogger(__name__)
 
 #: 预热并发上限（同时最多几只票在取日线）。上限写进代码，不留在注释里。
 #:
-#: `CHG-0099` 之后取 **3**：计算段已经离开事件循环（`daily.py` 用 `asyncio.to_thread`），
-#: 所以"并发放大停顿"不再是约束 —— 实测并发 1/2/3 的最大停顿都是 109~188 ms、
-#: **0 次 >1s**，而串行整轮 94.5 s 已超 90 s 预算（会被截断）。详见模块 docstring 的表。
-DAILY_WARM_CONCURRENCY = 3
+#: ★ `CHG-0149`（2026-09-30）：**3 → 1**。这是**安全性**修复，不是性能取舍。
+#:
+#: 实测（`scripts/_probe_v8_concurrency.py`，判据=退出码）：
+#: **并发 3 → 3/3 次崩溃**（退出码 `0x80000003` STATUS_BREAKPOINT，无 traceback，
+#: 原生栈落在 `py_mini_racer/mini_racer.dll`）；**串行 → 0/3 次崩溃**。
+#: 机制：日线链有一跳用 `py_mini_racer`（V8）跑反爬 JS，而链路是
+#: `asyncio.to_thread` 执行的 ⇒ 并发 3 = **3 个线程同时进 V8** ⇒ 硬崩。
+#: 这也解释了 pilot 那些"无痕死亡"（强杀/原生崩溃都不留 traceback）。
+#:
+#: 代价与配套：整轮 ~53 s → **~94.5 s**，会撞 90 s 预算 ⇒ 与
+#: `akshare_connector` 里的 **V8 串行闸门**（`_V8_GATE`）配套；闸门到位后
+#: 可以再谈把并发提回去（届时**第一判据是崩溃率**，不是停顿）。
+DAILY_WARM_CONCURRENCY = 1
 
 #: 预热目标总数上限（自选池 + 最近点开过）。
 #:
-#: 与预算一起构成"一轮跑得完"的保证：并发 3 实测约 1.06 s/只 ⇒ 80 只 ≈ 85 s，
-#: 仍在 `DAILY_WARM_BUDGET_SEC`(90 s) 内。超出的部分按顺序截断（自选在前）。
+#: ⚠️ `CHG-0137` **更正一处旧口径**：原文写"并发 3 实测约 1.06 s/只 ⇒ 80 只 ≈ 85 s，
+#: 仍在 90 s 预算内"—— 那是**理想情况**（每只都快）。最坏情况是
+#: `ceil(80/3) × 30 s 超时 = 810 s`，**比 90 s 预算大 9 倍**；
+#: 而当时**代码并不强制预算**（提交前看一眼，而 `create_task` 非阻塞 ⇒ 判据几乎不触发），
+#: 所以"预算"在过去只是**文档里的假设**。现在预算由 `warm_watchlist_daily` 用
+#: `asyncio.wait_for(gather, 剩余预算)` **强制**，本上限只决定"提交多少只"。
 DAILY_WARM_MAX_CODES = 80
 
 #: 一轮预热的墙钟预算（秒）。超了就停，剩下的留给下一轮。
@@ -102,11 +131,82 @@ DAILY_WARM_MAX_CODES = 80
 #: ⚠️ 池子涨到约 70 只就会撞预算（那时前 70 只热、后面的永远是冷的）——
 #: 撞了要调 TTL 与 tick（成对改，`test_warm_interval_is_shorter_than_cache_ttl` 会验），
 #: **不要**只把预算调大（调大就等于跨 tick）。
+#:
+#: ★ `CHG-0137`：**这个常量现在是硬约束**（见 `warm_watchlist_daily` 的
+#: `asyncio.wait_for`）。撞预算会：① 取消在飞任务 ② 记一条 `job_budget` 采集异常
+#: ③ 在 `WarmReport` 里如实计数 —— 不再靠人读日志发现"这一轮少预热了几只"。
 DAILY_WARM_BUDGET_SEC = 90.0
 
 #: 单只票的墙钟上限（秒）。日线链自己也有超时，这一层是"它自己没兜住"时的保险。
-#: 取 30 s：实测冷取一只 4.2 s，30 s 只切"病态慢"的那只，不误杀正常源。
-DAILY_WARM_PER_CODE_SEC = 30.0
+#:
+#: ★ `CHG-0137`：**30 s → 12 s**。原因不是"12 s 更好"，而是 30 s 与预算**互相矛盾**：
+#: 上游一挂（实测腾讯 501 / AkShare 返空），22 只 × 30 s / 并发 3 ⇒ 220 s 打底，
+#: 预算 90 s 根本不可能成立。12 s = 实测冷取一只（4.2 s）的 **2.9 倍**，
+#: 仍只切"病态慢"的那只；而"一只病态"对整轮的伤害从 30 s 降到 12 s。
+#: 真正的护栏是硬预算：即使 12 s 也不够，一轮也**不会**超过 90 s。
+DAILY_WARM_PER_CODE_SEC = 12.0
+
+
+def _record_warm_budget_anomaly(report: "WarmReport", budget_sec: float) -> None:
+    """撞预算时记一条 `job_budget` 采集异常（`CHG-0137`）。
+
+    为什么必须留痕：撞预算意味着**这一轮有几只没预热到**（下一轮它们仍是冷的），
+    而原来这件事**只有一行 INFO 日志**。用户口径是"不许静默降级"；
+    更实际的理由是：本次事故里正是这一条把"服务不可达"和"预热跑不完"连起来的，
+    没有它，两次报障之间只能靠人翻日志。
+    """
+    try:
+        from src.core.collection_anomalies import record
+
+        record(
+            "job_budget", "daily_warm",
+            f"日K预热一轮撞上 {budget_sec:.0f}s 墙钟预算：目标 {report.codes} 只、"
+            f"预热 {report.warmed} 只、失败 {report.failed} 只、"
+            f"未轮到 {report.skipped} 只，用时 {report.seconds:.1f}s。"
+            "⚠️ 撞预算说明**这一轮占满的事件循环时间已达上限**（前端 4s 探针会超时），"
+            "且未预热的票下一轮仍是冷的。先看是不是上游源在挂"
+            "（失败样例见 `日K预热：` 那行日志），再决定调并发/单只超时/池子上限。")
+    except Exception:  # noqa: BLE001 观测失败不影响预热
+        logger.debug("预热预算异常落盘失败", exc_info=True)
+
+
+#: 上一轮**没热成**（超时/异常）的标的，在这么多秒内被**降到队尾**（不是剔除）。
+#:
+#: `CHG-0145`。为什么需要它（pilot 实测 2026-09-30）：慢实例上总有 6~10 只票
+#: 每轮都撞单只超时（`688825 / 300308 / 603083 / 600667 / 301511 …` 跨轮次重复），
+#: 而它们**每只都要吃掉一次超时**（12 s × 6 只 ÷ 并发 3 ≈ 24 s）⇒
+#: 90 s 预算里 1/4 被"注定失败的票"占掉，结果整轮只热了 22~37/56 ——
+#: **健康的多数被少数拖累**。
+#:
+#: 降级而不是剔除：① 上游抖动是常见的，剔除会让一只票**永久**冷；
+#: ② 队尾仍然会在预算有富余时被轮到；③ 窗口 900 s > 缓存 TTL 180 s 的 5 倍，
+#: 足够让一次真实抖动过去。
+FAILURE_DEFER_SEC = 900.0
+
+#: `{code: 最近一次失败时刻}`。**只是排序提示**，不是正确性依赖 ——
+#: 所以进程内、重启即清空是可接受的（与 `_daily_cache` 同类）。
+_recent_failures: dict[str, float] = {}
+
+
+def note_failure(code: str, *, now: float | None = None) -> None:
+    """记一次"这只票这一轮没热成"（超时/异常），并顺手清掉过期条目。"""
+    moment = time.monotonic() if now is None else now
+    _recent_failures[str(code)] = moment
+    for stale in [item for item, ts in _recent_failures.items()
+                  if moment - ts >= FAILURE_DEFER_SEC]:
+        _recent_failures.pop(stale, None)
+
+
+def note_success(code: str) -> None:
+    """热成功 ⇒ 立刻恢复常规优先级（下一轮不必再排队尾）。"""
+    _recent_failures.pop(str(code), None)
+
+
+def deferred_codes(*, now: float | None = None) -> set[str]:
+    """当前仍在"降级窗口"内的标的。"""
+    moment = time.monotonic() if now is None else now
+    return {item for item, ts in _recent_failures.items()
+            if moment - ts < FAILURE_DEFER_SEC}
 
 
 def in_warm_window(now: datetime | None = None) -> bool:
@@ -136,6 +236,7 @@ class WarmReport:
     seconds: float = 0.0
     budget_hit: bool = False
     skipped_reason: str = ""
+    deferred: int = 0          #: 因**上一轮超时**而被降到队尾的只数
     errors: list[str] = field(default_factory=list)
 
     def render(self) -> str:
@@ -145,6 +246,8 @@ class WarmReport:
         head = (f"目标 {self.codes} 只（自选 {self.warm_targets} + 最近点开 "
                 f"{self.recent_targets}）：预热 {self.warmed} 只"
                 f"，失败 {self.failed} 只，用时 {self.seconds:.1f}s")
+        if self.deferred:
+            head += f"；{self.deferred} 只因上轮超时被降到队尾"
         if self.budget_hit:
             head += (f"；⚠️ 撞上 {DAILY_WARM_BUDGET_SEC:.0f}s 预算上限，"
                      f"{self.skipped} 只留给下一轮")
@@ -212,6 +315,12 @@ def warm_targets(service: Any, *,
         # 截断按顺序（自选在前）：把"哪些没被预热"变成可预测的事实，
         # 而不是随机丢几只
         targets = targets[:max_codes]
+    # ★ `CHG-0145`：上一轮超时的票**降到队尾**（不剔除）—— 见 `FAILURE_DEFER_SEC`。
+    #   预算被撞时按顺序截断，所以"降级"实际效果就是"预算先给健康的票"。
+    deferred = deferred_codes()
+    if deferred:
+        targets = [*[c for c in targets if c not in deferred],
+                   *[c for c in targets if c in deferred]]
     return targets, min(len(watch), len(targets))
 
 
@@ -263,7 +372,8 @@ async def warm_watchlist_daily(
         return WarmReport(skipped_reason="自选池为空且无最近点开记录")
 
     report = WarmReport(codes=len(targets), warm_targets=watch_count,
-                        recent_targets=len(targets) - watch_count)
+                        recent_targets=len(targets) - watch_count,
+                        deferred=len([c for c in targets if c in deferred_codes()]))
     sem = asyncio.Semaphore(max(1, int(concurrency)))
 
     pending: list[asyncio.Task[bool]] = []
@@ -276,13 +386,50 @@ async def warm_watchlist_daily(
         pending.append(asyncio.create_task(_warm_one(service, code, sem, report.errors)))
 
     if pending:
-        results = await asyncio.gather(*pending, return_exceptions=True)
+        # ★★ 2026-09-30（`CHG-0137`）：**预算必须是硬约束，而不是提交前的礼貌检查**。
+        #
+        # 原实现只在"提交下一只之前"看预算，而 `asyncio.create_task` 是**非阻塞**的
+        # ⇒ 提交循环**毫秒级跑完** ⇒ 那条判据**几乎永不触发**，而下面的 `gather`
+        # **没有任何时间上限** ⇒ 最坏 `ceil(n/并发) × 单只超时` 全等完。
+        #
+        # 实测代价（2026-09-30 13:57，就是用户报"前端又不可达"的那次）：
+        #   56 只 / 并发 3 / 22 只各撞 30 s 超时 ⇒ **一轮 316.4 s**，
+        #   是 90 s 预算的 **3.5 倍**，而 cron 是 120 s ⇒ 长期"上一轮未结束"，
+        #   **API 事件循环被它占着**，前端 4 s 探针必然超时 ⇒ 横幅"后端不可达"。
+        #
+        # 现在：给 `gather` 套上**剩余预算**的硬上限；到点就**取消在飞任务**，
+        # 未跑完的按 `skipped` 如实计数（不静默）。这样"一轮 ≤ 预算"成为**代码事实**，
+        # 而不是文档里的假设。
+        left = max(0.0, budget_sec - (time.monotonic() - started))
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True), timeout=left)
+        except (asyncio.TimeoutError, TimeoutError):
+            report.budget_hit = True
+            for task in pending:
+                task.cancel()
+            results = await asyncio.gather(*pending, return_exceptions=True)
         report.warmed = sum(1 for item in results if item is True)
-        # 异常在 `_warm_one` 里已吞掉并计数；这里只兜"连计数都没走到"的情形
-        report.failed = len(results) - report.warmed
+        # 异常在 `_warm_one` 里已吞掉并计数（返回 False）；`CancelledError` 是**预算截断**，
+        # 归到 `skipped`（"没轮到"），不冒充失败 —— 两者处置不同（失败要查源，截断是设计）。
+        report.failed = sum(1 for item in results if item is False)
+        # ★ `CHG-0145`：把成败回写进"降级表"——失败的下一轮排队尾，
+        #   成功的立刻恢复常规优先级。取消（预算截断）**两边都不记**：
+        #   它不是失败，不该被降级。
+        for _code, _item in zip(targets, results):
+            if _item is True:
+                note_success(_code)
+            elif _item is False:
+                note_failure(_code)
+        _budget_cut = sum(1 for item in results
+                          if isinstance(item, asyncio.CancelledError))
 
     if report.budget_hit:
         report.skipped = max(0, len(targets) - report.warmed - report.failed)
     report.seconds = time.monotonic() - started
     logger.info("日K预热：%s", report.render())
+    if report.budget_hit:
+        #: "预算截断"必须**留痕**：否则"这一轮少预热了 N 只"只能靠人读日志发现
+        #: （用户口径：不许静默降级）。记一条采集异常，管理员面板可见。
+        _record_warm_budget_anomaly(report, budget_sec)
     return report

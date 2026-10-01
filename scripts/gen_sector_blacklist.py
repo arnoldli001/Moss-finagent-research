@@ -17,13 +17,26 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.core.config import get_settings  # noqa: E402
+# ★ `CHG-0143`：拥挤度的**用户配置**表（`sector_crowding_list` 等）已从共享
+#   遗留主库迁到**本环境应用库**（`app_db`：dev → `data/dev/moss_dev.db`、
+#   pilot → `data/pilot/moss_pilot.db`）。所以路径**不能再写死**
+#   `data/moss_finagent.db`，也不能用 `settings.sqlite_path`
+#   （那在主实例上等于遗留主库、判据会随环境漂移）。
+#   统一走 registry 解析（与 `sector_crowding/config.py` 同一个来源）：
+#      `SECTOR_CROWDING_DB=<路径>` 可显式覆盖（离线演练/临时副本用）。
+import os as _os  # noqa: E402
+
+from src.sector_crowding.config import load_config as _load_crowding_config  # noqa: E402
+
+_CROWDING_CONFIG_DB = _os.environ.get("SECTOR_CROWDING_DB") or str(
+    _load_crowding_config().config_db_path)
+
 
 CUTOFF = "2026-09-20"
 OUT = Path("configs/sector_blacklist.yaml")
 
 connection = sqlite3.connect(
-    f"file:{Path(get_settings().sqlite_path).as_posix()}?mode=ro", uri=True)
+    f"file:{Path(_CROWDING_CONFIG_DB).as_posix()}?mode=ro", uri=True)
 connection.row_factory = sqlite3.Row
 rows = connection.execute(
     "SELECT sector_code, sector_name, visible, source FROM sector_crowding_list"

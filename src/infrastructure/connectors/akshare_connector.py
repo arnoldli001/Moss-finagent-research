@@ -26,6 +26,7 @@ import asyncio
 import logging
 import math
 import re
+import threading
 import time
 from datetime import date as _date
 from datetime import datetime
@@ -555,7 +556,29 @@ def _quant_basic_db_path() -> str:
 
 
 class AkshareConnector(BaseConnector):
-    """AkShare连接器：宏观(CPI/PPI/M2/社融)、A股行情、估值、财务比率、部分行业真实指标。"""
+    """AkShare连接器：宏观(CPI/PPI/M2/社融)、A股行情、估值、财务比率、部分行业真实指标。
+
+    ## ★ V8 串行闸门（`CHG-0149`，2026-09-30）
+
+    akshare 的部分接口用 `py_mini_racer`（V8）执行反爬 JS，而 **V8 不是线程安全的**。
+    本连接器是整条日线链的**公共路径**，`asyncio.to_thread` 会让"并发调用 =
+    并发线程进 V8" ⇒ 进程**硬崩**（实测 3/3 复现：退出码 `0x80000003`
+    STATUS_BREAKPOINT、**无 Python traceback**、原生栈在 `mini_racer.dll`；
+    串行 0/3）。所以所有 `to_thread(self._fetch_sync, …)` 都必须过下面的
+    **类级锁** —— 同一时刻只有一个线程进 akshare。
+
+    与既有手段的关系（"同一判断只允许一份实现"）：本项目对 mini_racer 的既有
+    隔离是**子进程**（`src/intraday/subproc.py`，用于同花顺板块快照这类**单点**
+    接口）。那不适合这里：日线链每个请求都走，起子进程的 ~1 s 固定开销会直接
+    压到交互时延上。闸门是同一目标在**热路径**上的实现 —— 只串行化"进 akshare"
+    这一小段，网络与后续计算仍可并发。
+    """
+
+    #: V8 串行闸门。用 `threading.Lock`（不是 `asyncio.Lock`）：
+    #: 它**与事件循环无关**，因此离线脚本/单测里多次 `asyncio.run()` 复用同一个
+    #: 模块也安全；`asyncio.Lock` 跨循环复用会踩"绑定到另一个 loop"的坑。
+    #: 在**工作线程里**持锁（见 `_fetch_sync_gated`），所以不占事件循环。
+    _V8_GATE = threading.Lock()
 
     source_name = "AkShare"
     source_url = "https://akshare.akfamily.xyz"
@@ -1347,5 +1370,31 @@ class AkshareConnector(BaseConnector):
         start_date: str | None = None,
         end_date: str | None = None,
     ) -> list[DataPoint]:
-        return await asyncio.to_thread(self._fetch_sync, indicator, start_date, end_date)
+        # ★ V8 串行闸门（`CHG-0149`）：**同一时刻只允许一个线程进 akshare**。
+        #
+        # akshare 的部分接口用 `py_mini_racer`（V8）执行反爬 JS，而 V8 **不是
+        # 线程安全的**。本连接器是整条链的公共路径，`asyncio.to_thread` 会让
+        # **并发调用 = 并发线程**进 V8 ⇒ 进程硬崩：实测 3/3 复现，
+        # 退出码 `0x80000003`(STATUS_BREAKPOINT)、**没有 Python traceback**、
+        # 原生栈落在 `py_mini_racer/mini_racer.dll`；串行则 0/3。
+        #
+        # 与既有手段的关系（"同一判断只允许一份实现"）：本项目对 mini_racer
+        # 的既有隔离是**子进程**（`src/intraday/subproc.py`，用于同花顺板块快照
+        # 这类**单点**接口）。那不适合这里 —— 日线链是**每个请求都走**的热路径，
+        # 每次调用起一个子进程的代价（~1 s 固定开销）会直接压到交互时延上。
+        # 闸门是同一目标（**不让两个线程同时进 V8**）在热路径上的实现：
+        # 只串行化"进 akshare"这一小段，网络与后续计算仍可并发。
+        #
+        # 待办：akshare 若把 V8 调用拆到独立进程（上游修复），本闸门可删。
+        return await asyncio.to_thread(
+            self._fetch_sync_gated, indicator, start_date, end_date)
+
+    def _fetch_sync_gated(self, *args: Any, **kwargs: Any) -> Any:
+        """在**工作线程里**持 `_V8_GATE` 再进 akshare（见类 docstring 的闸门说明）。
+
+        锁必须拿在**线程侧**：`to_thread` 之后代码已经在线程池里跑，
+        在那里串行化才真正保证"同一时刻只有一个线程在 V8 里"。
+        """
+        with self._V8_GATE:
+            return self._fetch_sync(*args, **kwargs)
 

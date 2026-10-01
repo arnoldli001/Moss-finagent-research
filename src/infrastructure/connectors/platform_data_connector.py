@@ -254,8 +254,16 @@ _WAREHOUSE = "warehouse"
 #: （`data/<env>/moss_<env>.db`）**没有** `sector_crowding_*` / `ml_*`；
 #: 而主实例下 `app_db` 与 `legacy_main` 是同一个文件。写死一个必然在某个实例上静默取空。
 _TABLE_CANDIDATES: dict[str, tuple[str, ...]] = {
+    # 参考数据：留在**共享**库（无用户维度，三个环境读同一份）
     "sector_crowding_daily": (_LEGACY_MAIN, _APP_DB),
-    "sector_crowding_list": (_LEGACY_MAIN, _APP_DB),
+    # ★★ 用户配置：`CHG-0143` 起在**本环境应用库**（原先在共享遗留主库）。
+    #
+    # ⚠️ **候选顺序必须 `app_db` 在前** —— `_table_store()` 取**第一个存在该表**
+    # 的候选。旧库里那张 `sector_crowding_list` 不会自动消失，若把
+    # `_LEGACY_MAIN` 放前面，迁移会**静默失效**：接口照常返回旧库那份
+    # （dev 与 pilot 仍共用一份板块清单），而**没有任何报错**。
+    # 判据 `test_crowding_list_prefers_app_db` 钉住这个顺序。
+    "sector_crowding_list": (_APP_DB, _LEGACY_MAIN),
     # ★ 2026-09-29：`_load_crowding()` 的 LEFT JOIN 读了这张表（"每个板块的历史最高
     #   平滑拥挤度"），但**声明里原来没有它** —— 于是"这张表在哪"无从解析，
     #   而后缀诊断/字段可达性判据都看不见它。实测由

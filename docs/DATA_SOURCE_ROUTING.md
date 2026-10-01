@@ -15,7 +15,7 @@
 >
 > | 用途 | 原链路（QMT 在链首） | 现链路 | 实测 |
 > |---|---|---|---|
-> | 日线（个股/ETF/指数） | QMT → 本地CSV → AkShare → 腾讯 → Tushare | **AkShare → 腾讯 → Tushare → baostock → 本地CSV → [QMT 开关] ** | 14/14 组合通过，最新=当前交易日 |
+> | 日线（个股/ETF/指数） | QMT → 本地CSV → AkShare → 腾讯 → Tushare | **AkShare → 腾讯 → Tushare → baostock → [本地CSV 开关] → [QMT 开关] ** | 14/14 组合通过，最新=当前交易日 |
 > | 分钟K / 分时 / 快照 | **QMT** → 腾讯 → 东财 → 新浪 | **腾讯 → 新浪 → 东财 → [QMT 开关]** | 腾讯 快照52ms / 分时~85ms / 分钟K~95ms |
 > | 全市场全量下载 | `download_qmt_data.py`（写进 QMT 私有库） | **`scripts/download_market_data.py`**（写进项目 `data/quant/prices*/`） | 19 只 / 7956 行 / 2.8s |
 >

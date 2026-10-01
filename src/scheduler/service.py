@@ -153,9 +153,23 @@ class CronScheduler:
 
         所以这里返回一条 `skipped` 记录（**不写 failed、不执行**），
         并在理由里说清为什么、去哪改 —— 与 `_tick()` **同源同判据**。
+
+        ## ★★ 同一道门在 `CHG-0139` 又来了一次（**进程角色**）
+
+        把 4 个重作业挪出在线进程时，第一次只改了 `_tick()` 走的
+        `schedulable_jobs()` —— 于是**这条旁路原样绕过了整次拆分**：
+        `_check_quant_sync_at_startup()` 正是用 `trigger("quant_data_sync")`
+        补缺口的，它会在**在线 API 进程**里把那个重作业跑起来。
+        症状与拆分前**一模一样**（前端又报不可达），而排查的人会以为
+        "已经挪出去了"，于是往别处找。
+
+        所以这里加的是**同一个** `job_out_of_role()`，而不是把角色判断再写一遍。
+        教训（本条的第二次出现）：**新增一道"谁能跑"的判据时，必须把
+        "所有触发路径"列出来逐条接上** —— 判据写在一条路径上，
+        等于给另一条路径开了后门。
         """
         from src.scheduler.jobs import execute_job
-        from src.scheduler.registry import job_deny_reason
+        from src.scheduler.registry import job_deny_reason, job_out_of_role
 
         reason = job_deny_reason(name)
         if reason:
@@ -163,6 +177,13 @@ class CronScheduler:
             return {"status": "skipped", "job_name": name, "trigger": source,
                     "records_processed": 0, "reason": reason,
                     "detail": "本实例没有该作业的写权限，未执行（不是失败）"}
+        role_reason = job_out_of_role(name)
+        if role_reason:
+            # 与上面同理：这是**分工**，不是故障 ⇒ `skipped`，理由指向谁来跑。
+            logger.info("作业%s不在本进程角色内，交由对方进程执行：%s", name, role_reason)
+            return {"status": "skipped", "job_name": name, "trigger": source,
+                    "records_processed": 0, "reason": role_reason,
+                    "detail": "本进程角色不含该作业，未执行（不是失败）"}
 
         fn = self._execute or execute_job
         self._running.add(name)

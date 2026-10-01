@@ -301,7 +301,7 @@ def recompute_stored_water_levels(*, config: SectorCrowdingConfig | None = None,
     """
     config = config or load_config()
     own = conn is None
-    conn = conn or db.get_db_connection(config)
+    conn = conn or db.get_db_connection(config, writable=True)
     started = time.perf_counter()
     stats = {"sectors": 0, "rows": 0, "skipped": 0, "seconds": 0.0}
     try:
@@ -372,7 +372,7 @@ def reclassify_boards(*, config: SectorCrowdingConfig | None = None,
     """
     config = config or load_config()
     own = conn is None
-    conn = conn or db.get_db_connection(config)
+    conn = conn or db.get_db_connection(config, writable=True)
     try:
         boards = {item["sector_code"]: item for item in sources.list_boards(config)}
         changed = 0
@@ -495,7 +495,7 @@ def refresh_single_sector(sector_code: str, *, conn: Any = None,
     """
     config = config or load_config()
     own = conn is None
-    conn = conn or db.get_db_connection(config)
+    conn = conn or db.get_db_connection(config, writable=True)
     own_warehouse = warehouse is None
     warehouse = warehouse or sources.open_warehouse(config)
     if warehouse is None:
@@ -678,7 +678,7 @@ def refresh_all_incremental(*, task_id: str = "", config: SectorCrowdingConfig |
     warehouse = None
     try:
         db.init_tables(config=config)
-        conn = db.get_db_connection(config)
+        conn = db.get_db_connection(config, writable=True)
         warehouse = sources.open_warehouse(config)
         if warehouse is None:
             raise RuntimeError("行情仓库不可用")

@@ -131,28 +131,50 @@ def test_prefix_keywords_still_match() -> None:
 
 
 def test_connector_advertises_per_industry_forms() -> None:
-    """★ 「截面没行业标签」的修法：把一级/二级的 `{行业名}` 形式登记出来。
+    """★ 「截面没行业标签」的修法：把**按行业点名**的模板全部声明出来。
 
     实测依据：`ind:sw_first_dividend_yield:银行` **真取得到**（2026-09-30 银行
-    股息率 **5.1%**、PE-TTM 7.34），但修前 `get_capabilities()` 只登记了**三级**的
+    股息率 **5.1%**、PE-TTM 7.34），但修前 `get_capabilities()` 只声明了**三级**的
     `{行业名}` 形式 ⇒ 规划侧看不见一级行业的按行业路径 ⇒ 只采 `:all` 无标签截面
     ⇒ Agent 无法把"银行"挑出来 ⇒ 报告写"股息率缺失"。
+
+    ⚠️ 判据**只要求模板**（`{行业名}`）—— 那是"按行业点名"这条路，且**零作业成本**
+    （`plan_jobs()` 对模板明确跳过）。而**非模板**的 `:all` 截面登记即产生每日作业，
+    属**成本决定**：本判据改为守**对齐不变量**「**声明的每一条 `:all` 都必须已登记**」，
+    而不是要求把 7 个未登记的截面也声明出来（那正是修前"能力↔登记不一致"的形状）。
     """
+    from pathlib import Path
+
     from src.infrastructure.connectors.sw_industry_valuation_connector import (
         SWIndustryValuationConnector as C,
     )
 
     caps = C().get_capabilities()
     inds = set(caps.get("indicators") or [])
-    for must in ("ind:sw_first_dividend_yield:{行业名}",
-                 "ind:sw_first_pe_ttm:{行业名}",
-                 "ind:sw_second_dividend_yield:{行业名}",
-                 "ind:sw_third_dividend_yield:{行业名}",
-                 "ind:sw_first_dividend_yield:all"):
-        assert must in inds, f"能力表缺 {must} ⇒ 规划侧看不见这条取数路径"
-    assert "不带行业标签" in str(caps.get("notes")), (
-        "notes 必须点明 `:all` 截面**不带行业标签** —— 否则下一个人还会踩"
+
+    # ① 3 级 × 4 指标的**模板**必须全部声明（这是"按行业点名"的全部入口）
+    for lv in ("first", "second", "third"):
+        for mt in ("pe_ttm", "pe_static", "pb", "dividend_yield"):
+            must = f"ind:sw_{lv}_{mt}:{{行业名}}"
+            assert must in inds, f"能力表缺 {must} ⇒ 规划侧看不见这条取数路径"
+    assert "ind:sw_first_dividend_yield:{行业名}" in inds, (
+        "用户报障的就是这条：银行属**申万一级**行业"
     )
-    # 能力表里登记的每一条，supports() 都必须认（否则登记是假的）
+
+    # ② 对齐不变量：声明的每一条 `:all` 都必须**已在登记表里**
+    #    （否则就是"声明了却没人采/没处引用"，既有判据会判能力↔登记不一致）
+    yaml_text = Path("configs/indicators.yaml").read_text(encoding="utf-8")
+    declared_all = sorted(i for i in inds if i.endswith(":all"))
+    assert declared_all, "能力表一条 `:all` 都没声明 —— 判据失去目标（会恒绿）"
+    unregistered = [i for i in declared_all if f"- id: {i}" not in yaml_text
+                    and f'- id: "{i}"' not in yaml_text]
+    assert not unregistered, (
+        f"这些 `:all` 声明了却没登记 ⇒ 能力↔登记不一致：{unregistered}"
+    )
+
+    # ③ notes 必须点明 `:all` **不带行业标签**（否则下一个人还会踩）
+    assert "不带行业标签" in str(caps.get("notes"))
+
+    # ④ 登记/声明的每一条，supports() 都必须认（否则登记是假的）
     for i in inds:
-        assert C.supports(i.replace("{行业名}", "银行")), f"登记了却 supports()=False: {i}"
+        assert C.supports(i.replace("{行业名}", "银行")), f"声明了却 supports()=False: {i}"

@@ -104,6 +104,18 @@ export default function MetricsPanel() {
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [healthError, setHealthError] = useState<string | null>(null);
+  /**
+   * ★ 数据采集异常（2026-09-30 用户口径）：
+   * 「这类信息异常信息，**不要显示在用户界面**。要记录并显示到管理员界面的
+   *  "运行指标"里，可以加一块**数据采集异常展示区**」。
+   *
+   * 加载方式与 `health` **同一条纪律**：**独立 loader + 独立区间**，
+   * 不并进 `Promise.all` —— 实测过一次"健康度慢 ⇒ 整页停在加载中"，
+   * 而上面那块其实早就拿到了。多一块数据不该让整页等它。
+   */
+  const [anomalies, setAnomalies] = useState<Awaited<
+    ReturnType<typeof api.collectionAnomalies>> | null>(null);
+  const [anomalyError, setAnomalyError] = useState<string | null>(null);
 
   /** LLM 指标（JSONL 实时聚合）：15 秒一刷，单独加载，**不**等健康度。 */
   const loadMetrics = useCallback(async () => {
@@ -133,20 +145,33 @@ export default function MetricsPanel() {
     }
   }, []);
 
+  /** 数据采集异常：30 秒一刷（它与另两块解耦，慢/失败只影响自己那一段）。 */
+  const loadAnomalies = useCallback(async () => {
+    try {
+      setAnomalies(await api.collectionAnomalies(100, 72));
+      setAnomalyError(null);
+    } catch (e) {
+      setAnomalyError(`数据采集异常获取失败（不影响上方指标）：${String(e)}`);
+    }
+  }, []);
+
   useEffect(() => {
     void loadMetrics();
     void loadHealth();
+    void loadAnomalies();
     const fast = window.setInterval(() => void loadMetrics(), 15000);
     const slow = window.setInterval(() => void loadHealth(), 60000);
+    const mid = window.setInterval(() => void loadAnomalies(), 30000);
     return () => {
       window.clearInterval(fast);
       window.clearInterval(slow);
+      window.clearInterval(mid);
     };
-  }, [loadMetrics, loadHealth]);
+  }, [loadMetrics, loadHealth, loadAnomalies]);
 
   const refresh = useCallback(async () => {
-    await Promise.all([loadMetrics(), loadHealth()]);
-  }, [loadMetrics, loadHealth]);
+    await Promise.all([loadMetrics(), loadHealth(), loadAnomalies()]);
+  }, [loadMetrics, loadHealth, loadAnomalies]);
 
   if (error) return <div className="error-box">{error}</div>;
   if (!metrics) {
@@ -165,6 +190,64 @@ export default function MetricsPanel() {
       {health ? <HealthStrip health={health} /> : null}
       {healthError && <div className="warn-box">{healthError}</div>}
       <DataSourceHealth />
+      {/*
+        ★★ 数据采集异常展示区（2026-09-30 用户口径）。
+        这些行**已经从用户界面移除**（见 `collectionAnomaly.ts`），
+        这里是它们唯一的展示落点：管理员维护用。
+        口径随数据下发：窗口/种类计数/读不出来的行数都由后端给。
+      */}
+      <section className="panel" id="collection-anomalies">
+        <h2>数据采集异常（近 {anomalies?.window_hours ?? 72} 小时）</h2>
+        {anomalyError && <div className="warn-box">{anomalyError}</div>}
+        {anomalies && (
+          <>
+            <div className="summary-row">
+              <div className="stat-card">
+                <span className="stat-label">异常总数</span>
+                <span className="stat-value">{anomalies.total}</span>
+              </div>
+              {(anomalies.kinds ?? []).map((k) => (
+                <div className="stat-card" key={k}>
+                  <span className="stat-label">
+                    {anomalies.kind_labels?.[k] ?? k}
+                  </span>
+                  <span className="stat-value">
+                    {anomalies.by_kind?.[k] ?? 0}
+                  </span>
+                </div>
+              ))}
+            </div>
+            {anomalies.bad_lines > 0 && (
+              <div className="warn-box">
+                有 {anomalies.bad_lines} 行日志解析不出来（文件可能被写坏）。
+              </div>
+            )}
+            {anomalies.items.length === 0 ? (
+              <p className="muted-note">
+                窗口内没有采集异常（文件：{anomalies.file}）。
+              </p>
+            ) : (
+              <table className="audit-table sched-table">
+                <thead>
+                  <tr>
+                    <th>时间</th><th>种类</th><th>指标</th><th>原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {anomalies.items.map((it, i) => (
+                    <tr key={i}>
+                      <td>{new Date(it.ts * 1000).toLocaleString()}</td>
+                      <td>{anomalies.kind_labels?.[it.kind] ?? it.kind}</td>
+                      <td>{it.indicator}</td>
+                      <td title={it.reason}>{it.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </>
+        )}
+      </section>
       <div className="sched-head">
         <div className="warn-box" style={{ margin: 0 }}>
           最近 {metrics.window_calls} 次LLM调用窗口（审计JSONL实时聚合，15秒自动刷新；慢调用阈值3秒）。

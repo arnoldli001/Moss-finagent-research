@@ -3,6 +3,11 @@ import {
   sectorCrowdingApi,
   type CrowdingDetail as DetailPayload,
 } from "../sectorCrowdingApi";
+import {
+  readCrowdingDetail,
+  readCrowdingDetailAge,
+  writeCrowdingDetail,
+} from "../crowdingDetailCache";
 import SectorCrowdingDetailChart from "./SectorCrowdingDetailChart";
 
 /**
@@ -20,8 +25,21 @@ import SectorCrowdingDetailChart from "./SectorCrowdingDetailChart";
  * - 点遮罩空白处
  * - 按 Esc
  *
- * 内容取数是**按板块懒加载**的（近 6 年 1400+ 根日线 ≈ 400ms），所以打开时
- * 先给出 loading 态，而不是把整张空图先画出来。
+ * ## 取数：**先画缓存、再后台核对**（stale-while-revalidate，`CHG-0137`）
+ *
+ * 这条曲线近 6 年 1400+ 根日线，即服务端已瘦身（gzip 砍半），在 ~51 KB/s
+ * 的公网隧道上仍是秒级；劣化档（~4.6 KB/s）下十几秒 —— 那正是用户报障
+ * 「十几秒才出数据」的现场。
+ *
+ * 原写法每次打开都 `setData(null)` + `setLoading(true)`，**必发一次冷请求**，
+ * 于是"关掉再看同一个板块"也要重付一遍。现在：
+ *
+ *   1. 命中缓存 → **立刻画出曲线**（`loading` 保持 false，不显示"正在读取"）；
+ *   2. 同时照常发请求核对，拿到新的覆盖 + 写回缓存；
+ *   3. 没命中缓存 → 才走原来的 loading 态。
+ *
+ * ⚠️ **旧数据期间不显示"正在读取"**，但要显示"正在核对" —— 否则用户会以为
+ * 看到的就是最新的。拥挤度是日频数据，旧曲线的日期也画在图上。
  */
 export default function SectorCrowdingDetailModal({
   sectorCode, sectorName, onClose,
@@ -33,6 +51,8 @@ export default function SectorCrowdingDetailModal({
 }) {
   const [data, setData] = useState<DetailPayload | null>(null);
   const [loading, setLoading] = useState(false);
+  /** 手里已有（缓存的）曲线、正在后台核对 —— 与 `loading` 是两件事 */
+  const [revalidating, setRevalidating] = useState(false);
   const [error, setError] = useState("");
   const [showRaw, setShowRaw] = useState(true);
   /** 放大视图：弹窗放开到几乎满屏，图表因此更宽、能看清更细的结构 */
@@ -61,15 +81,37 @@ export default function SectorCrowdingDetailModal({
   useEffect(() => {
     if (!sectorCode) { setData(null); return; }
     let alive = true;
-    setLoading(true);
     setError("");
-    setData(null);
+
+    // ① 缓存优先：有就直接画，不进入 loading（这是"打开即有图"的那一半）
+    const cached = readCrowdingDetail(sectorCode);
+    const cachedAge = readCrowdingDetailAge(sectorCode);
+    setData(cached);
+    setLoading(cached === null);
+    // 缓存很新（< 30 秒）就不必再核对：刚看过一遍，重传纯属浪费隧道带宽。
+    // 30 秒是"同一次比较动作内"的量级，不会漏掉盘中刷新。
+    const fresh = cached !== null && cachedAge !== null
+      && Date.now() - cachedAge < 30_000;
+    setRevalidating(cached !== null && !fresh);
+
+    if (fresh) return () => { alive = false; };
+
+    // ② 后台核对（无论有没有缓存都发；有缓存时不阻塞渲染）
     sectorCrowdingApi.detail(sectorCode)
-      .then((payload) => { if (alive) setData(payload); })
-      .catch((exc) => {
-        if (alive) setError(exc instanceof Error ? exc.message : String(exc));
+      .then((payload) => {
+        if (!alive) return;
+        setData(payload);
+        writeCrowdingDetail(payload);
       })
-      .finally(() => { if (alive) setLoading(false); });
+      .catch((exc) => {
+        if (!alive) return;
+        // 有缓存时不要把画面换成错误框 —— 旧曲线仍然可读，
+        // 失败只是"这次没核对上"。把提示留给没有数据可画的那种情况。
+        setError(exc instanceof Error ? exc.message : String(exc));
+      })
+      .finally(() => {
+        if (alive) { setLoading(false); setRevalidating(false); }
+      });
     return () => { alive = false; };
   }, [sectorCode]);
 
@@ -90,18 +132,27 @@ export default function SectorCrowdingDetailModal({
             水位 = 当前平滑拥挤度 / 近 6 年最高值
           </span>
           <span style={{ flex: 1 }} />
+          {revalidating && <span className="muted-text">正在核对…</span>}
           <button className="btn-ghost tiny crowding-modal-close"
                   onClick={onClose} aria-label="关闭">✕ 关闭</button>
         </div>
 
         <div className="crowding-modal-body">
           {loading && <div className="info-box">正在读取 {sectorName || sectorCode} …</div>}
-          {!loading && error && <div className="error-box">读取失败：{error}</div>}
+          {/* 只有"画不出图"时才用错误框顶掉内容；有旧曲线时错误降级为脚注 */}
+          {!loading && error && !data && (
+            <div className="error-box">读取失败：{error}</div>
+          )}
           {!loading && !error && data && (
             <SectorCrowdingDetailChart
               data={data} sectorCode={sectorCode} sectorName={sectorName}
               showRaw={showRaw} onToggleRaw={setShowRaw}
               expanded={expanded} onToggleExpand={() => setExpanded((v) => !v)} />
+          )}
+          {!loading && error && data && (
+            <div className="muted-text">
+              本次核对失败（{error}）—— 上图是上一次读到的数据。
+            </div>
           )}
         </div>
 

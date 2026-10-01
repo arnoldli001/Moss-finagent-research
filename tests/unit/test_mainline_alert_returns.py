@@ -21,10 +21,15 @@
    只测其中一边的话，把口径写回"平均收益"也能过。
 5. **比较是严格大于。** 恰好等于门槛的板块**隐藏**。
    `test_exactly_at_threshold_is_hidden` 守住这条边界 —— 写成 `>=` 不会报错、
-   只会让一批题材悄悄回来。默认门槛见 `DEFAULT_MIN_WIN_RATE`（2026-09-25 起 40%）。
+   只会让一批题材悄悄回来。默认门槛见 `DEFAULT_MIN_WIN_RATE`
+   （2026-09-25 起 40%，**2026-09-30 起 39%**）。
 6. **判不出胜率的不隐藏。** 一条 20 日窗口都没走满的板块没有胜率，
    谈不上"未过门槛"。若把"判不出"当"不通过"，最近一个月的板块会整片消失。
    `test_pending_gate_is_not_hidden` 守住它。
+7. **展示门槛与池级门槛已经解耦，且必须保持解耦。** 放宽展示门槛时若"顺手"
+   把 `theme_gate.DEFAULT_THRESHOLD` 也降下来，下次生成剔除清单会把胜率落在
+   (0.39, 0.40] 的题材也剔掉 —— 而它们不在冻结名单里，**池子会静默缩水**，
+   `--keep` 也留不住。`test_display_gate_is_decoupled_from_pool_gate` 守住它。
 """
 
 from __future__ import annotations
@@ -326,32 +331,39 @@ def test_gate_follows_win_rate_not_average_return() -> None:
 
 
 def test_exactly_at_threshold_is_hidden() -> None:
-    """**回归测试**：胜率**恰好等于**门槛 → 隐藏（比较是严格大于）。
+    """**回归测试**：胜率**不超过**门槛 → 隐藏（比较是严格大于）。
 
     用户口径是"只显示 20 日胜率**大于**门槛的概念板块"。写成 `>=` 不会报错、
     界面也照样出数，只会让一批卡在门槛上的题材悄悄回到表里，
-    所以这条边界必须由测试钉住 —— 而且**默认门槛和显式门槛都要测一遍**，
-    否则改了默认值之后这条测试会静默地不再覆盖边界。
-    """
-    # 恰好 40%（2/5）→ 默认门槛下就该隐藏
-    at_default = summarize_boards(
-        [row_of(value) for value in (10.0, 1.0, -6.0, -7.0, -8.0)])[0]
-    assert at_default["win_rate_20d"] == 0.4
-    assert at_default["gate"] == "hidden", "恰好等于默认门槛也算不达标"
-    assert at_default["passed"] is False
+    所以这条边界必须由测试钉住。
 
-    # 显式门槛同理：恰好 50% 在 min_win_rate=0.5 下也是隐藏
+    ⚠️ **判据用显式门槛，不用默认门槛** —— 默认门槛是 0.39，而 5 个窗口能表达的
+    比例只有 0/20/40/…%，**取不到"恰好等于 0.39"的那一档**。早先版本拿
+    `win_rate == 0.4` 去对默认门槛，默认值从 0.40 改成 0.39 之后它就不覆盖边界了
+    （而且会静默变成"高于门槛却断言 hidden"的假红）。所以这里：
+    用显式门槛 `0.5` 钉"恰好等于→隐藏"，用默认门槛钉"低于默认→隐藏"。
+    """
+    # ① 恰好等于显式门槛（2/5 = 40%，门槛 0.5 之下的另一档不算）
     at_half = summarize_boards(
         [row_of(value) for value in (10.0, 1.0, -6.0, -7.0)],
         min_win_rate=0.5)[0]
     assert at_half["win_rate_20d"] == 0.5
     assert at_half["gate"] == "hidden", "恰好等于显式门槛也算不达标"
+    assert at_half["passed"] is False
+    # 再高一个窗口就越过它 —— 两侧都要看得见
+    over_half = summarize_boards(
+        [row_of(value) for value in (10.0, 1.0, 1.0, -6.0, -7.0)],
+        min_win_rate=0.5)[0]
+    assert over_half["win_rate_20d"] == 0.6
+    assert over_half["gate"] == "pass"
 
-    # 多赢一个窗口就越过门槛 —— 两侧的行为都要看得见
-    over = summarize_boards(
-        [row_of(value) for value in (10.0, 1.0, 1.0, -6.0, -7.0, -8.0)])[0]
-    assert over["win_rate_20d"] == 0.5
-    assert over["gate"] == "pass"
+    # ② 默认门槛：明显不达标的一档必须隐藏（对**默认**取值生效的证据）
+    below_default = summarize_boards(
+        [row_of(value) for value in (10.0, -1.0, -2.0)])[0]   # 33%
+    assert below_default["win_rate_20d"] == 0.3333
+    assert below_default["gate"] == "hidden"
+    # ③ 默认值本身要有出处：改了默认门槛，这条会红（提醒同步上面两条判据）
+    assert DEFAULT_MIN_WIN_RATE == 0.39
 
 
 def test_win_rate_threshold_is_configurable() -> None:
@@ -359,8 +371,43 @@ def test_win_rate_threshold_is_configurable() -> None:
     rows = [row_of(value) for value in (10.0, 1.0, -6.0, -7.0)]   # 胜率 50%
     assert summarize_boards(rows, min_win_rate=0.4)[0]["gate"] == "pass"
     assert summarize_boards(rows, min_win_rate=0.5)[0]["gate"] == "hidden"
-    # 默认门槛：2026-09-25 用户按"减少假阳性"从 50% 放宽到 40%
-    assert DEFAULT_MIN_WIN_RATE == 0.4
+    # 默认门槛：2026-09-25 用户按"减少假阳性"从 50% 放宽到 40%；
+    # 2026-09-30 用户裁定再放宽到 **0.39**（让 CRO概念 0.3913 回到面板）。
+    assert DEFAULT_MIN_WIN_RATE == 0.39
+
+
+def test_display_gate_is_decoupled_from_pool_gate() -> None:
+    """**回归测试**：展示门槛（39%）与池级门槛（40%）是两件事，不许合并。
+
+    ## 为什么必须钉住
+
+    2026-09-30 用户裁定把「回测收益展示」的门槛放宽到 **0.39**。
+    而 `theme_gate.DEFAULT_THRESHOLD`（决定"哪些题材该被剔出池子"）当时**同值**，
+    看起来"顺手一起改"很自然 —— 但那会造成**静默缩水**：
+
+      · `select()` 会把胜率落在 `(0.39, 0.40]` 的题材也判成"该剔"；
+      · 它们**不在冻结名单**里 ⇒ 下次 `import_crowding_pool` 时池子直接少几个题材；
+      · `build_theme_exclusions.py --keep` **留不住** —— `--keep` 只在题材
+        **已经**被判为剔除时才把它挪回观察名单，而"不在池内"是另一回事。
+      · 本机实测（2026-09-30，池内 124 个）：门槛 >40% 时过门槛 **110** 个，
+        放宽到 >39% 时 **112** 个 —— 多出来的正是这一档，其中就有 `CRO概念`。
+
+    所以这条判据锁的是**两者可以不相等**：改任意一个都不该被另一个悄悄跟改。
+    它不是"数值必须不同"（将来若有意统一，改这里并写清理由），
+    而是"必须是两个独立的常量，且各自有出处"。
+    """
+    from src.mainline import theme_gate
+
+    assert DEFAULT_MIN_WIN_RATE == 0.39, "展示门槛（面板显示）"
+    assert theme_gate.DEFAULT_THRESHOLD == 0.40, "池级门槛（决定题材还做不做）"
+    # 两处口径的**比较方向**必须一致：都是"严格大于才通过/保留"
+    below = [row_of(value) for value in (10.0, 1.0, -6.0, -7.0)]     # 胜率 50%
+    assert summarize_boards(below, min_win_rate=0.5)[0]["gate"] == "hidden"
+    excluded, _ = theme_gate.select(
+        [{"board_code": "886999.TI", "board_name": "边界题材", "win_rate_20d": 0.4,
+          "done_20d": 5, "signals": 5, "alert_total": 5, "avg_ret_20d": 0.0}],
+        threshold=0.4, min_samples=3)
+    assert len(excluded) == 1, "恰好等于池级门槛也算不达标（与展示门槛同向）"
 
 
 def test_pending_gate_is_not_hidden() -> None:

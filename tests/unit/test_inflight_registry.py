@@ -18,6 +18,9 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from fastapi import Depends, FastAPI, WebSocket
+from fastapi.routing import APIRouter
+from fastapi.testclient import TestClient
 
 from src.core import inflight
 
@@ -116,6 +119,55 @@ def test_router_registration_is_effective_not_just_attached(monkeypatch) -> None
     assert kinds.count("enter") == kinds.count("leave"), (
         f"登记与注销不成对 ⇒ 登记簿会越涨越大：{calls}")
     assert any("health/live" in (label or "") for _, label in calls), calls
+
+
+def test_the_dependency_also_works_on_websocket_routes() -> None:
+    """★★ 全局依赖必须对 **WebSocket** 也成立（实测：收 `Request` 会让 WS 直接炸）。
+
+    ## 现场（2026-09-30 全量门禁当场抓到）
+
+    登记依赖挂在**汇总 router** 上 ⇒ 它同时作用于 WS 路由
+    （`/api/v1/ws/intraday`、`/api/v1/ws/alerts`）。而 WS 的 scope 里**没有**
+    `request` ⇒ 依赖解析抛：
+
+        TypeError: _mark_inflight() missing 1 required positional argument: 'request'
+
+    后果不是「WS 少了个登记」，而是 **2 个 WS 判据 + 7 个 health 契约判据一起红**
+    （它们共用同一条 app 装配路径）。修法：收 `HTTPConnection`
+    （`Request` 与 `WebSocket` 的**共同基类**）。
+
+    ## 为什么用**独立小应用**而不是整站
+
+    整站的 WS 需要 runtime 装配、登录门槛、真实行情源 —— 那条路红/绿取决于太多东西。
+    这里只问一件事：**把依赖挂上去，WS 还能不能正常收发**。
+    这正是缺陷的形状（依赖解析，不是业务），所以最小复现最准。
+
+    ## ⚠️ 另一个当场踩到的坑：注解必须在**模块级**可解析
+
+    本文件有 `from __future__ import annotations` ⇒ 注解是**字符串**，
+    FastAPI 用 `func.__globals__` 去解析它。第一版把 `WebSocket` 等 import 写在
+    **测试函数内部**（局部名）⇒ 解析失败 ⇒ FastAPI 把 `websocket` 当成
+    **查询参数**（症状是 `WebSocketDisconnect(1008)`，reason 里写着
+    `loc=['query','websocket'] Field required`）—— 与"依赖挂错"长得**完全不一样**。
+    所以这些 import 必须放**模块顶层**（见文件头）。
+    """
+    from src.api.routes import _mark_inflight
+
+    app = FastAPI()
+    router = APIRouter(dependencies=[Depends(_mark_inflight)])
+
+    @router.websocket("/ws")
+    async def _ws(websocket: WebSocket) -> None:
+        await websocket.accept()
+        await websocket.send_text("ok")
+        await websocket.close()
+
+    app.include_router(router)
+    inflight.reset()
+    with TestClient(app).websocket_connect("/ws") as ws:
+        assert ws.receive_text() == "ok", (
+            "WS 连接被全局依赖打挂了 —— 依赖必须收 `HTTPConnection` 而不是 `Request`")
+    assert inflight.inflight_count() == 0, "WS 请求结束后没有注销"
 
 
 @pytest.mark.asyncio

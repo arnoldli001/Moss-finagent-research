@@ -114,7 +114,7 @@
 | 禁止分析层直连 DB | **合规** | service 与 routes 只持有 EventRepository 抽象；sqlite3 仅出现在 event_sqlite_repo.py |
 | SQL 全参数化 | **合规** | 所有值入参均为 `?` 占位（event_sqlite_repo.py L188、L200、L223、L254、L269、L298、L307-L309、L319-L322、L330-L331、L339-L341）；f-string 仅拼接静态表名/列名/等量占位符（L151-L155、L219-L221、L253-L254、L293），无外部值拼接 |
 | 免责声明 | **基本合规** | 后端全通道携带；前端仅详情页固定展示，列表 Tab 缺失（D9） |
-| 密钥处理 | **合规** | SMTP 账号/授权码仅从环境变量读（[config.py:84-85](file:///d:/code/Moss-finagent-research/src/core/config.py#L84-L85)），.env.example 为空占位；代码与日志均不输出授权码（email_notifier.py 日志只记 alert_id/异常摘要）；硬编码收件人 2693888583@qq.com 系规格指定业务值，非密钥 |
+| 密钥处理 | **合规** | SMTP 账号/授权码仅从环境变量读（[config.py:84-85](file:///d:/code/Moss-finagent-research/src/core/config.py#L84-L85)），.env.example 为空占位；代码与日志均不输出授权码（email_notifier.py 日志只记 alert_id/异常摘要）；硬编码收件人 your_qq_number@qq.com 系规格指定业务值，非密钥 |
 | 多租户 tenant_id 隔离 | **部分合规** | 表含 tenant_id，list/get/mark_read/mark_all_read/count/list_unanalyzed 均带租户条件，get_alert 跨租户 404 有测试；但 `existing_event_keys`、`mark_events_analyzed`、`last_alert_time` 三个端口方法无 tenant 参数（端口文档自称"所有方法按租户隔离"），WS/导入的 tenant_id 为无鉴权查询参数（N7 单租户演示可接受）。见 D4 |
 | 单文件 ≤300 行 / 函数 ≤50 行 | **1 处超标** | [event_sqlite_repo.py](file:///d:/code/Moss-finagent-research/src/infrastructure/repositories/event_sqlite_repo.py) 353 行 > 300；其余最大 analyzer.py 258 行；函数均 ≤50 行（最大 `_analyze_and_alert` 25 行）。见 D10 |
 | 外部调用全部 try/except + to_thread | **合规** | akshare（news_flash/calendar）、SMTP、SQLite 均 to_thread 且异常隔离；单源/单事件/单邮件/单通道失败不阻断批次，有对应用例 |

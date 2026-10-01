@@ -36,6 +36,11 @@ def sandbox(tmp_path, monkeypatch: pytest.MonkeyPatch):
     """把事件流水与日志路径都指到临时目录（**不许碰生产 data/run**）。"""
     monkeypatch.setattr(manage, "RUN_DIR", tmp_path)
     monkeypatch.setattr(manage, "INCIDENT_LOG", tmp_path / "incidents.jsonl")
+    # ★ `CHG-0146`：`cmd_ensure` 现在还要问一句"**有没有实例正在启动**"
+    #   （端口空 ≠ 进程已消失）。默认给一张**空进程表** = 没有实例在启动。
+    #   不固定它，这条判据就会去读**真实**进程表 ⇒ 测试结果取决于
+    #   "这台机器此刻有没有人在启动后端"（既慢又不确定 —— 本机常年有实例在跑）。
+    monkeypatch.setattr(manage, "our_backend_processes", lambda: [])
     return tmp_path
 
 

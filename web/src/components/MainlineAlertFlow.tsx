@@ -27,7 +27,8 @@ import {
  *
  * 用户的固定口径：*"不显示 20 日胜率低于 50% 的概念板块回测信息"*，
  * 随后收紧为 *"只显示 20 日胜率**大于** 50% 的概念板块"*，
- * 2026-09-25 又按"减少假阳性"放宽到 **40%**。所以**强信号与中信号**里，
+ * 2026-09-25 又按"减少假阳性"放宽到 **40%**，
+ * **2026-09-30 放宽到 39%**（让 CRO概念 0.3913 回到本页签）。所以**强信号与中信号**里，
  * 属于"20 日胜率未超过门槛"板块的那些行不显示；
  * **弱信号不受这条规则影响**（它问的不是弱信号）。
  *
@@ -208,8 +209,8 @@ export default function MainlineAlertFlow({ alerts, onPick, loading }: Props) {
     return { hit, total: done.length, rate: hit / done.length };
   }, [gated]);
 
-  /** 门槛文案：接口还没回来时先按 40% 显示（与后端 `DEFAULT_MIN_WIN_RATE` 一致）。 */
-  const gatePct = `${((minWinRate ?? 0.4) * 100).toFixed(0)}%`;
+  /** 门槛文案：接口还没回来时先按 39% 显示（与后端 `DEFAULT_MIN_WIN_RATE` 一致）。 */
+  const gatePct = `${((minWinRate ?? 0.39) * 100).toFixed(0)}%`;
 
   return (
     <section className="mainline-card mainline-alert-flow">

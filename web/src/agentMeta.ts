@@ -23,6 +23,9 @@ const FALLBACK_AGENTS: Record<string, { name: string; layer: string }> = {
   A14_consumer: { name: "消费行业Agent", layer: "industry" },
   A15_cyclical: { name: "周期行业Agent", layer: "industry" },
   A16_pharma: { name: "医药行业Agent", layer: "industry" },
+  // ★ 2026-09-29：兜底行业 Agent（服务 A13-A16 之外的任意行业，如银行）。
+  //   前端不显示它 → 用户在协作过程里看到一条"行业结论"却找不到是哪个 Agent 给的。
+  A20_generic_industry: { name: "兜底行业Agent", layer: "industry" },
   A17_recommend: { name: "投研建议Agent", layer: "decision" },
   A18_audit: { name: "逻辑审计Agent", layer: "audit" },
 };

@@ -200,6 +200,11 @@ export function useAuth() {
         const { clearIntelCache } = await import("../intelCache");
         clearIntelCache();
       } catch { /* 清理失败不该阻断登出 */ }
+      // 板块拥挤度·历史曲线缓存同理（2026-09-30，`CHG-0137`）。
+      try {
+        const { clearCrowdingDetailCache } = await import("../crowdingDetailCache");
+        clearCrowdingDetailCache();
+      } catch { /* 清理失败不该阻断登出 */ }
       // 预取记账也要重置：否则下一个人登录后，保活续期会以为
       // "刚刚取过"而跳过第一次预取，缓存又是冷的。
       try {

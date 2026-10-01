@@ -369,6 +369,66 @@ def test_limits_are_written_in_code() -> None:
     assert 0 < DAILY_WARM_PER_CODE_SEC <= DAILY_WARM_BUDGET_SEC
 
 
+# ---------------------------------------------------------------- 4b. ★ 最坏情况（CHG-0137）
+def test_round_wall_clock_is_hard_capped_by_budget(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """★★ **最坏情况一轮 = 预算**，而不是 `ceil(n/并发) × 单只超时`。
+
+    ## 这条判据为什么必须存在（2026-09-30 实测事故）
+
+    用户连续报"前端显示后端不可达"。根因是日K预热一轮跑了 **316.4 s**
+    （56 只里 22 只各撞 30 s 超时，并发 3），而**预算 90 s、cron 120 s**
+    ⇒ 循环被占住 ⇒ 前端 4 s 探针必然超时 ⇒ 横幅。
+
+    当时的实现在**提交下一只之前**看预算，而 `asyncio.create_task` 是**非阻塞**的
+    ⇒ 提交循环毫秒级跑完 ⇒ 那条判据几乎永不触发，而 `gather` 没有时间上限
+    ⇒ 最坏 `ceil(80/3) × 30 s = 810 s`（**9 倍预算**）。
+    **"写在文档里的上限"不是上限** —— 这条判据把它变成行为事实。
+
+    构造：20 只全 hang、单只 5 s、并发 1、预算 0.5 s。
+    旧实现会跑 `ceil(20/1) × 5 = 100 s`；新实现必须 ~0.5 s 量级返回。
+    """
+    monkeypatch.setattr("src.intraday.warm.DAILY_WARM_PER_CODE_SEC", 5.0)
+    monkeypatch.setattr("src.intraday.warm.DAILY_WARM_CONCURRENCY", 1)
+    codes = [f"60000{i}" for i in range(20)]
+    service = _FakeService(codes, hang=set(codes))
+
+    started = time.monotonic()
+    report = asyncio.run(warm_watchlist_daily(
+        service, budget_sec=0.5, now=datetime(2026, 9, 28, 10, 0)))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0, (
+        f"预算没被强制：整轮跑了 {elapsed:.1f}s（旧实现是 ~100s）—— "
+        "`gather` 又变成没有时间上限了？")
+    assert report.budget_hit is True, "撞预算必须如实标出来"
+    assert report.skipped > 0, "被预算截断的只数必须计入 skipped（不许静默少预热）"
+    assert report.warmed + report.failed + report.skipped == report.codes, (
+        "三态之和必须等于目标数，否则就是静默丢了几只")
+
+
+def test_budget_hit_records_an_anomaly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ 撞预算必须**留痕**（`job_budget` 采集异常）—— 不许只在日志里。
+
+    实测事故里，"服务不可达"与"预热跑不完"之间**没有任何一条机器记录**把它们连起来，
+    只能靠人翻日志。这条判据把那个连接点钉死。
+    """
+    seen: list[tuple[str, str]] = []
+
+    def _spy(kind: str, indicator: str, reason: str, **kw: object) -> bool:
+        seen.append((kind, indicator))
+        return True
+
+    monkeypatch.setattr("src.core.collection_anomalies.record", _spy)
+    service = _FakeService([f"60000{i}" for i in range(4)])
+    report = asyncio.run(warm_watchlist_daily(
+        service, budget_sec=0.0, now=datetime(2026, 9, 28, 10, 0)))
+
+    assert report.budget_hit is True
+    assert ("job_budget", "daily_warm") in seen, (
+        f"撞预算没有记 `job_budget` 异常（实际记了 {seen}）⇒ 管理员面板看不到这件事")
+
+
 def test_warm_round_fits_before_the_next_tick() -> None:
     """一轮预热的预算必须**小于** tick 间隔，否则会压到下一轮上。
 
@@ -383,24 +443,32 @@ def test_warm_round_fits_before_the_next_tick() -> None:
 
 
 def test_warm_concurrency_is_justified_by_measurement() -> None:
-    """并发度必须保持 3 —— 取值是**量出来的**，不是保守也不是激进。
+    """并发度必须是 **1** —— 第一判据是**崩溃率**，不是停顿（`CHG-0149`）。
 
-    `CHG-0099` 把日K计算段移出了事件循环（护栏见
-    `tests/unit/test_daily_freshness.py::test_daily_compute_runs_off_the_event_loop`），
-    于是"并发放大停顿"这条约束消失，实测（自选 50 只）：
+    ## 判据升级的原因（这条测试原先只量停顿，因此放过了真正的杀手）
 
-    | 并发 | 修复前 max 停顿 / >1s | 修复后 max 停顿 / >1s | 修复后整轮 |
-    |---|---|---|---|
-    | 1 | 1000 ms / 0 | 109 ms / 0 | 94.5 s（**超 90 s 预算**） |
-    | 2 | 1890 ms / 12 | 188 ms / 0 | 56.0 s |
-    | **3（现行）** | 1906 ms / 11 | **188 ms / 0** | **53.1 s** |
+    旧判据断言 `== 3`，依据是"停顿表"（并发 1/2/3 的 max 停顿 109~188 ms）与
+    "整轮用时"（53 s vs 94.5 s）。它们**都是真的**，但**漏掉了一个更严重的维度**：
+    并发会让进程**直接死掉**。
 
-    所以约束只剩"整轮能不能在预算内跑完"：串行已经超预算（会被截断，
-    尾巴永远是冷的），取 3。**要改这个值，请先把上表重测一遍。**
+    实测（`scripts/_probe_v8_concurrency.py`，判据=退出码，各 3 次）：
+
+    | | 崩溃次数 | 形态 |
+    |---|---|---|
+    | **并发 3** | **3/3** | 退出码 `0x80000003`(STATUS_BREAKPOINT)，**无 traceback**，原生栈在 `py_mini_racer/mini_racer.dll`（V8 非线程安全） |
+    | **串行** | 0/3 | 12 次链调用 ~18 s 正常跑完 |
+
+    停顿表仍然成立（串行 94.5 s 会撞 90 s 预算），但**"会崩"压倒"慢一点"**：
+    崩溃的表现是"服务无痕消失"，而慢的表现只是"这一轮少预热几只"。
+    配套：`akshare_connector` 的 `_V8_GATE`（V8 串行闸门，见
+    `test_v8_gate_serialises_akshare_calls`）；闸门到位后若要把并发提回去，
+    **先证明崩溃率 0/N，再谈停顿与用时**。
     """
-    assert DAILY_WARM_CONCURRENCY == 3, (
-        "并发度被改了：请先重测整轮用时与事件循环停顿（见本测试 docstring 的表），"
-        "确认整轮仍在 DAILY_WARM_BUDGET_SEC 内、且 max 停顿远小于前端探针超时 4000ms")
+    assert DAILY_WARM_CONCURRENCY == 1, (
+        "并发被调大了：日线链的 akshare 一跳用 py_mini_racer(V8)，**V8 不是线程安全的** —— "
+        "实测并发 3 = 3/3 次原生崩溃（无 traceback，服务无痕消失）。"
+        "要提并发，先跑 scripts/_probe_v8_concurrency.py 证明崩溃率 0/N，"
+        "并确认 _V8_GATE 闸门真的把 V8 调用串行化了")
 
 
 # ---------------------------------------------------------------- 5. 真执行器

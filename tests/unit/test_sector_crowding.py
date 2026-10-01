@@ -39,9 +39,19 @@ def conn(tmp_path: Path) -> sqlite3.Connection:
 
 @pytest.fixture
 def config(tmp_path: Path) -> SectorCrowdingConfig:
-    """指向临时库的配置（不碰真实库）。"""
+    """指向临时库的配置（不碰真实库）。
+
+    ★ `CHG-0143`：必须**同时**把 `config_path` 指到临时库。
+    拥挤度现在跨两个库 —— 参考数据（`path`）× 用户配置（`config_path`）。
+    只改 `path` 的话，`config_path` 会解析到**真实应用库**
+    （`data/app/moss_app.db`），于是：
+      · 查询会 ATTACH 真实库 → 单测**读到真实数据**（隔离泄漏）；
+      · 或该库不存在 → `no such table: app_db.sector_crowding_watch`。
+    两个症状都实测出现过，所以这里显式把两者指到同一个临时文件。
+    """
     base = load_config()
     base.database.path = str(tmp_path / "crowding.db")
+    base.database.config_path = str(tmp_path / "crowding.db")
     return base
 
 

@@ -76,7 +76,11 @@ _TABLES_READY = threading.Event()
 def _ensure_tables() -> None:
     if _TABLES_READY.is_set():
         return
-    db.init_tables()
+    # ★ `CHG-0143`：这里只建**本环境用户配置库**那一半，**不碰共享参考库**。
+    #   共享库点名了写者（`writer: dev`）⇒ pilot 上只读；对只读库执行 DDL
+    #   会报错/挂锁，而且会把"读实例写共享库"变成正常动作。
+    #   共享库的建表由**写者实例**在刷新前调 `db.init_tables()` 完成。
+    db.ensure_config_tables()
     _TABLES_READY.set()
 
 
@@ -858,11 +862,23 @@ async def watchlist_remove(sector_code: str) -> dict:
 
 
 def _sector_detail_sync(sector_code: str, limit: int) -> dict:
+    """单板块历史曲线（**展示路径** → `slim=True`）。
+
+    ★ 2026-09-30 `CHG-0137`：这条是**展示**接口，必须走瘦身投影。
+    原先 `SELECT *` 把 `id`/`created_at`/`updated_at` 一起发出去（28.9% 的明文
+    白传），浮点又按完整 double 序列化（实测 2348 个值带 18~20 位小数 ⇒ gzip
+    压不动）—— 明文 424 KB / gzip 66 KB，在 ~4.6 KB/s 的劣化隧道上要 **14 秒**，
+    而**后端只花 13 毫秒**。加 `slim=True` 后 gzip 66,507 B → 33,491 B（砍半）。
+    口径与实测见 `docs/PRD.md` §22。
+
+    ⚠️ 元数据**不许**用 `db.query_sector_meta()` 全表再线性查找 —— 那是
+    2517 行的整表读出只为了取一行。这里改传 `sector_code=` 走主键直查。
+    """
     conn = _conn()
     try:
-        rows = db.query_sector_crowding(conn, sector_code)
-        meta = next((item for item in db.query_sector_meta(conn)
-                     if item["sector_code"] == sector_code), None)
+        rows = db.query_sector_crowding(conn, sector_code, slim=True)
+        found = db.query_sector_meta(conn, sector_code=sector_code)
+        meta = found[0] if found else None
         if limit > 0:
             rows = rows[-limit:]
         values = [item["water_level"] for item in rows

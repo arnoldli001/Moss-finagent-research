@@ -62,7 +62,27 @@ ALERT_TABLE = "sector_crowding_alert"
 # 新增专用表：refresh / recompute 时增量更新；查询 O(N)（按主键扫一次）
 MAX_MA5_TABLE = "sector_crowding_max_ma5"
 
-_SCHEMA = f"""
+# ======================================================================
+# 建表 DDL：**按库拆成两半**（★ `CHG-0143`）
+# ======================================================================
+#
+# ## 为什么必须拆
+#
+# 拥挤度有两类生命周期完全不同的数据，此前被塞进**同一个库**：
+#
+#   · **市场参考数据**（无用户维度，三个环境读同一份）→ 共享库 `crowding_shared`
+#       `sector_crowding_daily` / `sector_meta` / `sector_member` / `max_ma5`
+#   · **用户配置**（每人/每租户一份）→ 本环境库 `app_db`
+#       `sector_crowding_list` / `sector_crowding_watch` / `sector_crowding_alert`
+#
+# 混在一起的后果（实测）：`sector_crowding_list` 只有 **1,226 行、且只在共享
+# 遗留主库里**，于是 **dev 与 pilot 共用同一份板块清单与告警阈值** ——
+# 开发时点掉的板块，客户那边也消失。
+#
+# 拆开之后**各库只建自己那一半**，避免在两侧各留一堆空表
+# （空表会让"这张表在哪"的探测产生歧义，`platform_data_connector` 的
+#  `_table_store()` 就是按"表存在"来选库的）。
+_REFERENCE_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {DAILY_TABLE} (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     trade_date   TEXT    NOT NULL,
@@ -101,6 +121,18 @@ CREATE TABLE IF NOT EXISTS {MEMBER_TABLE} (
     PRIMARY KEY (sector_code, stock_code)
 );
 
+-- ★★★ 2026-09-27 第八轮：max_ma5 物化表（−1.5s 首屏）
+-- 替代 `MAX(ma5_crowding) GROUP BY sector_code` 扫 217 万行（实测 0.4-1.7s）。
+-- refresh/recompute 完成后增量 UPSERT；查询 = 全表 SELECT（主键已建索引）。
+CREATE TABLE IF NOT EXISTS {MAX_MA5_TABLE} (
+    sector_code  TEXT PRIMARY KEY,
+    max_ma5      REAL NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+"""
+
+#: **用户配置**表 —— 建在**本环境应用库**（`config_db_path`），见上面的说明。
+_CONFIG_SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {WATCH_TABLE} (
     sector_code TEXT PRIMARY KEY,
     sector_name TEXT NOT NULL DEFAULT '',
@@ -164,16 +196,12 @@ CREATE TABLE IF NOT EXISTS {ALERT_TABLE} (
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
-
--- ★★★ 2026-09-27 第八轮：max_ma5 物化表（−1.5s 首屏）
--- 替代 `MAX(ma5_crowding) GROUP BY sector_code` 扫 217 万行（实测 0.4-1.7s）。
--- refresh/recompute 完成后增量 UPSERT；查询 = 全表 SELECT（主键已建索引）。
-CREATE TABLE IF NOT EXISTS {MAX_MA5_TABLE} (
-    sector_code  TEXT PRIMARY KEY,
-    max_ma5      REAL NOT NULL,
-    updated_at   TEXT NOT NULL
-);
 """
+
+#: 兼容旧引用（`_SCHEMA`）：它是两份的并集。
+#: ⚠️ **不要**用它建表（会把配置表也建进共享库、把参考表建进应用库）；
+#: 建表请用 `init_tables()`，它按库分别执行上面两份。
+_SCHEMA = _REFERENCE_SCHEMA + _CONFIG_SCHEMA
 
 #: `sector_crowding_list.source` 取值：manual = 用户在前端新增；
 #: default = 首屏从"全量概念板块"种子化写入（用户删除后置 visible=0）；
@@ -217,43 +245,229 @@ def _now() -> str:
 # 连接
 # ======================================================================
 
+def assert_writable(store: str = "crowding_shared") -> None:
+    """写之前问一句"本实例能写这条存储吗"，不能就 **fail-closed 抛错**。
+
+    ## 为什么必须有它（`CHG-0143`）
+
+    写者闸门 `data_stores.writable_here()` 原来是**从登记派生的**，而
+    拥挤度的表**根本没登记** ⇒ 前端的「一键刷新」往共享库里 UPSERT 218 万行
+    **不受任何闸门管**。
+
+    而且**光登记还不够**：全仓库只有 `QuantWarehouse` 真正调 `writable_here()`
+    做拦截。拥挤度写的是自己的连接，所以要在**自己的写路径**上补这一道。
+
+    ## 为什么不做成"默认拦截"
+
+    拥挤度**读**的是共享参考数据（pilot 必须能读），而
+    `refresh.py` / `metrics.py` 是**同一个连接既读又写**。
+    无条件拦会把读也挡掉 ⇒ 所以拦的是**调用方显式声明的写意图**
+    （`get_db_connection(..., writable=True)`），默认 `False` = 安全侧。
+    """
+    from src.infrastructure.catalog.data_stores import writable_here
+
+    decision = writable_here(store)
+    if not decision.allowed:
+        raise PermissionError(
+            f"本实例不能写 {store}：{decision.reason}。"
+            f"（拥挤度参考数据是**共享**的，写者由 "
+            f"configs/data_stores.yaml 的 writer 字段声明；"
+            f"要改归属就改那一个字段）")
+
+
+#: `ATTACH` 用户配置库时用的库别名。
+#: SQL 里写 `app_db.sector_crowding_list` —— 与 `data_stores.yaml` 的存储名同名，
+#: 便于一眼看出"这张表在哪个库"。
+CONFIG_SCHEMA_ALIAS = "app_db"
+
+#: 必须加别名前缀的**用户配置表**（`CHG-0143` 之后它们不在主库了）。
+_CONFIG_TABLES: tuple[str, ...] = (
+    LIST_TABLE, WATCH_TABLE, ALERT_TABLE,
+    METRIC_TABLE, METRIC_META_TABLE,
+)
+
+
+def config_table(table: str) -> str:
+    """配置表的**限定名**（`app_db.sector_crowding_list`）。
+
+    给跨库 JOIN 用 —— `query_list_view` / `query_alerts` /
+    `query_all_latest_water_level` 等 10 处 SQL 同句引用参考表与配置表，
+    而 SQLite 支持 `ATTACH` 后的跨库 JOIN，所以只需给配置表加别名前缀。
+    """
+    return f"{CONFIG_SCHEMA_ALIAS}.{table}"
+
+
 def get_db_connection(config: SectorCrowdingConfig | None = None,
-                      *, path: str | Path | None = None) -> sqlite3.Connection:
+                      *, path: str | Path | None = None,
+                      writable: bool = False) -> sqlite3.Connection:
     """打开拥挤度库连接（WAL + busy_timeout，与项目其它仓储同范式）。
 
     为什么每次新建连接而不是长连接：一键刷新在**后台线程**里跑，
     SQLite 连接不能跨线程共享；短连接 + WAL 让"刷新写"与"前端读"互不阻塞。
+
+    ## ★ 用户配置库用 `ATTACH` 并进来（`CHG-0143`）
+
+    `db.py` 里有 **10 处 SQL 同句引用参考表与配置表**
+    （`query_list_view` / `query_alerts` / `query_all_latest_water_level` /
+    `seed_list` / `hide_dead_boards` / `query_hidden_boards` / …）。
+    若拆成两条连接在 Python 里合并，要重写这 10 处查询 + 5 个导出函数，
+    其中 `seed_list`（`INSERT ... SELECT` 跨库）与 `hide_dead_boards`
+    （`UPDATE ... WHERE EXISTS` 跨库）SQLite **明确不支持**。
+
+    所以沿用项目既有范式（`data_stores.open_readonly()` 同样是 `ATTACH` 多库）：
+    主库 = **共享参考数据**，`ATTACH` 上**本环境用户配置库**，
+    配置表在 SQL 里写 `app_db.<table>`（见 `config_table()`）。
+    这样 10 处 JOIN 全部保持 SQLite 原生执行，Python 侧零合并逻辑。
+
+    `config_db_path` 与 `db_path` 相同（单测的临时库、或主实例布局）时
+    **不 ATTACH** —— 那是同一条路径，重复 ATTACH 会报错。
+
+    ## `writable` 默认 `False`（★ 默认值即护栏）
+
+    `writable=True` 时先过 `assert_writable()` —— 非写者实例**当场抛错**，
+    而不是"连上去、写到一半被 SQLite 拒绝"。
+
+    ⚠️ **默认必须是 `False`**：读路径（pilot 读共享参考数据）绝不能因此变红，
+    而 `refresh.py` / `metrics.py` 是同一个连接既读又写。混淆两者的代价是
+    "读也写不了" —— 那正是 `data_stores.py` 里
+    「硬拒会让它们当场失去写者」那段注释警告过的形状。
+
+    **新增写调用点必须显式传 `writable=True`**；判据
+    `test_refresh_write_paths_declare_writable` 用语法树钉住这一点
+    （漏传 = 静默只读，不报错）。
     """
     config = config or load_config()
+    # ★ `path=` 是**显式指定单库**（单测的临时库、离线脚本的工作副本）——
+    #   此时不派生配置库、也不 ATTACH：调用方要的就是"这一个文件"。
+    #   生产路径都不传 `path`，所以这条不影响真实部署。
+    explicit_single = path is not None
     target = Path(path) if path is not None else config.db_path
+    if writable:
+        assert_writable("crowding_shared")
     os.makedirs(target.parent, exist_ok=True)
     conn = sqlite3.connect(str(target), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA synchronous=NORMAL")
+
+    # ★ 把本环境的**用户配置库**并进来。
+    #
+    # ⚠️ **必须无条件 ATTACH，包括"与主库同一个文件"的情形** ——
+    # 所有运行时 SQL 都写 `app_db.<table>`（见 `config_table()`），
+    # 所以别名 `app_db` 必须存在；否则查询会报
+    # `no such table: app_db.sector_crowding_watch`。
+    #
+    # 同一个文件 ATTACH 两次在 SQLite 里是合法的（两条连接句柄指向同一文件），
+    # 也正是**单测临时库**（只有一个文件）与**主实例布局**
+    # （`app_db` 与 `crowding_shared` 同指 `data/moss_finagent.db`）的形态。
+    # `path=` 显式单库时：配置库跟随该路径，同样满足"别名必须存在"。
+    config_target = target if explicit_single else config.config_db_path
+    os.makedirs(config_target.parent, exist_ok=True)
+    conn.execute("ATTACH DATABASE ? AS " + CONFIG_SCHEMA_ALIAS,
+                 (str(config_target),))
     return conn
+
+
+#: 每个库该建哪些表（`CHG-0143`）—— `init_tables()` 按这张表分别执行。
+#: key = `SectorCrowdingConfig` 上取路径的属性名，value = 该库的 DDL。
+_SCHEMA_BY_DB: tuple[tuple[str, str], ...] = (
+    ("db_path", "_REFERENCE_SCHEMA"),          # 共享参考数据
+    ("config_db_path", "_CONFIG_SCHEMA"),      # 本环境用户配置
+)
+
+
+def ensure_config_tables(config: SectorCrowdingConfig | None = None) -> None:
+    """只建**本环境用户配置库**那一半（幂等，恒可写）。
+
+    ## 为什么请求路径要用它，而不是 `init_tables()`
+
+    `init_tables()` 会**两个库都建**，其中包括共享参考库的 DDL。
+    而 `CHG-0143` 给共享库点名了写者（`writer: dev`）⇒ pilot 上那是**只读**的
+    （`decided=True`，fail-closed）。若请求路径（`routes._ensure_tables()`）
+    对共享库执行 `CREATE TABLE IF NOT EXISTS`：
+
+      · 表已存在时 SQLite 不写盘，但 `executescript` 仍会开写事务
+        ⇒ pilot 上会**报错或挂锁**；
+      · 更要命的是这会把"读实例去写共享库"变成一个正常动作 ——
+        正是写者闸门要防的事。
+
+    ⇒ 请求路径只负责**自己的库**（`per_env + writer: own`，恒可写）；
+    共享参考库的建表交给**写者实例**的 `init_tables()`（刷新前/部署时）。
+
+    ⚠️ **必须显式 `commit()`**（2026-09-30 实测踩到）：`executescript()` 只保证
+    "执行前先提交挂起事务"，**它自己不提交** DDL。少了这一句，表只活在当前
+    连接的隐式事务里，连接一关就**全部消失** —— 表现是"接口能跑、库里却没有表"，
+    而且 `list` 查询会静默走 `app_db` 的空表（`query_list_view` 仍返回 262 行，
+    因为它是 `LEFT JOIN META`，**看不出异常**）。
+    """
+    config = config or load_config()
+    target = config.config_db_path
+    os.makedirs(target.parent, exist_ok=True)
+    conn = sqlite3.connect(str(target), timeout=30.0)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.executescript(_CONFIG_SCHEMA)
+        _ensure_columns(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def init_tables(conn: sqlite3.Connection | None = None,
                 config: SectorCrowdingConfig | None = None) -> None:
-    """建表 + PRAGMA 补列（幂等）。"""
-    own = conn is None
-    conn = conn or get_db_connection(config)
-    try:
-        conn.executescript(_SCHEMA)
-        for table, columns in _ADDABLE.items():
-            if not columns:
-                continue
-            existing = {row["name"] for row in conn.execute(
-                f"PRAGMA table_info({table})")}
-            for name, ddl in columns.items():
-                if name not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
-        conn.commit()
-    finally:
-        if own:
-            conn.close()
+    """建表 + PRAGMA 补列（幂等）。
+
+    ## ★ 按库分建（`CHG-0143`）
+
+    `conn` 为 `None` 时**两个库都建自己那一半**：
+    参考表进共享库、用户配置表进本环境应用库。理由见 `_REFERENCE_SCHEMA`
+    上面的说明（混建会让"这张表在哪"的探测产生歧义）。
+
+    ⚠️ 用户配置库那一趟用 `writable=True` 打开 —— 它是 `per_env + writer: own`，
+    恒为"本环境私有"，所以过闸门不会有副作用；而共享库那一趟**不**传
+    `writable`（默认只读口径），因为建表不该被当成"我要刷数据"。
+
+    `conn` 给定时（调用方自己开好连接，如单测的临时库）**只做补列**，
+    不切库 —— 保持既有调用语义不变。
+    """
+    if conn is not None:
+        # 调用方自带连接（单测的临时库、或 `get_db_connection` 之外的手工连接）：
+        # 两份 DDL 都建在它上面 —— 保持既有调用语义不变（临时库只有一个文件）。
+        conn.executescript(_REFERENCE_SCHEMA)
+        conn.executescript(_CONFIG_SCHEMA)
+        _ensure_columns(conn)
+        return
+    config = config or load_config()
+    for attr, schema_name in _SCHEMA_BY_DB:
+        target = getattr(config, attr)
+        own = sqlite3.connect(str(target), timeout=30.0)
+        try:
+            own.row_factory = sqlite3.Row
+            own.execute("PRAGMA journal_mode=WAL")
+            own.execute("PRAGMA busy_timeout=30000")
+            own.executescript(globals()[schema_name])
+            _ensure_columns(own)
+            own.commit()
+        finally:
+            own.close()
+
+
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """`PRAGMA` 补列（幂等）—— 只动**这个库里存在**的表，不会凭空建表。"""
+    for table, columns in _ADDABLE.items():
+        if not columns:
+            continue
+        existing = {row["name"] for row in conn.execute(
+            f"PRAGMA table_info({table})")}
+        if not existing:
+            continue        # 这张表不属于本库 → 跳过（不越界建表）
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+    conn.commit()
 
 
 # ======================================================================
@@ -383,10 +597,112 @@ def get_last_update_date(conn: sqlite3.Connection, sector_code: str) -> str:
     return str(row["last_update_date"] or "") if row else ""
 
 
+# ======================================================================
+# 前端展示用的**瘦身投影**（★ 2026-09-30，`CHG-0137`）
+# ======================================================================
+#
+# ## 为什么需要它（用户报障原文）
+#
+# > 「板块拥挤度 里，打开单个概念的历史拥挤度数据的图，十**几秒才出数据**，
+# >   看下什么原因，加载这么慢」
+#
+# 实测（1268 根日线，`data/moss_finagent.db` 2.4 GB）：
+#
+#     后端全链路（meta 5.9ms + 行情 3.3ms + 组装 0.2ms）   ≈ 13 ms
+#     明文 424 KB / gzip 66 KB
+#     @51 KB/s 隧道 1.3~1.5 s；@4.6 KB/s 劣化档 **14.1~16.1 s**
+#
+# **SQLite 侧没有可优化项**（索引已存在且被命中）—— 慢的是**传字节**。
+# 所以这里做两件事，且**只对展示路径生效**（口径见 `docs/PRD.md` §22）。
+#
+# ## ① 字段白名单：不发前端从不读的列
+#
+# 原先 `SELECT *` 把 11 列全发出去，而前端 `CrowdingRow`
+# （`web/src/sectorCrowdingApi.ts`）只消费 8 个。实测白传：
+#
+#     created_at 51,988 B (12.5%) + updated_at 51,988 B (12.5%) + id 16,491 B (4.0%)
+#     = 120,467 B = **28.9% 的明文**
+#
+# 其中两个时间戳在 1268 行里**逐字相同**（同一批刷新的产物），纯冗余。
+#
+# ## ② 浮点按**显示精度**取整：这是收益最大的一步（反直觉）
+#
+# 前端图表只显示到 3 位小数，原先却按完整 double 序列化
+# （`0.00024339722008355307`，19 位；实测 **2348 个值带 18~20 位小数**）。
+#
+# ⚠️ **单看"去字段"只降 9%** —— 因为 gzip 本来就能压掉重复值。
+# 真正让体积掉下来的是**取整让 gzip 重新变得有效**：
+#
+#     gzip 66,507 B  →  33,491 B（**砍半**）
+#     @4.6 KB/s      →  14.1 s  →  7.1 s
+#
+# 所以精度**既是体积问题、也是压缩率问题**：高熵的随机尾数不可压缩。
+#
+# ## ⚠️ 为什么是 `slim=` 参数而不是直接改函数
+#
+# 本函数有**两个内部调用方**，都**依赖完整列**：
+#   * `refresh.py:317` `recompute_stored_water_levels()` —— 重算历史水位
+#   * `refresh.py:449` `_refresh_one_sector()` —— 拉完整历史再算水位
+# 直接改这里会**静默打断水位重算**（那是最难发现的一类故障）。
+# 默认 `False` ⇒ **默认值即护栏**：新调用方不传就是安全的一侧，
+# 只有明确知道自己在做"展示"的接口才 opt-in。
+
+#: 展示路径真正下发的列。与前端 `CrowdingRow` 类型定义**一一对应** ——
+#: 改这里必须同步改 `web/src/sectorCrowdingApi.ts`，否则前端会读到 undefined。
+SLIM_COLUMNS: tuple[str, ...] = (
+    "trade_date",
+    "sector_code",
+    "sector_name",
+    "sector_amount",
+    "market_amount",
+    "raw_crowding",
+    "ma5_crowding",
+    "water_level",
+)
+
+#: 各列的**下发精度**（小数位）。口径：够画图与读数即可，不保留原始尾数。
+#:
+#: * `water_level` 3 位 —— 前端就显示成 `86.3%`（3 位已超出显示精度）；
+#: * `raw_crowding` / `ma5_crowding` 6 位 —— 量级 1e-4，6 位有效数字足够
+#:   区分相邻曲线（原先是 19~20 位）；
+#: * `sector_amount` / `market_amount` 1 位 —— 单位是元，量级 1e8~1e12，
+#:   小数部分对图与读数都没有意义。
+SLIM_PRECISION: dict[str, int] = {
+    "sector_amount": 1,
+    "market_amount": 1,
+    "raw_crowding": 6,
+    "ma5_crowding": 6,
+    "water_level": 3,
+}
+
+
+def _slim_row(row: Any) -> dict[str, Any]:
+    """把一行完整记录裁成"展示用"投影 + 按精度取整（纯函数）。
+
+    `None` 原样保留 —— 水位为 `None` 是**有语义的**（"数据不足"），
+    取整不能把它变成 0，否则界面会把"不知道"画成"不拥挤"。
+    """
+    out: dict[str, Any] = {}
+    for key in SLIM_COLUMNS:
+        value = row[key]
+        digits = SLIM_PRECISION.get(key)
+        if digits is not None and isinstance(value, float):
+            value = round(value, digits)
+        out[key] = value
+    return out
+
+
 def query_sector_crowding(conn: sqlite3.Connection, sector_code: str, *,
-                          start_date: str = "", end_date: str = "") -> list[dict[str, Any]]:
-    """单板块历史序列（按交易日升序）。"""
-    sql = f"SELECT * FROM {DAILY_TABLE} WHERE sector_code = ?"
+                          start_date: str = "", end_date: str = "",
+                          slim: bool = False) -> list[dict[str, Any]]:
+    """单板块历史序列（按交易日升序）。
+
+    `slim=True` → **展示用瘦身投影**（`SLIM_COLUMNS` + `SLIM_PRECISION`），
+    响应体积 gzip 后减半。**只给前端展示接口用**；算水位必须用默认的完整行
+    —— 理由与实测见本节顶部注释与 `docs/PRD.md` §22。
+    """
+    columns = ", ".join(SLIM_COLUMNS) if slim else "*"
+    sql = f"SELECT {columns} FROM {DAILY_TABLE} WHERE sector_code = ?"
     params: list[Any] = [str(sector_code)]
     if start_date:
         sql += " AND trade_date >= ?"
@@ -395,7 +711,10 @@ def query_sector_crowding(conn: sqlite3.Connection, sector_code: str, *,
         sql += " AND trade_date <= ?"
         params.append(str(end_date))
     sql += " ORDER BY trade_date"
-    return [dict(row) for row in conn.execute(sql, params)]
+    rows = conn.execute(sql, params)
+    if slim:
+        return [_slim_row(row) for row in rows]
+    return [dict(row) for row in rows]
 
 
 def query_all_latest_water_level(conn: sqlite3.Connection, *,
@@ -429,7 +748,7 @@ def query_all_latest_water_level(conn: sqlite3.Connection, *,
            COALESCE(l.pinned, 0) AS pinned
     FROM {DAILY_TABLE} d
     LEFT JOIN {META_TABLE} m ON m.sector_code = d.sector_code
-    LEFT JOIN {LIST_TABLE} l ON l.sector_code = d.sector_code
+    LEFT JOIN {config_table(LIST_TABLE)} l ON l.sector_code = d.sector_code
     WHERE d.trade_date = ?
     """
     params: list[Any] = [target]
@@ -473,7 +792,7 @@ def query_alerts(conn: sqlite3.Connection, *, threshold: float = 0.8,
              WHERE x.sector_code = d.sector_code) AS max_ma5_crowding
     FROM {DAILY_TABLE} d
     LEFT JOIN {META_TABLE} m ON m.sector_code = d.sector_code
-    LEFT JOIN {LIST_TABLE} l ON l.sector_code = d.sector_code
+    LEFT JOIN {config_table(LIST_TABLE)} l ON l.sector_code = d.sector_code
     WHERE d.trade_date = ? AND d.water_level IS NOT NULL AND d.water_level >= ?
     """
     params: list[Any] = [target, float(threshold)]
@@ -490,12 +809,25 @@ def query_alerts(conn: sqlite3.Connection, *, threshold: float = 0.8,
 
 
 def query_sector_meta(conn: sqlite3.Connection, *,
-                      concepts_only: bool = False) -> list[dict[str, Any]]:
+                      concepts_only: bool = False,
+                      sector_code: str = "") -> list[dict[str, Any]]:
+    """板块元数据。
+
+    `sector_code` 非空时**按主键直查一行** —— 详情接口原先读整表（2517 行）
+    再在 Python 里线性查找，纯属浪费（`CHG-0137`）。返回仍是列表，
+    保持既有调用方的形态不变。
+    """
     sql = f"SELECT * FROM {META_TABLE}"
-    if concepts_only:
+    params: list[Any] = []
+    if sector_code:
+        sql += " WHERE sector_code = ?"
+        params.append(str(sector_code))
+        if concepts_only:
+            sql += " AND is_concept = 1"
+    elif concepts_only:
         sql += " WHERE is_concept = 1"
     sql += " ORDER BY sector_code"
-    return [dict(row) for row in conn.execute(sql)]
+    return [dict(row) for row in conn.execute(sql, params)]
 
 
 # ======================================================================
@@ -509,7 +841,7 @@ def list_watchlist(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         f"SELECT w.sector_code, w.sector_name, w.note, w.added_at, "
         f"       d.water_level, d.ma5_crowding, d.raw_crowding, "
         f"       d.sector_amount, d.market_amount, d.trade_date "
-        f"FROM {WATCH_TABLE} w "
+        f"FROM {config_table(WATCH_TABLE)} w "
         f"LEFT JOIN {DAILY_TABLE} d ON d.sector_code = w.sector_code "
         f"     AND d.trade_date = ? "
         f"ORDER BY w.added_at DESC", (latest,)).fetchall()
@@ -523,22 +855,25 @@ def add_to_watchlist(conn: sqlite3.Connection, sector_code: str, *,
     if not code:
         raise ValueError("sector_code 不能为空")
     existed = conn.execute(
-        f"SELECT 1 FROM {WATCH_TABLE} WHERE sector_code = ?", (code,)).fetchone()
+        f"SELECT 1 FROM {config_table(WATCH_TABLE)} WHERE sector_code = ?", (code,)).fetchone()
     conn.execute(
-        f"INSERT INTO {WATCH_TABLE}(sector_code, sector_name, note, added_at) "
+        f"INSERT INTO {config_table(WATCH_TABLE)}(sector_code, sector_name, note, added_at) "
         f"VALUES (?,?,?,?) ON CONFLICT(sector_code) DO UPDATE SET "
+        # 不写 `表名.列`：UPSERT 里目标表已限定为 `app_db.<table>`，
+        # 再拼一次会变成 `app_db.<table>.<col>`（**非法 SQL**）。
+        # `DO UPDATE` 的未限定列名本来就解析到目标表。
         f"sector_name = CASE WHEN excluded.sector_name <> '' "
         f"                    THEN excluded.sector_name "
-        f"                    ELSE {WATCH_TABLE}.sector_name END, "
+        f"                    ELSE sector_name END, "
         f"note = CASE WHEN excluded.note <> '' THEN excluded.note "
-        f"             ELSE {WATCH_TABLE}.note END",
+        f"             ELSE note END",
         (code, str(sector_name or ""), str(note or ""), _now()))
     conn.commit()
     return existed is None
 
 
 def remove_from_watchlist(conn: sqlite3.Connection, sector_code: str) -> bool:
-    cursor = conn.execute(f"DELETE FROM {WATCH_TABLE} WHERE sector_code = ?",
+    cursor = conn.execute(f"DELETE FROM {config_table(WATCH_TABLE)} WHERE sector_code = ?",
                           (str(sector_code).strip(),))
     conn.commit()
     return bool(cursor.rowcount)
@@ -546,7 +881,7 @@ def remove_from_watchlist(conn: sqlite3.Connection, sector_code: str) -> bool:
 
 def watchlist_codes(conn: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in conn.execute(
-        f"SELECT sector_code FROM {WATCH_TABLE}")}
+        f"SELECT sector_code FROM {config_table(WATCH_TABLE)}")}
 
 
 # ======================================================================
@@ -604,9 +939,9 @@ def query_list_view(conn: sqlite3.Connection, *,
            d.trade_date, d.sector_amount, d.market_amount,
            d.raw_crowding, d.ma5_crowding, d.water_level
     FROM {META_TABLE} m
-    LEFT JOIN {LIST_TABLE} l ON l.sector_code = m.sector_code
-    LEFT JOIN {WATCH_TABLE} w ON w.sector_code = m.sector_code
-    LEFT JOIN {ALERT_TABLE} a ON a.sector_code = m.sector_code
+    LEFT JOIN {config_table(LIST_TABLE)} l ON l.sector_code = m.sector_code
+    LEFT JOIN {config_table(WATCH_TABLE)} w ON w.sector_code = m.sector_code
+    LEFT JOIN {config_table(ALERT_TABLE)} a ON a.sector_code = m.sector_code
     LEFT JOIN {DAILY_TABLE} d
            ON d.sector_code = m.sector_code AND d.trade_date = ?
     """
@@ -624,10 +959,10 @@ def query_list_view(conn: sqlite3.Connection, *,
            COALESCE(a2.mode, ''), a2.threshold,
            d2.trade_date, d2.sector_amount, d2.market_amount,
            d2.raw_crowding, d2.ma5_crowding, d2.water_level
-    FROM {LIST_TABLE} l
+    FROM {config_table(LIST_TABLE)} l
     LEFT JOIN {META_TABLE} m2 ON m2.sector_code = l.sector_code
-    LEFT JOIN {WATCH_TABLE} w2 ON w2.sector_code = l.sector_code
-    LEFT JOIN {ALERT_TABLE} a2 ON a2.sector_code = l.sector_code
+    LEFT JOIN {config_table(WATCH_TABLE)} w2 ON w2.sector_code = l.sector_code
+    LEFT JOIN {config_table(ALERT_TABLE)} a2 ON a2.sector_code = l.sector_code
     LEFT JOIN {DAILY_TABLE} d2
            ON d2.sector_code = l.sector_code AND d2.trade_date = ?
     WHERE m2.sector_code IS NULL
@@ -685,25 +1020,28 @@ def upsert_list_item(conn: sqlite3.Connection, sector_code: str, *,
         raise ValueError("sector_code 不能为空")
     stamp = _now()
     existed = conn.execute(
-        f"SELECT 1 FROM {LIST_TABLE} WHERE sector_code = ?", (code,)).fetchone()
+        f"SELECT 1 FROM {config_table(LIST_TABLE)} WHERE sector_code = ?", (code,)).fetchone()
     conn.execute(
         f"""
-        INSERT INTO {LIST_TABLE}
+        INSERT INTO {config_table(LIST_TABLE)}
             (sector_code, sector_name, visible, pinned, source, sort_order,
              created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(sector_code) DO UPDATE SET
+            -- 不写 `表名.列`：目标表已限定为 `app_db.<table>`，
+            -- 再拼一次会变成 `app_db.<table>.<col>`（**非法 SQL**）。
+            -- `DO UPDATE` 的未限定列名本来就解析到目标表。
             sector_name = CASE WHEN excluded.sector_name <> ''
                                THEN excluded.sector_name
-                               ELSE {LIST_TABLE}.sector_name END,
+                               ELSE sector_name END,
             visible = CASE WHEN ? = 1 THEN excluded.visible
-                           ELSE {LIST_TABLE}.visible END,
+                           ELSE visible END,
             pinned  = CASE WHEN ? = 1 THEN excluded.pinned
-                           ELSE {LIST_TABLE}.pinned END,
+                           ELSE pinned END,
             source  = CASE WHEN excluded.source <> '' THEN excluded.source
-                           ELSE {LIST_TABLE}.source END,
+                           ELSE source END,
             sort_order = CASE WHEN ? = 1 THEN excluded.sort_order
-                              ELSE {LIST_TABLE}.sort_order END,
+                              ELSE sort_order END,
             updated_at = excluded.updated_at
         """,
         (code, str(sector_name or ""), 1 if (visible is None or visible) else 0,
@@ -714,7 +1052,7 @@ def upsert_list_item(conn: sqlite3.Connection, sector_code: str, *,
     )
     conn.commit()
     row = conn.execute(
-        f"SELECT visible, pinned FROM {LIST_TABLE} WHERE sector_code = ?",
+        f"SELECT visible, pinned FROM {config_table(LIST_TABLE)} WHERE sector_code = ?",
         (code,)).fetchone()
     return {"created": existed is None, "sector_code": code,
             "visible": bool(row["visible"]) if row else True,
@@ -754,7 +1092,7 @@ def seed_list(conn: sqlite3.Connection, *, concepts_only: bool = True) -> int:
     （主线点名批次 ∪ 拥挤度剔除清单），三处口径一致，不会漂移。
     """
     existing = {str(row[0]) for row in conn.execute(
-        f"SELECT sector_code FROM {LIST_TABLE}")}
+        f"SELECT sector_code FROM {config_table(LIST_TABLE)}")}
     blocked = _sector_blacklist()
     sql = f"SELECT sector_code, sector_name FROM {META_TABLE} WHERE bars > 0"
     if concepts_only:
@@ -768,7 +1106,7 @@ def seed_list(conn: sqlite3.Connection, *, concepts_only: bool = True) -> int:
     if not payload:
         return 0
     conn.executemany(
-        f"INSERT INTO {LIST_TABLE} (sector_code, sector_name, visible, pinned, "
+        f"INSERT INTO {config_table(LIST_TABLE)} (sector_code, sector_name, visible, pinned, "
         f"source, sort_order, created_at, updated_at) "
         f"VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(sector_code) DO NOTHING", payload)
     conn.commit()
@@ -789,12 +1127,12 @@ def hide_dead_boards(conn: sqlite3.Connection, *, force: bool = False) -> int:
     # 注意：SQLite 的 UPDATE 不接受 `SET 别名.列`（那只在 SELECT 里成立），
     # 所以这里不写 `UPDATE ... AS l SET l.visible=0`，直接写列名。
     cursor = conn.execute(f"""
-        UPDATE {LIST_TABLE}
+        UPDATE {config_table(LIST_TABLE)}
            SET visible = 0, source = '{SOURCE_HIDDEN}', updated_at = ?
          WHERE visible = 1
            AND COALESCE(source, '') <> '{SOURCE_MANUAL}'
            AND EXISTS (SELECT 1 FROM {META_TABLE} m
-                        WHERE m.sector_code = {LIST_TABLE}.sector_code
+                        WHERE m.sector_code = {config_table(LIST_TABLE)}.sector_code
                           AND m.bars = 0)
            {guard}
     """, (_now(),))
@@ -813,11 +1151,11 @@ def has_hideable_dead_boards(conn: sqlite3.Connection, *,
     """
     guard = "" if force else f" AND COALESCE(source, '') <> '{SOURCE_HIDDEN}'"
     row = conn.execute(f"""
-        SELECT 1 FROM {LIST_TABLE}
+        SELECT 1 FROM {config_table(LIST_TABLE)}
          WHERE visible = 1
            AND COALESCE(source, '') <> '{SOURCE_MANUAL}'
            AND EXISTS (SELECT 1 FROM {META_TABLE} m
-                        WHERE m.sector_code = {LIST_TABLE}.sector_code
+                        WHERE m.sector_code = {config_table(LIST_TABLE)}.sector_code
                           AND m.bars = 0)
            {guard}
          LIMIT 1
@@ -843,7 +1181,7 @@ def query_hidden_boards(conn: sqlite3.Connection, *, keyword: str = "",
            COALESCE(m.last_update_date, '') AS last_update_date,
            (SELECT MAX(d.trade_date) FROM {DAILY_TABLE} d
              WHERE d.sector_code = l.sector_code) AS last_trade_date
-      FROM {LIST_TABLE} l
+      FROM {config_table(LIST_TABLE)} l
       LEFT JOIN {META_TABLE} m ON m.sector_code = l.sector_code
      WHERE l.visible = 0
     """
@@ -863,7 +1201,7 @@ def query_hidden_boards(conn: sqlite3.Connection, *, keyword: str = "",
 def count_hidden_dead(conn: sqlite3.Connection) -> int:
     """被系统标为 hidden 且仍未刷到数据的板块数（界面提示用）。"""
     row = conn.execute(f"""
-        SELECT COUNT(*) AS n FROM {LIST_TABLE} l
+        SELECT COUNT(*) AS n FROM {config_table(LIST_TABLE)} l
           LEFT JOIN {META_TABLE} m ON m.sector_code = l.sector_code
          WHERE l.visible = 0 AND l.source = '{SOURCE_HIDDEN}'
            AND COALESCE(m.bars, 0) = 0
@@ -935,7 +1273,7 @@ def rebuild_max_ma5_table(conn: sqlite3.Connection, *,
 
 
 def count_list_rows(conn: sqlite3.Connection) -> int:
-    return int(conn.execute(f"SELECT COUNT(*) FROM {LIST_TABLE}").fetchone()[0])
+    return int(conn.execute(f"SELECT COUNT(*) FROM {config_table(LIST_TABLE)}").fetchone()[0])
 
 
 # ======================================================================
@@ -980,7 +1318,7 @@ def upsert_alert(conn: sqlite3.Connection, sector_code: str, *,
     stamp = _now()
     conn.execute(
         f"""
-        INSERT INTO {ALERT_TABLE}(sector_code, mode, threshold, note,
+        INSERT INTO {config_table(ALERT_TABLE)}(sector_code, mode, threshold, note,
                                   created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(sector_code) DO UPDATE SET
@@ -992,7 +1330,7 @@ def upsert_alert(conn: sqlite3.Connection, sector_code: str, *,
 
 
 def delete_alert(conn: sqlite3.Connection, sector_code: str) -> bool:
-    cursor = conn.execute(f"DELETE FROM {ALERT_TABLE} WHERE sector_code = ?",
+    cursor = conn.execute(f"DELETE FROM {config_table(ALERT_TABLE)} WHERE sector_code = ?",
                           (str(sector_code or "").strip(),))
     conn.commit()
     return bool(cursor.rowcount)
@@ -1001,12 +1339,12 @@ def delete_alert(conn: sqlite3.Connection, sector_code: str) -> bool:
 def query_alerts_config(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
     """全部自定义告警配置，按 `sector_code` 索引（前端整表渲染用）。"""
     return {str(row["sector_code"]): dict(row)
-            for row in conn.execute(f"SELECT * FROM {ALERT_TABLE}")}
+            for row in conn.execute(f"SELECT * FROM {config_table(ALERT_TABLE)}")}
 
 
 def count_alerts_config(conn: sqlite3.Connection) -> int:
     return int(conn.execute(
-        f"SELECT COUNT(*) FROM {ALERT_TABLE}").fetchone()[0])
+        f"SELECT COUNT(*) FROM {config_table(ALERT_TABLE)}").fetchone()[0])
 
 
 def reset_list(conn: sqlite3.Connection) -> int:
@@ -1016,7 +1354,7 @@ def reset_list(conn: sqlite3.Connection) -> int:
     全部抹掉，那是"重置"而不是"清空"。清空后靠 `query_list_view` 的
     `COALESCE(l.*, 默认)` 回落即可（新用户本来就该看到全量）。
     """
-    cursor = conn.execute(f"DELETE FROM {LIST_TABLE}")
+    cursor = conn.execute(f"DELETE FROM {config_table(LIST_TABLE)}")
     conn.commit()
     return int(cursor.rowcount or 0)
 
@@ -1056,7 +1394,7 @@ def upsert_metrics(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]],
         return 0
     conn.executemany(
         f"""
-        INSERT INTO {METRIC_TABLE}
+        INSERT INTO {config_table(METRIC_TABLE)}
             (sector_code, sector_name, compute_week, computed_at,
              base_date_5d, chg_5d, base_date_1m, chg_1m,
              base_date_2m, chg_2m, flow_base_date, flow_last_date,
@@ -1089,7 +1427,7 @@ def upsert_metrics(conn: sqlite3.Connection, rows: Iterable[dict[str, Any]],
 def latest_metric_week(conn: sqlite3.Connection) -> str:
     """库里最新一周的指标键（'' = 从未算过）。"""
     row = conn.execute(
-        f"SELECT MAX(compute_week) AS w FROM {METRIC_TABLE}").fetchone()
+        f"SELECT MAX(compute_week) AS w FROM {config_table(METRIC_TABLE)}").fetchone()
     return str(row["w"] or "") if row else ""
 
 
@@ -1117,7 +1455,7 @@ def query_metrics(conn: sqlite3.Connection, *, week: str = ""
     if not target:
         return {}
     rows = conn.execute(
-        f"SELECT * FROM {METRIC_TABLE} WHERE compute_week = ?", (target,))
+        f"SELECT * FROM {config_table(METRIC_TABLE)} WHERE compute_week = ?", (target,))
     blocked = _sector_blacklist()
     return {str(row["sector_code"]): dict(row) for row in rows
             if str(row["sector_code"]) not in blocked}
@@ -1156,13 +1494,13 @@ def _sector_blacklist() -> frozenset[str]:
 
 def get_metric_meta(conn: sqlite3.Connection) -> dict[str, str]:
     return {str(row["key"]): str(row["value"])
-            for row in conn.execute(f"SELECT key, value FROM {METRIC_META_TABLE}")}
+            for row in conn.execute(f"SELECT key, value FROM {config_table(METRIC_META_TABLE)}")}
 
 
 def set_metric_meta(conn: sqlite3.Connection, values: dict[str, str]) -> None:
     stamp = _now()
     conn.executemany(
-        f"INSERT INTO {METRIC_META_TABLE}(key, value, updated_at) VALUES (?,?,?) "
+        f"INSERT INTO {config_table(METRIC_META_TABLE)}(key, value, updated_at) VALUES (?,?,?) "
         f"ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
         f"updated_at = excluded.updated_at",
         [(str(k), str(v), stamp) for k, v in values.items()])
@@ -1171,7 +1509,7 @@ def set_metric_meta(conn: sqlite3.Connection, values: dict[str, str]) -> None:
 
 def reset_metrics(conn: sqlite3.Connection) -> int:
     """删掉全部周频指标（重算前清场用，避免历史周堆积）。"""
-    cursor = conn.execute(f"DELETE FROM {METRIC_TABLE}")
+    cursor = conn.execute(f"DELETE FROM {config_table(METRIC_TABLE)}")
     conn.commit()
     return int(cursor.rowcount or 0)
 
@@ -1246,6 +1584,7 @@ __all__ = [
     "count_list_rows",
     "count_rows",
     "delete_alert",
+    "ensure_config_tables",
     "get_db_connection",
     "get_last_update_date",
     "get_metric_meta",
@@ -1272,6 +1611,8 @@ __all__ = [
     "search_sectors",
     "seed_list",
     "set_metric_meta",
+    "SLIM_COLUMNS",
+    "SLIM_PRECISION",
     "update_sector_meta",
     "upsert_alert",
     "upsert_list_item",

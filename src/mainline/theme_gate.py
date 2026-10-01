@@ -36,7 +36,15 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-#: 胜率门槛：**严格大于**它才保留（与 `alert_returns.DEFAULT_MIN_WIN_RATE` 同值）。
+#: 胜率门槛（**池级取舍**）：**严格大于**它才保留。
+#:
+#: ⚠️ **不再与 `alert_returns.DEFAULT_MIN_WIN_RATE` 同值**（2026-09-30）：那个是
+#: **展示口径**（"这次给不给你看"，同年 09-30 放宽到 0.39），这个是**池级取舍**
+#: （"这个题材还做不做"）。**跟着一起降会造成静默缩水**：`select()` 会把胜率落在
+#: (0.39, 0.40] 的题材也判成"该剔"，而它们不在冻结名单内 ⇒ 下次生成清单 + 同步
+#: 之后池子会少几个题材，且 `scripts/build_theme_exclusions.py --keep` 也留不住
+#: （`--keep` 只在**已经**被判为剔除时才生效）。改这个数=改池子，必须显式。
+#: 判据：`tests/unit/test_mainline_alert_returns.py::test_display_gate_is_decoupled_from_pool_gate`。
 DEFAULT_THRESHOLD = 0.40
 #: 至少要有几个「已走满的 20 日窗口」才有资格被剔除；低于它的进观察名单。
 DEFAULT_MIN_SAMPLES = 3

@@ -49,9 +49,16 @@ KIND_SEARCH_SOURCE = "search_source"
 #: ★ 换源线索（`CHG-0120`）：某个指标没有连接器支持，联网搜到了候选源网址。
 #: **它不是故障**，是"待人工复核的候选" —— 所以单独一类，别与 gap 混。
 KIND_SOURCE_LEAD = "source_lead"
+#: ★ 作业**墙钟预算被截断**（`CHG-0137`）：一轮作业没跑完就到了预算上限。
+#: **不是故障**（源慢/源挂才是），但它是"作业与在线服务争资源"的**直接证据**，
+#: 且在实测里正是"前端显示后端不可达"的根因（日K预热 316s > 90s 预算 > 120s cron）。
+KIND_JOB_BUDGET = "job_budget"
+#: ★ API **事件循环被阻塞**（`CHG-0137`）：1 Hz 采样到的调度延迟超过阈值。
+#: 这一条是"服务不可达"的**唯一直接仪器** —— 在此之前我们只能靠请求延迟反推。
+KIND_LOOP_LAG = "loop_lag"
 
 KINDS = (KIND_GAP, KIND_TIMEOUT, KIND_ERROR, KIND_NOT_APPLICABLE,
-         KIND_SEARCH_SOURCE, KIND_SOURCE_LEAD)
+         KIND_SEARCH_SOURCE, KIND_SOURCE_LEAD, KIND_JOB_BUDGET, KIND_LOOP_LAG)
 
 #: 是否记录 `not_applicable`：它**不是故障**，默认不记（记了会让"异常区"变噪音）。
 RECORD_NOT_APPLICABLE = False
@@ -211,6 +218,8 @@ __all__ = [
     "KINDS",
     "KIND_ERROR",
     "KIND_GAP",
+    "KIND_JOB_BUDGET",
+    "KIND_LOOP_LAG",
     "KIND_NOT_APPLICABLE",
     "KIND_SEARCH_SOURCE",
     "KIND_SOURCE_LEAD",

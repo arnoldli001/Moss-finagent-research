@@ -8,12 +8,12 @@
 - **Priority**: high
 - **Depends On**: None
 - **Description**:
-  - `src/core/config.py` 新增告警配置段（均带默认值，敏感项无默认值仅取环境变量）：`alert_scan_candidate_limit=30`、`alert_confidence_min=0.70`、风险/机会各级阈值、`alert_expire_days=7`、`alert_cooldown_hours=24`、`alert_email_enabled`(默认按授权码是否存在推导)、`alert_smtp_host=smtp.qq.com`、`alert_smtp_port=465`、`alert_smtp_user`、`alert_smtp_auth_code`(env ALERT_SMTP_AUTH_CODE)、`alert_email_to=2693888583@qq.com`、`alert_email_min_level=high`、`alert_keywords`（政策/板块触发词内置默认列表，逗号分隔可覆盖）。
+  - `src/core/config.py` 新增告警配置段（均带默认值，敏感项无默认值仅取环境变量）：`alert_scan_candidate_limit=30`、`alert_confidence_min=0.70`、风险/机会各级阈值、`alert_expire_days=7`、`alert_cooldown_hours=24`、`alert_email_enabled`(默认按授权码是否存在推导)、`alert_smtp_host=smtp.qq.com`、`alert_smtp_port=465`、`alert_smtp_user`、`alert_smtp_auth_code`(env ALERT_SMTP_AUTH_CODE)、`alert_email_to=your_qq_number@qq.com`、`alert_email_min_level=high`、`alert_keywords`（政策/板块触发词内置默认列表，逗号分隔可覆盖）。
   - 新建 `src/domain/alerts/__init__.py`、`models.py`：EventType/AlertType/AlertLevel/EventSource 枚举；`Event`、`Alert`、`AffectedStock` Pydantic 模型（snake_case，含 tenant_id、溯源字段、disclaimer 常量）。
   - `.env.example` 增加告警/邮件段（授权码占位，不写真实值）。
 - **Acceptance Criteria Addressed**: AC-2
 - **Test Requirements**:
-  - `rule` TR-1.1: 配置从环境变量读取授权码且默认收件人为 2693888583@qq.com；模型默认 tenant_id=tenant_001；证据：tests/unit/test_alert_models.py
+  - `rule` TR-1.1: 配置从环境变量读取授权码且默认收件人为 your_qq_number@qq.com；模型默认 tenant_id=tenant_001；证据：tests/unit/test_alert_models.py
   - `rule` TR-1.2: 模型序列化字段全部 snake_case 且 Event/Alert 必需字段缺失时抛校验错误；证据：同文件断言
 
 ## Task 2: 事件采集器与标准化（多源主备）

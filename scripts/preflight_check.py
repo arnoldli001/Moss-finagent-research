@@ -267,6 +267,24 @@ _AGENT_MODS: dict[str, str] = {
     "A15_cyclical":
         "src.domain.agents.industry.cyclical.agent:CyclicalIndustryAgent",
     "A16_pharma": "src.domain.agents.industry.pharma.agent:PharmaIndustryAgent",
+    #: ★ 2026-09-30 补：`A20_generic_industry`（兜底行业 Agent，2026-09-29 新增）。
+    #:
+    #: **为什么会漏**：这张表是**手写**的，而"新增了一个 Agent"这个动作
+    #: **不会**自动让它长出一行 —— 于是 A20 在被加进 `runtime`（实测注册 20 个）
+    #: 与白名单（带 `cal:`）之后，这里仍然只有 9 条。
+    #: 症状不是"少查一项"，而是 `test_preflight_check.py` **两条红灯**：
+    #: 「已教 9/10，**漏教**：A20_generic_industry(分析映射)」
+    #: 与「这些 Agent 带了 cal: 但 preflight 没有做映射」。
+    #:
+    #: ⚠️ **真因只是这张表少一行，A20 的 prompt 其实教了**
+    #: （它 `system_prompt` 里调了 `render_unlock_teaching("A20_generic_industry")`，
+    #: 实测产出 623 字、含「解禁」与 `unlock`）。
+    #: 也就是说：**看到"漏教"别急着去改 prompt** —— 先看是不是这张手写表漏了行。
+    #: 同一个坑 `tests/unit/test_indicator_prefix_wiring.py` 里已经踩过一次
+    #: （它自己那份 `_AGENT_CLASS_SPECS` 当时也漏了 A20，注释里记着）。
+    #: **两份手写映射 = 必然漂移**，所以另有一条跨表一致性判据盯着它们。
+    "A20_generic_industry":
+        "src.domain.agents.industry.generic.agent:GenericIndustryAgent",
 }
 
 #: 前缀 → prompt 判据关键词（只认机器可读的标识，不认文案）

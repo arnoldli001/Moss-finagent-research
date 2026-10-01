@@ -29,8 +29,8 @@ SQLite 文件里 upsert，而且各自以为自己是唯一写者。
 """
 from __future__ import annotations
 
-import asyncio
 import ast
+import asyncio
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,8 +40,8 @@ import pytest
 
 from src.infrastructure.catalog import data_stores as ds
 from src.scheduler import registry as reg
-from src.scheduler.service import CronScheduler
 from src.scheduler.registry import JOB_REGISTRY, JobSpec
+from src.scheduler.service import CronScheduler
 
 #: 事故里那个"更新行情仓"的作业（从 `updates` 派生，不写死名字）
 WAREHOUSE_JOBS = tuple(
@@ -638,8 +638,8 @@ def test_health_exposes_schedule_scope_contract(client) -> None:
     而"不可见的护栏"正是本项目最贵的那类缺陷。
     """
     from src.scheduler.registry import (
-        SCHEDULER_DENY_ENV,
         JOB_REGISTRY,
+        SCHEDULER_DENY_ENV,
         job_deny_reason,
         schedulable_jobs,
     )
@@ -649,14 +649,32 @@ def test_health_exposes_schedule_scope_contract(client) -> None:
     assert isinstance(scope, dict), (
         "data_sources.schedule 缺失 —— 被裁的作业又变成不可见的了")
     assert scope.get("available") is True, scope
-    for key in ("env", "total", "active", "pruned", "unknown_denied", "deny_env"):
+    # ★ `CHG-0141`：`role` / `out_of_role` / `worker` 三个字段是"重作业移出本进程"
+    #   之后**唯一能看见**"它们此刻跑不跑"的面 —— 缺了它们，`/health` 会全绿，
+    #   而那 4 个作业可能一直没人执行（前端不会报，因为 worker 没有端口）。
+    for key in ("env", "total", "active", "pruned", "unknown_denied", "deny_env",
+                "role", "out_of_role", "worker"):
         assert key in scope, f"缺字段 {key}"
     assert scope["env"] == ds.current_env()
     assert scope["deny_env"] == SCHEDULER_DENY_ENV
     assert scope["total"] == len(JOB_REGISTRY)
     # ★ 同源判据：接口里的 active 必须等于 `_tick()` 真跑时遍历的作业数
     assert scope["active"] == len(schedulable_jobs())
-    assert scope["active"] + len(scope["pruned"]) == scope["total"]
+    # 恒等式要写成**通用**形式（角色外也算掉一份）—— 原来写的是
+    # `active + pruned == total`，那在"未设角色"时才成立；一旦角色拆分生效
+    # （role=api）它就会假红，而假红的下场是有人把这条判据删掉。
+    assert (scope["active"] + len(scope["pruned"])
+            + len(scope["out_of_role"])) == scope["total"]
+    # `worker` 段的形状（值随环境变，但字段与路径来源是契约）
+    worker = scope["worker"]
+    for key in ("needed", "alive", "fresh", "age_sec", "ok", "verdict", "path"):
+        assert key in worker, f"worker 段缺字段 {key}"
+    assert worker["verdict"].strip(), "worker 段必须带人话结论"
+    assert worker["path"].endswith("worker_heartbeat.json"), worker["path"]
+    assert str(worker["path"]).startswith(str(ds.store_rel("scheduler_dir"))) or \
+        "scheduler" in worker["path"], (
+            f"心跳路径必须来自本环境的调度目录（否则会读到别的实例的心跳）："
+            f"{worker['path']}")
     # 逐条对账：被点名的作业必须真的被判为"不该触发"，且理由是人话
     assert {i["job"] for i in scope["pruned"]} == {
         name for name in JOB_REGISTRY if job_deny_reason(name)}

@@ -348,6 +348,58 @@ def checkpoint_and_close(db_path: str | Path) -> bool:
             pass
 
 
+def sqlite_paths_to_check() -> list[str]:
+    """关停/启动时要确认可用的**可写** SQLite 库清单。
+
+    ★ 2026-09-30（`CHG-0139`）从 `src/api/main.py` 搬到这里，**逐字搬运**。
+
+    为什么必须搬：调度 worker 拆成了独立进程，它和 API 进程各持一份主库连接，
+    关停时**两边都要** checkpoint。如果清单/收尾逻辑留两个副本，
+    必然出现"改了 API 那份、忘了 worker 那份"——而症状是
+    **worker 被杀后留下脏 `-wal`**，下次启动的主库 `disk I/O error`
+    （本模块开头记的那次事故）。本项目对"同一件事写两处"的记账是：
+    **写在两处的清单必然漂移**，所以这里只留一处，两边都调它。
+
+    刻意**不含** `data/quant/warehouse.db`：那是 15GB 只读为主的行情仓库，
+    没有 WAL 一致性问题的历史，不该在关停时对它做任何写动作。
+    """
+    from src.core.config import get_settings
+
+    settings = get_settings()
+    paths = [str(settings.sqlite_path)]
+    for name in ("alert_db_path", "scheduler_dir"):
+        raw = getattr(settings, name, None)
+        if isinstance(raw, str) and raw.endswith(".db"):
+            paths.append(raw)
+    # 去重保序
+    seen: set[str] = set()
+    unique: list[str] = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+
+def checkpoint_and_release_all() -> tuple[int, int]:
+    """**关停收尾**：释放常驻连接 + 对每个主干库各做一次 checkpoint。
+
+    返回 `(released, cleaned)`：释放的常驻连接数、checkpoint 成功的库数。
+    任何一句失败都**不影响**其余收尾（关停是尽力而为 —— `src/api/main.py`
+    的关停段为这条写过一次血案：一句 `AttributeError` 让后面的 checkpoint
+    全部没执行，于是下次启动又读到脏 `-wal`）。
+    """
+    released = release_all_connections()
+    cleaned = 0
+    for db in sqlite_paths_to_check():
+        try:
+            if checkpoint_and_close(db):
+                cleaned += 1
+        except Exception:  # noqa: BLE001 单库失败不拖累其余
+            continue
+    return released, cleaned
+
+
 def is_healthy(db_path: str | Path) -> bool:
     """只读判断（给测试/诊断用），不改动磁盘。"""
     path = Path(db_path)

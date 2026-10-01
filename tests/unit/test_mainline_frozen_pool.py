@@ -9,6 +9,11 @@
 落地：`configs/mainline_frozen_pool.yaml`（122 条）+ `import_crowding_pool`
 以它为**唯一权威**。
 
+⚠️ **冻结值 122 → 124**（`CHG-0121`，2026-09-30）：用户裁定「只放过这两个题材」
+—— `886015.TI 创新药` / `885927.TI CRO概念` 由人工放回池内（恢复前判据：
+胜率 23.8% / 39.1%，已走满 21 / 23 个窗口）。判据见
+`test_restored_themes_are_in_the_pool`。
+
 ⚠️ 这些测试的**关键不变量**是「读不到就退回动态口径」——
 冻结文件坏掉/被删时，绝不能把主线池变成空的（那会让整条主线静默停摆）。
 """
@@ -20,6 +25,12 @@ import pytest
 
 CONFIGS = Path(__file__).resolve().parents[2] / "configs"
 REAL = "mainline_frozen_pool.yaml"
+THEME_EXCLUSIONS = "mainline_theme_exclusions.yaml"
+
+#: 2026-09-30 人工恢复的 2 个题材（用户裁定「只放过这两个题材」）。
+#: ⚠️ 它们必须同时在**两处**被放过：冻结名单（决定能不能入池）与
+#: 池级剔除清单（`boards()` 出口还会再挡一道）—— 只改一处等于没改，且不报错。
+RESTORED_THEMES = {"886015.TI": "创新药", "885927.TI": "CRO概念"}
 
 
 def test_missing_file_returns_none() -> None:
@@ -74,22 +85,60 @@ def test_entries_without_code_are_ignored() -> None:
         path.unlink(missing_ok=True)
 
 
-def test_shipped_frozen_pool_is_122_and_all_concept_prefixes() -> None:
-    """随仓库发布的冻结名单：122 条，且全是 885/886 概念指数。
+def test_shipped_frozen_pool_is_124_and_all_concept_prefixes() -> None:
+    """随仓库发布的冻结名单：124 条，且全是 885/886 概念指数。
 
     `885/886` 是同花顺概念指数段；出现别的段（`881` 行业 / `700` 宽基 /
     `871` GICS）说明名单里混进了非概念板块 —— 那正是这次要清掉的东西。
 
-    ⚠️ 122 是**冻结值**：它变了说明有人在动这条口径，必须是有意的。
+    ⚠️ 124 是**冻结值**（122 + 2026-09-30 人工恢复的 2 个，`CHG-0121`）：
+    它变了说明有人在动这条口径，必须是有意的。
     """
     from src.mainline.datastore import load_frozen_pool
 
     codes = load_frozen_pool(REAL)
     if codes is None:
         pytest.skip(f"{REAL} 不存在（未启用冻结口径）")
-    assert len(codes) == 122, f"冻结名单应为 122 条，实际 {len(codes)}"
+    assert len(codes) == 124, f"冻结名单应为 124 条，实际 {len(codes)}"
     bad = sorted(c for c in codes if not c.startswith(("885", "886")))
     assert not bad, f"名单里混进了非概念段：{bad[:5]}"
+
+
+def test_restored_themes_are_in_the_pool() -> None:
+    """**回归测试**：2026-09-30 人工恢复的 2 个题材必须两处都在。
+
+    ## 它防的是哪一种故障
+
+    「放过一个题材」要改**两处**才产生可观察行为：
+
+      ① `configs/mainline_frozen_pool.yaml` —— 决定它能不能**入池**
+         （`import_crowding_pool` 只保留名单内的）；
+      ② `configs/mainline_theme_exclusions.yaml` 的 `codes:` —— `boards()`
+         出口**再挡一道**（池级剔除：不打分 / 不告警 / 不再同步行情）。
+
+    只改① → 板块进了 `ml_board`、却仍被 `boards()` 过滤掉：
+    **库里有、接口里没有**，而全程零报错（面板上只表现为"改了名单但还是看不到"）。
+    只改② → 它压根不入池，同样看不到。
+
+    ⚠️ 第②处是**生成脚本的产物**（`scripts/build_theme_exclusions.py`），
+    重新生成时若忘了带 `--keep 886015.TI --keep 885927.TI`，这两行会被写回去
+    —— 这个测试就是那次"静默回退"的哨兵。
+    """
+    from src.mainline.config import load_theme_exclusions
+    from src.mainline.datastore import load_frozen_pool
+
+    frozen = load_frozen_pool(REAL)
+    if frozen is None:
+        pytest.skip(f"{REAL} 不存在（未启用冻结口径）")
+    missing = sorted(set(RESTORED_THEMES) - frozen)
+    assert not missing, (
+        f"人工恢复的题材不在冻结名单里：{missing} —— "
+        "它们会被重新挡在池外（见 mainline_frozen_pool.yaml 头部说明）")
+
+    gated = sorted(set(RESTORED_THEMES) & load_theme_exclusions(THEME_EXCLUSIONS))
+    assert not gated, (
+        f"人工恢复的题材又出现在池级剔除清单里：{gated} —— "
+        "重新生成清单时必须带 `--keep`，否则冻结名单改了也看不到")
 
 
 def test_pool_is_subset_of_frozen_list() -> None:

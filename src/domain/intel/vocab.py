@@ -10,16 +10,18 @@
 
 | kind | 来源 | 实测条数 | 说明 |
 |---|---|---|---|
-| `concept_board` | `ml_board`（`kind='concept'`） | **122** | 主线挖掘跟踪的板块，带板块代码 |
+| `concept_board` | `ml_board`（`kind='concept'`） | **124** | 主线挖掘跟踪的板块，带板块代码 |
 | `a_stock` | `quant_stock_directory` | **5562** | A 股名录，**代码只从这里取** |
 | `overseas` | 用户手工清单 | **14** | 外部关键标的与关键词（含"加息"） |
 | `ai` | 用户手工清单 | **6** | AI 关键词 |
 
-⚠️ `concept_board` **曾是 138，2026-09-27 起为 122**：主线概念池冻结后
-（`configs/mainline_frozen_pool.yaml`，同样 122 条），`ml_board` 里
-`kind='concept'` 的目录与之**逐字相等**。这个数字是**文档表格**，
+⚠️ `concept_board` **曾是 138，2026-09-27 起为 122，2026-09-30 起为 124**：
+主线概念池冻结后（`configs/mainline_frozen_pool.yaml`）`ml_board` 里
+`kind='concept'` 的目录与之**逐字相等**；124 = 冻结的 122 + 用户裁定
+「只放过这两个题材」人工恢复的 2 个（`886015.TI 创新药` / `885927.TI CRO概念`，
+`CHG-0121`）。这个数字是**文档表格**，
 真正的哨兵在 `tests/unit/test_intel_vocab.py::test_real_table_matches_the_documented_sources`
-（它对着真实库断言）—— 两处必须一起改，否则就是"文档说 138、库里有 122"的漂移。
+（它对着真实库断言）—— 两处必须一起改，否则就是"文档说 122、库里有 124"的漂移。
 
 ⚠️ 顺序有意义：`concept_board` / `a_stock` 是**数据源**，`overseas` / `ai` 是
 **手工维护的清单**（用户原话："不可能完全识别完的，漏掉就漏掉吧"），

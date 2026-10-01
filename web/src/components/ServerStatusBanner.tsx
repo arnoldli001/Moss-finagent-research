@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { pingServer } from "../api";
+import { lastApiOkAgeMs, pingServer } from "../api";
 import { isLocalDevHost } from "../errors";
 
 /** 后端可达性横幅：**只在真的连不上时出现**。
@@ -56,9 +56,24 @@ const GRACE_MULTIPLIER = 3;
 /** 抖动容忍窗口：连续不可达不超过这个时长**不弹红条**。 */
 const GRACE_MS = RETRY_MS * GRACE_MULTIPLIER;
 
+/** 「服务活着但慢」的证据窗口（毫秒，`CHG-0138`）。
+ *
+ * 判据：探针超时了，但**最近这么长时间内有过任何一个成功的 API 请求** ⇒
+ * 服务是活着的、只是在排队（2026-09-30 实测：探针 4s 超时的那几分钟里
+ * `/mainline/refresh_status`、`/alerts/bootstrap` 等最终**全部 200**，最长 64.3 秒）。
+ * 取 8 秒：比"正常页面轮询间隔"略宽，又远小于"真宕机"的判定需要。
+ * 没有这个证据就只能说"不可达"—— 那是**没证据的因果结论**。
+ */
+const SLOW_EVIDENCE_MS = 8000;
+
 export default function ServerStatusBanner() {
   const [down, setDown] = useState(false);
   const [checking, setChecking] = useState(false);
+  //: 「已持续多久」要显示给人看 ⇒ 起算时刻也必须进 state（ref 变化不触发重渲染）。
+  const [downAt, setDownAt] = useState<number | null>(null);
+  //: 浏览器自报的联网状态（`CHG-0138`：它决定文案说"你的网络"还是"服务"）。
+  const [online, setOnline] = useState<boolean>(
+    typeof navigator === "undefined" ? true : navigator.onLine !== false);
   //: 本轮"持续不可达"是从什么时候开始的（恢复即清空）。**唯一**的判据来源。
   const downSince = useRef<number | null>(null);
   const timer = useRef<number | undefined>(undefined);
@@ -68,11 +83,16 @@ export default function ServerStatusBanner() {
     window.clearTimeout(timer.current);
     const ok = await pingServer(4000);
     if (!alive.current) return;
+    setOnline(typeof navigator === "undefined" ? true : navigator.onLine !== false);
     if (ok) {
       downSince.current = null;
+      setDownAt(null);
       setDown(false);
     } else {
-      if (downSince.current === null) downSince.current = Date.now();
+      if (downSince.current === null) {
+        downSince.current = Date.now();
+        setDownAt(downSince.current);
+      }
       // 只有一个判据：**持续不可达够久**（阈值 = 重试周期 × 倍数）。
       // 不再单独数次数 —— 时长窗口本身就蕴含"失败过若干轮"，
       // 两个判据并存等于同一个决定有两个旋钮，迟早互相打架。
@@ -86,12 +106,21 @@ export default function ServerStatusBanner() {
     alive.current = true;
     void tick();
     // 系统层面的断网/恢复事件比轮询更及时
-    const onOnline = () => { downSince.current = null; void tick(); };
-    // ⚠️ offline **不再立刻弹条**：网卡瞬断两三秒就闪"后端不可达"，
+    const onOnline = () => {
+      setOnline(true);
+      downSince.current = null;
+      setDownAt(null);
+      void tick();
+    };
+    // ⚠️ offline **不再立刻弹条**：网卡瞬断两三秒就闪一次横幅，
     //    正是抖动容忍窗口要挡的。这里只**开始计时**，是否显示仍由 tick 按
     //    同一个 GRACE_MS 判定（真断网超过窗口照样会显示）。
     const onOffline = () => {
-      if (downSince.current === null) downSince.current = Date.now();
+      setOnline(false);
+      if (downSince.current === null) {
+        downSince.current = Date.now();
+        setDownAt(downSince.current);
+      }
       void tick();
     };
     window.addEventListener("online", onOnline);
@@ -113,22 +142,50 @@ export default function ServerStatusBanner() {
 
   if (!down) return null;
 
+  // ---- 文案按**证据**分三种，不再用一句"后端不可达"盖住三种完全不同的原因 ----
+  const slowAge = lastApiOkAgeMs();
+  const cause: "offline" | "slow" | "unreachable" =
+    online === false ? "offline"
+      : slowAge <= SLOW_EVIDENCE_MS ? "slow"
+        : "unreachable";
+  const lasted = Math.max(0, Math.round((Date.now() - (downAt ?? Date.now())) / 1000));
+  const lastedText = downAt ? `已持续约 ${lasted} 秒` : "";
+  const okText = Number.isFinite(slowAge)
+    ? `最近一次成功请求 ${Math.round(slowAge / 1000)} 秒前`
+    : "本次会话还没有成功过任何请求";
+
   return (
     <div className="conn-banner" role="alert">
       <span className="conn-dot" aria-hidden="true" />
       <span className="conn-text">
-        <b>后端服务当前不可达。</b>
-        刚才那些「无法连接」的提示就是这么来的 —— 不是你的操作有问题。
-        {isLocalDevHost() ? (
+        {cause === "offline" ? (
           <>
-            请在项目目录执行&nbsp;
-            <code>python manage.py start --daemon --replace</code>
-            &nbsp;，确认 <code>python manage.py status</code> 显示「后端 API
-            本项目运行中」后点右侧重试。
+            <b>你的网络已断开。</b>
+            这是本机网络的问题，与服务无关 —— 恢复联网后会自动消失（也会随
+            「恢复联网」事件立刻重试）。
+          </>
+        ) : cause === "slow" ? (
+          <>
+            <b>服务响应很慢（可能正在跑重型任务）。</b>
+            {okText} ⇒ 服务是活着的，只是排队。刚才那些「无法连接」的提示就是这么来的。
+            {isLocalDevHost() ? "（本地开发实例；可看后端日志确认。）" : ""}
           </>
         ) : (
-          "服务可能正在维护重启，请稍后点右侧重试；若持续不可达请联系管理员。"
+          <>
+            <b>连不上服务。</b>
+            {okText}。{isLocalDevHost() ? (
+              <>
+                请在项目目录执行&nbsp;
+                <code>python manage.py start --daemon --replace</code>
+                &nbsp;，确认 <code>python manage.py status</code> 显示「后端 API
+                本项目运行中」后点右侧重试。
+              </>
+            ) : (
+              "服务可能正在维护重启，请稍后点右侧重试；若持续不可达请联系管理员。"
+            )}
+          </>
         )}
+        {lastedText ? <span className="muted-text">（{lastedText}）</span> : null}
       </span>
       <button className="auth-inline-btn" onClick={onRetry} disabled={checking}>
         {checking ? "检测中…" : "重试连接"}

@@ -27,7 +27,19 @@ from difflib import get_close_matches
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MAIN_DB = ROOT / "data" / "moss_finagent.db"
+
+# ★ `CHG-0143`：拥挤度的**用户配置**表（`sector_crowding_list` 等）已从共享
+#   遗留主库迁到**本环境应用库**（`app_db`：dev → `data/dev/moss_dev.db`、
+#   pilot → `data/pilot/moss_pilot.db`）。所以路径**不能再写死**
+#   `data/moss_finagent.db` —— 那会读到旧库那份、而写入静默落到没人看的地方。
+#   统一走 registry 解析（与 `sector_crowding/config.py` 同一个来源）：
+#      `SECTOR_CROWDING_DB=<路径>` 可显式覆盖（离线演练/临时副本用）。
+import os as _os
+from src.sector_crowding.config import load_config as _load_crowding_config
+_CROWDING_CONFIG_DB = _os.environ.get("SECTOR_CROWDING_DB") or str(
+    _load_crowding_config().config_db_path)
+
+
 
 RAW = """
 粤港澳大湾区、股权转让（并购重组）、京津冀一体化、中俄贸易概念、肝炎概念、POE胶膜、
@@ -52,7 +64,7 @@ def main() -> int:
     args = parser.parse_args()
 
     names = parse(RAW)
-    conn = sqlite3.connect(f"file:{MAIN_DB}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{_CROWDING_CONFIG_DB}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     listed = {str(r["sector_name"]): dict(r) for r in conn.execute(
         "SELECT sector_code, sector_name, visible FROM sector_crowding_list")}

@@ -123,6 +123,48 @@ stores:
       主线挖掘数据仓（906 MiB）：板块指数/资金流/两融/北向/龙虎榜/ETF/宏观/期货。
       回测与实盘**共用同一份输入**（`src/mainline/datastore.py`）。
 
+  - name: crowding_shared
+    kind: sqlite
+    path: data/moss_finagent.db
+    isolation: shared
+    # ★ 唯一写者 = **dev**（用户 2026-09-30 裁定）。
+    #
+    # ## 为什么必须有这一条（`CHG-0143`）
+    #
+    # 拥挤度的表原先**根本没登记**，而写者闸门是从登记派生的
+    # （`JobSpec.updates × writable_here()`）—— 于是：
+    #   · 前端的「一键刷新」（`POST /sector_crowding/refresh_all`）
+    #     往这个共享库里 UPSERT 218 万行，**不受任何闸门管**；
+    #   · `/health` 与 `describe()` 里也看不见它。
+    # ⚠️ 登记本身**还不构成强制** —— 全仓库只有 `QuantWarehouse` 调
+    # `writable_here()`。所以同时给 `db.get_db_connection` 加了 `writable=`
+    # 参数（默认 `False`=安全侧）；**两处一起才真正生效**。
+    #
+    # ## 为什么写者点名为 `dev`，而不是 `pilot` 或 `main`
+    #
+    #   · `main` → `writable_here()` 对隔离档只能给 `decided=False`
+    #     （"口径待裁定"），**只报告不阻断** ⇒ 闸门形同虚设，等于没做；
+    #   · `pilot` → 一次刷新要回填近 6 年、跑几分钟，而 pilot 是**对外实例**，
+    #     重活会占它的事件循环（`CHG-0139` 刚把 4 个重作业从它挪走）；
+    #     且实测刷新历来是**本机**在跑（`sector_meta.updated_at` 的写入者）。
+    #   ⇒ 写者 = `dev`；pilot 点刷新会被 fail-closed 拒并给出人话理由。
+    #
+    # ⚠️ 它只有**参考数据**（`sector_crowding_daily` / `sector_meta` /
+    # `sector_crowding_max_ma5` / `sector_member`）。
+    # **用户配置**（`sector_crowding_list` / `_watch` / `_alert`）**不在这里** ——
+    # 它们已迁到本环境的 `app_db`（`CHG-0143`）。
+    writer: dev
+    writable: true
+    protected: false
+    role: source
+    time_column: trade_date
+    note: >-
+      共享**板块拥挤度参考数据**（同花顺 2517 个指数的日频拥挤度）。
+      `sector_crowding_daily` 218 万行、`sector_meta` 2517 行、
+      `sector_crowding_max_ma5`、`sector_member`。
+      **没有用户维度**（无 `tenant_id`），三个环境读同一份 —— 这是对的。
+      写入只发生在「一键刷新」；写者声明见上面的 `writer`。
+
   - name: mainline_archive
     kind: sqlite
     path: data/archive/mainline_archive.db
