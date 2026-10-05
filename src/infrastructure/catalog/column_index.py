@@ -93,16 +93,51 @@ NON_INVESTABLE_COLUMN_HINTS: tuple[str, ...] = (
     "deleted_at", "tenant_id", "user_id", "note", "remark", "comment",
 )
 
-#: 实体（标的）列候选：按优先级。
+#: 实体（标的）列候选：按优先级。**唯一事实源** —— `local_data` / `assets`
+#: 一律 `import` 这里，不许再抄一份字面量。
+#:
+#: ## 为什么钉在这里（实测：同一个判据被写过 2 份，且**逐字不同**）
+#:
+#: 原先 `local_data._ENTITY_COLS` 是第二份拷贝：只有 6 项（少 `secid` / `asset_id`），
+#: 注释却写着「与 `column_index.ENTITY_COLUMN_CANDIDATES` 同源」。
+#: 更值得记的是它**从未被任何代码读取**（全仓只有定义行）—— 拷贝既没同步，
+#: 那句"某些表取不到实体列"的后果也没真的发生：它是一颗**看起来在生效**的雷。
+#: 判据：`tests/unit/test_local_data_paths.py` 的 `..._have_single_source`
+#: （用 AST 断言**字面量只有一处**，不是"值相等"——值相等但两份拷贝照样会漂）。
 ENTITY_COLUMN_CANDIDATES: tuple[str, ...] = (
     "code", "ts_code", "symbol", "stock_code", "sec_code", "secid",
     "indicator", "asset_id",
 )
 
-#: 时间列候选（与 `assets._TIME_COLUMN_CANDIDATES` 同源同序）。
+#: 时间列候选：按优先级（越靠前越代表「**数据自己的时间**」）。**唯一事实源**。
+#:
+#: ## 三份拷贝是怎么被合并成一份的（先讲取舍，再讲实现）
+#:
+#: 实测（`scripts/_audit_time_column_ssot.py`，真实库：**去重后 95 张表**）：`column_index` 10 项、
+#: `local_data._TIME_COLS` 9 项（少 `latest_publish_time`，且**从未被读取**）、
+#: `assets._TIME_COLUMN_CANDIDATES` 8 项（`period_date` 排在 `trade_date` 之前，
+#: 独有 `latest_publish_time`，没有 `date`/`datetime`/`timestamp`）。
+#:
+#: **为什么判它们"该合并"而不是"刻意不同"**：两个调用方（本模块的选库排序、
+#: `assets` 的资产登记）扫的是**同一份 registry**（`data_stores.all_stores()`），
+#: 回答的是同一个问题（这张表的时间列是哪一列）。"assets 只扫资产不扫事实表"
+#: 这个前提在本仓库**不成立** —— 所以拆分只会留下同一个判断的两个顺序。
+#:
+#: **并集实测影响**：落点变化的只有 `news_cache` 一张表
+#: （`fetch_time` → `latest_publish_time`）。方向是对的：新闻"数据自己的时间"
+#: 是**发布时间**，不是我们抓取的时间。其余 190 张表零变化。
+#:
+#: **顺序为什么是 `trade_date` 在前**：本模块既有的顺序**一字不动** ——
+#: 选库排序里 `latest_time` 直接决定"取最新期次"，动它会改真实落点；
+#: 而它对另一侧无影响（真实库中同时含 `trade_date` 与 `period_date` 的表 = **0 张**）。
+#:
+#: **被否决的方案**：拆成 `INDEX_TIME_CANDIDATES` / `ASSET_TIME_CANDIDATES` 两组。
+#: 否决理由：两组扫描范围完全相同，"为什么不同"写不出**可复核的判据**，
+#: 只能写成"因为它们是两个模块"—— 那正是本轮要消灭的缺陷类别（同一判断两份实现）。
 TIME_COLUMN_CANDIDATES: tuple[str, ...] = (
     "trade_date", "period_date", "date", "datetime", "timestamp",
-    "publish_time", "fetch_time", "trigger_time", "updated_at", "created_at",
+    "publish_time", "latest_publish_time", "fetch_time", "trigger_time",
+    "updated_at", "created_at",
 )
 
 #: ⚠️ **已降级为兜底**（`CHG-0066`）：扫描范围现在由
@@ -172,6 +207,149 @@ def _neg_latest(latest: str) -> tuple[int, str]:
     return (0, "".join(chr(0x30 + 9 - int(c)) for c in digits[:14]))
 
 
+def period_key(latest: str) -> tuple[int, int, int, int, int, int] | None:
+    """把 `latest_time` 归一成**可比较的期次**；解析不出返回 `None`。
+
+    ## 为什么需要它（`_neg_latest` 不够 —— 实测判错方向）
+
+    `_neg_latest` 是**刻意松散**的键（数字倒序字典序），它对定长
+    `YYYYMMDD` 精确，但**同一天**上判反：`20260930`（只有日期）
+    与 `2026-09-30T21:05:43`（同一天带时分秒）相比，前者是后者的**前缀**，
+    而前缀在字符串序里更小 → 松散键让**当天 00:00 胜出**，可真实期次是
+    21:05:43 更晚。
+
+    真实库实测（`scripts/_audit_time_column_ssot.py` ④，**去重后 119 个多路径列**）：
+    这一处方向错误会让 `ts_code` 的 rank-0 由 `warehouse.db:quant_adj_factor`
+    变成 `moss_finagent.db:map_stock_concept`（同一张 15,993,661 行的行情表
+    被一张 8,287 行的映射表抢走）。全库仅此 1 处，但方向必须对。
+
+    ## 解析不出就返回 `None`（**不猜**）
+
+    epoch 秒/毫秒（实测 `indicator_catalog` 存的是 `1790842694098`）**单位与时区
+    都无法在本地断言** —— 猜 s 还是 ms、猜哪个时区，就是"用看起来很有据的数字
+    回答一个没人验证过的问题"。所以这一类一律 `None`，由调用方退回既有顺序。
+    """
+    digits = re.sub(r"\D", "", str(latest or ""))
+    if len(digits) < 8:
+        return None
+    year, month, day = int(digits[:4]), int(digits[4:6]), int(digits[6:8])
+    if not (1990 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    rest = digits[8:14].ljust(6, "0")
+    return (year, month, day, int(rest[:2]), int(rest[2:4]), int(rest[4:6]))
+
+
+#: ★ 时间列的**两种角色**（2026-10-01 裁定，`CHG-0155`）。
+#:
+#: 判据：**期次列**描述"这条数据自己是什么时候的"；**运维列**描述
+#: "我们什么时候动过这一行"。两者都能排序，但**只有期次列能表达"数据更新"**。
+#:
+#: 为什么必须分开（实测证据）：真实库里 `ts_code` 的 rank-0 曾由
+#: `warehouse.db:quant_adj_factor`（**15,993,661 行**的行情表，`trade_date=20260930`）
+#: 变成 `moss_finagent.db:map_stock_concept`（**8,287 行**的映射表，
+#: 时间列是 `updated_at=2026-09-30T21:05:43`）——因为运维列写得最勤，
+#: 按"最新写入优先"它**永远**赢。系统性地让**小表/缓存表**抢走大表的列，
+#: 是"认错"而不是"认新"（本项目最贵的一类错误）。
+#:
+#: 运维列存在时的行为：**不参与期次比较**，退回"权威层级 → 行数"
+#: （即 `_period_component` 的不可比分支），并在原因码里说清"这一关没比"。
+PERIOD_COLUMNS: frozenset[str] = frozenset({
+    "trade_date", "period_date", "date", "datetime",
+    # 发布/披露时刻：对资讯类数据而言，发布时刻**就是**这条数据的期次
+    "publish_time", "latest_publish_time",
+})
+
+OPERATIONAL_COLUMNS: frozenset[str] = frozenset({
+    "updated_at", "created_at", "fetch_time", "timestamp",
+    # `trigger_time`：调度/任务被触发的时刻（`assets` 的候选集带进来的），
+    # 同样是"我们什么时候动的手"，不是数据的期次。
+    "trigger_time",
+})
+
+
+def is_period_column(column: str) -> bool:
+    """该时间列是不是**期次列**（能表达"数据更新"）。
+
+    未登记的时间列一律**不算期次列**：宁可退回既有顺序，也不要拿一个
+    含义没确认过的列去决定"哪张表的数据更新"（不猜）。
+    """
+    return str(column or "").strip().lower() in PERIOD_COLUMNS
+
+
+def _period_component(latest: str,
+                      time_column: str = "") -> tuple[int, tuple[int, ...], tuple[int, str]]:
+    """期次在排序键里的**分量**：可比期次优先（越新越靠前），否则退回松散键。
+
+    三个层级：
+      ① `(0, 期次取负, ...)` —— 期次列且可比 → 按真实期次排序（越新越小 = 越靠前）
+      ② `(1, (), 松散键)` —— 期次不可得/不可比/该列是**运维列** →
+         排在所有可比期次之后，并在这一组内保持既有顺序，不猜。
+    """
+    if time_column and not is_period_column(time_column):
+        # 运维列（`updated_at`/`fetch_time`/…）：**不参与期次比较**
+        return (1, (), _neg_latest(latest))
+    key = period_key(latest)
+    if key is not None:
+        return (0, tuple(-x for x in key), (0, ""))
+    return (1, (), _neg_latest(latest))
+
+
+#: 选库排序键的**判据名**（顺序即优先级，与 `_rank_key()` 的分量一一对应）。
+#:
+#: 为什么要有这份名字表：多方块"为什么选了这张"必须说得出**是哪一条判据决定的**。
+#: 如果解释逻辑自己再写一遍比较顺序，它就成同一判断的第二份实现（必然漂移）。
+#: 现在解释是"逐分量比较排序键"，键改了标签自动跟着改；
+#: 分量个数由 `tests/unit/test_local_data_paths.py` 钉住（键加一项就必须登记一个名字）。
+_RANK_CRITERIA: tuple[str, ...] = ("has_data", "period", "authority", "row_count")
+
+
+class PathReason:
+    """「这一列为什么选了这张表」的**机器可读**原因码（风格同 `local_data.DiagCode`）。"""
+
+    SINGLE = "single_path"
+    """只有一条路径 —— 没有可择的，也就没有取舍。"""
+
+    HAS_DATA = "has_data"
+    """期次与权威都没打平之前，先由「**表里到底有没有数据**」决定。
+
+    实测教训：主库（更权威）`quant_daily_basic` 表在但空，dev 库有数据 ——
+    先看有没有，再看谁新、谁权威。
+    """
+
+    NEWEST_PERIOD = "newest_period"
+    """★ 由**最新期次**决定（本模块的择优规则）。两边期次都可比，取更新的那张。"""
+
+    PERIOD_UNAVAILABLE = "period_unavailable"
+    """期次**取不到 / 不可比**（空值、非日期串、epoch 这类无法断言单位的口径）
+    → 退回既有顺序（权威层级 → 行数）。**这是退回，不是择优** —— 不许猜。
+
+    也用于"期次这一关没分出胜负**是因为有路径根本没有期次**"的情形：
+    此时决定性判据虽是权威/行数，但必须先说清"我们没比期次"。"""
+
+    AUTHORITY = "authority"
+    """期次打平，由库的权威层级决定（主库 > 试点 > dev）。"""
+
+    ROW_COUNT = "row_count"
+    """期次与权威都打平，由行数决定（同上的最终 tiebreaker）。"""
+
+    TIE = "tie"
+    """判据全打平 —— 落在扫描顺序上（稳定排序）。这条存在本身就是提示：
+    说明这几张表在现有判据下**无法区分**，应由人复核而不是让机器假装有理由。"""
+
+
+#: 原因码 → 一句人话（给日志/`plan`/审计脚本读，免得每处各写一句）
+PATH_REASON_TEXT: dict[str, str] = {
+    PathReason.SINGLE: "只有一条路径",
+    PathReason.HAS_DATA: "期次/权威未分胜负前，先取『表里确实有数据』的那张",
+    PathReason.NEWEST_PERIOD: "两边期次可比，取期次更新的那张",
+    PathReason.PERIOD_UNAVAILABLE: (
+        "期次不可得/不可比 → 退回既有顺序（可比期次在前 → 权威 → 行数），未做猜测"),
+    PathReason.AUTHORITY: "期次打平 → 按库的权威层级",
+    PathReason.ROW_COUNT: "期次与权威都打平 → 按行数",
+    PathReason.TIE: "判据全打平 → 落在扫描顺序（需人工复核）",
+}
+
+
 def is_investable_column(name: str) -> bool:
     """该列名是否"看起来与投研相关"（用于挑候选，不做自动接线）。"""
     low = (name or "").lower()
@@ -235,6 +413,103 @@ class TableColumns:
 _NUMERIC_TYPE_HINTS: tuple[str, ...] = (
     "int", "real", "float", "double", "numeric", "decimal", "number",
 )
+
+
+def _rank_key(t: TableColumns) -> tuple[Any, ...]:
+    """候选表的**唯一**排序键（分量与 `_RANK_CRITERIA` 一一对应，顺序即优先级）。
+
+    ① `not has_data` —— 表里到底有没有数据（实测：主库表在但空，dev 库有数据）
+    ② `_period_component` —— **最新期次优先**（只对**期次列**；运维列不参与，
+       见 `PERIOD_COLUMNS` 的裁定）；期次不可得则退回既有顺序（不猜）
+    ③ `authority` —— 库的权威层级（主库 > 试点 > dev）
+    ④ `-row_count` —— 同上的最终 tiebreaker
+
+    ⚠️ 本函数必须保持**模块级**（`_ranked_tables` 按名字调用它）：
+    护栏 `..._would_go_red` 靠 monkeypatch 关掉"最新期次"这一条来**自证**判据会红。
+    """
+    return (not t.has_data,
+            _period_component(t.latest_time, getattr(t, "time_column", "")),
+            t.authority, -t.row_count)
+
+
+def _decide_reason(ranked: list[TableColumns]) -> str:
+    """rank-0 胜出的**首个决定性判据**（`PathReason.*`）。
+
+    实现方式是**逐分量比较排序键**，不另写一套比较顺序 ——
+    否则"为什么选它"就成了选库逻辑的第二份实现，两套必然漂移。
+
+    ⚠️ 两处刻意的措辞纪律：
+
+    ① 原因只解释 **rank-0 为什么胜过 rank-1**，不解释整张清单。
+       清单里远处某条路径"期次取不到"不影响这个结论 ——
+       它本来就没赢（`_period_component` 把不可比的排在可比之后）。
+    ② 但如果**前两条**里有期次取不到的，就必须报 `PERIOD_UNAVAILABLE`
+       而不是 `AUTHORITY`：否则日志读起来像"按权威层级选的"，
+       而事实是**期次这一关我们没比，退回了既有顺序**。这两件事必须能分开看见。
+    """
+    if len(ranked) == 1:
+        return PathReason.SINGLE
+    top, nxt = _rank_key(ranked[0]), _rank_key(ranked[1])
+    contenders = ranked[:2]
+    for i, name in enumerate(_RANK_CRITERIA):
+        if i >= len(top) or top[i] == nxt[i]:
+            continue
+        if name == "has_data":
+            return PathReason.HAS_DATA
+        if name == "period" and not any(
+                period_key(t.latest_time) is None for t in contenders):
+            return PathReason.NEWEST_PERIOD
+        if any(period_key(t.latest_time) is None for t in contenders):
+            return PathReason.PERIOD_UNAVAILABLE
+        return (PathReason.AUTHORITY if name == "authority"
+                else PathReason.ROW_COUNT)
+    return PathReason.TIE
+
+
+@dataclass
+class ColumnPath:
+    """同一列的**一条物理路径**（候选清单的一项）—— 回答「取的是哪张、为什么」。
+
+    ## 为什么要有它（本轮实测的空白）
+
+    实测（按 `asset_id` 去重后）**119 个列**能被多张表提供：
+    `code` 47 张、`trade_date` 37 张、`created_at` 23 张……
+    而选库只有 `best_for_column` 一个入口，**只返回一张表**：
+    "同一列还有别的路径吗、为什么不是那张" 在系统里**没有任何出口**。
+    期次/口径不同的两张表看起来一样可用 —— 这是"看起来很有据"的错误温床。
+
+    ## 为什么它不引入第二套排序
+
+    `column_paths()` 直接复用 `_ranked_tables()`（与 `best_for_column`、
+    `dataset_registry` 同一份排序）—— 三者对同一列的 rank-0 **必然同一个对象**，
+    由护栏 `..._share_one_ranking` 钉住。
+    """
+
+    asset_id: str
+    db: str
+    table: str
+    time_column: str
+    latest_time: str
+    period: tuple[int, ...] | None
+    has_data: bool
+    row_count: int
+    authority: int
+    rank: int
+    chosen: bool
+    reason: str = ""
+
+    @property
+    def why(self) -> str:
+        """一句人话（给日志与 `plan` 用；原因码本身是机器可读的 `reason`）。"""
+        return PATH_REASON_TEXT.get(self.reason, self.reason or "（非选中路径）")
+
+    def render(self) -> str:
+        when = ("-".join(f"{x:02d}" for x in self.period) if self.period
+                else "期次不可得")
+        return (f"{'★选中' if self.chosen else '　候选'} [{self.rank}] "
+                f"{self.db}:{self.table} 时间列={self.time_column or '（无）'} "
+                f"期次={when} 行数={self.row_count} 权威={self.authority} "
+                f"判据={self.reason or '-'}")
 
 
 class ColumnIndex:
@@ -311,6 +586,21 @@ class ColumnIndex:
 
         **要不要扫由登记的 `kind` 决定，不由名字或体积决定** ——
         名字/体积启发式正是行情仓被跳过两次的原因。
+
+        ## ★ 同一个文件被多个存储条目指向时**只收一次**（实测：不收敛就数不清路径）
+
+        实测（`scripts/_audit_time_column_ssot.py` ⑥⑦）：registry 里有 3 个 sqlite
+        条目（`app_db` / `legacy_main` / `crowding_shared`）**指向同一个文件**
+        `data/moss_finagent.db`。按条目逐个收下 → 该库每张表被扫 3 次
+        （191 张表里 48 个 `asset_id` 重复）→
+
+          · "这一列有几条路径"从 119 变成 **345**（虚报近 3 倍）——
+            而多路径择优的全部价值就在这个数字**诚实**；
+          · `unconsumed_investable_columns()` 把同一张表列 3 遍，人工复核清单被稀释。
+
+        `TableColumns.asset_id` 本身就是 `sqlite:{库文件名}:{表名}` ——
+        模型层认为它们是同一个资产，所以扫描层也必须收敛。**不去重不是"多扫无害"，
+        而是让上层报出一个没人复核得过来的假数字。**
         """
         found: list[Path] = []
         try:
@@ -318,12 +608,25 @@ class ColumnIndex:
                 all_stores,
                 unregistered_databases,
             )
+            seen: dict[str, str] = {}          # 规范化路径 → 首个登记它的存储名
+            aliases: dict[str, list[str]] = {}
             for s in all_stores():
                 if s.kind != "sqlite":
                     continue
                 p = s.resolved()
+                key = str(p.resolve()) if p.exists() else str(p)
+                aliases.setdefault(key, []).append(s.name)
+                if key in seen:
+                    continue
                 if p.exists() and self._looks_like_sqlite(p):
+                    seen[key] = s.name
                     found.append(p)
+            for key, names in aliases.items():
+                if len(names) > 1:
+                    logger.warning(
+                        "同一个库被 %d 个存储条目指向（只扫一次，避免路径数虚报；"
+                        "如非有意，请检查 configs/data_stores.yaml）：%s ← %s",
+                        len(names), key, names)
             # 没登记却在 data 下的库 → **记警告**：不收下（否则"未登记"会变成事实标准），
             #   也不静默漏掉（那正是原来那个假阴性）。护栏是 test_store_registry.py。
             for p in unregistered_databases():
@@ -583,6 +886,22 @@ class ColumnIndex:
         out.sort(key=lambda d: -d["row_count"])
         return out
 
+    def _ranked_tables(self, column: str) -> list[TableColumns]:
+        """该列的候选表，**按 `_rank_key` 降序**（越靠前越该被选）。
+
+        ⚠️ 这是选库排序的**唯一实现**：`dataset_registry` / `column_paths` /
+        `best_for_column` 全部走它。第一版 `local_data` 自己写了一套"优先带实体列的"
+        挑选逻辑，与本模块的排序并存 —— **两套排序必然漂移**（本项目已登记过同类）。
+
+        ⚠️ 按**列**排，不物化全量登记视图：`best_for_column` 原先每次调用都
+        `dataset_registry()`（495 列 × `to_dict()`）→ 实测单列 **24.05 ms**；
+        现在只排这一列 → 单列 **0.0x ms**（见 `scripts/_audit_time_column_ssot.py` ⑤）。
+        """
+        if not self._built:
+            self.build()
+        return sorted(self._by_column.get((column or "").lower(), []),
+                      key=_rank_key)
+
     def dataset_registry(self) -> dict[str, list[dict[str, Any]]]:
         """**数据集登记视图**：列名 → 该列在哪些库/表里、按可用性降序。
 
@@ -592,9 +911,14 @@ class ColumnIndex:
              实测教训：`quant_daily_basic.dv_ratio` 只在 dev 库有 1184 万行，
              主库/试点库**连表都没有**。若按"主库优先"选，会选中一张空表 →
              用户又看到"缺数据"。**先看有没有，再看谁权威。**
-          ② `latest_time` 新的优先（同一字段两个库都有时，要新的那个）
+          ② `latest_time` 新的优先（同一字段两个库都有时，要新的那个）。
+             期次可比时按**真实期次**（`period_key`）；不可比时
+             （空值 / 非日期串 / epoch）**退回既有顺序**，不猜。
           ③ `authority`（主库 > 试点 > dev）—— 仅在①②打平时才用得上
           ④ `row_count` 大的优先（同上的最终 tiebreaker）
+
+        ⚠️ 这个视图是**多路径**的：同一列可能有多条。要知道"取的是哪条、为什么"，
+        用 `column_paths()`（同一次排序，带 `rank` / `chosen` / `reason`）。
 
         Returns:
             `{列名: [ {db, table, asset_id, row_count, latest_time,
@@ -602,15 +926,51 @@ class ColumnIndex:
         """
         if not self._built:
             self.build()
-        out: dict[str, list[dict[str, Any]]] = {}
-        for col_low, tables in self._by_column.items():
-            ranked = sorted(
-                tables,
-                key=lambda t: (not t.has_data, _neg_latest(t.latest_time),
-                               t.authority, -t.row_count),
+        return {col_low: [t.to_dict() for t in self._ranked_tables(col_low)]
+                for col_low in self._by_column}
+
+    def column_paths(self, column: str) -> list[ColumnPath]:
+        """该列的**候选路径清单**（rank 0 = 会被选中的那条）—— 多路径择优的可见性面。
+
+        ## 为什么需要它（实测空白）
+
+        同一列被多张表提供时，期次/口径可能不同，而选库只有
+        `best_for_column` 一个入口、**只返回一张表** ——
+        "还有别的路径吗、为什么不是那张"在系统里没有任何出口。
+        2026-10-01 实测（**按 `asset_id` 去重后**）：**119 个列**有多条路径
+        （`code` 47 张、`trade_date` 37 张、`created_at` 23 张…）。
+
+        ## 规则（顺序即优先级，与 `dataset_registry` 同一次排序）
+
+          ① 表里确实有数据 ② **最新期次优先**（期次可比时）
+          ③ 期次不可得 → 退回既有顺序（权威 → 行数），**不猜**
+          ④ 库权威层级 → 行数
+
+        ## 性能纪律（别让它变成"扫全库"）
+
+        只对**这一列**排（`_ranked_tables`），不建全量视图、不碰 SQLite ——
+        纯内存操作，实测单列 0.0x ms，且与库/列规模无关（见探针 ⑤）。
+        """
+        ranked = self._ranked_tables(column)
+        if not ranked:
+            return []
+        reason = _decide_reason(ranked)
+        return [
+            ColumnPath(
+                asset_id=t.asset_id, db=t.db_name, table=t.table,
+                time_column=t.time_column, latest_time=t.latest_time,
+                period=period_key(t.latest_time), has_data=t.has_data,
+                row_count=t.row_count, authority=t.authority,
+                rank=i, chosen=(i == 0),
+                reason=reason if i == 0 else "",
             )
-            out[col_low] = [t.to_dict() for t in ranked]
-        return out
+            for i, t in enumerate(ranked)
+        ]
+
+    def best_path(self, column: str) -> ColumnPath | None:
+        """该列被选中的**那一条路径**（带"为什么"）；无候选则 `None`。"""
+        paths = self.column_paths(column)
+        return paths[0] if paths else None
 
     def best_for_column(self, column: str) -> TableColumns | None:
         """该列**最可用**的那张表（选库契约的唯一入口）。
@@ -618,12 +978,15 @@ class ColumnIndex:
         执行器必须走这里，不要在别处另写一套排序 —— 否则
         "两条路径选出的表不同"会成为一个静默缺陷（本项目已登记过同类：
         在线人数 3≠1）。
+
+        实现上它就是 `best_path()` 的第一条 —— **同一个排名的两种呈现**
+        （表对象 vs 带原因的路径），不是两次决策。
         """
-        reg = self.dataset_registry()
-        ranked = reg.get((column or "").lower())
-        if ranked:
-            aid = ranked[0]["asset_id"]
-            return next((t for t in self._tables if t.asset_id == aid), None)
+        path = self.best_path(column)
+        if path is not None:
+            return next((t for t in self._tables
+                         if t.asset_id == path.asset_id), None)
+        # 保留原有兜底：索引里没有该列时，仍按"表里真有这一列"扫一遍
         for t in self._tables:
             if column in t.columns:
                 return t

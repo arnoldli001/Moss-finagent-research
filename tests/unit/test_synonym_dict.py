@@ -332,25 +332,28 @@ def test_pinyin_is_registered_exactly_when_globally_unique(
     与浙商银行、`ylgf` 同时是伊利股份与另外 11 只），收进来就是**认错**而不是
     认不出。规则本身写在 `ALIAS_SOURCE_NOTE` ③，这里让规则**可执行**：
     表一变，这条测试就会告诉你"该加一行"或"该删一行"，不靠人记得。
+
+    ## ★ 2026-10-01：本测试原先**自己算了一遍**唯一性（规则的第二份实现）
+
+    实测后果：除息日快照里 `600028` 叫 `XD中国石`，与「中国神华」的 `zgsh`
+    本该撞车，不剥前缀就"不撞了" ⇒ 本测试要求收一条**按除息日固化的错别名**。
+    根因不是"别名表缺一行"，而是**唯一性规则有两份实现**（本测试一份、
+    `synonym_dict` 一份）。现在规则只有一份：`synonym_dict.pinyin_index()`，
+    本测试只**核对表与规则是否一致**（`required_*` / `ambiguous_*`）。
     """
     pytest.importorskip("pypinyin", reason="拼音别名由 pypinyin 生成")
-    from pypinyin import Style, lazy_pinyin
-
-    def initials(name: str) -> str:
-        return "".join(lazy_pinyin(name, style=Style.FIRST_LETTER,
-                                   errors=lambda x: list(x))).lower()
-
-    def full(name: str) -> str:
-        return "".join(lazy_pinyin(name, errors=lambda x: list(x))).lower()
+    from src.infrastructure.catalog.synonym_dict import (
+        ambiguous_pinyin_aliases,
+        pinyin_keys,
+        required_pinyin_aliases,
+    )
 
     raw = json.loads(_NAME_TABLE.read_text(encoding="utf-8"))["pairs"]
     names = [(str(c), re.sub(r"\s+", "", str(n))) for c, n in raw]
     by_code = dict(names)
-    ini_index: dict[str, list[str]] = collections.defaultdict(list)
-    full_index: dict[str, list[str]] = collections.defaultdict(list)
-    for code, name in names:
-        ini_index[initials(name)].append(code)
-        full_index[full(name)].append(code)
+
+    required = required_pinyin_aliases()          # {拼音: (代码,)}
+    ambiguous = ambiguous_pinyin_aliases()        # {拼音: (代码, …)}
 
     table = entity_aliases()
     checked = 0
@@ -359,23 +362,28 @@ def test_pinyin_is_registered_exactly_when_globally_unique(
         if key not in name_table:
             continue          # 不是官方名（口语简称/英文/拼音），跳过
         checked += 1
-        name = by_code[codes[0]]
-        for kind, pkey, index in (("首字母", initials(name), ini_index),
-                                  ("全拼", full(name), full_index)):
-            owners = index[pkey]
-            if len(owners) == 1:
+        name = by_code.get(codes[0], "")
+        if not name:
+            continue
+        ini_key, full_key = pinyin_keys(name)     # 唯一实现（已剥行情前缀）
+        for kind, pkey in (("首字母", ini_key), ("全拼", full_key)):
+            if pkey in required:
                 assert pkey in table, (
                     f"『{name}』的{kind} `{pkey}` 在全表唯一，按规则**必须收录** —— "
-                    f"请在 _ENTITY_ALIASES 加一行 \"{pkey}\": (\"{owners[0]}\",)，"
-                    "并更新 ALIAS_SOURCE_NOTE ③ 的计数")
-                assert owners[0] in table[pkey], (
-                    f"『{name}』的{kind} `{pkey}` 应为 {owners[0]}，"
-                    f"实际 {table[pkey]!r}")
-            else:
+                    f"请在 _ENTITY_ALIASES 加一行，并更新 ALIAS_SOURCE_NOTE ③ 的计数。"
+                    f"（唯一性由 `synonym_dict.pinyin_index()` 算，已剥行情前缀）")
+                assert codes[0] in table[pkey], (
+                    f"『{name}』的{kind} `{pkey}` 应为 {codes[0]}，实际 {table[pkey]!r}")
+            elif pkey in ambiguous:
                 assert pkey not in table, (
-                    f"『{name}』的{kind} `{pkey}` 在全表**有 {len(owners)} 个主人**"
-                    f"（{owners}），按规则**不许收录** —— 收了就是认错。"
+                    f"『{name}』的{kind} `{pkey}` 在全表**有 {len(ambiguous[pkey])} 个"
+                    f"主人**（{ambiguous[pkey]}），按规则**不许收录** —— 收了就是认错。"
                     "若确实要收，改规则并同步 ALIAS_SOURCE_NOTE ③")
+            else:
+                # 规则表里没有它（例如名字被剥成了另一个名字）：不猜，直接报出来
+                raise AssertionError(
+                    f"『{name}』的{kind} `{pkey}` 既不在唯一集也不在歧义集 —— "
+                    "规则与名称表不同步，请检查 `pinyin_index()` 的剥前缀规则")
     assert checked >= 60, f"只核对上 {checked} 个官方名，判据可能失效了"
 
 
@@ -462,9 +470,26 @@ def test_cold_cache_resolution_does_not_deadlock() -> None:
 
 
 def test_indexes_have_no_normalization_collisions() -> None:
-    """别名规范化后不许撞车（撞车 = 后写静默覆盖先写）。"""
-    assert len(synonym_dict._METRIC_INDEX) == len(metric_aliases())
+    """别名规范化后不许撞车（撞车 = 后写静默覆盖先写）。
+
+    ★ 2026-10-01（`CHG-0155`）：指标索引现在会**再补一层生成键**
+    （`augment_targets_as_keys()`：把"只作为目标出现"的名字补成键，
+    否则 32 个连接器 id 问下去返回 `[]`）。所以"索引大小 == 手工表大小"
+    这条**形式**已经不成立 —— 但它要防的东西（手工别名之间规范化撞车）
+    必须原样保住，所以改成两段：
+      ① 手工表的索引仍然 1:1（撞车仍会当场抛 / 这里仍会红）；
+      ② 多出来的键**恰好**是生成的那批，且每一个都不是手工键
+         （生成层不可能掩盖一次撞车）。
+    """
+    manual = synonym_dict._build_index(metric_aliases(), "指标")   # noqa: SLF001
+    assert len(manual) == len(metric_aliases()), (
+        "手工指标别名规范化后撞车（后写会静默覆盖先写）")
     assert len(synonym_dict._STATIC_ENTITY_INDEX) == len(entity_aliases())
+    generated_keys = set(synonym_dict._METRIC_INDEX) - set(manual)   # noqa: SLF001
+    assert len(generated_keys) == synonym_dict._AUGMENTED_METRIC_KEYS, (   # noqa: SLF001
+        "索引里多出来的键与「生成条数」对不上 —— 要么生成层被改坏，"
+        "要么有别的路径偷偷往索引里塞键")
+    assert generated_keys, "生成层没生效（那 32 个死胡同会回来）"
     for table, index, kind in (
         (metric_aliases(), synonym_dict._METRIC_INDEX, "指标"),
         (entity_aliases(), synonym_dict._STATIC_ENTITY_INDEX, "实体"),

@@ -263,16 +263,16 @@ _METRIC_ALIASES_FALLBACK: dict[str, tuple[str, ...]] = {
     "成交额": ("amount",),
 }
 
-#: 实体列候选（与 `column_index.ENTITY_COLUMN_CANDIDATES` 同源）
-_ENTITY_COLS: tuple[str, ...] = (
-    "code", "ts_code", "symbol", "stock_code", "sec_code", "indicator",
-)
-
-#: 时间列候选
-_TIME_COLS: tuple[str, ...] = (
-    "trade_date", "period_date", "date", "datetime", "timestamp",
-    "publish_time", "fetch_time", "updated_at", "created_at",
-)
+#: ⚠️ 实体列 / 时间列候选**不在本模块定义**（`CHG-0066` 后续，2026-10-01 删除）。
+#:
+#: 这里原先有 `_ENTITY_COLS`（6 项）与 `_TIME_COLS`（9 项）两份拷贝，
+#: 注释写着「与 `column_index.*` 同源」—— 实测**逐字不同**（各少 1~2 项），
+#: 而且它们**从未被任何代码读取**（全仓只有定义行）。
+#: 结果是：一份不会生效、却看起来在生效的判据，加一句不成立的"同源"注释。
+#: 唯一事实源是 `column_index.ENTITY_COLUMN_CANDIDATES` /
+#: `column_index.TIME_COLUMN_CANDIDATES`（本模块实际用的实体列/时间列
+#: 来自 `TableColumns.entity_column` / `.time_column`，那是按常量扫出来的）。
+#: 判据：`tests/unit/test_local_data_paths.py::..._have_single_source`。
 
 #: 默认陈旧容忍（天）。超过就报 `STALE_BEYOND_TOLERANCE`，但仍**返回数据**
 #: （带 `stale_days`）—— 丢掉一个真实的历史值比标出它更糟。
@@ -448,7 +448,12 @@ class LocalDataExecutor:
         （本项目已登记过同类缺陷："同一个判断只允许一份实现"）。
 
         现在选库只有一处：`best_for_column` 按
-        **①有没有数据 → ②新鲜度 → ③库权威层级 → ④行数** 排序。
+        **①有没有数据 → ②最新期次优先（期次不可得则退回既有顺序）→
+        ③库权威层级 → ④行数** 排序。
+
+        ⚠️ 同一列常常**有多条路径**（实测去重后 119 个列）。本函数只回答
+        "选哪张"，"还有哪几条、为什么选它"由 `_path_visibility()` 从**同一次排序**
+        取出来挂进 `plan` —— 不是第二套排序，也不会退化成扫全库。
 
         ⚠️ 为什么"有没有数据"要排在"库权威"**前面**（实测教训）：
         `quant_daily_basic.dv_ratio` 只在 **dev 库**有 1184 万行，
@@ -464,6 +469,53 @@ class LocalDataExecutor:
         return None, "", candidates
 
     # ---------- 执行 ----------
+
+    def _path_visibility(self, column: str) -> dict[str, Any]:
+        """「这一列有几条路径、选了哪条、为什么」—— 挂进 `plan` 与日志。
+
+        ## 为什么必须有（实测空白）
+
+        同一列被多张表提供是**常态**而非例外：2026-10-01 实测（按 `asset_id`
+        去重后）**119 个列**有多条路径（`code` 47 张、`trade_date` 37 张、
+        `created_at` 23 张…），而选库只有一个入口、只返回一张表 ——
+        "还有别的路径、为什么不是那张"在返回结果里**一个字都没有**。
+        期次/口径不同的两张表看起来一样可用：这正是"看起来很有据"的错误温床。
+
+        ## 挂在哪（沿用既有设施，不新造一套）
+
+        · **机器可读** → `MetricSeries.plan["path_reason"]`（`PathReason.*`，
+          与 `DiagCode` 同一风格：每个码对应一个明确结论）
+        · **人读** → `plan["paths"]` / `plan["path_why"]` / `plan["path_candidates"]`
+          与 `logger.info`（多于一条路径才记，避免刷日志）
+        · 空结果时的诊断**不改**：`Diag` 回答"为什么没取到"，
+          这里回答"取到了，为什么是它" —— 两件事，别混。
+
+        ## 性能与失败纪律
+
+        `column_paths` 只排**这一列**（纯内存，单列 0.0x ms）。
+        诊断是增强：拿不到就返回 `{}`（`plan` 里少几个键），**绝不阻断取数**。
+        """
+        try:
+            paths = self._idx().column_paths(column)
+        except Exception as exc:  # noqa: BLE001 诊断失败不影响取数
+            logger.debug("路径可见性不可用（不影响取数）：%s", exc)
+            return {}
+        if not paths:
+            return {}
+        top = paths[0]
+        if len(paths) > 1:
+            logger.info("列 %s 有 %d 条路径；选中 %s（%s）",
+                        column, len(paths), top.asset_id, top.why)
+        return {
+            "paths": len(paths),
+            "path_rank": top.rank,
+            "path_reason": top.reason,
+            "path_why": top.why,
+            "path_candidates": [
+                f"{p.db}:{p.table}" + (f"@{p.latest_time}" if p.latest_time else "")
+                for p in paths[:5]
+            ],
+        }
 
     def metric_series(self, metric: str, *, entity: str = "",
                       start: str | None = None, end: str | None = None,
@@ -487,6 +539,8 @@ class LocalDataExecutor:
             "entity_column": table.entity_column,
             "start": start, "end": end,
         }
+        # ★ 多路径可见性：几条路径 / 选了哪条 / 为什么（本轮新增，见 _path_visibility）
+        plan.update(self._path_visibility(column))
         rows, err = self._fetch(table, column, entity, start, end, limit)
         if err is not None:
             return MetricSeries(metric=metric, entity=entity, plan=plan,
@@ -508,9 +562,11 @@ class LocalDataExecutor:
                             metric=metric, entity=entity, points=retry,
                             source=f"{fresh.db_name}:{fresh.table}.{column}",
                             dataset_id=fresh.asset_id,
+                            # 重新算一遍路径可见性：落点换了，旧的"为什么"就过期了
                             plan={**plan, "db": fresh.db_name,
                                   "table": fresh.table,
-                                  "index_refreshed": True},
+                                  "index_refreshed": True,
+                                  **self._path_visibility(column)},
                         )
             return MetricSeries(
                 metric=metric, entity=entity, plan=plan,

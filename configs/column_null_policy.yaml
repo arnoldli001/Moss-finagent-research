@@ -1,0 +1,148 @@
+# ============================================================================
+# 列级 NULL 语义登记表：某列出现 NULL，是「合法无值」还是「数据洞」？
+# ============================================================================
+#
+# ## 为什么需要这张表（用户 2026-10-02 裁定 1）
+#
+# `akshare_connector._quant_column_points` 的空结果分流里，第②支原先**分不开**
+# 两种含义相反的成因：
+#
+#   · **合法无值** —— 如某只票从未分红 ⇒「股息率」这个口径对它本来就没有值。
+#     把它当成缺陷去修是白费力气，而且会把"该口径对它不适用"这条真信息抹掉；
+#   · **数据洞** —— 该入库没入库（ETL 断链/漏列）⇒ 真缺口，必须去修。
+#
+# 两者在数据上**同形**（都是 `IS NULL`），原先只能一律 fail-closed 报普通
+# `DataFetchError`。本表把"哪一列的 NULL 是合法无值"从**猜语义**变成**登记 + 证据**。
+#
+# ## 默认方向（★ 不许反过来）
+#
+# **未登记的列一律按「取数失败」处理**（普通 `DataFetchError`，fail-closed）。
+# 反过来（默认豁免）就是**多豁免** —— 而多豁免会把真缺口说成"本来就没有"，
+# 是本项目最危险的那个方向。
+#
+# 读不到 / YAML 损坏 / 同一个列名写两次 / 某条字段不全或取值非法 ⇒
+# **整表按未登记处理**（`null_policy.py` 里实现，判据钉住"绝不抛"）。
+#
+# ## 每条必须具备的四个字段（缺一条 ⇒ 该条作废，按未登记处理）
+#
+#   column   : 列名，必须与它所在的映射键**逐字相同**（判据会断言；
+#              防的是复制粘贴错行 —— 键与字段不一致时当场红，不留到线上）
+#   null_is  : 只许两个取值 —— `legitimate`（合法无值）或 `hole`（数据洞）；
+#              其它取值该条作废（枚举是**硬判据**，见 test_null_policy_registry.py）
+#   why      : 人话理由（为什么这个 NULL 不是缺口）
+#   evidence : **可复现**的证据 —— `文件:行`，或一条能直接跑的查询。
+#              禁止"我记得好像"。
+#
+# ## 怎么复核本表（都是只读，可复跑）
+#
+#   uv run python scripts/_probe_quant_column_null.py --db data/quant/warehouse.db
+#   uv run python scripts/_probe_quant_column_null.py --help
+#
+#   # 逐列 NULL 数（本文件的实测数字来源，表 quant_daily_basic = 15,436,577 行）
+#   SELECT COUNT(*) FROM quant_daily_basic WHERE "<列名>" IS NULL;
+#
+# ⚠️ 只登记**能拿出证据**的列。拿不出证据的（例如"量比/市销率的 NULL 是不是
+# 新股上市不足 5 日造成的"）宁可不写 —— 未登记 = fail-closed，是安全方向；
+# 凭印象写进 `legitimate` 才是把真缺口豁免掉。
+# ============================================================================
+
+version: 1
+
+columns:
+
+  # --------------------------------------------------------------------------
+  # 股息率族：**没分红 ⇒ 没有股息率**（仓库既有语义，不是猜的）
+  # --------------------------------------------------------------------------
+  dv_ttm:
+    column: dv_ttm
+    null_is: legitimate
+    why: |
+      `quant_daily_basic.dv_ttm` 是「股息率TTM（滚动十二个月）」。股息率的口径是
+      **分红 ÷ 股价**：一只从不分红的票，这个比值**没有定义**，NULL 就是它的正确取值，
+      而不是"该补没补"。所以这一列历史上全 NULL 只能说明"这只票没分过红"，
+      不能据此判成取数链故障。
+      ★ 边界（本条只保证语义方向）：若某只票**公告过分红**却整列无值，那仍然是数据洞
+      —— 复核方式见 evidence ③ 的判别查询（它能把"只有这一列为空"与"整行缺失"分开）。
+    evidence: |
+      ① 语义链（仓库自己的定义，两处）：
+         · `src/infrastructure/connectors/akshare_connector.py:379-393`
+           —— `_DERIVED_STOCK_INDICATORS["股息率"]`：股息率(%) = 最近一次实施的
+           每股派息 ÷ 同期收盘价 × 100；
+         · `src/infrastructure/connectors/akshare_connector.py:465-466`
+           —— `_dividend_yield_points` 在**没有已实施派息**时返回空结果而不是 0，
+           即「没分红 ⇒ 这个口径没有值」是仓库既有语义。
+      ② 列名链：`src/infrastructure/catalog/synonym_dict.py:398-406` 把 `dv_ttm` 定为
+         「股息率TTM（滚动十二个月）」、`dv_ratio` 定为「静态股息率（最近一期分红/股价）」，
+         并记着 600036 实测 `dv_ratio=5.05 / dv_ttm=5.76`（两个口径数值不同，不许合并）。
+      ③ 数据链（2026-10-02 实测，表 15,436,577 行；只读，可复跑）：
+         `uv run python scripts/_probe_quant_column_null.py --db data/quant/warehouse.db`
+           → dv_ttm: NULL 5,302,755 / 非 NULL 10,133,822（NULL 率 34.35%）
+         判别查询（证明空缺是**列级**的，不是整行缺失）：
+           SELECT COUNT(*) FROM quant_daily_basic
+            WHERE dv_ttm IS NULL AND total_mv IS NOT NULL AND ps_ttm IS NOT NULL
+              AND turnover_rate IS NOT NULL AND close_basic IS NOT NULL;
+           → 5,288,976（占 dv_ttm 全部 NULL 的 99.74%：同一行的市值/换手率/收盘都在）
+         同表对照：total_mv / circ_mv / turnover_rate 三列全表 **0 个 NULL**
+         （即"表整体在填"，dv_ttm 的空缺是这一列自己的语义）。
+      ④ 群体对照（同一张库）：
+           SELECT code, COUNT(*), SUM(dv_ttm IS NOT NULL) FROM quant_daily_basic
+            WHERE 1=1 GROUP BY code HAVING COUNT(*) >= 200;
+           → 5,431 只票里有 **168 只** dv_ttm 全 NULL，集中在
+             000004/000005/000007/000010/000017/000020/000022/… 这一族长期不分红的票；
+           而 600519（贵州茅台）4,973 行里 4,877 行有值、688981 1,502 行里 0 行有值。
+
+  dv_ratio:
+    column: dv_ratio
+    null_is: legitimate
+    why: |
+      与 `dv_ttm` 同一个口径族（`src/infrastructure/catalog/synonym_dict.py:398-406`：
+      `dv_ratio` = 静态股息率 = 最近一期分红 ÷ 股价）。分母是股价、分子是分红，
+      没分红就没有这个比值 ⇒ NULL 是正确取值。
+      ★ 为什么它也要登记（尽管 `_QUANT_COLUMN_INDICATORS` 现在只映射了 `dv_ttm`）：
+      登记表按**列名**索引、不按调用点索引 —— 取数侧将来加 `股息率:dv_ratio` 这条映射时
+      不必再重新裁定一次；而无论有没有调用点，这个语义都一样。
+    evidence: |
+      ① 同 `dv_ttm` 的 ①/②（仓库定义：股息率 = 分红 ÷ 股价；
+         `synonym_dict.py:398-406` 明确 `dv_ratio` 是静态股息率）。
+      ② 数据链（2026-10-02 实测，同一张 15,436,577 行的表，只读）：
+           SELECT COUNT(*) FROM quant_daily_basic WHERE dv_ratio IS NULL;  → 1,626,835
+         即 NULL 率 10.54%，与 dv_ttm 的 34.35% **不同**（静态口径只看最近一期分红，
+         滚动口径要看十二个月）—— 两个口径数值与空缺都不同，故分列登记、不合并。
+
+  # --------------------------------------------------------------------------
+  # 市值族：NULL 就是「没取到」，是数据洞（fail-closed，与未登记同向）
+  # --------------------------------------------------------------------------
+  total_mv:
+    column: total_mv
+    null_is: hole
+    why: |
+      `quant_daily_basic` 是**全A股日频截面**：每一行 = 一只票的一个交易日。
+      总市值是这一行的**必备字段**（= 总股本 × 当日价，两个输入都在同一行/同一张库里），
+      不存在"某只票某天没有总市值"这种合法情形 ⇒ 出现 NULL 只能是入库链的缺口。
+      登记它的价值是**把方向写下来**：既有的下游代码已经按"缺口"在处置
+      （见 evidence），本表让它显式化，且与 fail-closed 默认同向（改不动行为）。
+    evidence: |
+      ① `src/mainline/models.py:210-211`：`circ_mv` 为 None 表示**市值没取到** ——
+         比值类指标（净额/市值）必须跳过它，不能当 0。
+      ② `src/quant/screening.py:112-118`：缺少市值数据（`daily_basic.total_mv`）时
+         记为缺口并跳过市值中性化 —— 即"NULL = 缺口"而不是"合法无值"。
+      ③ `src/quant/panels.py:676-677`：`daily_basic.total_mv` 无数据 ⇒
+         记 gap「可能未下载」。
+      ④ 数据链（2026-10-02 实测，只读）：
+           SELECT COUNT(*) FROM quant_daily_basic WHERE total_mv IS NULL;  → 0
+         （15,436,577 行里一个 NULL 都没有）⇒ 一旦出现 NULL 即为**新出现**的异常，
+         不是这张表的常态。
+
+  circ_mv:
+    column: circ_mv
+    null_is: hole
+    why: |
+      同 `total_mv`：流通市值也是日频截面行的必备字段（= 流通股本 × 当日价），
+      没有"合法为空"的情形。下游多个比值口径（净流入/流通市值、换手率交叉核对）
+      都假定它有值 ⇒ NULL 只能是入库缺口。
+    evidence: |
+      ① `src/mainline/models.py:210-211`（逐字）："`circ_mv` 为 None 表示市值没取到 ——
+         比值类指标（净额/市值）必须跳过它，不能当 0（当 0 会让这只票在比值榜上排到最前）"。
+      ② 数据链（2026-10-02 实测，只读）：
+           SELECT COUNT(*) FROM quant_daily_basic WHERE circ_mv IS NULL;  → 0
+         （15,436,577 行 0 个 NULL；同一批里 `turnover_rate` 也是 0）。

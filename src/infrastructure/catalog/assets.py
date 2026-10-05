@@ -35,6 +35,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.infrastructure.catalog.column_index import (
+    TIME_COLUMN_CANDIDATES as _TIME_COLUMN_CANDIDATES,
+)
 from src.infrastructure.repositories.event_sqlite_base import connect_sqlite
 
 logger = logging.getLogger(__name__)
@@ -328,11 +331,20 @@ _ASSET_MIGRATIONS: tuple[tuple[str, str], ...] = (
      "role TEXT NOT NULL DEFAULT 'source'"),
 )
 
-#: 时间列候选（按优先级：越靠前越能代表"数据本身的时间"）
-_TIME_COLUMN_CANDIDATES = (
-    "period_date", "trade_date", "publish_time", "fetch_time",
-    "trigger_time", "latest_publish_time", "updated_at", "created_at",
-)
+#: 时间列候选：**从唯一事实源 import（见文件顶部），不再手抄一份**。
+#:
+#: 这里原先是一份 8 项的独立字面量（`period_date` 在 `trade_date` 之前，
+#: 独有 `latest_publish_time`，没有 `date`/`datetime`/`timestamp`），
+#: 与 `column_index.TIME_COLUMN_CANDIDATES`（10 项）**逐字不同** ——
+#: 而后者曾注释写着「同源同序」。两份拷贝的注释会互相背书，值却各走各的。
+#:
+#: 为什么不保留"两组"：两个调用方（本模块的资产登记、`column_index` 的选库排序）
+#: 扫的是**同一份 registry**（`data_stores.all_stores()`），问的是同一个问题
+#: （这张表的时间列是哪一列）—— "assets 只扫资产不扫事实表"这个前提不成立，
+#: 拆分的理由写不出可复核的判据。合并实测影响只有 `news_cache` 一张表
+#: （`fetch_time` → `latest_publish_time`，后者才是"数据自己的时间"）。
+#: 详见 `column_index.TIME_COLUMN_CANDIDATES` 的注释与
+#: `scripts/_audit_time_column_ssot.py`。
 
 
 def classify(table_or_path: str) -> str:

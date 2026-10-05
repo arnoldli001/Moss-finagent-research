@@ -370,6 +370,18 @@ class IndicatorRegistry:
         只认「已登记的 id 是本 id 的**前缀**，且紧随其后就是 `:`」——**最长者胜**。
         不许模糊/相似匹配：`PE(TTM)` 与 `PE(TTM):同比` 这类必须由更长者胜出，
         否则会把"同比"口径的周期套到水平值上。
+
+        ⚠️ **2026-10-01 修一个越界缺陷（`CHG-0157`）**：原实现写的是
+        `indicator.startswith(base) and indicator[len(base)] == ":"` ——
+        当**查询串本身正好等于某个已登记 id**（`"us_cpi_yoy"`：前面那句
+        `":" not in indicator` 拦不住它，因为 id 里本来就没有冒号）
+        或 `base` 比 `indicator` 还长时，`indicator[len(base)]` **下标越界抛
+        `IndexError`**。实测由跨通道判决的探针炸出来（
+        `scripts/_audit_cross_channel_tolerance.py`）。
+        它的危害不是崩一次，而是**调用方只能 try/except 吞掉** ⇒
+        "查不到容忍度"与"查的时候炸了"在下游长得一模一样，
+        功能会**静默失效**（"判据接在没人走的路上"的又一形态）。
+        修法用 `startswith(base + ":")`：前缀 + 边界一次表达，不可能越界。
         """
         self._ensure_loaded()
         if not indicator or ":" not in indicator:
@@ -379,7 +391,7 @@ class IndicatorRegistry:
         for base, meta in self._by_id.items():
             if not base or len(base) <= best_len:
                 continue
-            if indicator.startswith(base) and indicator[len(base)] == ":":
+            if indicator.startswith(f"{base}:"):
                 best, best_len = meta, len(base)
         return best
 

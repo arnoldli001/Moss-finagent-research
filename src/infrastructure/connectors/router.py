@@ -22,6 +22,23 @@
   全部源都比 DB 旧、或网络链整体失败时，回退用 DB。
   这条规则解决了实测的一个真问题：QMT 未启动时，"本地行情CSV"（QMT 的导出文件，
   可能停在三周前）会把 AkShare/腾讯挡在门外，而本地 SQL 库里其实躺着更新的数据。
+
+## 子路径自报（`subpath_stats`，2026-09-30；逐次归属 2026-10-01）
+
+调用方只看到"`fetch()` 返回了/没返回"一个结果，于是**第三跳内部**走了哪条近路
+（TTL 缓存 / 本地库 / 真联网 / 被冷却或预算拒绝）此前不可见 ——「本地命中率」
+「为什么这次联网了」只能靠猜（缺口由 `src/domain/agents/data/collector/path_stats.py`
+的「诚实边界」一节登记）。
+
+两半，各答一个问题：
+
+* **聚合分布**（2026-09-30）：每次 `fetch()` 由 `subpath_stats.record()` 记**一条**
+  子路径（逐次互斥），读出口是 `hop_stats.snapshot()` 里的 `connector_subpaths`
+  （`/health` 既有的 `query_data_hops` 段直接带着它，未新增端点）。
+* **逐次归属**（2026-10-01）：`fetch(..., outcome=...)` 让调用方**自己新建**一个
+  `Outcome` 带回去，router 把**本次**的子路径 mark 到**那个对象**上 —— 采集侧
+  因此能把"这一次走的是哪条近路"记进自己的审计与日志（并发下读"最近一次"会把
+  别人的结果算给自己，所以那一半只能这样接）。详见 `fetch()` 的 docstring。
 """
 
 from __future__ import annotations
@@ -35,7 +52,24 @@ from typing import TYPE_CHECKING, Any
 
 from src.core.exceptions import DataFetchError
 from src.core.schemas import DataPoint
+
+# 第三跳**内部**的子路径记账（TTL 缓存 / 本地库 / 真联网 / 各类拒绝）：
+# 单一事实源是 `subpath_stats`，这里只 import 键名、持有者与写入口，
+# **不另写一套计数**（本仓库实测过"同一个判断两份实现"的后果）。
+from src.infrastructure.connectors import subpath_stats
 from src.infrastructure.connectors.base import BaseConnector
+from src.infrastructure.connectors.subpath_stats import (
+    SUBPATH_BUDGET_REFUSED,
+    SUBPATH_CONNECTOR_NETWORK,
+    SUBPATH_COOLDOWN_REFUSED,
+    SUBPATH_DB_SNAPSHOT,
+    SUBPATH_DB_SNAPSHOT_FALLBACK,
+    SUBPATH_MISS,
+    SUBPATH_NOT_SUPPORTED,
+    SUBPATH_TTL_CACHE,
+    UNRECORDED,
+    Outcome,
+)
 
 if TYPE_CHECKING:
     from src.infrastructure.repositories.base import DataPointRepository
@@ -402,6 +436,7 @@ class ConnectorRouter(BaseConnector):
         *,
         min_date: str | None = None,
         deadline_sec: float | None = None,
+        outcome: Outcome | None = None,
     ) -> list[DataPoint]:
         """三级短路：TTL 缓存 → 本地 DB → connector 链。
 
@@ -431,7 +466,14 @@ class ConnectorRouter(BaseConnector):
           2. 链上某个源返回的数据**早于**这个下限 → 视为该源不可用（记日志、不下冷却），
              继续尝试下一个源 → AkShare/腾讯就有机会了；
           3. 链上全部源都比 DB 旧、或网络链整体失败 → **回退用 DB**（比用更旧的数据强）。
+
+        `outcome`：这次 fetch 的**子路径持有者**（见 `subpath_stats` 模块头）。
+        本方法在每个"决定由谁服务"的出口 `mark()` 一条，**不在任何出口写计数** ——
+        写入只在真实入口 `fetch()` 的 finally 一处（互斥因此是结构性的）。
+        不传（测试/内部直调）时建一个一次性对象：打点自然落空、计数不动，
+        这正是"计数只挂在真实入口上"的结构性保证。
         """
+        outcome = outcome if outcome is not None else Outcome()
         ttl = self._cache_ttl(indicator)
         now = time.monotonic()
         ranged = bool(start_date or end_date)
@@ -443,6 +485,7 @@ class ConnectorRouter(BaseConnector):
         if not skip_ttl:
             hit = self._ttl_hit(indicator, now, demanded)
             if hit is not None:
+                outcome.mark(SUBPATH_TTL_CACHE)
                 return hit
 
         # ====== [2] 本地持久化 DB ======
@@ -474,6 +517,7 @@ class ConnectorRouter(BaseConnector):
                     indicator, len(db_points), db_newest or "?")
                 if not self._disable_cache and ttl is not None:
                     self._cache[indicator] = (now + ttl, list(db_points))
+                outcome.mark(SUBPATH_DB_SNAPSHOT)
                 return db_points
             elif _is_db_fresh(db_points, indicator):
                 logger.info(
@@ -482,6 +526,7 @@ class ConnectorRouter(BaseConnector):
                 # DB 命中也回填 TTL（减少同进程后续查询的 sqlite 开销）
                 if not self._disable_cache and ttl is not None:
                     self._cache[indicator] = (now + ttl, list(db_points))
+                outcome.mark(SUBPATH_DB_SNAPSHOT)
                 return db_points
             else:
                 logger.info("路由DB有但过期 %s (最新=%s), 穿透到网络刷新",
@@ -501,6 +546,7 @@ class ConnectorRouter(BaseConnector):
                 now = time.monotonic()
                 hit = self._ttl_hit(indicator, now, demanded)
                 if hit is not None:
+                    outcome.mark(SUBPATH_TTL_CACHE)
                     return hit
             # 真正发网络请求（把"不该比这更旧"的下限传下去：
             # 区间查询用 DB 最新日期，再与调用方声明的下限取更严的一个）
@@ -509,7 +555,7 @@ class ConnectorRouter(BaseConnector):
                     indicator, start_date, end_date,
                     min_expected_date=_later_date(
                         db_newest if ranged else None, demanded),
-                    deadline_sec=deadline_sec)
+                    deadline_sec=deadline_sec, outcome=outcome)
             except DataFetchError:
                 # 网络全挂时用本地 DB 兜底（有数据总比让面板整块缺口强）。
                 # `demanded` 也要走这条：调用方点名要更新的数据、而网络又挂了，
@@ -518,6 +564,10 @@ class ConnectorRouter(BaseConnector):
                     logger.warning(
                         "网络链全部失败，回退本地DB %s（%dpts, 最新=%s）",
                         indicator, len(db_points), db_newest or "?")
+                    # ★ 覆盖掉链上记的 `miss`：数据**最终由库给出**，而"联网被走过"
+                    #   这件事仍看得出来（`db_snapshot_fallback`）——
+                    #   这两条的处置相反（去修源 / 少联网），不许混成一条。
+                    outcome.mark(SUBPATH_DB_SNAPSHOT_FALLBACK)
                     return db_points
                 raise
             # 网络链给回来的东西比本地还旧：用本地（数据更完整、更新）
@@ -527,6 +577,7 @@ class ConnectorRouter(BaseConnector):
                     logger.warning(
                         "网络链最新(%s) 不新于本地DB(%s) → 改用本地DB %s（%dpts）",
                         net_newest or "无", db_newest, indicator, len(db_points))
+                    outcome.mark(SUBPATH_DB_SNAPSHOT_FALLBACK)
                     return db_points
             # 回填两级缓存
             now = time.monotonic()
@@ -613,6 +664,7 @@ class ConnectorRouter(BaseConnector):
         *,
         min_date: str | None = None,
         deadline_sec: float | None = None,
+        outcome: Outcome | None = None,
     ) -> list[DataPoint]:
         """取数（TTL 缓存 → 本地 DB → connector 链，见 `_cached_fetch`）。
 
@@ -625,10 +677,60 @@ class ConnectorRouter(BaseConnector):
         定时作业与预热路径**不传** ⇒ 行为与原来逐字一致 ——
         重活正是要在那里做，掐掉它们会让"预热养缓存"永远养不起来。
         取值依据见 `src/core/intel_limits.py::QUERY_DEADLINE_SEC` 的实测表。
+
+        `outcome`：**可选的出参** —— 调用方传进来的对象，router 把**本次**走的那条
+        子路径 mark 到它上面（`subpath_stats.Outcome`，8 个互斥键之一）。
+        聚合分布（"整个进程里各条近路各走了多少次"）不需要它；它给的是
+        **逐次归属**（"这一次采集走的是哪条近路"）—— 采集侧据此才能把
+        "本地命中率 / 联网触发率"落进自己的审计与日志行。三条契约：
+
+        * **一次一个、调用方自己新建**（局部、不上锁、不共享）。去读全局
+          `latest_subpath` 冒充本次、或跨调用共享一个对象，在并发下会拿到
+          **别人的**结果 —— 那正是"看起来完全正常的错数"，也是这个出参存在的
+          理由。入口处会先 `reset()`：复用同一个对象也不会把上一次的结论算给这一次。
+        * **不传时逐字一致**：内部建一个一次性对象，返回的数据与
+          `subpath_stats.record()` 的聚合计数都与加这个参数之前完全相同。
+        * **异常 / 取消如实表达**：`outcome.subpath == UNRECORDED`
+          （`outcome.resolved is False`）= 本次**没有**定下子路径（在决定之前就
+          抛了 / 被取消），**不是** `miss`；`miss` 仍然只表示"链上真的全失败"。
+          取消且未定 ⇒ 连聚合计数都不记；已经定下再被取消 ⇒ 键留在对象上、
+          聚合也照记（数据确实由那条近路给出）。
+
+        ## 子路径自报（为什么记账挂在这一处）
+
+        调用方只看到"返回了/没返回"一个结果，于是第三跳内部的
+        「TTL 缓存 / 本地库 / 真联网 / 被冷却或预算拒绝」此前**不可见**，
+        「本地命中率」「为什么这次联网了」都只能靠猜（缺口登记在
+        `src/domain/agents/data/collector/path_stats.py` 的「诚实边界」一节）。
+
+        现在：链上各处只 `Outcome.mark()`（纯赋值），**唯一写计数的地方是这里的
+        finally** —— 一次 fetch 只记一条，互斥是结构性的（不靠"记得别记两次"）。
+        `record()` 绝不抛（见 `subpath_stats` 模块头），所以它既不会顶掉下面这个
+        真异常，也不会把取数带下去。
         """
-        return await self._cached_fetch(
-            indicator, start_date, end_date, min_date=min_date,
-            deadline_sec=deadline_sec)
+        if outcome is None:
+            # 不传 ⇒ 与加这个出参之前**逐字一致**：一个一次性的局部对象，
+            # 只为聚合计数而存在（没人读它）。
+            outcome = Outcome()
+        else:
+            # 传了 ⇒ 先清回「还没定」：调用方复用了同一个对象时，
+            # 上一次的结论**不许**算给这一次（否则就是那个"看起来正常的错数"）。
+            outcome.reset()
+        cancelled = False
+        try:
+            return await self._cached_fetch(
+                indicator, start_date, end_date, min_date=min_date,
+                deadline_sec=deadline_sec, outcome=outcome)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            # 已经定下子路径的照记（取消**不改变**"数据确实由这条近路给出"这个事实）；
+            # 走完却一处都没登记的 ⇒ 记 `UNRECORDED`，落进 `unexpected`（漏埋点自鸣，
+            # 见 `subpath_stats.UNRECORDED`）。唯一不记的是"取消且还没定下子路径"：
+            # 取消是**上层**放弃等待，不是第三跳内部的任何一条近路，硬记一条就是编。
+            if outcome.subpath != UNRECORDED or not cancelled:
+                subpath_stats.record(outcome.subpath)
 
     async def _fetch_uncached(
         self,
@@ -638,6 +740,7 @@ class ConnectorRouter(BaseConnector):
         *,
         min_expected_date: str | None = None,
         deadline_sec: float | None = None,
+        outcome: Outcome | None = None,
     ) -> list[DataPoint]:
         """按顺序尝试命中的连接器。
 
@@ -669,9 +772,18 @@ class ConnectorRouter(BaseConnector):
              这样"全部源都够不到下限"时仍能按原逻辑返回最新的一份，不会因为
              跳过而变成硬失败；
           3. 一旦该源给出了够新的数据就立刻忘掉这条记忆（源恢复了就马上用它）。
+
+        `outcome`：子路径持有者（同 `_cached_fetch` 的说明）。本方法只在**它自己**
+        决定得下来的出口登记：不支持 / 全冷却 / 真联网 / 预算用尽 / 链上全失败。
+        「上层会不会再拿库覆盖这次结果」不在这里判 —— 那由 `_cached_fetch` 后写覆盖，
+        所以不会出现"一次 fetch 记两条"。
         """
+        outcome = outcome if outcome is not None else Outcome()
         matched = self._matched(indicator)
         if not matched:
+            # 契约不满足（没连接器认这个指标名）—— 与"源故障"处置相反：
+            # 该改指标名/补登记，而不是去修源或重试。
+            outcome.mark(SUBPATH_NOT_SUPPORTED)
             raise _no_support_error(indicator, self._known_indicators())
 
         # ★★ 2026-09-30：**换源覆盖层优先**（用户口径：「找到后就**更新数据源地址**」）。
@@ -795,6 +907,13 @@ class ConnectorRouter(BaseConnector):
                 if not simulated:
                     real_attempted = True
                 continue
+            except Exception:
+                # 非 DataFetchError（程序缺陷）照旧**立即上抛、不掩盖**，
+                # 但要如实登记子路径：这条出口也是"第三跳没给出数据"，
+                # 不记的话 `fetch()` 会把它算成"漏埋点"（`unexpected`）——
+                # 一个已知路径的异常不该污染那盏自鸣报警的灯。
+                outcome.mark(SUBPATH_MISS)
+                raise
             # 成功：清除该连接器对该指标的失败冷却记录（如果有）
             self._failure_cache.pop(fkey, None)
             if min_expected_date is not None:
@@ -835,6 +954,9 @@ class ConnectorRouter(BaseConnector):
             if errors:
                 logger.info("指标 %s 经故障转移后由 %s 取到 %d 点",
                             indicator, connector.source_name, len(points))
+            # 真联网（哪怕链上返回空列表，这一次网络也确实发出去了 —— 联网触发率
+            # 与成本口径不能少算它；「网络给没给数据」由下面的 `miss` 承载）。
+            outcome.mark(SUBPATH_CONNECTOR_NETWORK)
             return points
 
         # 所有源都比下限旧：返回其中最新的一份（上层还会与本地 DB 比较）
@@ -844,6 +966,7 @@ class ConnectorRouter(BaseConnector):
             logger.warning(
                 "指标 %s 所有源都早于新鲜度下限(%s)；采用其中最新的 %s(最新=%s)",
                 indicator, min_expected_date, name, newest)
+            outcome.mark(SUBPATH_CONNECTOR_NETWORK)
             return points
 
         # 所有源都失败或在冷却中
@@ -852,8 +975,14 @@ class ConnectorRouter(BaseConnector):
             logger.info(
                 "指标 %s 所有匹配源均在失败冷却中，跳过网络请求",
                 indicator)
+            # 被**冷却拒绝**：一次网络请求都没发 —— 与"网络失败"处置相反
+            # （源已知坏、等冷却即可），混成一个键会让"联网失败率"虚高。
+            outcome.mark(SUBPATH_COOLDOWN_REFUSED)
             return []
 
+        # 防撞钟用尽 ⇒ 终止剩余尝试：这是**预算**拒绝（活太重 ⇒ 该挪去定时作业），
+        # 不是源故障 —— 与 `miss` 分开，否则"该去修链"与"该去预热"分不开。
+        outcome.mark(SUBPATH_BUDGET_REFUSED if timed_out else SUBPATH_MISS)
         raise DataFetchError(
             f"所有数据源获取 {indicator} 均失败: " + " | ".join(errors)
         )

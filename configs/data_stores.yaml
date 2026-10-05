@@ -43,9 +43,34 @@
 #   time_column 新鲜度判据列（可空）
 #   note        人话说明（会被 `/health` 与审计脚本原样展示）
 # ---------------------------------------------------------------------------
+# 同一物理文件被多条登记指向时的**治理字段**（`CHG-0144`，用户 2026-09-30 裁定）
+# ---------------------------------------------------------------------------
+# 现场：`app_db` / `legacy_main` / `crowding_shared` **三条登记指向同一个文件**
+# `data/moss_finagent.db`（前者的 `main_path` 在未注入 `MOSS_SQLITE_PATH` 时回落
+# 到它）。不声明关系的话，三条看起来像"三个各自独立的库"，于是同一个文件的
+# `protected` / `writer` 各写一份、互相矛盾而没人发现。
+#
+#   canonical_for_file  ★ 治理字段：本条目是 `path` 所指**物理文件**的权威登记。
+#                       同一物理文件的多条登记里**最多一条**为 true，且该文件级的
+#                       属性（`protected`）**只在这一条上声明** —— 其余条目不得
+#                       再写第二份（同一个文件不能既受保护又不保护）。
+#   alias_of            本条目**不是另一个库**，而是 `<canonical>` 那份**同一个
+#                       文件**的另一张"表范围"视图（表不同、写者可以不同，
+#                       文件是同一个）。文件级属性**继承** canonical。
+#   main_path_alias_of  `isolation: per_env` 专用：`main_path` 那次**回落到**的登记
+#                       名 —— 即"只在主实例那条回落路径上与它同文件"。本条自己的
+#                       `protected` 只描述 `path`（本环境的 `moss_<env>.db`）。
+#   writer_scope        写权的**范围**（表名 / 表前缀 / 补集说明）。★ 同一物理文件
+#                       上出现两个不同的 `writer` 时**两边都必须写**，且范围必须
+#                       互不相同 —— 否则"谁写哪张表"就是两处各说各的裸字段。
+#
+# ⚠️ 这三个 `*_of` / `canonical_for_file` / `writer_scope` **只被治理判据读**
+# （`tests/unit/test_store_governance.py` 与 `scripts/_audit_store_governance.py`
+# 读原始 YAML），`data_stores.Store` 不认识它们 ⇒ **零运行期行为变更**。
+# ---------------------------------------------------------------------------
 
 version: 1
-updated: "2026-09-28"
+updated: "2026-09-30"
 
 stores:
   # ======================= 数据库 =======================
@@ -54,6 +79,21 @@ stores:
     kind: sqlite
     path: "{env_root}/moss_{env}.db"
     main_path: "data/moss_finagent.db"
+    # ★ 主实例那条回落路径与 `legacy_main` 是**同一个文件**，这里显式声明这条关系
+    #   （而不是让两条登记看起来像两个库）。
+    #
+    #   代码事实：`Store.resolved()` **只在** `is_main_instance()` 为真时才取
+    #   `main_path`（src/infrastructure/catalog/data_stores.py:107-108），而
+    #   `is_main_instance()` 的判据是"没注入 `MOSS_SQLITE_PATH`，或注入的指向
+    #   legacy_main 的文件名"（同文件 :164-180）。
+    #   ⇒ 三档隔离实例（dev/test/pilot）下本条目**不指向** `data/moss_finagent.db`。
+    #
+    #   `protected` 的口径由此继承：本条的 `protected: false` **只描述 `path`**
+    #   （`data/<env>/moss_<env>.db` 那三个文件不受保护）；一旦回落到
+    #   `main_path`，那个文件受不受保护由它的 canonical `legacy_main` 说了算
+    #   （= `protected: true`）。判据见
+    #   tests/unit/test_store_governance.py::test_main_path_fallback_inherits_canonical_protection
+    main_path_alias_of: legacy_main
     isolation: per_env
     writer: own
     writable: true
@@ -62,8 +102,8 @@ stores:
     note: >-
       应用库：账号/会话/告警/事件/自选/池子/选股结果/主线结果/索引。
       由 `MOSS_SQLITE_PATH` 注入（`manage.py` 的 dev/test/pilot 三档隔离）。
-      **主实例**（未注入）沿用 `data/moss_finagent.db`（= `legacy_main`），
-      与改动前的行为**逐字一致**。
+      **主实例**（未注入）沿用 `data/moss_finagent.db`（= `legacy_main` 那份文件，
+      见上面的 `main_path_alias_of`），与改动前的行为**逐字一致**。
       ⚠️ 默认值是遗留主库这一点曾被写成代码字面量 —— 于是"漏传 db_path 就写到共享库"；
       现在由本文件表达，`default_app_db()` 默认取**本环境**的库（CHG-0069 / CHG-0071）。
 
@@ -99,8 +139,33 @@ stores:
   - name: legacy_main
     kind: sqlite
     path: data/moss_finagent.db
+    # ★★ 本条目是 `data/moss_finagent.db` 这个**物理文件**的权威（canonical）登记。
+    #
+    # 判据不是"谁的 note 写得更全"，而是**线上展示实际取谁**（用户 2026-09-30 裁定：
+    # 「同路径先看下线上展示的数据取自谁，谁就更权威，应该是 legacy_main」）。
+    # 实测（2026-09-30，本机）：
+    #   · pilot（对外实例）的应用库是 `data/pilot/moss_pilot.db`
+    #     （manage.py:1161 注入 `MOSS_SQLITE_PATH`；实测 `resolve_store("app_db")`
+    #      = data/pilot/moss_pilot.db）；
+    #   · 但同一批参考表**只**从**本条目**读：前端的概念/行业拥挤度看板走
+    #     `platform_data_connector._TABLE_CANDIDATES`，而
+    #     `sector_crowding_daily` / `sector_crowding_max_ma5` 的首选就是
+    #     `legacy_main`（platform_data_connector.py:258 / :271），
+    #     且该连接器**按候选顺序取第一个真的有这张表的存储**（:560-578）
+    #     —— 实测（2026-09-30，本机 53/41/42 张表）：
+    #       · `data/moss_finagent.db` 有 `sector_crowding_daily` / `sector_meta` /
+    #         `sector_crowding_max_ma5` / `sector_member`；
+    #       · **pilot 的 `data/pilot/moss_pilot.db` 与 dev 的库这 4 张表全部没有**
+    #         ⇒ 线上展示要落回这个文件，用的 key 只能是 `legacy_main`。
+    #
+    # ⇒ 同一文件上"哪条登记是权威" = 本条目；文件级属性 `protected`
+    #   **只在这里声明一次**（下面两条 `*_of` 本条目都不写）。
+    canonical_for_file: true
     isolation: shared
     writer: main
+    # 写权范围：本文件的写者**按表切分**（见 `crowding_shared.writer: dev`）——
+    # 不得两处各留一个裸 `writer` 而没人解释"谁写哪张表"。
+    writer_scope: "该文件里除 `crowding_shared` 声明的那批表之外的其余表"
     writable: true
     protected: true
     role: source
@@ -110,6 +175,9 @@ stores:
       **那个标签只对认证表成立**（18 张为空）；它的 `fact_data_points` 是
       **全项目覆盖最全**的一份（756 指标 / 199.8 万行）。
       ⚠️ **不得据"空库"标签判定整库可删**（CHG-0060）。已回填 127 万行到 pilot。
+      ★ 本条目是 `data/moss_finagent.db` 的 canonical 登记（见上面
+      `canonical_for_file`）：`crowding_shared` 是同一文件的表范围视图，
+      `app_db` 只在主实例回落路径上与它同文件。
 
   - name: mainline_cache
     kind: sqlite
@@ -126,6 +194,15 @@ stores:
   - name: crowding_shared
     kind: sqlite
     path: data/moss_finagent.db
+    # ★ 本条目**不是另一个库** —— 是 `legacy_main` 那份**同一个文件**的另一张
+    #   "表范围"视图（同一个物理文件、不同的表、不同的写者）。
+    #   文件级属性 `protected` **继承** canonical（`legacy_main.protected: true`），
+    #   所以这里**不写第二份**：写成 `false` 就是"同一个文件既受保护又不保护"，
+    #   写成 `true` 又会让 `protected_stores()` 出现同路径两条
+    #   （判据 test_store_registry.py::test_protected_stores_are_declared_and_intact
+    #   直接红，且 `/health` 的 protected 名单属运行期行为）
+    #   —— 两条路都不对，唯一自洽的做法是**只留一个声明点**。
+    alias_of: legacy_main
     isolation: shared
     # ★ 唯一写者 = **dev**（用户 2026-09-30 裁定）。
     #
@@ -154,8 +231,11 @@ stores:
     # **用户配置**（`sector_crowding_list` / `_watch` / `_alert`）**不在这里** ——
     # 它们已迁到本环境的 `app_db`（`CHG-0143`）。
     writer: dev
+    # 写权范围：与 canonical 条目 `legacy_main.writer: main` 是**按表切分**的，
+    # 不是两处各说各的裸字段。表名与 `src/sector_crowding/db.py:85-135` 的
+    # `_REFERENCE_SCHEMA` 逐字对应（那张 DDL 才是权威，这里只是它的名字）。
+    writer_scope: "sector_crowding_daily / sector_meta / sector_crowding_max_ma5 / sector_member"
     writable: true
-    protected: false
     role: source
     time_column: trade_date
     note: >-
@@ -164,6 +244,8 @@ stores:
       `sector_crowding_max_ma5`、`sector_member`。
       **没有用户维度**（无 `tenant_id`），三个环境读同一份 —— 这是对的。
       写入只发生在「一键刷新」；写者声明见上面的 `writer`。
+      ★ 本条目与 `legacy_main` 是**同一个文件**（见 `alias_of`）：线上 pilot
+      的概念拥挤度看板正是经 `legacy_main` 这个 key 读到这里的表。
 
   - name: mainline_archive
     kind: sqlite

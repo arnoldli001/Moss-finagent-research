@@ -56,9 +56,15 @@ KIND_JOB_BUDGET = "job_budget"
 #: ★ API **事件循环被阻塞**（`CHG-0137`）：1 Hz 采样到的调度延迟超过阈值。
 #: 这一条是"服务不可达"的**唯一直接仪器** —— 在此之前我们只能靠请求延迟反推。
 KIND_LOOP_LAG = "loop_lag"
+#: ★ **跨通道一致性**（`CHG-0157`）：本地库与在线源两条通道都拿得到这个指标时，
+#: 出现的"本地陈旧 / 同期次数值不一致 / 在线不可得"三种情形。
+#: 为什么必须单独一类：`hop_stats` 只回答"哪一跳答出来的"，
+#: **"命中的是旧数据"在命中率里看不见** —— 本地命中率很高可能正是问题本身。
+KIND_CROSS_CHANNEL = "cross_channel"
 
 KINDS = (KIND_GAP, KIND_TIMEOUT, KIND_ERROR, KIND_NOT_APPLICABLE,
-         KIND_SEARCH_SOURCE, KIND_SOURCE_LEAD, KIND_JOB_BUDGET, KIND_LOOP_LAG)
+         KIND_SEARCH_SOURCE, KIND_SOURCE_LEAD, KIND_JOB_BUDGET, KIND_LOOP_LAG,
+         KIND_CROSS_CHANNEL)
 
 #: 是否记录 `not_applicable`：它**不是故障**，默认不记（记了会让"异常区"变噪音）。
 RECORD_NOT_APPLICABLE = False

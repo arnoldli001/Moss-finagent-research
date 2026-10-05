@@ -59,6 +59,26 @@
 `total` = 四跳路径走过多少次（**不是** HTTP 请求数：A17 一次工具调用 = 一次）；
 有了它，"命中率"的分母不必让调用方自己把几项加起来（自己加必然有人加漏——
 把 `misses` 忘了就是一个偏高的命中率）。`latest_hop` 见上。
+
+## 第三跳**内部**的子路径明细（`connector_subpaths`，2026-09-30 接上）
+
+本模块只回答「哪一跳答出来的」。第三跳（`ConnectorRouter`）内部还是一条三级短路
+（TTL 缓存 → 本地库 → 真联网），**同一次 `hop3_connector` 的代价可以差三个数量级**
+（毫秒级的缓存命中 vs 十几秒的联网）——「本地命中率」「为什么这次联网了」
+此前**一个数都没有**（缺口由 `src/domain/agents/data/collector/path_stats.py`
+的「诚实边界」一节登记并点名修法：由 `ConnectorRouter` 自报子路径）。
+
+现在那份自报随 `snapshot()` 的 `connector_subpaths` 一起出去（唯一事实源是
+`src/infrastructure/connectors/subpath_stats.py`）。三点边界写清楚：
+
+1. ⚠️ **两个 total 不是一回事，不许相加**：本模块的 `total` 是四跳链的决策次数
+   （`query_data_for_agent` 每次调用算一次），子路径的 `total` 是
+   `ConnectorRouter.fetch()` 的调用次数 —— 而绝大多数 fetch（分时面板、回测 API、
+   定时作业、A17 工具）**根本不走四跳链**。混算出来的"命中率"不是任何一个链路的。
+2. 子路径只接在**既有读出口**上（`/health` 的 `query_data_hops` 已经在读这个
+   `snapshot()`）：不新开端点、不新增往返 —— `/health` 是 20 秒轮询的热路径。
+3. 两段**各自降级**：子路径计数坏了只让 `connector_subpaths.available=False`，
+   本模块那四跳计数照常给（反之亦然）。读不到时**绝不给 0**。
 """
 from __future__ import annotations
 
@@ -137,6 +157,36 @@ def bump(hop: str) -> None:
         _STATS.total += 1
 
 
+def connector_subpaths() -> dict[str, Any]:
+    """第三跳（`ConnectorRouter`）**内部**的子路径明细 —— 回答「第三跳这次走的是哪条近路」。
+
+    ## 为什么挂在这里（而不是新开端点 / 新加一个读口）
+
+    `hop_stats` 只回答「哪一跳答出来的」；第三跳内部还有一条三级短路
+    （TTL 缓存 → 本地库 → 真联网），那次服务的成本与原因都不同 ——
+    「本地命中率」「为什么这次联网了」此前**一个数都没有**
+    （缺口登记在 `src/domain/agents/data/collector/path_stats.py` 的「诚实边界」）。
+    唯一事实源是 `src/infrastructure/connectors/subpath_stats.py`；这里只是**转出去**。
+
+    挂在这一处而不是 `/health` 里新加一段，是因为 `_query_data_hops()` 已经在读
+    `snapshot()`：把它带进这份快照 ⇒ **`src/api/routes/research.py` 一行都不用改**，
+    而「第三跳的子路径」正好就该显示在第三跳那一项的旁边（同一个聚合层级）。
+    ⚠️ 两个 total **不是一回事**，别相加：本模块的 `total` 是四跳链的决策次数，
+    子路径的 `total` 是 `ConnectorRouter.fetch()` 的调用次数（绝大多数 fetch
+    根本不走四跳链）。
+
+    **绝不抛**：`/health` 是前端 20 秒轮询的热路径，子路径计数坏了不该把整张
+    健康检查（连同四跳那份**没问题**的计数）一起打挂 —— 所以只降级这一段，
+    并且**不给 0**：读不到时 `available: False`，全 0 会被读成"一次都没联网"（假绿）。
+    """
+    try:
+        from src.infrastructure.connectors import subpath_stats
+
+        return {"available": True, **subpath_stats.snapshot()}
+    except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def snapshot() -> dict[str, Any]:
     """只读快照（`/health` 与运维页读它）。
 
@@ -145,15 +195,22 @@ def snapshot() -> dict[str, Any]:
 
     返回的 `counters` 是**副本**：调用方改它不会污染真计数
     （本项目实测过"返回内部 dict，调用方清一下就把计数清了"那类自伤）。
+
+    `connector_subpaths` 是第三跳内部的子路径明细（见 `connector_subpaths()`）：
+    它与四跳计数**同源同出口**，所以 `/health` 那边不需要为它加任何一行。
     """
     with _LOCK:
-        return {
+        snap = {
             "counters": dict(_STATS.counters),
             "latest_hop": _STATS.latest_hop,
             "total": _STATS.total,
             "kinds": list(HOP_KINDS),
             "unmeasured": UNMEASURED_HOPS,
         }
+    # ⚠️ 在锁**外**拼：子路径快照有自己的锁（`subpath_stats._LOCK`），
+    # 两把锁不许嵌套持有 —— 那会造出一个只在这个组合下才出现的死锁面。
+    snap["connector_subpaths"] = connector_subpaths()
+    return snap
 
 
 def reset_for_test() -> None:
@@ -176,6 +233,7 @@ __all__ = [
     "UNMEASURED_HOPS",
     "HopStats",
     "bump",
+    "connector_subpaths",
     "reset_for_test",
     "snapshot",
 ]

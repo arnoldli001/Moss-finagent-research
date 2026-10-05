@@ -199,21 +199,72 @@ def normalize_alias(text: str) -> str:
 _norm = normalize_alias
 
 
-def _ascii_token_aligned(container: str, part: str) -> bool:
-    """`part` 是否在 `container` 里以**完整字母数字词**出现（只用于纯 ASCII 串）。
+def ascii_full_word(haystack: str, needle: str) -> bool:
+    r"""`needle` 是否以**完整词**出现在 `haystack` 里（两侧都必须是纯 ASCII）。
 
-    "完整词"= 左边是串首或非字母数字，**且**右边是串尾或非字母数字。
-    调用点已保证两个串都是 ASCII，所以 `str.isalnum()` 不会碰到汉字。
+    ## ★ 这个函数是全仓库「ASCII 全词匹配」的**唯一实现**（2026-10-01 收敛）
+
+    收敛之前，同一条判据有**两份实现、两套规则、两个字符串域**：
+
+    | 位置 | 规则 | 输入域 |
+    |---|---|---|
+    | 本模块旧 `_ascii_token_aligned` | **两侧都要非字母数字**（不管 needle 自己两端是什么） | 已 `normalize_alias` 过（`_`/`-`/`:`/括号**已被剥掉**） |
+    | `supervisor._kw_hit` | **只在 needle 该端本身是字母数字时才要求边界** | 原始小写 indicator id（分隔符**还在**） |
+
+    实测分歧（`scripts/_audit_matching_layer.py` part ②，11 对样本里 5 对不一致）：
+    `fed:` / `cal:` / `ind:` / `mkt:` / `roe` 这四个前缀式与同族别名，
+    **一条路径认得出、另一条认不出**。两边各自都是"为了修一个真实事故"才长成这样：
+
+    * 旧 `_ascii_token_aligned` 是**过度否决**：`pe` 曾被 `fed:target_upper`
+      （归一后 `fedtargetupper`）里的 `pe` 误命中 ⇒ 拿"市盈率"的问句去取**美联储利率**
+      （数字取回来、看着完全正常，本项目最贵的一类错误）；
+    * `_kw_hit` 的规则是**修完那次回归的版本**：白名单里大量前缀式关键词
+      （`fed:`、`cal:`、`ind:`、`mkt:`、`sw_`）**以分隔符结尾**，无条件要求右边界
+      会让它们在 `fed:policy_range` 里被判不命中 ⇒ 三个 Agent 立刻不可达。
+
+    ## 现在只有一条规则（上面两件事同时成立）
+
+    **只在 `needle` 该端本身是字母数字时才要求那一侧的边界。**
+
+        needle = "pe"    → 两端都是字母 ⇒ 左、右都要边界 ⇒ 不命中 `penetration`
+        needle = "fed:"  → 尾端是冒号   ⇒ 右端**不**要求 ⇒ 命中 `fed:policy_range`
+
+    ## 调用方必须自己保证"域"一致（这是本函数唯一的契约）
+
+    它只在**分隔符还留在串里**的域里有意义（原始小写 id）。本模块内部的别名索引
+    是**归一化后**的（分隔符已剥），那里调用本函数等价于"只接受完全相等"——
+    这正是保守且正确的行为（边界信息已经丢了，不能猜），`_match_span` 的注释说明了这点。
     """
-    start = container.find(part)
-    while start != -1:
-        end = start + len(part)
-        left_ok = start == 0 or not container[start - 1].isalnum()
-        right_ok = end == len(container) or not container[end].isalnum()
+    if not needle or not haystack:
+        return False
+    first_alnum = bool(_ASCII_ALNUM.match(needle[0]))
+    last_alnum = bool(_ASCII_ALNUM.match(needle[-1]))
+    start = 0
+    while True:
+        i = haystack.find(needle, start)
+        if i < 0:
+            return False
+        before = haystack[i - 1] if i > 0 else ""
+        after = haystack[i + len(needle):i + len(needle) + 1]
+        left_ok = (not first_alnum) or not _ASCII_ALNUM.match(before)
+        right_ok = (not last_alnum) or not _ASCII_ALNUM.match(after)
         if left_ok and right_ok:
             return True
-        start = container.find(part, start + 1)
-    return False
+        start = i + 1
+
+
+#: 字母/数字（用于"词边界"判断）。与 `supervisor` 曾各写一份，现在只此一份。
+_ASCII_ALNUM = re.compile(r"[a-z0-9]")
+
+
+def _ascii_token_aligned(container: str, part: str) -> bool:
+    """**已废弃的旧名**：保留为薄封装，行为等同 `ascii_full_word`。
+
+    为什么不直接删：它在同模块的两处被调用，改名会让"还在用旧规则"这件事
+    变得不可见；留一个显式转发，并把规则正文放在 `ascii_full_word` 里，
+    读代码的人只会看到一处规则。
+    """
+    return ascii_full_word(container, part)
 
 
 def _match_span(alias_key: str, query_key: str) -> int:
@@ -242,11 +293,63 @@ def _match_span(alias_key: str, query_key: str) -> int:
         return span
     if not (alias_key.isascii() and query_key.isascii()):
         return span                      # 有一侧是中文 → 原判据原样生效
+    # ⚠️ 这里的两个串**都已经过 `normalize_alias`**（`_`/`-`/`:`/括号被剥掉），
+    #    所以 `ascii_full_word` 在本域里等价于"只接受完全相等"——
+    #    边界信息已经丢了，**不能猜**。规则本身只有一处实现（见那个函数）。
     if alias_key in query_key:           # 别名是查询的一部分
-        return span if _ascii_token_aligned(query_key, alias_key) else 0
+        return span if ascii_full_word(query_key, alias_key) else 0
     if query_key in alias_key:           # 查询是别名的一部分
-        return span if _ascii_token_aligned(alias_key, query_key) else 0
+        return span if ascii_full_word(alias_key, query_key) else 0
     return 0                             # 理论上到不了（span>0 必属上面两类）
+
+
+def augment_targets_as_keys(index: dict[str, tuple[str, ...]],
+                            table: dict[str, tuple[str, ...]]) -> int:
+    r"""**任何目标名也必须是键** —— 生成，不靠人记得（返回新增条数）。
+
+    ## 为什么必须生成（2026-10-01 实测：32 个死胡同）
+
+    指标别名表是**人手写**的，方向是「人话名 → 数据名」。反方向
+    （数据名 → 同族）只有"谁想起来了谁加"：实测 215 个在表里出现过的名字里
+    **32 个问下去返回 `[]`** —— 全是**目标名**：
+
+        `dividend_yield` / `close_basic` / `debt_to_assets` / `high` / `low`
+        / `open` / `stock_close` / `vol` / `roe_sina` / `idx_val:snapshot:all` …
+
+    这些**正是连接器与 planner 会直接吐出来的指标 id**（不是人话名）。
+    它们问不出结果 = "数据在库里、某个名字进不去" —— 与 `CHG-0136` 那次
+    「采了白采」同一形状，只是入口换成了机器侧。
+
+    ## 生成的规则（可预测、可复核）
+
+    对每个目标名 `t`：收集**所有含 `t` 的行**的目标并集作为它的同族，
+    然后 `t` 自己排第一（"按列名问"必须先拿到它本身，口径不能被别的挤掉）。
+    已有键不动（人手写的顺序优先）。
+
+    ⚠️ 相似度口径**故意保持"行内同族"**：不跨行推理（例如不会因为
+    `dv_ratio` 与 `dv_ttm` 同族就把两行的口径合并 —— 那两个数**不一样**，
+    合并才是真缺陷，见 `_METRIC_ALIASES` 里 600036 的实测 5.05 / 5.76）。
+    """
+    fam: dict[str, list[str]] = {}
+    for targets in table.values():
+        raws = [str(t) for t in targets]
+        for raw in raws:
+            key = _norm(raw)
+            if not key:
+                continue
+            bucket = fam.setdefault(key, [])
+            for cand in raws:               # 同一行的其它名字都算同族
+                if cand not in bucket:
+                    bucket.append(cand)
+    added = 0
+    for key, raws in fam.items():
+        if key in index:                    # 已有键：人手写的顺序优先，不动
+            continue
+        ordered = ([r for r in raws if _norm(r) == key]
+                   + [r for r in raws if _norm(r) != key])
+        index[key] = tuple(dict.fromkeys(ordered))
+        added += 1
+    return added
 
 
 def _build_index(table: dict[str, tuple[str, ...]],
@@ -482,8 +585,17 @@ _METRIC_ALIASES: dict[str, tuple[str, ...]] = {
     "估值分位": ("idx_val:snapshot:all",),
 }
 
-#: 规范化后的指标索引（导入期构建，撞车即抛）
+#: 规范化后的指标索引（导入期构建，撞车即抛）。
+#:
+#: ★ 构建后**必须**把"目标名也是键"补齐（`augment_targets_as_keys`）：
+#: 手工表的反方向天生有漏，实测漏了 32 个（`dividend_yield`/`close_basic`/
+#: `debt_to_assets`/`high`/`low`… 全是连接器与 planner 会直接吐出的 id）。
+#: 补齐条数**打日志**（不静默）：它是"人手表覆盖不足"的度量。
 _METRIC_INDEX: dict[str, tuple[str, ...]] = _build_index(_METRIC_ALIASES, "指标")
+_AUGMENTED_METRIC_KEYS: int = augment_targets_as_keys(_METRIC_INDEX, _METRIC_ALIASES)
+if _AUGMENTED_METRIC_KEYS:
+    logger.debug("指标别名索引：为 %d 个「只作为目标出现」的名字补了键"
+                 "（否则按这些 id 问会返回空）", _AUGMENTED_METRIC_KEYS)
 
 
 # ============================================================
@@ -831,6 +943,48 @@ _ENTITY_INDEX: dict[str, tuple[str, ...]] | None = None
 _GENERATED_INDEX: dict[str, tuple[str, ...]] | None = None
 
 
+#: 行情快照会给名字**临时加前缀**：除息 `XD`、除权 `XR`、除权除息 `DR`、
+#: 新股 `N`、次新 `C`，以及风险警示 `ST` / `*ST`。
+_PREFIX_RE = re.compile(r"^(?:XD|XR|DR|N|C|\*ST|ST)", re.IGNORECASE)
+
+#: 去掉前缀后至少要有这么多字符，且必须含中文 —— 否则不认（避免吃掉 TCL 这类真名）。
+_MIN_STRIPPED_LEN = 2
+
+
+def strip_market_prefix(name: str) -> str:
+    r"""剥掉行情快照的**临时/风险前缀**（`XD`/`XR`/`DR`/`N`/`C`/`ST`/`*ST`）。
+
+    ## 为什么必须有它（2026-10-01 实测，两个后果都真实发生了）
+
+    `data/security_names.json` 是行情侧的名称快照，**会带当日前缀**。实测该表
+    5,572 只里有 **229 只**带前缀（`ST` 109、`*ST` 92、`XD` 26、`N` 1、`C` 1）。
+    不剥前缀有两个后果：
+
+    1. **认不出**（客户可见）：`*ST三六五` 在表里，而用户敲的是「三六五网」
+       ⇒ `resolve_entity("三六五网")` 返回 **`[]`**（实测），而 `*ST三六五` 能命中。
+       名字是**用户输入的自然形态**，前缀只是当天的行情标记。
+    2. **派生键漂移**（判据被污染）：`600028` 在除息日快照里叫 **`XD中国石`**
+       （还有截断），它与「中国神华 601088」的首字母本该**撞车**（都是 `zgsh`），
+       前缀一改就"不再撞车" ⇒ 拼音唯一性判据把 `zgsh` 判成**唯一**，
+       于是护栏要求把 `zgsh → 601088` 收进别名表 —— 那会是**按除息日固化的一条错别名**，
+       下一个交易日照样翻车。**判据红不是别名表缺一行，是数据层缺一次归一。**
+
+    ## 规则与边界
+
+    * 只剥**开头**的前缀，且剥完必须仍有 ≥2 字符并含中文（`TCL科技`、`N视频` 之类不被误伤）；
+    * `*ST` 先于 `ST` 匹配（正则里已按长度排序）；
+    * **原始写法照旧保留在索引里** —— 有人就是会贴 `XD中国石`（行情软件上就这么写），
+      所以是"两种写法都能认"，不是"替换"。
+    """
+    raw = str(name or "").strip()
+    stripped = _PREFIX_RE.sub("", raw).strip()
+    if stripped == raw or len(stripped) < _MIN_STRIPPED_LEN:
+        return raw
+    if not any("\u4e00" <= ch <= "\u9fff" for ch in stripped):
+        return raw
+    return stripped
+
+
 def _load_name_table() -> tuple[tuple[str, str], ...]:
     """读名称表落盘缓存；缺失/损坏 → 空表（**降级，不是报错**）。
 
@@ -852,15 +1006,36 @@ def _build_generated_index() -> dict[str, tuple[str, ...]]:
 
     同名不同码**合并成候选**而不是后写覆盖先写（名称表实测 0 例重复，
     但表会变，静默覆盖在这里是不可接受的失败模式）。
+
+    ## ★ 每个名字登记**两种写法**：原样 + 剥掉行情前缀（2026-10-01）
+
+    快照会带 `XD`/`ST`/`*ST` 这类**当日前缀**（实测 229/5572 只），
+    只登记原样会让用户敲的自然名（「三六五网」）**认不出**。
+    两种写法都进索引 ⇒ `*ST三六五` 与 `三六五网` 都能命中；
+    剥前缀的规则与理由见 `strip_market_prefix()`。
+
+    ⚠️ 剥出来的名字若与**别的代码**撞车，这里按既有约定**合并成候选**（不静默覆盖），
+    并**出声登记**一条 warning —— "认不出"变成"认出两个"是更危险的失败模式，
+    必须有人看得见（本模块的既有纪律：宁可标出不确定，也不要假装确定）。
     """
     index: dict[str, list[str]] = {}
+    collisions: list[tuple[str, list[str]]] = []
     for code, name in _load_name_table():
-        key = _norm(name)
-        if not key:
-            continue
-        codes = index.setdefault(key, [])
-        if code not in codes:
-            codes.append(code)
+        for variant in (str(name), strip_market_prefix(name)):
+            key = _norm(variant)
+            if not key:
+                continue
+            codes = index.setdefault(key, [])
+            if code not in codes:
+                if codes:
+                    collisions.append((key, [*codes, code]))
+                codes.append(code)
+    if collisions:
+        # 只记前几条，避免刷屏；但**必须出声**（静默合并会让"认错"看起来像"认对"）
+        sample = "、".join(f"{k}→{v}" for k, v in collisions[:3])
+        logger.warning(
+            "实体名剥前缀后出现 %d 组同名多码（已合并为候选，不覆盖）：%s",
+            len(collisions), sample)
     return {k: tuple(v) for k, v in index.items()}
 
 
@@ -885,6 +1060,172 @@ def _ensure_indexes() -> None:
             _ENTITY_INDEX = merged
 
 
+def pinyin_keys(name: str) -> tuple[str, str]:
+    r"""一个名字的 `(首字母, 全拼)` —— **唯一实现**（规则与生成都从这里走）。
+
+    先剥行情前缀再算（`XD中国石` → `中国石`）：前缀是当天行情标记，
+    不该改变一个名字的拼音键，更不该改变"它在全表里唯不唯一"。
+    """
+    from pypinyin import Style, lazy_pinyin
+
+    canonical = re.sub(r"\s+", "", strip_market_prefix(name))
+    return (
+        "".join(lazy_pinyin(canonical, style=Style.FIRST_LETTER,
+                            errors=lambda x: list(x))).lower(),
+        "".join(lazy_pinyin(canonical,
+                            errors=lambda x: list(x))).lower(),
+    )
+
+
+#: `code → 静态表里的官方中文名`（惰性 + 缓存）。
+_STATIC_OFFICIAL: dict[str, str] | None = None
+
+#: 官方中文名的形状：**纯中文**（可带 `ST`/`*ST` 前缀），2~6 字，且代码是 6 位。
+_CJK_ONLY_RE = re.compile(r"^[\u4e00-\u9fff]{2,6}$")
+
+
+def _looks_like_official_cn_name(alias: str) -> bool:
+    """这个别名**看起来**是官方中文名吗（纯中文、2~6 字）。
+
+    为什么不要求"必须出现在名称表里"：那条判据会被**被污染的名称表**反噬 ——
+    实测 `600028` 在快照里是 `XD中国石`（除息前缀 + 字段宽度截断），
+    于是静态表里的 `中国石化` 反而"不在表里"，被判成非官方名 ⇒ 权威名缺失
+    ⇒ 拼音唯一性继续被污染。**判据的输入不能依赖被判据检查的那份脏数据。**
+    """
+    return bool(_CJK_ONLY_RE.match(str(alias or "")))
+
+
+def _static_official_names() -> dict[str, str]:
+    """从静态别名表里挑出**官方中文名**：`code → 名字`（纯中文候选里取最长）。
+
+    取最长的理由：同一只票的静态条目里既有官方名（`中国石化`）也有口语简称
+    （`中石化`）；官方名信息更全，且实测的口语简称都更短。
+    """
+    global _STATIC_OFFICIAL
+    if _STATIC_OFFICIAL is not None:
+        return _STATIC_OFFICIAL
+    out: dict[str, str] = {}
+    for alias, codes in _ENTITY_ALIASES.items():
+        if not codes or not _looks_like_official_cn_name(alias):
+            continue
+        code = str(codes[0])
+        if not (len(code) == 6 and code.isdigit()):
+            continue
+        if len(alias) > len(out.get(code, "")):
+            out[code] = alias
+    _STATIC_OFFICIAL = out
+    return out
+
+
+def canonical_name(code: str, name: str = "") -> str:
+    r"""一个代码的**权威中文名**：静态表里的官方名优先，否则用名称表的名字。
+
+    ## 为什么需要"优先级"而不是"用哪个表"（2026-10-01 实测）
+
+    名称表是**行情快照**，字段宽度有限：`600028`（中国石化，4 字）在除息日
+    变成 `XD中国石化`（2+4 字），而快照里存的是 **`XD中国石`** —— 被截断成 3 字。
+    于是它的首字母由 `zgsh` 变成 `zgs`，**与「中国神华 601088」的撞车消失了**
+    ⇒ 拼音唯一性判据把 `zgsh` 判成唯一 ⇒ 要求在别名表里收一条
+    **按除息日固化的错别名**（下个交易日就会翻车）。
+
+    所以"权威名"必须来自**不受显示层污染**的地方：静态别名表里的官方中文名
+    （人工 review 过）。名称表只在静态表没有该代码时兜底（全市场 5,000+ 只
+    绝大多数没有手工条目）。
+
+    实测效果：`600028` 的权威名回到「中国石化」，`zgsh` 重新与 601088 撞车
+    ⇒ 判据**因为正确的原因**变绿，而不是靠加一行错别名。
+    """
+    code = str(code or "")
+    snap = re.sub(r"\s+", "", strip_market_prefix(name)) if name else ""
+    official = _static_official_names().get(code, "")
+    # 静态名与快照名都可能是"部分名"（截断），取**更长**的那个：
+    # 实测截断只会变短（`中国石` ⊂ `中国石化`），所以更长的那个信息更多。
+    if official and snap:
+        return official if len(official) >= len(snap) else snap
+    return official or snap
+
+
+def snapshot_name_conflicts() -> list[tuple[str, str, str]]:
+    r"""**两处来源对不上**的实体：`(代码, 快照名, 权威名)`。
+
+    判据是"快照名必须是权威名的**前缀**（或相等）"—— 因为实测的失败形态是
+    **字段宽度截断**（`XD中国石` vs `中国石化`）。若某只票的快照名不再是权威名的
+    前缀，说明发生了**更名**（或换了数据源口径），那是需要人看一眼的事件，
+    而不是可以静默吸收的差异。
+    """
+    out: list[tuple[str, str, str]] = []
+    official = _static_official_names()
+    for code, name in _load_name_table():
+        want = official.get(str(code), "")
+        if not want:
+            continue
+        got = re.sub(r"\s+", "", strip_market_prefix(name))
+        if got and got != want and not want.startswith(got):
+            out.append((str(code), str(name), want))
+    return out
+
+
+#: 拼音索引缓存：`(首字母索引, 全拼索引)`，各自是 `{拼音: [代码, …]}`。
+_PINYIN_INDEX: tuple[dict[str, list[str]], dict[str, list[str]]] | None = None
+
+
+def pinyin_index() -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    r"""名称表 → `(首字母索引, 全拼索引)`，**唯一实现**（惰性 + 缓存）。
+
+    ## ★ 为什么把它收进模块（2026-10-01）
+
+    "拼音只收全表唯一的拼写"这条规则原先有**三份**实现：护栏测试里一份、
+    审计脚本里一份、人脑里一份。于是**规则一改就会漂** —— 而且它刚刚真的漂了：
+
+    除息日快照里 `600028` 叫 `XD中国石`，与「中国神华」的 `zgsh` 本该撞车；
+    不剥前缀就"不撞了" ⇒ 唯一性判据把 `zgsh` 判成唯一 ⇒ 护栏要求收一条
+    **按除息日固化的错别名**。规则正文只有一份之后，测试与审计脚本
+    都改成**调这里**（`required_pinyin_aliases()` / `ambiguous_pinyin_aliases()`），
+    再也不会各算各的。
+
+    名字**先剥行情前缀**再算拼音（见 `strip_market_prefix()`）：
+    前缀是当天行情标记，不该改变"这个名字在全表里唯不唯一"。
+    """
+    global _PINYIN_INDEX
+    if _PINYIN_INDEX is not None:
+        return _PINYIN_INDEX
+    ini: dict[str, list[str]] = {}
+    full: dict[str, list[str]] = {}
+    for code, name in _load_name_table():
+        # ★ 用**权威名**（静态官方名优先）算键：快照的名字可能被前缀/字段宽度污染，
+        #   用它算会把"本来撞车的拼音"算成唯一（实测 `zgsh` 就是这么被误判的）。
+        ini_key, full_key = pinyin_keys(canonical_name(code, name))
+        for index, key in ((ini, ini_key), (full, full_key)):
+            if not key:
+                continue
+            codes = index.setdefault(key, [])
+            if code not in codes:
+                codes.append(code)
+    _PINYIN_INDEX = (ini, full)
+    return _PINYIN_INDEX
+
+
+def required_pinyin_aliases() -> dict[str, tuple[str, ...]]:
+    """**全表唯一**因而必须被收录的拼音别名 → `{拼音: (代码,)}`。"""
+    ini, full = pinyin_index()
+    return {k: (v[0],) for index in (ini, full)
+            for k, v in index.items() if len(v) == 1}
+
+
+def ambiguous_pinyin_aliases() -> dict[str, tuple[str, ...]]:
+    """**有多个主人**因而必须被丢弃的拼音别名 → `{拼音: (代码, …)}`。
+
+    收了它们就是"认错"而不是"认不出"（`ALIAS_SOURCE_NOTE` ③ 的规则）。
+    """
+    ini, full = pinyin_index()
+    out: dict[str, tuple[str, ...]] = {}
+    for index in (ini, full):
+        for k, v in index.items():
+            if len(v) > 1:
+                out.setdefault(k, tuple(v))
+    return out
+
+
 def reset_caches_for_test() -> None:
     """清空惰性缓存（**只给测试用**，用于复现"首次调用"路径）。
 
@@ -892,10 +1233,11 @@ def reset_caches_for_test() -> None:
     缓存命中就再也不走那条路径，"第二次跑是绿的"会把缺陷藏起来。
     与 `catalog/__init__.py::reset_registry_for_test` 同一套约定。
     """
-    global _ENTITY_INDEX, _GENERATED_INDEX
+    global _ENTITY_INDEX, _GENERATED_INDEX, _PINYIN_INDEX
     with _INDEX_LOCK:
         _ENTITY_INDEX = None
         _GENERATED_INDEX = None
+        _PINYIN_INDEX = None
 
 
 def generated_entity_aliases() -> dict[str, tuple[str, ...]]:

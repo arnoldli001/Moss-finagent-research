@@ -473,7 +473,8 @@ def _alias_expansion() -> dict[str, tuple[str, ...]]:
     return _ALIAS_EXPANSION
 
 
-#: ASCII 字母/数字（用于"词边界"判断）。
+#: ASCII 字母/数字（用于"词边界"判断）。**规则本体不在这里** ——
+#: 见下面 `_kw_hit` 的说明：全仓库只有一处实现。
 _ASCII_ALNUM = re.compile(r"[a-z0-9]")
 
 
@@ -485,35 +486,25 @@ def _kw_hit(ind_lower: str, kw: str) -> bool:
     纯子串会让 A11 把"AI 渗透率"也吞进来（白花 token）。
     中文别名保持子串语义（中文没有词边界问题，且指标名里常带后缀）。
 
-    ## ★★ 边界只在"关键词那一端是字母数字"时才检查（第一版就错在这里）
+    ## ★★ 边界规则只有一处实现（2026-10-01 收敛，`CHG-0155`）
 
-    白名单里大量是**前缀式**关键词：`fed:`、`fred:`、`cal:`、`ind:`、`mkt:`、`sw_`、
-    `idx_val:` —— 它们**以分隔符结尾**。第一版无条件要求"匹配位置后一个字符不是
-    字母数字"，于是 `fed:` 在 `fed:policy_range` 里因为后面跟了 `p` 而**被判不命中**
-    ⇒ 立刻打破了三条既有回归判据（`fed:policy_range` 到不了 A08、
-    `mkt:turnover:total` 到不了 A09、`ind:sw_third_…` 到不了 A13）。
+    本函数原先**自己实现**了一套词边界判据，而 `catalog/synonym_dict.py`
+    里还有另一套（`ascii_full_word` 的前身）——**两份实现、两套规则**。
+    实测分歧：`fed:` / `cal:` / `ind:` / `mkt:` / `roe` 这类别名
+    **一条路径认得出、另一条认不出**（`scripts/_audit_matching_layer.py` part ②）。
 
-    正确规则：**只在关键词该端本身是字母数字时才要求边界** ——
-    `pe`（两端都是字母）要求边界；`fed:`（尾端是冒号）不要求。
+    现在本函数只做**域适配**（中文走子串、ASCII 委托给唯一实现），
+    规则本体在 `synonym_dict.ascii_full_word()`。判据断言"两条路径调的是同一个函数"
+    （用探针替换那个函数、看两处是否都被点到），而**不是**只比对两边的返回值 ——
+    值相等但两份拷贝照样会漂，那正是这次缺陷的成因。
     """
     if not kw:
         return False
     if not kw.isascii():
         return kw in ind_lower
-    first_alnum = bool(_ASCII_ALNUM.match(kw[0]))
-    last_alnum = bool(_ASCII_ALNUM.match(kw[-1]))
-    start = 0
-    while True:
-        i = ind_lower.find(kw, start)
-        if i < 0:
-            return False
-        before = ind_lower[i - 1] if i > 0 else ""
-        after = ind_lower[i + len(kw):i + len(kw) + 1]
-        left_ok = (not first_alnum) or not _ASCII_ALNUM.match(before)
-        right_ok = (not last_alnum) or not _ASCII_ALNUM.match(after)
-        if left_ok and right_ok:
-            return True
-        start = i + 1
+    from src.infrastructure.catalog.synonym_dict import ascii_full_word
+
+    return ascii_full_word(ind_lower, kw)
 
 
 def _filter_points_for_agent(agent_id: str, points: list[dict[str, Any]],
@@ -2356,34 +2347,201 @@ def _backend_of(agents: dict[str, Any]) -> Any | None:
     return getattr(collector, "_backend", None)  # noqa: SLF001 与第三跳同一口径
 
 
-async def _query_data_via_connectors(key: str, limit: int, *,
-                                     state: ResearchState,
-                                     agents: dict[str, Any]) -> str:
-    """第三跳：把指标交给 A01 的采集路由（连接器链）试一次。
+#: 跨通道判定结论码（稳定、可枚举；同时写进标注与采集异常）。
+CROSS_CHANNEL_KIND: Final[str] = "cross_channel"
+CROSS_CHANNEL_FRESH: Final[str] = "kept_local_fresh"
+CROSS_CHANNEL_UPGRADED: Final[str] = "used_online"
+CROSS_CHANNEL_STALE_KEPT: Final[str] = "kept_local_stale"
+CROSS_CHANNEL_DISAGREE: Final[str] = "kept_local_online_differs"
+CROSS_CHANNEL_NO_TOLERANCE: Final[str] = "no_declared_tolerance"
 
-    ## 为什么需要这一跳（实测驱动，不是设计想象）
 
-    本会话实测：并发清理期间 `quant_daily_basic` 一度从库中消失，
-    而**同一个口径 `股息率TTM:600036` 仍能从源取到 4915 条**。
-    也就是说"本地库没有"**不等于**"数据找不到" ——
-    中间还隔着连接器这一层能力。
+@dataclass(frozen=True)
+class CrossChannelVerdict:
+    """跨通道一致性判定的结论（**口径见 PRD §三十三 / `CHG-0157`**）。"""
 
-    ## 复用而不是另造（AGENTS.md：「同一判断只允许一份实现」）
+    code: str
+    #: 拼进本地正文的标注（空串 = 无需标注）
+    note: str = ""
+    #: 用在线值时的正文（空串 = 用本地）
+    text: str = ""
+    #: 结构化事实（写进采集异常，便于事后复核"当时差多少"）
+    facts: dict[str, Any] = field(default_factory=dict)
 
-    走的是 `A01_data_collector` 的 backend ——
-    **与主采集链路同一个 `ConnectorRouter` 实例**，
-    因此自带故障转移、失败冷却、新鲜度下限，成功率与主链路一致。
+    @property
+    def used_online(self) -> bool:
+        return self.code == CROSS_CHANNEL_UPGRADED
 
-    失败**绝不抛**：第三跳是兜底，它坏了不能拖垮主链（返回空串，
-    由调用方给出本地诊断）。
 
-    ⚠️ 2026-09-28 第二十五轮：本函数从 `recommend_node` 内的闭包**提到模块级**
-    （只加了 `state`/`agents` 两个显式参数，行为逐字未改）——
-    否则第四跳没法单独验收，而"没人调它"正是本轮要修的缺陷本身。
+def _declared_tolerance_days(indicator: str) -> float | None:
+    """该指标**声明**的新鲜度容忍（天）；未登记 ⇒ `None`（**不猜**）。
+
+    判据来源是登记表自己的 `freshness_hours`（默认 24h），
+    不是在这里另定一套天数 —— "同一件事只允许一份实现"。
+    """
+    try:
+        from src.infrastructure.catalog.registry import get_registry
+
+        reg = get_registry()
+        meta = reg.get(indicator) or reg.get_by_base(
+            str(indicator).partition(":")[0])
+        if meta is None:
+            return None
+        return max(0.0, float(getattr(meta, "freshness_hours", 0.0))) / 24.0
+    except Exception:  # noqa: BLE001 登记表读不到 ⇒ 当作未登记（不升级）
+        logger.debug("新鲜度容忍读取失败（按未登记处理）: %s", indicator,
+                     exc_info=True)
+        return None
+
+
+def _local_latest(res: Any) -> tuple[str, Any]:
+    """本地序列里期次最新的一条 → `(期次, 值)`；取不到返回 `("", None)`。"""
+    best_period, best_value = "", None
+    for p in getattr(res, "points", None) or []:
+        period = str((p or {}).get("period") or "")
+        if period > best_period:
+            best_period, best_value = period, (p or {}).get("value")
+    return best_period, best_value
+
+
+def _record_cross_channel(indicator: str, verdict: CrossChannelVerdict, *,
+                          state: Any) -> None:
+    """把跨通道结论记进**采集异常**（一次一条，绝不抛）。
+
+    为什么要记：`hop_stats` 只回答"哪一跳答出来的"，
+    而"本地其实已经陈旧了"这件事在命中统计里**看不见** ——
+    它正是本轮要暴露的那一类（否则"本地命中率很高"会掩盖"命中的是旧数据"）。
+    """
+    try:
+        from src.core.collection_anomalies import record as _record
+
+        detail = " ".join(f"{k}={v}" for k, v in verdict.facts.items())
+        _record(CROSS_CHANNEL_KIND, indicator,
+                f"{verdict.code}: {detail}".strip(),
+                task_id=str((state or {}).get("task_id") or ""))
+    except Exception:  # noqa: BLE001 观测失败绝不影响取数
+        logger.debug("跨通道异常记录失败（忽略）", exc_info=True)
+
+
+async def _cross_channel_decide(key: str, res: Any, *, limit: int,
+                                state: ResearchState,
+                                agents: dict[str, Any]) -> CrossChannelVerdict:
+    r"""本地已命中时，判断**要不要因为陈旧而升级到在线**，以及"两条都拿到"怎么处置。
+
+    ## 口径（`CHG-0157`，写进 PRD §三十三）
+
+    **R1 顺序不变**：本地优先这条链顺序**不动**（实测本地一次 ~85ms，
+    联网是秒级；且本地是我们自己落库的快照）。
+    **R2 陈旧才升级**：判据是**该指标声明的新鲜度**（`freshness_hours`），
+    **不是**这里另拍一个天数 —— 与 `SmartFetcher` 判 stale 用的是同一个契约。
+    未登记容忍度 ⇒ **不升级**（不猜），但如实标注。
+    **R3 两条都拿到时不静默改数**：
+      · 在线期次**更新** ⇒ 用在线值（这是"修数据"的正当事由），并标注；
+      · 期次相同但**值不同**（或在线更旧）⇒ **保留本地**（顺序优先）+ 记异常，
+        因为"在线抖动就静默改数"比"用一条已知陈旧但稳定的值"更难查；
+      · 在线取不到 ⇒ 保留本地 + 如实标注"陈旧且在线不可得"。
+    **R4 必须留痕**：无论哪一支都记一条采集异常（`kind=cross_channel`）。
+    """
+    from src.infrastructure.catalog.network_fallback import UNMEASURED
+
+    plan = getattr(res, "plan", None) or {}
+    stale_days = float(plan.get("stale_days") or 0.0)
+    local_period, local_value = _local_latest(res)
+    base_facts = {"stale_days": round(stale_days, 1),
+                  "local_period": local_period or UNMEASURED,
+                  # ★ 选库原因（`CHG-0156` 的 `PathReason`）跟着事实一起记：
+                  #   "为什么是这张表"与"这张表陈旧了"是同一个决定的两半，
+                  #   分开记会让事后复核要跑两次探针才能还原现场。
+                  #   ⚠️ 它只进**管理员侧**的采集异常，不进用户可见文案。
+                  "path_why": str(plan.get("path_why") or "") or UNMEASURED}
+
+    tolerance = _declared_tolerance_days(key)
+    if tolerance is None:
+        verdict = CrossChannelVerdict(
+            CROSS_CHANNEL_NO_TOLERANCE,
+            note="（未登记新鲜度容忍 ⇒ 未做跨通道比对）",
+            facts=base_facts)
+        # 未登记是"我们没有契约"，不是缺陷：不记异常，避免按未登记量刷屏
+        return verdict
+    if stale_days <= tolerance:
+        return CrossChannelVerdict(CROSS_CHANNEL_FRESH, facts={
+            **base_facts, "tolerance_days": round(tolerance, 2)})
+
+    facts = {**base_facts, "tolerance_days": round(tolerance, 2)}
+    fetched = await _connector_probe(key, limit, state=state, agents=agents)
+    if not fetched:
+        verdict = CrossChannelVerdict(
+            CROSS_CHANNEL_STALE_KEPT,
+            note=(f"（⚠️ 本地已陈旧 {stale_days:.0f} 天 > 声明容忍 "
+                  f"{tolerance:.1f} 天；在线通道本次未取到，故仍用本地值）"),
+            facts={**facts, "online": "unavailable"})
+        _record_cross_channel(key, verdict, state=state)
+        return verdict
+
+    probe, points = fetched
+    online_period = max((str(getattr(p, "period_date", "") or "") for p in points),
+                        default="")
+    same_period = bool(online_period) and online_period == local_period
+    online_same_value = any(
+        str(getattr(p, "value", "")) == str(local_value)
+        for p in points if str(getattr(p, "period_date", "")) == local_period)
+    facts = {**facts, "online": probe, "online_period": online_period or UNMEASURED}
+
+    if online_period > local_period and not same_period:
+        rows = sorted(points, key=lambda p: str(getattr(p, "period_date", "")),
+                      reverse=True)[:limit]
+        body = "\n".join(
+            f"- {getattr(p, 'period_date', '?')}: {getattr(p, 'value', '?')} "
+            f"(来源{getattr(p, 'source_name', '?')})" for p in rows)
+        verdict = CrossChannelVerdict(
+            CROSS_CHANNEL_UPGRADED,
+            note=(f"（本地陈旧 {stale_days:.0f} 天 > 声明容忍 {tolerance:.1f} 天；"
+                  f"已用在线刷新到 {online_period}）"),
+            # ⚠️ 理由必须**跟着数据走**：这条正文是给 LLM 与用户看的，
+            #   只给在线值、不说"为什么换源"，等于把一次改数据变成静默行为。
+            text=(f"（跨通道刷新 {probe}，共 {len(points)} 条；"
+                  f"本地陈旧 {stale_days:.0f} 天 > 声明容忍 {tolerance:.1f} 天，"
+                  f"已用在线刷新到 {online_period}）\n{body}"),
+            facts=facts)
+        _record_cross_channel(key, verdict, state=state)
+        return verdict
+
+    if same_period and not online_same_value:
+        verdict = CrossChannelVerdict(
+            CROSS_CHANNEL_DISAGREE,
+            note=(f"（⚠️ 本地与在线同期次 {online_period} 数值不一致："
+                  f"本地 {local_value} / 在线 {getattr(points[0], 'value', '?')}；"
+                  f"仍用本地值，差异已留痕）"),
+            facts={**facts, "local_value": local_value,
+                   "online_value": str(getattr(points[0], "value", ""))})
+        _record_cross_channel(key, verdict, state=state)
+        return verdict
+
+    verdict = CrossChannelVerdict(
+        CROSS_CHANNEL_STALE_KEPT,
+        note=(f"（⚠️ 本地已陈旧 {stale_days:.0f} 天 > 声明容忍 "
+              f"{tolerance:.1f} 天；在线期次 {online_period or UNMEASURED} "
+              f"未更新，故仍用本地值）"),
+        facts=facts)
+    _record_cross_channel(key, verdict, state=state)
+    return verdict
+
+
+async def _connector_probe(key: str, limit: int, *,
+                           state: ResearchState,
+                           agents: dict[str, Any]) -> tuple[str, list[Any]] | None:
+    """第三跳的**取数本体**（唯一实现）：返回 `(命中的 probe, 结构化 points)`。
+
+    为什么从 `_query_data_via_connectors` 里拆出来：跨通道比对需要**结构化**结果，
+    而那个函数返回的是**给 LLM 看的文案**。让比对去解析文案 = "把判据塞进措辞"
+    （本项目明令禁止：验收会依赖文案）。拆出本体之后，文案版与比对版**共用同一次取数**，
+    不会出现"两次取数结果不同"的问题。
+
+    失败**绝不抛**（返回 `None`），行为与原来逐字一致。
     """
     backend = _backend_of(agents)
     if backend is None:
-        return ""
+        return None
     metric, _, entity = key.partition(":")
     code = (entity or str(state.get("focus_stock_code") or "")).strip()
     if entity and not code.isdigit():
@@ -2411,18 +2569,53 @@ async def _query_data_via_connectors(key: str, limit: int, *,
             continue
         if not points:
             continue
-        rows = sorted(
-            points,
-            key=lambda p: str(getattr(p, "period_date", "")),
-            reverse=True)[:limit]
-        body = "\n".join(
-            f"- {getattr(p, 'period_date', '?')}: "
-            f"{getattr(p, 'value', '?')} "
-            f"(来源{getattr(p, 'source_name', '?')})"
-            for p in rows
-        )
-        return f"（连接器兜底 {probe}，共 {len(points)} 条）\n{body}"
-    return ""
+        return probe, list(points)
+    return None
+
+
+async def _query_data_via_connectors(key: str, limit: int, *,
+                                     state: ResearchState,
+                                     agents: dict[str, Any]) -> str:
+    """第三跳：把指标交给 A01 的采集路由（连接器链）试一次。
+
+    ## 为什么需要这一跳（实测驱动，不是设计想象）
+
+    本会话实测：并发清理期间 `quant_daily_basic` 一度从库中消失，
+    而**同一个口径 `股息率TTM:600036` 仍能从源取到 4915 条**。
+    也就是说"本地库没有"**不等于**"数据找不到" ——
+    中间还隔着连接器这一层能力。
+
+    ## 复用而不是另造（AGENTS.md：「同一判断只允许一份实现」）
+
+    走的是 `A01_data_collector` 的 backend ——
+    **与主采集链路同一个 `ConnectorRouter` 实例**，
+    因此自带故障转移、失败冷却、新鲜度下限，成功率与主链路一致。
+
+    失败**绝不抛**：第三跳是兜底，它坏了不能拖垮主链（返回空串，
+    由调用方给出本地诊断）。
+
+    ★ 取数本体已抽到 `_connector_probe()`（`CHG-0157`）：跨通道比对需要结构化结果，
+    而本函数返回的是**给 LLM 看的文案**。两者共用同一次取数，行为逐字未改。
+
+    ⚠️ 2026-09-28 第二十五轮：本函数从 `recommend_node` 内的闭包**提到模块级**
+    （只加了 `state`/`agents` 两个显式参数，行为逐字未改）——
+    否则第四跳没法单独验收，而"没人调它"正是本轮要修的缺陷本身。
+    """
+    fetched = await _connector_probe(key, limit, state=state, agents=agents)
+    if not fetched:
+        return ""
+    probe, points = fetched
+    rows = sorted(
+        points,
+        key=lambda p: str(getattr(p, "period_date", "")),
+        reverse=True)[:limit]
+    body = "\n".join(
+        f"- {getattr(p, 'period_date', '?')}: "
+        f"{getattr(p, 'value', '?')} "
+        f"(来源{getattr(p, 'source_name', '?')})"
+        for p in rows
+    )
+    return f"（连接器兜底 {probe}，共 {len(points)} 条）\n{body}"
 
 
 async def _fallback_fetch(
@@ -2625,9 +2818,17 @@ async def query_data_for_agent(indicator: str, limit: int = 10, *,
         local_error = exc
         logger.warning("query_data 本地兜底异常(%s)：%s", key, exc)
     if res is not None and res.ok:
-        # ★ 跳级命中埋点：第二跳真的给出了数据（第一跳空才走到这里）。
+        # ★ 跨通道一致性（`CHG-0157`，口径见 PRD §三十三）：本地命中**不等于**可以用它 ——
+        #   如果它已经陈旧到违反**声明的新鲜度**，要么用在线刷新，要么如实标注。
+        #   ⚠️ 打点只记**最终答出来的那一跳**（`total` 是"四跳路径走过的次数"，
+        #   一次查询只能 +1）；"本地其实陈旧"这件事由采集异常承载，不进命中率。
+        verdict = await _cross_channel_decide(key, res, limit=limit,
+                                              state=state, agents=agents)
+        if verdict.used_online and verdict.text:
+            bump(HOP3_CONNECTOR)
+            return verdict.text
         bump(HOP2_LOCAL)
-        return (f"（本地库 {res.source}，共 {res.row_count} 条）\n"
+        return (f"（本地库 {res.source}，共 {res.row_count} 条{verdict.note}）\n"
                 + res.summary(limit))
 
     # 第三跳：连接器兜底
@@ -2744,6 +2945,40 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
         _gap_resolver = DataGapResolverAgent(gw)
         return _gap_resolver
 
+    #: 豁免类的 `gap_kind` 取值 → 人话（**唯一**的文案映射，别处不许再写一份）。
+    EXEMPT_GAP_WORDING: dict[str, str] = {
+        "not_applicable": "该口径对本主体不适用（非缺陷）",
+        "not_covered": "该专题未收录本主体（非缺陷）",
+    }
+
+    def _record_exempt_gap(ind: str, gap_kind: str, exc: BaseException) -> None:
+        """把"这条缺口属于豁免类"记进**缺口台账**（`CHG-0155`）。
+
+        为什么要有这一跳：豁免结论原先只活在**这一处的 progress 文案**里，
+        而下游（`collect_node` 的缺口文案、审计的完整性三态）各自再判断一次
+        —— 于是同一件事在界面上出现两句互相矛盾的话。实测现场：豁免类同时显示
+        「ℹ️ …不适用（非缺陷，已跳过）」与「⚠️ …缺口（实时失败 + DB 无快照）」，
+        用户读到后者会以为系统坏了。
+
+        取值优先用取数侧挂在异常上的结构化字段（拿不到才用 `miss_stage` 映射），
+        **绝不抛**：观测失败不该影响采集（与 `audit.record` 同一条纪律）。
+        """
+        try:
+            from src.domain.agents.data.collector.gap_ledger import (
+                record as _record_gap,
+            )
+
+            _record_gap(
+                task_id=str(state.get("task_id") or ""),
+                indicator=str(ind),
+                gap_kind=str(getattr(exc, "gap_kind", "") or gap_kind),
+                reason=exc,
+                path_stats=dict(getattr(exc, "path_stats", {}) or {}),
+                source="supervisor._live_fetch_one",
+            )
+        except Exception:  # noqa: BLE001 观测失败绝不影响采集
+            logger.debug("豁免缺口台账记录失败（忽略）", exc_info=True)
+
     async def _live_fetch_one(
         collector: Any, state: ResearchState, ind: str,
         updates: dict[str, Any], live_calls: set[str],
@@ -2799,7 +3034,15 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             #   **可见性不丢，只是不再吓人**（一屏注册表那次就是丢在这里）。
             miss_reason = f"{type(exc).__name__}: {exc}"
             text = str(exc)
-            if any(marker in text for marker in NOT_COVERED_MARKERS):
+            # ★★ 2026-10-01（`CHG-0155`）：**优先用结构化载体**，文本标记只作回退。
+            #   取数侧在抛出时把结论挂在异常上（`exc.gap_kind`，取值就是
+            #   `NoApplicableData.KINDS` 里那两个）；文本匹配是上一版的做法，
+            #   它把"结论"降级成"猜语义"（`catalog` 那侧有一模一样的教训）。
+            #   两条都留：老路径/别的连接器可能只给散文。
+            structured_kind = str(getattr(exc, "gap_kind", "") or "")
+            if structured_kind == "not_covered" or (
+                    not structured_kind
+                    and any(marker in text for marker in NOT_COVERED_MARKERS)):
                 # ★ 2026-09-30（`CHG-0135`）：口径存在、专题表未收录该主体。
                 #   三种处置与"不适用"完全一致（都不是故障），只是文案不同：
                 #   ① **不进 errors**；② **不联网硬试**（表里本来就没有它）；
@@ -2808,7 +3051,9 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 if ct is not None:
                     ct.push_progress(
                         f"ℹ️ {ind} 该专题未收录本主体（≠ 取值为 0，非缺陷，已跳过）")
-            elif any(marker in text for marker in NOT_APPLICABLE_MARKERS):
+            elif structured_kind == "not_applicable" or (
+                    not structured_kind
+                    and any(marker in text for marker in NOT_APPLICABLE_MARKERS)):
                 # ★ 取数侧**自己下的结论**："该口径对这个主体不适用"（银行没有流动比率）。
                 #   三种处置（照 AGENTS.md 的 `NOT_APPLICABLE_FOR_ENTITY` 纪律）：
                 #   ① **不进 errors**（它不是故障，是口径不适用）；
@@ -2820,6 +3065,13 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                         f"ℹ️ {ind} 该口径对本主体不适用（非缺陷，已跳过）")
             else:
                 miss_stage = "local"
+            if miss_stage in ("not_applicable", "not_covered"):
+                # ★ 让这个结论**随指标一起走**：下游（`collect_node` 的缺口文案、
+                #   审计的三态豁免）都要用它，否则同一件事会在界面上出现两句
+                #   互相矛盾的话 —— 实测现场：豁免类会同时显示
+                #   「ℹ️ …不适用（非缺陷，已跳过）」与
+                #   「⚠️ …缺口（实时失败 + DB 无快照）」。用户读到后者会以为系统坏了。
+                _record_exempt_gap(ind, miss_stage, exc)
             logger.warning("%s", format_gap_note_for_log(ind, exc))
 
         if miss_reason and not points and miss_stage not in (
@@ -3507,10 +3759,40 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             # 旧实现 live 返回空时 silently 走 storage_fallback，不计硬错误）。
             # 真正的硬错误（agent 抛异常）已在 live_fetch 里被吞，仅记日志。
             # A17 综合分析时若需提示数据缺口，通过 "数据缺口" 字段在结论中显式声明。
+            #
+            # ★ 2026-10-01（`CHG-0155`）：**豁免类不许说成「缺口」**。
+            #   实测现场：豁免类（不适用/未收录）会同时出现
+            #     「ℹ️ …不适用（非缺陷，已跳过）」（`_live_fetch_one`）
+            #     「⚠️ …缺口（实时失败 + DB 无快照）」（本循环，来源 `result.missing`）
+            #   —— 前者说不是缺陷、后者说取数失败，用户读到后者会以为系统坏了。
+            #   事实源是缺口台账（`gap_ledger`，`_live_fetch_one` 已写入），
+            #   文案映射只有 `EXEMPT_GAP_WORDING` 一份。
+            exempt_here: dict[str, str] = {}
+            try:
+                from src.domain.agents.data.collector.gap_ledger import (
+                    exemptions as _gap_exemptions,
+                )
+                from src.domain.agents.data.collector.logic import (
+                    EXEMPT_GAP_KINDS as _EXEMPT_KINDS,
+                )
+
+                for row in _gap_exemptions(str(state.get("task_id") or ""),
+                                           exempt_kinds=_EXEMPT_KINDS):
+                    exempt_here[str(row.get("indicator") or "")] = str(
+                        row.get("gap_kind") or "")
+            except Exception:  # noqa: BLE001 台账读不到就退回旧文案（不阻断采集）
+                logger.debug("缺口台账不可读，缺口文案退回默认口径", exc_info=True)
+
             for ind in result.missing:
-                updates["progress"] += [
-                    f"⚠️ {ind} 缺口（实时失败 + DB 无快照）"
-                ]
+                kind = exempt_here.get(ind, "")
+                if kind:
+                    updates["progress"] += [
+                        f"ℹ️ {ind} {EXEMPT_GAP_WORDING.get(kind, '非缺陷')}"
+                    ]
+                else:
+                    updates["progress"] += [
+                        f"⚠️ {ind} 缺口（实时失败 + DB 无快照）"
+                    ]
             # ★ 2026-09-29 用户要求：「数据采集 agent 要记录任何未能获取到的信息
             #   日志，展示在后端日志里，方便查看采集效果，定期维护数据」。
             #   缺口逐条记 **WARNING** + 本轮汇总记 INFO（`src` 命名空间已装配

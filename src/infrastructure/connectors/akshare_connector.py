@@ -40,9 +40,10 @@ from src.core.errors import (
     BRIEF_TIGHT,
     brief,
 )
-from src.core.exceptions import DataFetchError
+from src.core.exceptions import DataFetchError, NoApplicableData
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
 from src.infrastructure.connectors.base import BaseConnector
+from src.infrastructure.connectors.null_policy import null_is_legitimate
 from src.infrastructure.connectors.real_industry_connector import (
     _latest_snapshot,
     parse_csindex_pe,
@@ -520,6 +521,13 @@ _QUANT_COLUMN_INDICATORS: dict[str, str] = {
     "市销率": "ps_ttm",
 }
 
+#: 表名**只写这一份**（`CHG-0059` 的那张全A股日频截面表）。
+#:
+#: 为什么单独立一个常量：本轮 `_quant_column_points` 的空结果分流要**多跑两条
+#: 探针查询**，它们问的是同一张表。表名在这里抄成 3 份（主查询 / 探针① / 探针②）
+#: 正是本仓库最贵的缺陷形状 —— "同一个 key 写在 3 处，只改一处 ⇒ 静默不一致"。
+_QUANT_BASIC_TABLE = "quant_daily_basic"
+
 
 def _quant_basic_db_path() -> str:
     """`quant_daily_basic` 所在的库 —— **共享行情仓**，不是应用库。
@@ -899,10 +907,35 @@ class AkshareConnector(BaseConnector):
                 start_date=start_date, end_date=end_date,
                 extra={"valuation": baidu_ind}, confidence=0.8)
 
-        # ETF无个股财务报表，禁止误打个股接口产生误导性数据
-        if prefix in (*_FIN_PREFIXES, *_QUANT_COLUMN_INDICATORS) \
-                and _is_etf_code(code):
-            raise DataFetchError(f"ETF({code})无个股{prefix}财务/基本面指标")
+        # ETF无个股财务报表，禁止误打个股接口产生误导性数据。
+        #
+        # ★ 这里必须**按语义分两档**（两个闸门、两个 `kind`，不许互换）：
+        #   · `_FIN_RATIO_INDICATORS`（流动比率/资产负债率/ROE…）是**个股财务报表口径**
+        #     —— ETF 没有资产负债表，该口径对 ETF **根本不存在**（与"银行没有流动比率"
+        #     同形）⇒ 语义不适用 `not_applicable`。判定依据是**代码本身是不是 ETF**
+        #     （`_is_etf_code`，与网络/源可用性无关），所以这是结构化证据、不是猜语义；
+        #   · `_DERIVED_STOCK_INDICATORS`（股息率）与 `_QUANT_COLUMN_INDICATORS`
+        #     （市值/换手率/量比/市销率/股息率TTM）**不同**：这些口径对 ETF **客观存在**
+        #     （ETF 也有市值、也可能分红），而我们的 `quant_daily_basic` 是**全A股**
+        #     截面表、这条合成链也只吃个股分红明细 ⇒ 缺的是"**表/链不收录这个主体**"
+        #     ⇒ **覆盖问题** `not_covered`（用户 2026-10-02 裁定 2；`docs/PRD.md`
+        #     §33.5 第 2 条点名的正是 `总市值:588170` 这个判点）。
+        #     标成 `not_applicable` 是**假的**（口径明明存在）＝多豁免；继续标普通
+        #     `DataFetchError` 也不对：那是把"承认覆盖不到、别去补"说成"取数链故障、
+        #     去修一条本来就不该收 ETF 的链"，排查方向被带偏。
+        #
+        # ⚠️ 原文案（`f"ETF({code})无个股{prefix}财务/基本面指标"`）**逐字保留**：
+        #   构造函数据它拼标记（`NoApplicableData.__init__` 把对应的 `MARKER_*`
+        #   追加在文案后面），既有文案核对依赖这些字。
+        # ⚠️ 这两处**不是**"口径存在但我们此源缺数据"那一类（族 A/族 B 内部，
+        #   以及 `_quant_column_points` 的两条 fail-closed）：那些一个字都没动。
+        if _is_etf_code(code) and prefix in _FIN_RATIO_INDICATORS:
+            raise NoApplicableData(
+                f"ETF({code})无个股{prefix}财务/基本面指标", kind="not_applicable")
+        if _is_etf_code(code) and prefix in (
+                *_DERIVED_STOCK_INDICATORS, *_QUANT_COLUMN_INDICATORS):
+            raise NoApplicableData(
+                f"ETF({code})无个股{prefix}财务/基本面指标", kind="not_covered")
 
         # ---------- 族 A：由 quant_daily_basic 列直接取（★ 第二十四轮新增）----------
         if prefix in _QUANT_COLUMN_INDICATORS:
@@ -925,32 +958,109 @@ class AkshareConnector(BaseConnector):
             raise DataFetchError(f"未登记的个股财务指标: {prefix}")
         start_year = int(start_date[:4]) if start_date else datetime.now().year - 3
         df = ak.stock_financial_analysis_indicator(symbol=code, start_year=str(start_year))
+        if df is None or len(df) == 0:
+            # 空帧 ⇒ **一点证据都没有**：既判不出"列名写错"，更判不出"该实体无值"
+            # （拿不到任何列，就没有任何东西可核对）。必须 fail-closed 按真失败报：
+            # 原实现会让空帧流进下面的"列未命中"分支，报出一句「最相近的列：（无）
+            # —— 请在 `_FIN_RATIO_INDICATORS` 里改正列名」，把"源什么都没返回"
+            # 说成"我们的列名写错了"，排查方向正好相反。
+            # 若不先挡住，空帧还会带着"列存在、一个值都没有"的形状掉进下面的豁免
+            # 分支 ⇒ **把源故障豁免成"该口径不适用"**（最危险的方向）。
+            raise DataFetchError(
+                f"{code} 的财务指标源表为空（{start_year} 起 0 期）——"
+                "没有任何列可核对，按**取数失败**处理：先查源可用性，不要改映射表")
+        # A) 列名根本不在源表列中 → **我们的契约写错了**（要改映射表）。
+        #    这一判必须排在 `series_to_points` **之前**：转换器找不到数值列时会先抛
+        #    它自己的「AkShare返回结构异常(缺日期/数值列)」—— 那句既不给最相近的列名、
+        #    也不说"改映射表"，于是这段更可执行的诊断成了**死代码**（本轮实测：
+        #    本判据第一版就是被它顶掉的，`_suggest_columns` 一次都没跑到过）。
+        #    判定用 `_find_col`（与转换侧**同一套**包含匹配）：列被重命名但仍能被
+        #    关键词命中的情况照旧可用，不会在这里被误判成"缺列"。
+        cols = [str(c) for c in df.columns]
+        column = _find_col(cols, col_keyword)
+        if column is None:
+            near = _suggest_columns(col_keyword, cols)
+            raise DataFetchError(
+                f"财务指标列未命中：{code} 的 {col_keyword!r} 不在源表列中。"
+                f"最相近的列：{near or '（无）'} —— "
+                "请在 `_FIN_RATIO_INDICATORS` 里改正列名")
         points = series_to_points(
             df, indicator, date_keywords=("日期",), value_keywords=(col_keyword,),
             start_date=start_date, end_date=end_date,
             extra={"frequency": "quarterly", "source_column": col_keyword},
             confidence=0.8)
         if not points:
-            # 空结果必须**分成两类**，否则排查方向完全相反：
-            #   A) 列名根本不在源表里 → **我们的契约写错了**（要改映射表）
-            #   B) 列在、但这只票没有值 → **语义正确**（如银行资产负债不划分
-            #      流动/非流动，「流动比率」对银行必然为空）。当成缺陷去修会
-            #      白费力气，还会把"这个口径对银行不适用"这条真信息抹掉。
-            cols = [str(c) for c in df.columns]
-            if col_keyword not in cols:
-                near = _suggest_columns(col_keyword, cols)
-                raise DataFetchError(
-                    f"财务指标列未命中：{code} 的 {col_keyword!r} 不在源表列中。"
-                    f"最相近的列：{near or '（无）'} —— "
-                    "请在 `_FIN_RATIO_INDICATORS` 里改正列名")
+            # 空结果必须**分成三类**，否则排查方向完全相反（A 已在上面判掉）：
+            #   B) 列在、全表有值，但没有一期落在**这次请求的区间**内 → 区间/时效
+            #      问题（放宽区间或更新源），**不是**"该实体无值"
+            #   C) 列在、全表一个可转数值都没有 → **语义正确**（如银行资产负债不划分
+            #      流动/非流动，「流动比率」对银行必然为空）。当成缺陷去修会白费力气，
+            #      还会把"这个口径对银行不适用"这条真信息抹掉。
+            #
+            # 为什么 B/C 必须分开（而不是"空结果 ⇒ 不适用"）：豁免 = 这条缺口
+            # **不再进缺陷清单、也不去补**。"区间没覆盖到"是真缺口，一刀切豁免
+            # 等于把真缺口说成"这个口径本来就没有" —— 与用户报障的那类误判互为镜像，
+            # 只是方向相反、更难发现。
+            #
+            # 判据是**证据**（读原帧那列的全表取值），不是文案：`_to_float` 认
+            # `"--"`/NaN 为无值（新浪表用它们表示"没披露"）。
+            label = next(c for c in df.columns if str(c) == column)
+            series = df[label]
+            raw = series.tolist() if hasattr(series, "tolist") else None
+            numeric = ([] if raw is None
+                       else [v for v in raw if _to_float(v) is not None])
+            if raw is not None and raw and not numeric:
+                # ★ **结构化**结论（`kind`），不只是文本标记：异常经路由器聚合后
+                #   类型会丢、`kind` 也会丢，但标记跨层可读；而下游拿 `kind` 判
+                #   才不必靠猜文案。文案逐字保留（既有的标记核对依赖它）。
+                raise NoApplicableData(
+                    f"{code} 的 {col_keyword!r} 在源表中**该实体无值**"
+                    f"（已取到 {len(df)} 期）。这通常是**语义正确**而非缺陷 ——"
+                    "例如银行资产负债不划分流动/非流动，「流动比率」对银行必然为空。"
+                    "请换用适用于该行业的杠杆/资本类口径（资产负债率/产权比率等）。",
+                    kind="not_applicable")
+            # 走到这里 = 有值但不在区间内（或列内容读不出来）⇒ **没有豁免证据**。
+            # 默认落到"真失败"这一档：宁可多报假阳性，也不许把真缺口豁免掉。
             raise DataFetchError(
-                f"{code} 的 {col_keyword!r} 在源表中**该实体无值**"
-                f"（已取到 {len(df)} 期）。这通常是**语义正确**而非缺陷 ——"
-                "例如银行资产负债不划分流动/非流动，「流动比率」对银行必然为空。"
-                "请换用适用于该行业的杠杆/资本类口径（资产负债率/产权比率等）。")
+                f"{code} 的 {col_keyword!r} 没有落在请求区间"
+                f"（{start_date}~{end_date}）内的可用值：该列读到 "
+                f"{'-' if raw is None else len(raw)} 个单元格 / {len(numeric)} 个可转数值"
+                " —— 证据不足以判为口径问题，按**取数失败**处理：放宽区间或查数据源")
         return points
 
     # ---------------- 族 A：quant_daily_basic 列 ----------------
+
+    def _probe_quant_rows(
+        self, con: Any, where: str, params: list[Any], *,
+        column: str | None = None,
+    ) -> int:
+        """跑一条**廉价探针**查询，返回匹配行数；读不出来 ⇒ 抛 `DataFetchError`。
+
+        `column is None` ⇒ 探针①（**不加列过滤、不加区间**）：这只票在这张表里
+        到底有没有行；否则 ⇒ 探针②（加 `IS NOT NULL`、**仍不加区间**）：这一列
+        对它**历史上**有没有过值。
+
+        为什么探针失败**绝不吞**：探针答的是「这只票到底在不在表里」。把读失败
+        当成"不在表里"，就会把**一次数据源故障**说成「该专题未收录本主体（非缺陷）」
+        —— 正是本项目最贵的那类错误（真故障被豁免掉，之后没人去修）。
+        """
+        # 表名**不在这里另写一份字面量**：下面主查询用的就是 `_QUANT_BASIC_TABLE`
+        # （本仓库最贵的缺陷形状是"同一个名字写在 3 处，只改一处"）。
+        sql = f'SELECT COUNT(*) FROM "{_QUANT_BASIC_TABLE}" WHERE {where}'
+        if column is not None:
+            sql += f' AND "{column}" IS NOT NULL'
+        try:
+            out = list(con.execute(sql, params))
+        except Exception as exc:  # noqa: BLE001 探针读失败 ⇒ 按取数失败报
+            raise DataFetchError(
+                f"quant_daily_basic 探针查询不可读（WHERE {where}）：{exc}") from exc
+        if len(out) != 1 or len(out[0]) != 1:
+            # 聚合查询**必须**恰好返回一个值；形状变了（例如 SQL 被改成非聚合）
+            # 就说明它答的不再是"有几行"，此时按第一行硬读会**静默**得出错误的
+            # 豁免结论 —— 宁可显式报错。
+            raise DataFetchError(
+                f"quant_daily_basic 探针查询返回了意外形状：{out[:3]!r}")
+        return int(out[0][0])
 
     def _quant_column_points(
         self, indicator: str, code: str, column: str,
@@ -982,17 +1092,50 @@ class AkshareConnector(BaseConnector):
         `latest_trade_date` 与 `staleness_days` 仍然写进 `extra`：
         行情仓是**日频定稿**数据（当日 15:00~16:00 后才入库），
         盘中取到的最后一天是上一交易日 —— 调用方要能看出来，而不是当成实时值。
+
+        ## ★ 空结果按**证据**分流（`CHG-0157` §33.5 第 2 条的确切缺口）
+
+        原来一条 SQL 把三种情形折叠成 `rows == []` ⇒ 只能一律报普通
+        `DataFetchError`。**能分开的那部分**现在用两次廉价探针分开（**只在
+        这条罕见路径上跑**：空结果本来就是要报错的那一支，不进热路径）：
+
+        * 探针①（**不加列过滤、不加区间**）**无行** ⇒ 这张表**不收录该主体**
+          ⇒ `NoApplicableData(kind="not_covered")`：承认覆盖不到、**别去补**
+          （表里本来就没有它）。这是取数侧自己写下的结论，不是猜语义；
+        * 探针① 有行、探针②（加 `IS NOT NULL`、仍不加区间）**该列历史全 NULL**
+          ⇒ 分不分得开**只看登记表** `configs/column_null_policy.yaml`（读取器
+          `null_policy.py`，用户 2026-10-02 裁定 1）：登记为 `legitimate`
+          （如 `dv_ttm` 真没分红）⇒ `NoApplicableData(kind="not_applicable")`；
+          **未登记**或登记为 `hole`、或登记表读不到/该条不合格 ⇒ 保持**普通
+          `DataFetchError`**（fail-closed：默认豁免 = 多豁免，最危险方向）；
+        * 探针① 有行、探针② 有值、只是**请求区间内没有** ⇒ 区间/新鲜度问题，
+          保持**普通 `DataFetchError`**：豁免它等于把真缺口说成"本来就没有"。
+
+        ⚠️ 上面两条 `DataFetchError` 的文案里**一个豁免标记都不许出现**：
+        `supervisor.NOT_APPLICABLE_MARKERS` / `NOT_COVERED_MARKERS` 是**文本兜底**
+        （异常经 `ConnectorRouter` 聚合后类型会丢），文案里混进标记就会把真失败
+        豁免掉 —— 上一轮已经踩过这个形状。
+
+        ⚠️ `code` 形状已核对：表里存的是**裸代码**（实测 `code='600036'` 命中
+        4983 行、`LIKE '600036.%'` 命中 0 行），与主查询的 `code = ?` 同源，
+        所以探针①问的确实是"这只票在不在表里"。
         """
         db_path = _quant_basic_db_path()
-        sql = (f'SELECT trade_date, "{column}" FROM quant_daily_basic '
-               f'WHERE code = ? AND "{column}" IS NOT NULL')
-        params: list[Any] = [code]
-        if start_date:
+        #: 主体条件**只写这一份**：主查询与两条探针问的必须是**同一个主体**，
+        #: 抄成两份就会出现"主查询问 600036、探针问别的" ⇒ 分流结论无意义。
+        where, params = "code = ?", [code]
+        start_key = str(start_date).replace("-", "")[:8] if start_date else None
+        end_key = str(end_date).replace("-", "")[:8] if end_date else None
+
+        sql = (f'SELECT trade_date, "{column}" FROM "{_QUANT_BASIC_TABLE}" '
+               f'WHERE {where} AND "{column}" IS NOT NULL')
+        query_params = list(params)
+        if start_key:
             sql += " AND trade_date >= ?"
-            params.append(str(start_date).replace("-", "")[:8])
-        if end_date:
+            query_params.append(start_key)
+        if end_key:
             sql += " AND trade_date <= ?"
-            params.append(str(end_date).replace("-", "")[:8])
+            query_params.append(end_key)
         sql += " ORDER BY trade_date"
 
         try:
@@ -1000,16 +1143,78 @@ class AkshareConnector(BaseConnector):
 
             con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
             try:
-                rows = list(con.execute(sql, params))
+                rows = list(con.execute(sql, query_params))
+                # 探针**只在这条罕见路径上**跑：主查询非空就直接跳过，
+                # 热路径一次额外查询都不加（判据 4 用执行记录钉死这一点）。
+                coverage: int | None = None
+                ever: int | None = None
+                if not rows:
+                    coverage = self._probe_quant_rows(con, where, params)
+                    if coverage:
+                        ever = self._probe_quant_rows(
+                            con, where, params, column=column)
             finally:
                 con.close()
+        except DataFetchError:
+            raise                      # 探针自己的结论（含"读不到就不许猜"）原样上传
         except Exception as exc:  # noqa: BLE001 表缺失/库不可读 → 明确报错
             raise DataFetchError(
                 f"quant_daily_basic 不可读（{code} 的 {column}）：{exc}") from exc
 
         if not rows:
+            if coverage == 0:
+                # 全表都没有这只票 ⇒ **覆盖问题**，而**不是**"口径不存在"：
+                # 这两个结论对客户的说法不同（`supervisor.NOT_COVERED_MARKERS`
+                # 那段注释写明了为什么必须分开）。
+                raise NoApplicableData(
+                    f"{_QUANT_BASIC_TABLE} 未收录 {code}"
+                    f"（该表是全A股日频截面，按 code 查 0 行）——"
+                    f"『表里没有这只票』≠『{indicator} 为 0』；"
+                    "这是**覆盖问题**（承认取不到），不是取数链故障，也别去补。",
+                    kind="not_covered")
+            if coverage and not ever:
+                # 有行、但这一列对它**历史上一个非 NULL 都没有**：合法无值
+                # 与数据洞同形 —— 分得开分不开**只看登记表**
+                # （`configs/column_null_policy.yaml`，读取器 `null_policy.py`）。
+                #
+                # ★ 用户 2026-10-02 裁定 1 建了这张登记表，于是这一支从"一律分不开"
+                #   变成按**登记 + 证据**分流：
+                #   · 该列登记为 `legitimate`（如 `dv_ttm`：没分红 ⇒ 股息率没有定义）
+                #     ⇒ `NoApplicableData(kind="not_applicable")`：承认"该口径对它没有
+                #     值"，别去补；
+                #   · 登记为 `hole` 或**未登记** ⇒ 保持普通 `DataFetchError`（fail-closed）。
+                #     **默认必须是这一档**：默认豁免 = 多豁免，而多豁免会把真缺口说成
+                #     "本来就没有"（最危险方向，比多报假阳性难发现得多）。
+                if null_is_legitimate(column):
+                    raise NoApplicableData(
+                        f"{_QUANT_BASIC_TABLE} 的 {code} 在表内共 {coverage} 行，"
+                        f"{column} 列**历史上全为空**：该列已在 "
+                        "`configs/column_null_policy.yaml` 登记为**合法无值**"
+                        "（NULL 就是该口径的正确取值，不是缺数据）——"
+                        "按**口径不适用**处理，别去补，也别当成取数链故障。",
+                        kind="not_applicable")
+                # 文案里**不许**出现任何豁免标记（否则文本兜底会把数据洞豁免掉）。
+                raise DataFetchError(
+                    f"{_QUANT_BASIC_TABLE} 的 {code} 在表内共 {coverage} 行，"
+                    f"但 {column} 列**历史上全为空**："
+                    "『合法无值』与『数据洞』（该补没补）**只能靠登记表分开**，"
+                    f"而 {column} **没有**在 `configs/column_null_policy.yaml` 里"
+                    "登记为合法无值（或登记表读不到/该条不合格，一律按未登记处理）"
+                    "⇒ 故按**取数失败**处理 —— 请先核对该列的数据入库链，"
+                    "确属合法无值再到登记表里补一条（附证据），"
+                    "不要就地改判为口径不适用")
+            if coverage:
+                # 有行、该列历史上也有值 ⇒ 缺的是**这次的区间**（或新鲜度）。
+                # 这是真缺口，放宽区间/更新源才对，**不是**豁免。
+                raise DataFetchError(
+                    f"{_QUANT_BASIC_TABLE} 的 {code} 有 {coverage} 行、"
+                    f"{column} 列历史上有值，但都不在请求区间"
+                    f"（{start_date}~{end_date}）内 —— 按**取数失败**处理："
+                    "放宽区间或更新源，不要改判为口径不适用")
+            # 探针没跑成 = 不变量被破坏（空结果必跑探针）。**不编结论**：
+            # 走下面那条与改动前逐字相同的兜底文案（fail-closed）。
             raise DataFetchError(
-                f"quant_daily_basic 里没有 {code} 的 {column} 数据"
+                f"{_QUANT_BASIC_TABLE} 里没有 {code} 的 {column} 数据"
                 f"（或期间不在 {start_date}~{end_date} 内）")
 
         latest = str(rows[-1][0])
@@ -1028,7 +1233,7 @@ class AkshareConnector(BaseConnector):
                 indicator=indicator, value=float(v),
                 period_date=f"{td[:4]}-{td[4:6]}-{td[6:8]}",
                 extra={
-                    "column": column, "table": "quant_daily_basic",
+                    "column": column, "table": _QUANT_BASIC_TABLE,
                     "latest_trade_date": latest,
                     "staleness_days": stale_days,
                     "staleness_note": (
