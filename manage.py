@@ -586,6 +586,71 @@ DEV_ROOT = ROOT / "data" / "dev"
 #: 实例一起停掉**。跨端口并存时不要用 `--replace`。
 PILOT_BACKEND_PORT = 8110
 
+#: ★ `CHG-0239`：**环境 → 惯用端口 / 后端 PID 文件名**的唯一一张表。
+#:
+#: ## 为什么必须把这张表写出来（2026-10-08 实测自伤一次）
+#:
+#: `restart-pilot` 原来的取法是 `port = args.port or 8110`，**与 `--env` 无关**，
+#: 而停止段又固定读 `backend.pid`（pilot 的）。于是：
+#:
+#:     manage.py restart-pilot --env dev            # 想补起 dev
+#:     → 端口取 8110（pilot 的）⇒ 停掉 8110 的监听者 = **pilot 整棵树**
+#:     → 再用 dev 的环境变量把 dev 实例**起在 8110 上**
+#:
+#: 结果：pilot 被杀、dev 占了客户端口、对外全站 502，而命令自己报"✅ 已启动"。
+#: ★ 这类缺陷的形状是**「参数各取各的默认值，彼此不校验」** ——
+#: 单看每一行都对，合起来就是一次生产事故。
+#:
+#: 键与 `cmd_start` 的命名约定一致（见 `cmd_start` 里
+#: `"backend" if extra_env.get("MOSS_ENV") != "dev" else "backend-dev"`）。
+_ENV_BACKEND_PORT: dict[str, int] = {"dev": DEFAULT_BACKEND_PORT, "pilot": PILOT_BACKEND_PORT}
+_ENV_BACKEND_PID_NAME: dict[str, str] = {"dev": "backend-dev", "pilot": "backend"}
+
+#: ★ `--demo`：只做两件事 —— 给一个**宽松的**端到端期限、
+#: 把缓存窗口放宽。**不用"跳过流程 / 少采数据"换时间**（见下方墓碑表）。
+#:
+#: ## 依据（实测，不是偏好）
+#:
+#: 2026-10-05 一次真实投研分析（`trace=task_20261005_8ffe9efe`）端到端 **116.7s**：
+#:   提交→规划 8s · planner 3.9s · **采集 27.3s** · 采集尾 13s ·
+#:   **扇出 29s（含 A09 白等 25s）** · **A17 34.7s（3 次串行）**
+#: 而热缓存下是 **26.6s**（09-30 复问）—— "快"来自"数据热 + 命中缓存"，
+#: 不是来自"少做几步"。
+#:
+#: ## 用户口径（2026-10-05，本轮修正）
+#:
+#: > 「**可以做到40秒，不是完全卡死在30秒，如果很多流程都跳过，
+#: >   数据也没采集到，这也是不合格的。**」
+#:
+#: 所以：**40 秒是软目标**；采集与流程完整性优先于它。
+DEMO_ENV: dict[str, str] = {
+    # ★ L2：任务级端到端期限（秒）。**40 而不是 28** ——
+    #   用户口径（2026-10-05 原话）：「可以做到40秒，不是完全卡死在30秒，
+    #   **如果很多流程都跳过，数据也没采集到，这也是不合格的**。」
+    #   ⇒ 期限只管 LLM 那几跳的等待上限，不许压缩采集或砍流程。
+    "MOSS_ANALYSIS_DEADLINE_SEC": "40",
+    # 结果缓存窗口 10 分钟 → 2 小时：彩排一次，整个演示窗口都命中。
+    "MOSS_RESULT_CACHE_TTL": "7200",
+}
+
+#: ⛔ **已废除的三个演示开关**（2026-10-05 同一轮口径修正，留墓碑不复活）：
+#:
+#: | 开关 | 曾经的"好处" | 为什么废除 |
+#: |---|---|---|
+#: | `MOSS_QUERY_DEADLINE_SEC=8` | 采集失败路径少等 2s | **压缩采集** ⇒ 缺口变多 |
+#: | `MOSS_ATTEMPT_BUDGET_CAP_SEC=20` | 压住付费链首 41s 预算 | 砍掉主源（更强模型） |
+#: | `MOSS_REACT_MAX_STEPS=1` | A17 省掉一次自我校验往返 | **跳过流程**本身 |
+#:
+#: 替代做法（同一轮已落地）：① 采集只认 `MOSS_QUERY_DEADLINE_SEC` 一个来源
+#: （`intel_limits` 的语义边界注释）；② 被期限砍掉的那一跳**跑完写缓存**
+#: （`MOSS_KEEP_LATE_RESULT`，当次仍按预算降级、下次同问直接命中主源答案）；
+#: ③ 到期后 `deadline.clamp()` 停手，让剩下的跳按各自正常预算跑完。
+DEMO_ENV_REMOVED: tuple[str, ...] = (
+    "MOSS_QUERY_DEADLINE_SEC",
+    "MOSS_ATTEMPT_BUDGET_CAP_SEC",
+    "MOSS_REACT_MAX_STEPS",
+)
+
 
 def _env_choices() -> tuple[str, ...]:
     """`--env` 的合法取值，**以 `src.core.config.ENVS` 为唯一权威**。
@@ -1286,6 +1351,21 @@ def _prepare_environment(env_name: str | None) -> tuple[dict[str, str], int]:
         print("   参考：docs/PLATFORM_MULTI_TENANCY_DESIGN.md §8.7.2", file=sys.stderr)
         return extra, 1
 
+    # ★ `CHG-0192`：PG 后端 + RLS 会话变量未接线 ⇒ 拒绝启动。
+    #
+    # 为什么放在这里（而不是只放 lifespan）：这是**更便宜的失败点** ——
+    # 在起子进程之前就报错，而且覆盖 `status` / `doctor` / `retention`
+    # 这类**不启动 API、因而永远不跑 lifespan** 的命令。
+    # 判据是单一实现（`assert_backend_can_start`），另有 lifespan 兜底。
+    try:
+        from src.infrastructure.security.rls import assert_backend_can_start
+
+        assert_backend_can_start(settings.data_backend)
+    except RuntimeError as exc:
+        print(f"❌ 后端自检未通过（MOSS_ENV={name}），**拒绝启动**：", file=sys.stderr)
+        print(f"   {exc}", file=sys.stderr)
+        return extra, 1
+
     missing = missing_runtime_dependencies()
     if missing:
         print("❌ 依赖自检未通过，**拒绝启动**：当前解释器缺少 "
@@ -1364,6 +1444,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     extra_env, rc = _prepare_environment(getattr(args, "env", None))
     if rc != 0:
         return rc
+
+    if getattr(args, "demo", False):
+        # 演示档：把"宁可降级也不等"的口径一次打开（见 DEMO_ENV 的实测依据）。
+        # **必须逐条打印** —— 否则"设了没生效"与"没设"长得一模一样。
+        extra_env.update(DEMO_ENV)
+        print("★ 演示档（--demo）已并入启动环境：", file=sys.stderr)
+        for key, value in DEMO_ENV.items():
+            print(f"   {key}={value}", file=sys.stderr)
 
     # 前端端口（如需）
     if args.with_frontend and not port_open("127.0.0.1", DEFAULT_FRONTEND_PORT):
@@ -1818,6 +1906,71 @@ def cmd_worker(args: argparse.Namespace) -> int:
         subprocess.run(cmd, cwd=str(ROOT), check=False)
     except KeyboardInterrupt:
         print("\n已停止。")
+    return 0
+
+
+def cmd_retention(args: argparse.Namespace) -> int:
+    """跑一次保留清理；`--dry-run` 只统计不修改（先看后做）。
+
+    ## 为什么必须有 dry-run
+
+    保留清理是**批量删数据**：按天/年口径动辄几万行，而"保留期配错一格"
+    （比如把 `retention_event_days` 从 730 填成 7）**不会报错**，
+    只会安静地把两年的业务数据删掉。在此之前唯一的"预览"手段是读代码算，
+    而算错了没有第二次机会。`--dry-run` 让"这一轮会删什么"变成一条命令。
+
+    ## 它保证什么、不保证什么
+
+    · **保证**：dry-run 报的行数与紧接着真跑删的行数**逐表相等**
+      （计数与执行共用同一个 WHERE，见 `retention_passes._dereference_where`）；
+    · **不保证**：跨天/跨零点两次调用之间到期的行（cutoff 按"今天"算）。
+      要据此决策，请在**同一天内**先 dry-run 再真跑。
+    · 当前 dry-run **只覆盖第 3 档**（增量流水表）；数据点/新闻缓存两档仍是
+      真实统计口径，见 `run_retention` 的 docstring —— **不假装它做了**。
+    """
+    import asyncio
+    import json
+
+    from src.core.config import get_settings
+    from src.infrastructure.retention_service import run_retention
+
+    # ★ `--env` 支持：本命令是**唯二会删数据**的 manage 子命令（另一个是 vacuum），
+    #   而"删错库"的代价不可逆。三档隔离（dev/test/pilot）与 prod 自检走的是
+    #   与 `start` 同一套 `_prepare_environment` —— 不另写一份。
+    env_name = getattr(args, "env", None)
+    if env_name:
+        injected, code = _prepare_environment(env_name)
+        if code != 0:
+            return code
+        os.environ.update(injected)
+
+    dry = bool(getattr(args, "dry_run", False))
+    settings = get_settings()
+    # ★ `CHG-0192`：本命令**不走 FastAPI lifespan**，而 `--env` 是可选的 ——
+    #   于是 `_prepare_environment` 里的后端自检在这条路径上**会被绕过**
+    #   （实测：`DATA_BACKEND=postgres` 时它照跑，只是取数阶段才失败）。
+    #   数据保留是"删数据"的命令，配置没完成时必须更早拒绝。
+    try:
+        from src.infrastructure.security.rls import assert_backend_can_start
+
+        assert_backend_can_start(settings.data_backend)
+    except RuntimeError as exc:
+        print(f"❌ 后端自检未通过，**拒绝执行保留清理**：\n   {exc}", file=sys.stderr)
+        return 1
+    # 横幅必须**显式报出目标库**：本命令默认打遗留主库（`data/moss_finagent.db`），
+    # 而"我以为它打的是 dev"是这条链路上最容易犯、最难发现的错。
+    print(f"目标库：{settings.sqlite_path}")
+    print(f"环境：{env_name or os.environ.get('MOSS_ENV') or '（未指定，取默认）'}")
+    print("模式：" + ("dry-run（只统计，不修改任何数据）" if dry else "真跑（会删除数据）"))
+    outcome = asyncio.run(run_retention(settings, dry_run=dry))
+    print(json.dumps(outcome, ensure_ascii=False, indent=2, default=str))
+    if dry:
+        total = int(outcome.get("passes_deleted") or 0)
+        casc = int(outcome.get("passes_cascaded") or 0)
+        print(f"\n本轮**将**删除 {total} 行、级联 {casc} 行（未执行）。")
+    if outcome.get("errors"):
+        print("\n有错误：" + "; ".join(map(str, outcome["errors"])))
+        return 1
     return 0
 
 
@@ -2560,9 +2713,36 @@ def cmd_restart_pilot(args: argparse.Namespace) -> int:
     停（并等端口释放）→ 起（`cmd_start`）→ 校验（端口/存活探针/worker）。
     起的那一步会**连带**拉起 worker（见 `ensure_worker`），
     所以"重启后端却忘了 worker"这个静默失效在这里不可能发生。
+
+    ## ★ `CHG-0239`：端口与 PID 文件**都按 `--env` 取**（否则会误杀另一个实例）
+
+    原实现是 `port = args.port or 8110` + 固定读 `backend.pid`，
+    ⇒ `--env dev` 会把 **pilot** 停掉、再把 dev 起在 8110 上（详见
+    `_ENV_BACKEND_PORT` 的注释）。现在：目标端口、PID 文件名、要不要管 worker
+    三件事**都由 `--env` 决定**；显式指定的 `--port` 若正好是**另一个环境**的
+    惯用端口，直接**拒绝执行**并给出正确命令 —— 这不是多此一举：
+    那个组合的全部效果就是"停掉生产、把开发实例放上生产端口"。
     """
-    port = args.port or PILOT_BACKEND_PORT
-    env = args.env or "pilot"
+    env = str(args.env or "pilot").strip().lower()
+    canonical_port = _ENV_BACKEND_PORT.get(env, PILOT_BACKEND_PORT)
+    port = args.port if args.port else canonical_port
+    other = {p: e for e, p in _ENV_BACKEND_PORT.items() if e != env}
+    if args.port and args.port != canonical_port and args.port in other:
+        print(f"❌ 拒绝执行：--env {env} 的端口是 {canonical_port}，"
+              f"而 {args.port} 是 **{other[args.port]}** 的端口。", file=sys.stderr)
+        print(f"   继续下去的效果是：**停掉 {other[args.port]} 实例**，"
+              f"再用 {env} 的环境变量占住 {args.port}（2026-10-08 实测自伤过一次，"
+              "对外全站 502，而命令自己报「✅ 已启动」）。", file=sys.stderr)
+        print(f"   要重启 {env}：manage.py restart-pilot --env {env}"
+              f"（端口自动取 {canonical_port}）", file=sys.stderr)
+        print(f"   要重启 {other[args.port]}：manage.py restart-pilot --env {other[args.port]}",
+              file=sys.stderr)
+        return 2
+    #: 本环境的 worker 是否由**独立进程**承担（dev 是"全跑" ⇒ 没有 worker，
+    #: 见 `env_needs_worker`）。★ 这条同时决定停止段**要不要去动 worker** ——
+    #: 原实现无条件枚举本项目全部 worker，`--env dev` 时会把 pilot 的 worker 杀掉。
+    needs_worker = env_needs_worker(env)
+    backend_pid_name = _ENV_BACKEND_PID_NAME.get(env, "backend")
     t_phase = time.time()
 
     def _phase(label: str) -> None:
@@ -2574,22 +2754,32 @@ def cmd_restart_pilot(args: argparse.Namespace) -> int:
         t_phase = now
 
     targets: dict[int, str] = {}
-    for label, pid_file in (("pilot后端(PID文件)", RUN_DIR / "backend.pid"),
-                            ("worker(PID文件)", RUN_DIR / "scheduler-worker.pid")):
+    # ★ `CHG-0239`：PID 文件名按 env 取，**不回退到另一个环境的文件** ——
+    #   原实现固定读 `backend.pid`（pilot 的），`--env dev` 时停的就是 pilot。
+    for label, pid_file in (
+        (f"{env}后端(PID文件 {backend_pid_name}.pid)", RUN_DIR / f"{backend_pid_name}.pid"),
+    ) + ((("worker(PID文件)", RUN_DIR / "scheduler-worker.pid"),) if needs_worker else ()):
         pid = read_pid_file(pid_file)
         if pid is not None:
             targets[pid] = label
     listener = find_listening_pid(port)
     if listener is not None:
-        targets[listener] = f"pilot后端({port} 监听者)"
+        targets[listener] = f"{env}后端({port} 监听者)"
         parent = _parent_of(listener)
         if parent is not None and parent in list_our_backend_pids():
-            targets[parent] = "pilot后端(监听者的父进程/启动器)"
-    for pid in list_our_worker_pids():
-        targets.setdefault(pid, "worker(命令行枚举)")
+            targets[parent] = f"{env}后端(监听者的父进程/启动器)"
+    if needs_worker:
+        for pid in list_our_worker_pids():
+            targets.setdefault(pid, "worker(命令行枚举)")
+    else:
+        left = list_our_worker_pids()
+        if left:
+            print(f"  （本环境 {env} 不需要独立 worker，实测枚举到 {len(left)} 个本项目 worker"
+                  f" {left} —— **不动它们**：无法判定属于哪个 env，误杀会打在"
+                  "另一个实例上）")
 
     if not targets:
-        print(f"（没有发现 {port} 上的 pilot 后端或 worker，直接启动）")
+        print(f"（没有发现 {port} 上的 {env} 后端或 worker，直接启动）")
     else:
         # ★ 优雅请求的**返回值必须用起来**（2026-09-30 实测白等 20 秒）：
         #   `request_graceful_stop` 走 CTRL_BREAK，而它要求调用方与目标**共享控制台**
@@ -2605,7 +2795,7 @@ def cmd_restart_pilot(args: argparse.Namespace) -> int:
         # worker 额外走停止文件（CTRL_BREAK 到不了无控制台的守护进程）。
         # ★ 路径必须在**目标环境**里求值，否则会发到另一个目录、两边都静默
         #   （见 `_worker_stop_files` 的实测记录）。
-        worker_pids = list_our_worker_pids()
+        worker_pids = list_our_worker_pids() if needs_worker else []
         stop_file = None
         if worker_pids:
             try:
@@ -2654,7 +2844,8 @@ def cmd_restart_pilot(args: argparse.Namespace) -> int:
 
     start_args = argparse.Namespace(
         env=env, host=args.host or "127.0.0.1", port=port, reload=False,
-        daemon=True, with_frontend=False, replace=False, auto_port=False)
+        daemon=True, with_frontend=False, replace=False, auto_port=False,
+        demo=bool(getattr(args, "demo", False)))
     code = cmd_start(start_args)
     _phase("启动命令（含等端口就绪）")
     if code != 0:
@@ -2693,6 +2884,254 @@ def cmd_restart_pilot(args: argparse.Namespace) -> int:
     print(f"  校验：端口={'✅' if ok_port else '❌'} "
           f"存活探针={'✅' if live else '❌'} worker={worker_txt}")
     return 0 if (ok_port and live and present) else 1
+
+
+#: 进程启动的日志标记（每启动一次出现一次）。用来判断"结果缓存写入之后，
+#: 进程有没有重启过" —— 内存缓存重启即失，而日志里那条"结果缓存写入"还在。
+_START_MARKERS: tuple[str, ...] = (
+    "进程内Cron调度器已启动",
+    "Uvicorn running on",
+)
+
+
+def _log_line_ts(raw: str) -> float | None:
+    """日志行开头的 `YYYY-mm-dd HH:MM:SS` → epoch；没有就 None。"""
+    import time as _time
+
+    if len(raw) < 19:
+        return None
+    try:
+        return _time.mktime(_time.strptime(raw[:19], "%Y-%m-%d %H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def _result_cache_status(log_lines: list[str], qhash: str,
+                         now: float) -> dict:
+    """从后端日志尾部推断"演示问句的结果缓存**现在**还有效吗"。
+
+    ★ 为什么不能只看"结果缓存写入"那一行（本函数存在的理由，2026-10-05 实测）：
+    结果缓存是**进程内存**里的 dict，重启即清空；而日志里那条写入记录**还在**
+    ⇒ 只按"写入时间 + TTL"算剩余，重启后会报出 **`✅ 还可秒回 5314s` 的假绿**。
+    这正是本项目最贵的一类缺陷（验收工具自己骗人），所以这里必须同时看
+    "写入之后有没有出现过启动标记"。
+
+    返回 `{state, left, written_at, last_start}`，`state ∈`：
+      * `hit`     —— 写入在最后一次启动之后且未过期 ⇒ 演示会秒回；
+      * `stale`   —— 写入在启动之后但已过期；
+      * `wiped`   —— **写入之后进程重启过** ⇒ 缓存已清空（必须重新彩排）；
+      * `missing` —— 日志里根本没有这次写入。
+    """
+    import time as _time
+
+    write_ts: float | None = None
+    write_ttl = 600.0
+    last_start: float | None = None
+    for raw in log_lines:
+        ts = _log_line_ts(raw)
+        if ts is None:
+            continue
+        if any(mark in raw for mark in _START_MARKERS):
+            last_start = ts if last_start is None else max(last_start, ts)
+        if "结果缓存写入" in raw and f"qhash={qhash}" in raw:
+            if write_ts is None or ts >= write_ts:
+                write_ts = ts
+                seg = raw.split("TTL=")[-1].split("s")[0]
+                try:
+                    write_ttl = float(seg)
+                except ValueError:
+                    write_ttl = 600.0
+    fmt = lambda v: (_time.strftime("%H:%M:%S", _time.localtime(v))  # noqa: E731
+                     if v else None)
+    if write_ts is None:
+        return {"state": "missing", "left": 0.0, "written_at": None,
+                "last_start": fmt(last_start), "ttl": write_ttl}
+    left = write_ttl - (now - write_ts)
+    if last_start is not None and write_ts < last_start:
+        state = "wiped"
+    elif left > 120:
+        state = "hit"
+    else:
+        state = "stale"
+    return {"state": state, "left": left, "written_at": fmt(write_ts),
+            "last_start": fmt(last_start), "ttl": write_ttl}
+
+
+def _tail_text(path: Path, max_bytes: int = 8_000_000) -> list[str]:
+    """读文件**尾部**若干字节并按行切（后端日志 50MB+，不能整读）。"""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+                fh.readline()          # 丢掉可能被截断的首行
+            data = fh.read()
+        return data.decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
+def cmd_demo_check(args: argparse.Namespace) -> int:
+    """演示前 checklist（只读、可复跑）：每条打 ✅/❌，退出码 = 有没有 ❌。
+
+    ## 为什么要有它（而不是"我看一眼挺好"）
+
+    演示翻车的三个真实形态都**不看不知道**：
+
+    1. 后端 / 公网入口不通（重启窗口没走完、隧道抖动、cloudflared 停了）；
+    2. 演示问句的**结果缓存已过期**（默认 TTL 600s）⇒ 演示时又变成 117s 全跑；
+    3. 质押整表索引过期 ⇒ 那 254 个请求会在演示中途被触发（本轮已改成
+       请求期 fail-closed，但过期就是"该指标拿不到值"）。
+
+    判据全部来自**本地可读的事实**（进程/端口、落盘索引、后端日志的缓存写入行、
+    LLM 审计的最近一次 trace），**不需要登录凭据**。
+    """
+    import time as _time
+    import urllib.error
+    import urllib.request
+
+    port = int(args.port)
+    failures: list[str] = []
+    warnings: list[str] = []
+
+    def line(ok: bool, label: str, detail: str = "") -> None:
+        print(f"{'✅' if ok else '❌'} {label}" + (f"：{detail}" if detail else ""))
+        if not ok:
+            failures.append(label)
+
+    print("=" * 68)
+    print("演示前 checklist")
+    print("=" * 68)
+
+    # ① 后端在跑 + 存活探针
+    info = diagnose_port(port)
+    line(bool(info["occupied"]), f"后端监听 127.0.0.1:{port}",
+         f"PID={info['pid']}" if info["occupied"] else "端口没人听 —— 先 manage.py start")
+    live = False
+    try:
+        with urllib.request.urlopen(  # noqa: S310 本机回环
+                f"http://127.0.0.1:{port}/api/v1/health/live", timeout=5) as resp:
+            live = resp.status == 200
+    except (urllib.error.URLError, OSError):
+        live = False
+    line(live, "本机存活探针 200", "/api/v1/health/live")
+
+    # ② 公网入口
+    if args.skip_public:
+        print("⏭  公网探针：按 --skip-public 跳过")
+    else:
+        code = None
+        try:
+            with urllib.request.urlopen(  # noqa: S310 外网入口
+                    args.public_url, timeout=20) as resp:
+                code = resp.status
+        except urllib.error.HTTPError as exc:      # 401/403 也算"活着"
+            code = exc.code
+        except (urllib.error.URLError, OSError) as exc:
+            code = f"{type(exc).__name__}"
+        line(code == 200, "公网入口 200", f"{args.public_url} → {code}")
+
+    # ③ 质押整表索引（本轮修的 233s 孤儿拉取就在这条路上）
+    from src.infrastructure.connectors.compliance_fin_connector import (
+        _PLEDGE_DETAIL_TTL,
+        _PLEDGE_INDEX_FILE,
+        _pledge_index_read,
+    )
+
+    index, fresh = _pledge_index_read()
+    if index is None:
+        line(False, "质押整表索引（落盘）", f"缺失：{_PLEDGE_INDEX_FILE}")
+    else:
+        age_h = (_time.time() - float(index["at"])) / 3600
+        line(fresh, "质押整表索引新鲜",
+             f"{index['rows']} 行 / {len(index['by_code'])} 只 / "
+             f"as_of={index['as_of'] or '-'} / 已存 {age_h:.1f}h（TTL "
+             f"{_PLEDGE_DETAIL_TTL // 3600}h）")
+
+    # ④ 演示问句还会秒回吗（结果缓存 = 唯一 100% 确定的路径）
+    log_lines = _tail_text(RUN_DIR / "backend.log")
+    if args.query:
+        try:
+            from src.api.routes.research import _query_hash
+        except Exception as exc:  # noqa: BLE001 拿不到就明说，不假装
+            warnings.append(f"无法加载 _query_hash：{type(exc).__name__}")
+            qhash = ""
+        else:
+            qhash = _query_hash(args.query, args.analysis_type,
+                                args.target or args.query)
+        if qhash:
+            print(f"   （演示问句 qhash={qhash}）")
+            st = _result_cache_status(log_lines, qhash, _time.time())
+            if st["state"] == "missing":
+                line(False, "演示问句的结果缓存",
+                     "日志里没有它的「结果缓存写入」—— 先在界面上把**同一问句**"
+                     "跑一遍（这就是彩排）")
+            elif st["state"] == "wiped":
+                line(False, "演示问句的结果缓存",
+                     f"写入于 {st['written_at']}，但进程在 {st['last_start']} "
+                     "**重启过** ⇒ 内存缓存已清空（日志里那行写入还在，是假绿）"
+                     "—— 请重新彩排一次")
+                warnings.append("重启会清空结果缓存：最后一次重启之后必须再彩排一次")
+            elif st["state"] == "stale":
+                line(False, "演示问句的结果缓存",
+                     f"写入于 {st['written_at']}（TTL {st['ttl']:.0f}s）⇒ "
+                     f"已过期 {abs(st['left']):.0f}s，请重新彩排")
+                warnings.append("缓存已过期：演示前再彩排一次，或用 --demo 重启把 "
+                                "MOSS_RESULT_CACHE_TTL 放宽")
+            else:
+                line(True, "演示问句的结果缓存",
+                     f"写入于 {st['written_at']}（TTL {st['ttl']:.0f}s）⇒ "
+                     f"还可秒回 **{st['left']:.0f}s**"
+                     + (f"；上次进程启动 {st['last_start']}"
+                        if st["last_start"] else ""))
+    else:
+        warnings.append("未传 --query ⇒ 无法核对『演示问句是否秒回』（强烈建议传）")
+
+    # ⑤ 最近一次投研分析的实测（用了多少调用 / 命中几次 / 墙钟多长）
+    audit = PILOT_ROOT / "audit" / "llm_audit.jsonl"
+    by_trace: dict[str, list[dict]] = {}
+    import json as _json
+    for raw in _tail_text(audit, 4_000_000):
+        try:
+            rec = _json.loads(raw)
+        except ValueError:
+            continue
+        tid = str(rec.get("trace_id") or "")
+        if tid.startswith("task_"):
+            by_trace.setdefault(tid, []).append(rec)
+    if by_trace:
+        last = max(by_trace, key=lambda k: by_trace[k][-1].get("ts", ""))
+        rows = by_trace[last]
+        stamps = [str(r.get("ts") or "") for r in rows if r.get("ts")]
+        span_txt = "未知"
+        if len(stamps) >= 2:
+            from datetime import datetime as _dt
+
+            try:
+                span = (_dt.fromisoformat(stamps[-1]) - _dt.fromisoformat(stamps[0])
+                        ).total_seconds()
+                span_txt = f"{span:.1f}s"
+            except ValueError:
+                span_txt = "未知（时间戳解析失败）"
+        hits = sum(1 for r in rows if r.get("cache_hit"))
+        print(f"ℹ️  最近一次投研分析：{last} · LLM 调用 {len(rows)} 次 · "
+              f"缓存命中 {hits} 次 · LLM 段墙钟 {span_txt}（首条 {stamps[0][11:19]}）")
+        if hits == 0:
+            warnings.append("最近一次分析 **0 次 LLM 缓存命中**（冷跑）—— "
+                            "演示当天要的是热跑：先彩排一次同问句")
+    else:
+        warnings.append("审计里没有 task_ 记录（还没跑过投研分析？）")
+
+    print("-" * 68)
+    if failures:
+        print(f"❌ {len(failures)} 项不合格：{'；'.join(failures)}")
+    else:
+        print("✅ 全部硬判据通过")
+    for note in warnings:
+        print(f"⚠️  {note}")
+    print("提示：用 `--demo` 重启（`manage.py restart-pilot --demo`）会打印 4 行演示档"
+          "环境；**看到那 4 行才算生效**（看不到就是没生效）。")
+    return 1 if failures else 0
 
 
 def cmd_logs(args: argparse.Namespace) -> int:
@@ -2883,6 +3322,8 @@ def build_parser() -> argparse.ArgumentParser:
                          help="端口被本项目旧实例占用时，精确停止旧实例后重启")
     p_start.add_argument("--auto-port", action="store_true",
                          help="端口冲突时自动 +1 寻找空闲端口")
+    p_start.add_argument("--demo", action="store_true",
+                         help="并入【演示档】环境（见 DEMO_ENV）：宁可降级也不等")
     p_start.set_defaults(func=cmd_start)
 
     # 调度 worker（`CHG-0139`）：只跑 4 个重作业，与 API 进程分开。
@@ -2902,14 +3343,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="精确重启对外试点（8110）+ 它的调度 worker；**不碰 dev(8100)**")
     p_restart.add_argument("--env", choices=("pilot", "dev"), default="pilot",
                            help="目标环境（默认 pilot）")
-    p_restart.add_argument("--port", type=int, default=PILOT_BACKEND_PORT,
-                           help=f"目标端口（默认 {PILOT_BACKEND_PORT}）")
+    p_restart.add_argument("--port", type=int, default=None,
+                           help="目标端口（**默认按 `--env` 取**：pilot=8110 / dev=8100）")
     p_restart.add_argument("--host", default="127.0.0.1", help="监听地址")
     p_restart.add_argument("--timeout", type=float, default=20.0,
                            help="等优雅退出的秒数（超时才树杀）")
     p_restart.add_argument("--verify-timeout", type=float, default=90.0,
                            help="重启后等就绪的秒数（实测启动段 25 秒以上）")
+    p_restart.add_argument("--demo", action="store_true",
+                           help="并入【演示档】环境（见 DEMO_ENV）：宁可降级也不等")
     p_restart.set_defaults(func=cmd_restart_pilot)
+
+    p_demo = sub.add_parser(
+        "demo-check",
+        help="演示前 checklist：每条都是可复跑的 ✅/❌（含「演示问句还会秒回吗」）")
+    p_demo.add_argument("--query", default="", help="演示问句（原样，用于算 qhash）")
+    p_demo.add_argument("--target", default="", help="标的（默认取 query）")
+    p_demo.add_argument("--analysis-type", default="full", help="分析类型（默认 full）")
+    p_demo.add_argument("--port", type=int, default=PILOT_BACKEND_PORT,
+                        help=f"后端端口（默认 {PILOT_BACKEND_PORT}）")
+    p_demo.add_argument("--public-url",
+                        default="https://hk.wujiaitool.cn/api/v1/health/live",
+                        help="公网入口存活探针（默认 hk.wujiaitool.cn）")
+    p_demo.add_argument("--skip-public", action="store_true",
+                        help="跳过公网探针（离线/内网时用）")
+    p_demo.set_defaults(func=cmd_demo_check)
 
     p_status = sub.add_parser("status", help="查看服务与依赖状态")
     p_status.set_defaults(func=cmd_status)
@@ -3001,6 +3459,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", action="store_true",
         help="跳过确认（脚本化时用）")
     p_vacuum.set_defaults(func=cmd_vacuum)
+
+    p_retention = sub.add_parser(
+        "retention",
+        help="跑一次保留清理（`--dry-run` 只看会删多少，不动数据）")
+    p_retention.add_argument(
+        "--dry-run", action="store_true",
+        help="只统计不修改：报出「这一轮会删/会改多少行」，用于先看后做")
+    p_retention.add_argument(
+        "--env", choices=list(_env_choices()), default=None,
+        help="目标环境（默认取 MOSS_ENV，未设则打遗留主库）—— "
+             "本命令会删数据，**先 --dry-run 看清目标库**")
+    p_retention.set_defaults(func=cmd_retention)
     return parser
 
 

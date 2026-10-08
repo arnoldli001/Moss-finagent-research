@@ -13335,6 +13335,152 @@ patch 目标换了，测试**不会报"没打到"** —— 它只会**静默测�
   然后它半小时内就变成了第二次故障。** "登记待办"不等于"风险已隔离" ——
   当待办正好是**唯一的安全网**时，必须先做最小止血（本例：清挂起实例 + 手动复核），不能只登记。
 
+
+### 41.46 四项收口：**值守的第二个判据 / 起实例不再自伤 / 信息层由判据决定 / 门槛统一**（`CHG-0239`~`CHG-0241`）
+
+> **触发**：用户「1、2、3、4都修」—— 指 §41.45 末尾我列的四项待办。
+> 本节 ①②③ 是工程改动，④ 是**真实端到端**（三次）跑出来的结果与一个新根因。
+
+#### 41.46.1 ① 前端发布到对外实例（`ship-frontend`）
+
+`manage.py ship-frontend` 同步 **25 个文件** → `web/dist-pilot`；两个 dist 的
+`index.html` **SHA256 逐字节相同**；逐只面板分块 `MultiSubjectPanel-Dn9YxXNv.js`
+（12,960 B）已进 pilot。静态资源由 `StaticFiles` 每请求读盘 ⇒ **无需重启**，客户刷新即见。
+
+#### 41.46.2 ② 值守加固：`ExecutionTimeLimit` 按间隔算 + 新增 `STALE` 判据（`CHG-0239`）
+
+**(a) 执行时限原来是"一小时内合法停摆"**
+
+| 任务 | 原 `ExecutionTimeLimit` | 现在 |
+|---|---|---|
+| `MossPilotWatchdog`（60s 一轮） | **PT1H** | **PT3M** |
+| `MossFrpEnsure`（300s 一轮） | **PT72H**（3 天！） | **PT15M** |
+| `MossAutostartGuard` / `MossPilotAutostart` | PT1H | PT15M |
+
+配合 `MultipleInstances=IgnoreNew`，原来的组合意味着**一个挂住的实例能让 60 个 tick
+全部作废、而且要挂满一小时才被系统收掉**（`MossFrpEnsure` 是 3 天）。
+算法写成**唯一实现** `execution_time_limit_sec()` = `min(max(3×间隔, 120s), 900s)`，
+`--install` 与线上任务用的是同一个函数。
+
+**(b) 判据从"任务定义"扩到"运行史"：新增 `STALE`**
+
+原来的五种坏形态都能从**定义**看出来；第六种（本次实测）**定义全对、但已经不再触发**。
+`evaluate()` 现在读 `LastRunTime` / `LastTaskResult` / `NumberOfMissedRuns`，
+并按三条**不许假红**的约束判定：
+
+1. 只在开机触发的任务**不参与**（机器没重启过 ⇒ "很久没跑"是正常的）；
+2. 运行史**读不到**就不判（`None` ≠ "从没跑过"；`1999-11-30` 是
+   `SCHED_S_TASK_HAS_NOT_RUN` 的哨兵值，`_parse_ts` 把它归成 `None`）；
+3. `267009`（`SCHED_S_TASK_RUNNING`）**单独不足以报警** —— 正常查询时也会看到它，
+   所以它只作为 `STALE` 的**佐证**出现在文案里。
+
+宽限 = `max(3×间隔, 600s)`。`STALE` 进 `BROKEN_STATES` ⇒ **退出码 1**（否则值守脚本
+仍然报"一切正常"）。判据落在最后一位：定义错了先修定义，报"没在跑"只会把方向带偏。
+
+**(c) 判据与证据**
+
+* `--self-test` **全部通过**（新增：挂住⇒STALE / 刚跑过⇒OK / 读不到⇒OK 不猜 /
+  时限 4 例 / 时间戳 4 例）；
+* 新增 `tests/unit/test_autostart_staleness.py` **19 条**（含"任何任务的时限都不许 ≥1 小时"
+  的回归护栏）；与协作者既有的 `test_moss_autostart.py` 合跑 **59 passed**；
+* ★ **探针真的读到了运行史**（不是死代码）：`--check` 输出
+  「最近一次 59s 前 / 121s 前 / 975s 前」；四个任务当前全 OK。
+
+#### 41.46.3 ③ `restart-pilot --env dev` 不再自伤（`CHG-0239`）
+
+**缺陷**：`port = args.port or 8110`（**与 `--env` 无关**）+ 固定读 `backend.pid`（pilot 的）
++ **无条件枚举本项目全部 worker** ⇒ `--env dev` 会把 pilot 整棵树停掉、再用 dev 的
+环境变量把 dev 起在 8110 上，**而命令自己报「✅ 已启动」**。
+
+**改法**：新增唯一一张表 `_ENV_BACKEND_PORT` / `_ENV_BACKEND_PID_NAME`，
+**端口、PID 文件名、要不要管 worker 三件事全部由 `--env` 决定**；
+显式 `--port` 若正好是**另一个环境**的惯用端口 ⇒ **拒绝执行（退出码 2）**并给出正确命令。
+worker 只在 `env_needs_worker(env)` 为真时才动（dev 是"全跑"，本来就没有独立 worker）；
+无法判定归属时**不动**（误杀会打在另一个实例上）。
+
+**实测不变量**（这条比"命令没报错"重要）：
+
+    restart-pilot --env dev 前：pilot PID=12456  dev PID=26032
+    执行：目标识别为 「dev后端(监听者的父进程/启动器) PID=26032」→ 起在 8100(PID=14928)
+    之后：pilot PID **12456 不变**、8110 **200**、8100 **200**
+
+反事实：`--env dev --port 8110` ⇒ **退出码 2** + 说明"继续下去会停掉 pilot"。
+
+#### 41.46.4 ④ 真实端到端（三次）+ 一个新根因：信息层**从来没人执行**（`CHG-0240`）
+
+**跑法**：`scripts/_probe_multi_subject_e2e.py --submit`（提交用户原话到 dev 8100、
+轮询到完成、再核 trace；含 `--codes` 基线）。
+
+**(a) 我第一次读错了端点**：`/research/{id}` 是**任务记录**（status/progress/report），
+`agent_outputs` 在 **`/trace/{id}`** 上。第一次的"5 个 agent 都没出现在 agent_outputs 里"
+是**读错端点**造的假红 —— 记在这里免得下一个人重踩。
+
+**(b) 逐只结论：真的出来了**（第三次运行，`task_20261008_dc0263a3`，红灯 **0**）
+
+| 键 | 结果 | 附加证据 |
+|---|---|---|
+| A17 `per_subject` | **2 条**，代码 `002142`/`601088` | ★ `per_subject_checked=**A17_recommend/supervisor-react**` ⇒ 此前只有接线判据的那条 ReAct 路径**真跑并生效** |
+| A10 `valuation_calc_by_code` | 2 条 | 结论同时覆盖两只票 |
+| A12 `compliance_per_code` | 2 条 | — |
+| A12 `compliance_by_code` | 2 条 | `compliance_by_code_checked=A12_compliance/_enrich_result` ⇒ ④ 的护栏在生产路径上跑了，且**模型确实逐只返回**（无 `_missing`） |
+| A20 `generic_industry_sections` | **不出现（按设计）** | A20 本次**可用行业只有 1 个**（银行）；煤炭属 A15 覆盖范围 ⇒ 门槛 ≥2 不成立 |
+| A07 `sentiment_metrics_by_group` | 不出现 | `event_count=0` ⇒ 如实为空（见下方待办） |
+
+**(c) ★★ 新根因：信息层三个 Agent 在规划里、却一次都不执行**
+
+前两次运行的 dev 审计里该 trace **只有 8 次调用**（planner/A08/A10/A11/A12/A20/A09/A17），
+A05/A06/A07 **零调用**；与此同时 `_fetch_news_per_code()` 单独实测**返回 20 条**
+（每只 10 条、`stock_code` 归属正确）⇒ **不是"没有新闻"，是没人处理新闻**。
+
+根因是「同一判断两份实现」：规则路径 `plan_run()` **确定性**追加信息层，
+而 **LLM 规划路径**的 `state["plan"]` 直接来自 `llm_plan["agents"]`（**模型选的**）
+⇒ 模型不选，节点闸门 `agent_id in INFO_AGENTS and (agent_id not in state["plan"] or …)`
+第一句就命中，三个 Agent 静默跳过（**连一行日志都没有**）。
+
+**改法**：判据抽成唯一实现 `ensure_info_agents()`，**两条路径调同一个函数**；
+并补上"问句点名了个股（`focus_stock_codes`）"这一支（`target` 不是代码时也要取新闻）。
+
+**验证**：第三次运行 **14 个 agent**（多出 A05/A06/A07），进度里出现
+`A07_sentiment 已完成`；A05 `stats = {total: 20, verified: 11, rejected: 9}`。
+
+判据：`tests/unit/test_info_agents_judge.py` **8 条**（含 `ast` 接线判据"两条路径都得调"）；
+反事实：拿掉 LLM 路径那处调用 ⇒ 接线判据**恰好 1 红**，源码逐字节还原。
+
+#### 41.46.5 门槛统一：逐只数组**只在多标的时出现**（`CHG-0241`）
+
+§41.43 只统一了**形状**（dict→list），门槛仍不一致（A10 单标的不出现 / A12 单标的留 1 条）。
+现在发射判据写成唯一实现 `emit_per_item_rows(data, key, rows)`：**≥2 条才写**，
+四个键（`per_subject` / `valuation_calc_by_code` / `compliance_per_code` /
+`compliance_by_code`）同一条规则。`compliance_multi_target` 是**布尔性质**（不是逐只明细）
+⇒ 仍始终下发。
+
+★ 方向选"向 A10 看齐（不出现）"而不是"让 A10 也多留一条"：**把冻结的那一侧当基准，
+改动面最小**（"单标的路径逐字不变"是本仓库最值钱的安全性质）。
+★ 不写成"出现且为 None"：消费方读的是 `key in result` 三态，`None` 会被读成
+"给了但是空的"，与"本次没有逐只概念"混在一起（「没量到 ≠ 量到 0」）。
+判据：`test_emit_rule_is_one_implementation_and_uniform` + 单/多标的各一条；
+改后 `test_compliance_multi_target.py` / `test_micro_multi_target.py` /
+`test_per_item_runtime_guard.py` **55 passed**（唯一变红的是**我自己**编码旧约定的那条断言）。
+
+#### 41.46.6 诚实边界（本轮**没做**的）
+
+* ★ **A06 抽出 0 条事件，且无法区分原因**：它确实调了 1 次（审计可见），
+  11 条已核验新闻进去、**0 条事件出来**，而 **A06 的结果不进 `agent_outputs`**
+  ⇒ "这批快讯确实没有事件" 与 "抽不出来" **在现有留痕下无法区分**。
+  登记待办：A06 必须把「输入 N 条 → 抽出 M 条（含丢弃原因）」写进结果/审计。
+  （本次 11 条多为**资金流榜/定增榜**类快讯，判 0 有可能就是对的 —— 但**没有证据**，
+  所以不许当成"已验证正确"。）
+* **端到端跑的是 dev(8100)，不是对外 pilot(8110)**：pilot 上跑真分析会占用客户实例；
+  两侧代码同源（21:47 与 22:2x 两次重启后同版本），但**这不是"pilot 也验过了"**。
+* **`restart-pilot` 的 worker 归属仍是近似**：靠"该 env 是否需要独立 worker"来判定，
+  不是按进程真实归属（Windows 上外部读不到子进程的 `MOSS_ENV`）。
+  无法判定时选择**不动**（宁可不重启 worker，也不误杀另一个实例）。
+* **`STALE` 的下限 600s 是拍的**（没有任何"多久算死"的实测依据）；间隔 ≤200s 的任务
+  都按 600s 判。
+* 仍未声明的包（`pymupdf` / `python-docx` / `playwright` / `argon2-cffi`）**仍未声明**，
+  见 §41.45.7 的说明（`argon2-cffi` 是**刻意不装**的陷阱）。
+
+
 ## 四十二、投研分析的多 Agent 协作模式：**5 类在用、2 类半用、5 类刻意不用**（现行口径 · 2026-10-07 定型，`CHG-0189`）
 
 > **触发**（用户原话）：「在投研分析功能模块，用了如下哪些多agent模式，选型是否合理？」

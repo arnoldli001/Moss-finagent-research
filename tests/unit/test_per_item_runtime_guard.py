@@ -353,14 +353,88 @@ def test_a12_rule_only_path_is_explicitly_skipped() -> None:
 
 
 def test_a12_single_target_has_no_guard_keys() -> None:
-    """★ 单标的回归护栏：一个校验键都不许出现（`compliance_per_code` 仍有 1 条）。"""
+    """★ 单标的回归护栏：一个校验键都不许出现。
+
+    ★★ `CHG-0241`（2026-10-08）**改了这里的期望**：原来断言
+    `len(compliance_per_code) == 1`（A12 单标的保留 1 条），现在改成
+    **键不出现** —— 与 A10 的 `valuation_calc_by_code` 统一到同一条规则
+    （「逐只数组 ≥2 条才出现」，见 `emit_per_item_rows`）。
+    这条断言是那个旧约定的唯一编码处 ⇒ 它变红正是"约定换了"的信号。
+    """
     out, _ = _a12_run({"conclusion": "单标的结论", "confidence": "high",
                        "compliance_level": "无", "burst_risk": "未见明确爆雷路径",
                        "red_flags": [], "key_points": []},
                       codes=[COAL])
 
     assert not [k for k in out.result if k.startswith("compliance_by_code")], out.result
-    assert len(out.result["compliance_per_code"]) == 1, out.result["compliance_per_code"]
+    assert "compliance_per_code" not in out.result, (
+        "单标的不该有逐只数组（`CHG-0241` 统一后的约定）")
+    assert "compliance_codes" not in out.result, out.result
+    # 布尔性质仍要下发：它描述"本次判定的性质"，不是逐只明细
+    assert out.result["compliance_multi_target"] is False, out.result
+
+
+def test_emit_rule_is_one_implementation_and_uniform() -> None:
+    """★★★ `CHG-0241`：四个逐只键**同一条门槛**，而且它只有**一份实现**。
+
+    ## 为什么这条判据值得单独存在
+
+    2026-10-08 的现场：同一条报障的两半，两个**全新**字段的门槛不一样 ——
+    A10 的 `valuation_calc_by_code` 单标的**不出现**，A12 的 `compliance_per_code`
+    单标的**留 1 条**（"dict→list"那次只统一了形状、没统一门槛）。
+    代价落在消费方：前端与 A17 要**同时处理两种形状**，而"写两套分支"的下一站
+    就是其中的一套**悄悄走不到**（本项目已实测过一次同款回归）。
+
+    ⇒ 门槛现在写在 `emit_per_item_rows()` 里，四个键都调它；这里直接测那条规则。
+    """
+    from src.domain.agents.analysis.base import emit_per_item_rows
+
+    # 0 条 / 1 条 ⇒ **不写**（键不出现，不是"出现但为空"）
+    for rows in ([], [{"code": COAL}], (), ({"code": COAL},)):
+        box: dict = {}
+        assert emit_per_item_rows(box, "k", rows) is False, rows
+        assert "k" not in box, box
+
+    # ≥2 条 ⇒ 写；且写进去的是**拷贝**（不许把调用方的 list 别名进结果）
+    rows = [{"code": BANK}, {"code": COAL}]
+    box = {}
+    assert emit_per_item_rows(box, "k", rows) is True
+    assert box["k"] == rows and box["k"] is not rows, box
+
+    # 形状不对（None / 字符串 / 字典）⇒ 不写、也不抛
+    for bad in (None, "abc", {"601088": {"valuation": "高估"}}):
+        box = {}
+        assert emit_per_item_rows(box, "k", bad) is False, bad
+        assert "k" not in box, box
+
+
+def test_single_target_emits_no_per_item_key_in_either_agent() -> None:
+    """单标的：A17 与 A12 的逐只键**一个都不出现**（同一条门槛的行为侧证据）。"""
+    a17_single, _ = _a17_run({"conclusion": "单", "confidence": "high", "stance": "中性"},
+                             [{"code": COAL, "name": "中国神华"}])
+    a12_single, _ = _a12_run({"conclusion": "单", "confidence": "high",
+                              "compliance_level": "无", "burst_risk": "未见",
+                              "red_flags": [], "key_points": []}, codes=[COAL])
+    for key in ("per_subject", "compliance_per_code", "compliance_by_code"):
+        assert key not in a17_single.result, (key, a17_single.result)
+        assert key not in a12_single.result, (key, a12_single.result)
+
+
+def test_multi_target_emits_every_per_item_key_with_equal_length() -> None:
+    """多标的：出现的逐只键**都必须等长**（2 条）且代码集合 = 标的集合。"""
+    codes = [BANK, COAL]
+    a17_multi, _ = _a17_run({"conclusion": "多", "confidence": "high", "stance": "中性"},
+                            [{"code": BANK, "name": "宁波银行"},
+                             {"code": COAL, "name": "中国神华"}])
+    a12_multi, _ = _a12_run({"conclusion": "多", "confidence": "high",
+                             "compliance_level": "高", "burst_risk": "质押",
+                             "red_flags": [], "key_points": []}, codes=codes)
+
+    assert len(a17_multi.result["per_subject"]) == 2, a17_multi.result["per_subject"]
+    for key in ("compliance_per_code", "compliance_by_code"):
+        rows = a12_multi.result.get(key)
+        assert rows and len(rows) == 2, (key, a12_multi.result)
+        assert sorted(r["code"] for r in rows) == sorted(codes), (key, rows)
 
 
 # ===========================================================================

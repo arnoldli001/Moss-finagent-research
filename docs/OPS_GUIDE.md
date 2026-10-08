@@ -477,6 +477,36 @@ ALERT_EMAIL_TO=...
 
 ---
 
+### 2.9b ★ 值守的**第二个判据**：任务在、但已经不再触发（`CHG-0239`，2026-10-08 实测）
+
+`--check` 原先只看**任务定义**（在不在 / 启用没 / 动作与间隔对不对）。2026-10-08 实测撞到
+第六种坏形态：**定义全对，但运行史已经停了** —— `MossPilotWatchdog` 的实例挂住，
+`MultipleInstances=IgnoreNew` 把后续每分钟的触发**全部丢弃**，对外全站 502 半小时，
+而当时的 `--check` 报的是 **OK**（`LastTaskResult=267009`、`LastRunTime` 卡住不动）。
+
+现在它读**运行史**（`LastRunTime` / `LastTaskResult` / `NumberOfMissedRuns`）：
+
+```powershell
+uv run python scripts/moss_autostart.py --check   # 期望四个任务全 OK，并打印「最近一次 Ns 前」
+```
+
+* 新增状态 **`STALE`**（进 `BROKEN_STATES` ⇒ **退出码 1**，不是"看起来正常"）；
+* 三条**不许假红**的约束：只在开机触发的任务**不参与**（机器没重启过就该"很久没跑"）；
+  运行史**读不到就不判**（`1999-11-30` 是 `SCHED_S_TASK_HAS_NOT_RUN` 的哨兵值）；
+  `267009`（`SCHED_S_TASK_RUNNING`）**单独不足以报警**（正常查询时也会看到），只作佐证；
+* **执行时限按间隔算**（`execution_time_limit_sec()`）：看守 60s 一轮 ⇒ **3 分钟**、
+  链路自愈 300s 一轮 ⇒ **15 分钟**、只在开机触发的 ⇒ 15 分钟。
+  ⚠️ 原值是 **1 小时**（`MossFrpEnsure` 甚至是 **72 小时**）—— 配合 `IgnoreNew` 等于
+  **"挂住后可以合法停摆一小时/三天"**。
+  **改这个值要重跑 `--install`**；不可代装的任务（如 `MossFrpEnsure`）用
+  `Set-ScheduledTask` 单独设：
+
+```powershell
+$t = Get-ScheduledTask -TaskName 'MossFrpEnsure'
+$s = $t.Settings; $s.ExecutionTimeLimit = 'PT15M'; $s.MultipleInstances = 'IgnoreNew'
+Set-ScheduledTask -TaskName 'MossFrpEnsure' -Settings $s
+```
+
 ### 2.10 ★★★ 改 venv（`uv sync`）**必须在停服务时做**（`CHG-0237`，2026-10-08 又一次全站 502）
 
 > 本节每条时间都是实测；完整事故分析见 `docs/PRD.md` §41.45。
@@ -530,15 +560,25 @@ uv sync --all-extras --dry-run    # 判据：期望 "Would make no changes"
 > 不要用"静态扫 import"。`lightgbm` 就是被这条判据漏掉的（我一度把它写成"孤儿包"，
 > 见 `docs/PRD.md` §41.45.7 的废止痕迹）。
 
-**修单个实例时：用 `start`，不要用 `restart-*` 或 `--replace`**（`CHG-0238` 实测踩过）
+**修单个实例时：`restart-pilot --env X` 现在是安全的（`CHG-0239` 已修）**
 
 ```powershell
-# ✅ 只启动，不停别人（本次事故里我把 pilot 误杀的教训）
+# ✅ 只重启 dev：端口、PID 文件名、要不要管 worker **三件事都按 --env 取**
+uv run python manage.py restart-pilot --env dev      # 目标 8100，**不碰 pilot(8110)**
+# ✅ 只重启 pilot
+uv run python manage.py restart-pilot                # 目标 8110
+# ✅ 只启动、不停别人（补起一个没在跑的实例）
 uv run python manage.py start --env pilot --port 8110 --daemon
-# ❌ restart-pilot 的停止段**按 PID 文件杀**，而 PID 文件不按 env 分
-#    ⇒ `restart-pilot --env dev --port 8100` 会把 pilot + 它的 worker 一起杀掉
-# ❌ start --replace 按命令行枚举本项目**全部**后端进程
+# ❌ 显式给一个**属于另一个环境**的端口 ⇒ **拒绝执行（退出码 2）**
+#    `--env dev --port 8110` 的全部效果就是"停掉 pilot、把 dev 放上生产端口"
+# ❌ start --replace：按命令行枚举本项目**全部**后端进程
 ```
+
+★ **实测不变量**（改完用这个复核，而不是看命令有没有报错）：
+
+    restart-pilot --env dev 前记下 pilot PID → 执行 → pilot PID **必须不变**、8110 **必须 200**
+
+2026-10-08 实测：`pilot PID 12456 → 12456`、8110 与 8100 均 200。
 
 **起隧道要用分离进程**（不要把隧道挂在一个"会挂住的包装命令"底下 ——
 那样 kill 那个命令会把隧道和 frpc 一起带走）：

@@ -14,6 +14,7 @@ import hashlib
 import logging
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
@@ -2064,11 +2065,63 @@ def extract_topic_keywords(
     return kws
 
 
+def ensure_info_agents(
+    agents: list[str],
+    *,
+    info_items: list | None,
+    analysis_type: str,
+    target: str,
+    query: str = "",
+    focus_stock_codes: Sequence[str] = (),
+    auto_topic: list[str] | None = None,
+) -> list[str]:
+    """**确定性**决定信息层（`A05`/`A06`/`A07`）参不参与 —— 两条规划路径共用这一份判据。
+
+    ## 为什么要有它（`CHG-0240`，2026-10-08 **真实端到端**跑出来的）
+
+    规则兜底路径一直有这段确定性补齐，而 **LLM 规划路径**下 `state["plan"]` 直接来自
+    `llm_plan["agents"]`（**模型选的**）⇒ 模型不选，三个信息层 Agent 就不在计划里，
+    于是节点里的闸门
+
+        agent_id in INFO_AGENTS and (agent_id not in state["plan"] or not info_items)
+
+    **第一句就命中**，三个 Agent 一次都不执行（连日志都不留一行）。
+
+    实测（两次同问句端到端，`task_20261008_09a27591` / `task_20261008_b3b2adc2`）：
+    提交响应的 `plan` 里明明有 A05/A06/A07，而 dev 审计里该 trace **只有 8 次调用**
+    （planner / A08 / A10 / A11 / A12 / A20 / A09 / A17），信息层**零调用**；
+    同时 `_fetch_news_per_code` 单独实测**返回 20 条**（每只 10 条、代码归属正确）
+    ⇒ **不是"没有新闻"，是没人去处理新闻**。用户看到的就是本轮一直在修的那个形态：
+    **数据进得去，结论出不来**（"该股近期无消息"看起来像数据源坏了）。
+
+    ★ 这正是「同一判断两份实现」的又一例：**一份确定性、一份交给模型**。
+    现在两条路径调同一个函数。
+
+    ## 判据（与修复前的规则路径**逐字同源**，只是多了 `focus_stock_codes`）
+
+      · 显式给了 `info_items`（调用方已经拿到新闻/公告/研报）；
+      · 或 `target` 是 6 位个股代码且 `analysis_type ∈ {stock, full}`（会自动拉个股新闻）；
+      · 或能提取到主题关键词（自动拉全球财经快讯，取不到时信息层节点空跳过）；
+      · ★ 或问句里点名了个股（`focus_stock_codes`）—— 多标的场景下 `target` 可能
+        不是代码（比如只填了一个板块），但**既然点名了票就该去取它的新闻**。
+    """
+    if auto_topic is None:
+        auto_topic = extract_topic_keywords(analysis_type, target, query)
+    if (info_items
+            or (bool(re.fullmatch(r"\d{6}", target or ""))
+                and analysis_type in ("stock", "full"))
+            or auto_topic
+            or tuple(focus_stock_codes)):
+        return list(agents) + [a for a in INFO_AGENTS if a not in agents]
+    return list(agents)
+
+
 def plan_run(
     analysis_type: str,
     target: str,
     info_items: list | None = None,
     query: str = "",
+    focus_stock_codes: Sequence[str] = (),
 ) -> dict[str, Any]:
     """规则式Supervisor规划：决定采集指标与参与Agent（Demo用确定性路由）。
 
@@ -2131,9 +2184,14 @@ def plan_run(
         agents = list(dict.fromkeys(agents))  # 保序去重
     # 信息层参与条件：显式info_items / 个股(自动拉个股新闻) /
     # 宏观或行业问题能提取到主题关键词（自动拉全球财经快讯，无新闻时节点空跳过）
+    #
+    # ★ `CHG-0240`：判据抽成**一份实现** `ensure_info_agents()`，LLM 规划路径共用
+    #   （原来只有这条规则路径有这段确定性补齐，LLM 选谁就是谁 —— 见该函数注释）。
     auto_topic = extract_topic_keywords(analysis_type, target, query)
-    if info_items or (is_stock_code and analysis_type in ("stock", "full")) or auto_topic:
-        agents += [a for a in INFO_AGENTS if a not in agents]
+    agents = ensure_info_agents(
+        agents, info_items=info_items, analysis_type=analysis_type,
+        target=target, query=query, focus_stock_codes=focus_stock_codes,
+        auto_topic=auto_topic)
     # 行业/个股/全量研判确定性补齐大盘流动性指标；海外流动性关键词补FedWatch
     resolved = append_liquidity_indicators(analysis_type, route_text, resolved)
     # ★ 2026-09-29：中国宏观四件套（与 LLM 分支**同一份实现**，见
@@ -3999,6 +4057,22 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             if fix_notes:
                 progress = [f"规划修正：{n}" for n in fix_notes] + progress
                 logger.info("规划契约修正：%s", "；".join(fix_notes))
+            # ★★ `CHG-0240`：**信息层由判据决定，不由模型决定**。
+            #
+            # 上面 `planned_agents` 的起点是 `llm_plan["agents"]`（模型选的）。
+            # 模型没选 A05/A06/A07 时，节点里的闸门第一句就命中，三个 Agent
+            # **一次都不执行、连日志都不留** —— 实测两次端到端都是这个结果
+            # （提交响应的 plan 里有、审计里零调用），而新闻其实是取到了的。
+            # 判据与规则路径**同一个函数**（`ensure_info_agents`），不再各写一份。
+            planned_agents = ensure_info_agents(
+                planned_agents,
+                info_items=state.get("info_items"),
+                analysis_type=llm_plan["analysis_type"],
+                target=llm_plan.get("target") or state.get("target", ""),
+                query=state["user_query"],
+                focus_stock_codes=state.get("focus_stock_codes") or (),
+                auto_topic=topic_kw,
+            )
             return {
                 "plan": planned_agents,
                 "analysis_type": llm_plan["analysis_type"],

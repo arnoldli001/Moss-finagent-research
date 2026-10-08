@@ -65,6 +65,7 @@ from typing import Any
 from src.domain.agents.analysis.base import (
     AnalysisAgentBase,
     AnalysisPayload,
+    emit_per_item_rows,
     enforce_per_item_rows,
 )
 from src.domain.agents.analysis.compliance.logic import (
@@ -318,8 +319,16 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
         # ★ 2026-10-02：per-code 维度随结果下发 —— 多标的时**唯一诚实**的表达方式。
         #   扁平三件套是逐只结果的汇总（族清单取交集），没有它，
         #   汇总字段会被读成"这家公司量到了 6/6 族"。
-        data["compliance_per_code"] = calc.get("compliance_per_code")
-        data["compliance_codes"] = calc.get("compliance_codes")
+        #
+        # ★★ `CHG-0241`（2026-10-08）：**单标的时这个键不再出现** ——
+        #   发射判据改用共用实现 `emit_per_item_rows()`，与 A10 的
+        #   `valuation_calc_by_code` 同一条规则（「≥2 条才出现」）。
+        #   修复前 A12 单标的会多留 1 条，而 A10 单标的不出现 ⇒
+        #   同一个消费方（前端 / A17）要处理**两种形状**。
+        #   `compliance_multi_target` 是**布尔性质**（不是逐只明细）⇒ 仍然始终下发。
+        if emit_per_item_rows(data, "compliance_per_code",
+                              calc.get("compliance_per_code")):
+            data["compliance_codes"] = calc.get("compliance_codes")
         data["compliance_multi_target"] = calc.get("compliance_multi_target")
         data["compliance_unattributed_event_flags"] = calc.get(
             "compliance_unattributed_event_flags")

@@ -107,6 +107,40 @@ def parse_llm_json(agent_id: str, content: str) -> dict[str, Any]:
 PER_ITEM_MISSING = "未返回"
 
 
+def emit_per_item_rows(data: dict[str, Any], key: str, rows: Any) -> bool:
+    """**逐只数组的唯一发射判据**：≥2 条才写进结果（`CHG-0241`，2026-10-08 统一）。
+
+    ## 统一后的约定（四个键**同一条规则**）
+
+        `per_subject`(A17) / `valuation_calc_by_code`(A10)
+        `compliance_per_code`(A12) / `compliance_by_code`(A12)
+
+        **≥2 条（= 多标的）⇒ 出现；否则键本身不出现**（不是"出现但为空"）。
+
+    ## 为什么统一到"不出现"，而不是"总是出现、单标的 1 条"
+
+    单标的时扁平字段（`valuation_calc` / `compliance_level`…）**就是**逐只结果，
+    数组是纯冗余（A10 从 `CHG-0229` 起就是这个口径，且它保住了
+    "单标的路径逐字不变"这条本仓库最值钱的安全性质 —— 回归时它最先变红）。
+    2026-10-08 发现 A12 的单标的会多留 1 条 ⇒ 同一个消费方要处理两种形状。
+    统一的方向选"向 A10 看齐"，而不是"让 A10 也多留一条"：
+    **把冻结的那一侧当基准，改动面最小。**
+
+    ## 为什么不写成"出现且为 None"
+
+    消费方（前端 / A17 / trace）读的都是 `key in result` 的三态
+    （缺席 / 在场 / 条数）。`None` 会被读成"给了但是空的"，与"本次根本没有
+    逐只概念"混在一起 —— 正是本项目反复踩的「没量到 ≠ 量到 0」。
+
+    Returns:
+        `True` 表示已写入（≥2 条）；`False` 表示**没有写**。
+    """
+    if isinstance(rows, (list, tuple)) and len(rows) >= 2:
+        data[key] = list(rows)
+        return True
+    return False
+
+
 def _row_code(row: Any) -> str:
     """取一行的代码：容忍 `{"code": …}` / `{"stock_code": …}` 两种写法。
 

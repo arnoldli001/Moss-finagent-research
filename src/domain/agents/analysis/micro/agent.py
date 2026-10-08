@@ -5,7 +5,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from src.domain.agents.analysis.base import AnalysisAgentBase, AnalysisPayload
+from src.domain.agents.analysis.base import (  # noqa: E402
+    AnalysisAgentBase,
+    AnalysisPayload,
+    emit_per_item_rows,
+)
 from src.domain.agents.analysis.platform_data_teaching import (
     render_platform_data_teaching,
 )
@@ -258,9 +262,11 @@ class MicroAnalysisAgent(AnalysisAgentBase):
     def _enrich_result(self, payload: AnalysisPayload, data: dict[str, Any]) -> dict[str, Any]:
         data["valuation_calc"] = payload.hint.get("valuation_calc")
         # ★ `CHG-0219`：多标的时把逐票结果一并带出，下游/A17 才可能逐票表态
-        by_code = payload.hint.get("valuation_calc_by_code")
-        if by_code:
-            data["valuation_calc_by_code"] = by_code
+        # ★ `CHG-0241`：发射判据改用**共用实现** `emit_per_item_rows`
+        #   （"≥2 条才出现"这条约定现在四个逐只键同源，见该函数注释）。
+        emit_per_item_rows(
+            data, "valuation_calc_by_code",
+            payload.hint.get("valuation_calc_by_code"))
         return data
 
     def _requirements(self, payload: AnalysisPayload) -> str:
