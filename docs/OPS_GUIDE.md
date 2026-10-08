@@ -524,6 +524,29 @@ uv sync --all-extras --dry-run    # 判据：期望 "Would make no changes"
 |---|---|---|
 | `paramiko`（`tunnel` extra） | `scripts/frp_ssh_tunnel.py` | **全站 502** |
 | `bcrypt`（core） | `auth_sqlite_repo.verify_password()` | pilot 34 个账号里 **21 个是 `$2b$`**，而校验**按前缀派发**且"任何异常都返回 False" ⇒ 用户看到的是**「密码错误」**（与真输错密码**无法区分**） |
+| `lightgbm`（core，`CHG-0238`） | `moss_selector/models/*` 的 **joblib 反序列化** | ★ **静态扫 `import` 扫不到它**（源码里没有那一行）⇒ 症状不是报错，而是「`moss_selector/models` 下没有可用的模型文件」+ 反复自动重训（模型其实一直都在）。**`manage.py` 自己的依赖自检会拒绝启动并说清原因** —— 那条自检是对的 |
+
+> ★ **「没 import」≠「不需要」**：判据要用"真实依赖"（跑一次 / 启动自检），
+> 不要用"静态扫 import"。`lightgbm` 就是被这条判据漏掉的（我一度把它写成"孤儿包"，
+> 见 `docs/PRD.md` §41.45.7 的废止痕迹）。
+
+**修单个实例时：用 `start`，不要用 `restart-*` 或 `--replace`**（`CHG-0238` 实测踩过）
+
+```powershell
+# ✅ 只启动，不停别人（本次事故里我把 pilot 误杀的教训）
+uv run python manage.py start --env pilot --port 8110 --daemon
+# ❌ restart-pilot 的停止段**按 PID 文件杀**，而 PID 文件不按 env 分
+#    ⇒ `restart-pilot --env dev --port 8100` 会把 pilot + 它的 worker 一起杀掉
+# ❌ start --replace 按命令行枚举本项目**全部**后端进程
+```
+
+**起隧道要用分离进程**（不要把隧道挂在一个"会挂住的包装命令"底下 ——
+那样 kill 那个命令会把隧道和 frpc 一起带走）：
+
+```powershell
+Start-Process .venv\Scripts\python.exe -ArgumentList 'scripts\frp_ssh_tunnel.py' -WindowStyle Hidden
+Start-Process bin\frpc.exe -ArgumentList '-c','frpc.toml' -WindowStyle Hidden
+```
 
 **健康判据**
 

@@ -37,6 +37,13 @@ dependencies = [
     #   （`_pick_algo()` 仍有 argon2id > bcrypt > pbkdf2 的降级顺序，
     #     所以"新哈希用哪个算法"仍随环境变；但"已有哈希能不能验"不能随环境变。）
     "bcrypt>=4.0",
+    # 量化选股模型的反序列化依赖（`CHG-0238`）：**AST 静态扫不到它** ——
+    #   全仓没有一处 `import lightgbm`，但 `moss_selector/models/*` 是 joblib 产物，
+    #   **反序列化时会去 import lightgbm**；缺了它的表现不是报错，而是
+    #   「moss_selector/models 下没有可用的模型文件」+ 反复自动重训（模型其实一直都在）。
+    #   ★ 是 `manage.py` 自己的依赖自检拦住了启动并说清了原因 —— 那条自检是对的，
+    #     本条只是把它拦的那个包**声明出来**。
+    "lightgbm>=4.0",
 ]
 
 [project.optional-dependencies]
