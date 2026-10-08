@@ -38,6 +38,22 @@
 那是本仓最典型的失败模式（"没什么可分析的"其实只是"没匹配上"）。
 本类把"申万截面按 `extra.industry_name` 命中"也算作关注指标，
 正是为了让银行这类**只有截面、没有专属时序指标**的行业不再被跳过。
+
+## ★ 2026-10-08：一条问句里**多个行业**时，逐行业各出一节
+
+用户那条报障问句里有**两个**行业（`601088` → `煤炭开采`；「宁波银行」→ `银行`）：
+`煤炭开采` 有主（A15），`银行` 没人管 ⇒ 编排层的并集判据
+（`supervisor.needs_generic_industries`）把 A20 挂上来管**银行**。
+但本类原先的输出契约是**一次一个行业**（`_industry_name_for` 只解析一个行业）
+⇒ 即使挂上了，也只有**一节**结论，另一个行业在交付里不存在。
+
+⇒ 现在：`requested_industries()` 给出**本次要兜底的全部行业**（并集 − 已有专属
+Agent 的行业，判据与编排层**同源**：`needs_generic_industries`）；
+`execute()` 在 **≥2 个行业**时**逐行业各跑一次**既有路径，把 N 节结论合并成
+一份输出（每节保留原有的 JSON 契约与字段）。
+
+⚠️ **单行业（0 或 1 个）时走的是修复前那条原文路径** —— `execute()` 直接
+`return await super().execute(input)`，一个字都不多：挂载、裁剪、输出**逐字不变**。
 """
 
 from __future__ import annotations
@@ -45,11 +61,21 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from src.core.models import AgentInput, AgentOutput
+from src.core.schemas import Confidence, TraceStep
 from src.domain.agents.analysis.unlock_teaching import render_unlock_teaching
 from src.domain.agents.industry.base import IndustryAgentBase
 
 #: 不能当行业名的噪声（这些名字本身就是"综合/其他"的意思，用来分析没有信息量）
 _NOISE_INDUSTRIES = frozenset({"", "综合", "其他", "综合行业"})
+
+#: 置信度排序（合并多行业结论时取**最弱**那一节）。
+_CONF_RANK = {Confidence.HIGH: 2, Confidence.MEDIUM: 1, Confidence.LOW: 0}
+
+#: **显式截断**上限：一条问句里点到的"没人管的行业"超过这个数时，
+#: 只逐行业分析前 N 个（每个行业一次 reasoning 调用），并在 `result` 里
+#: 记下被截断的行业名 —— 截断必须显式（"少写了一个行业"不许伪装成"只有这些行业"）。
+_MAX_SECTIONS = 6
 
 
 class GenericIndustryAgent(IndustryAgentBase):
@@ -69,6 +95,14 @@ class GenericIndustryAgent(IndustryAgentBase):
     #: 通用框架下不设行业特定警戒线，沿用基类默认（40 倍）
     pe_high_watermark = 40.0
     capabilities_names = ("generic_industry_analysis", "dynamic_industry_routing")
+
+    FOCUS_HINT_KEY = "generic_industry_focus"
+    """逐行业各出一节时，把"这一节分析哪个行业"钉在 `payload.hint` 上的键。
+
+    ⚠️ **只在 A20 自己发起的子运行里出现**（编排层不写它）—— 单行业路径
+    的 payload 里没有这个键，`resolve_industry()` 的第 1 层因此不生效，
+    行为与修复前逐字一致。
+    """
 
     system_prompt = (
 
@@ -103,12 +137,174 @@ class GenericIndustryAgent(IndustryAgentBase):
         **编排层（决定要不要挂本 Agent）与这里必须用同一份实现**，
         否则"编排层认为该挂兜底、Agent 自己解析出另一个行业"，
         结论里的行业名会与路由不一致，且不报错。
+
+        ★ 2026-10-08 三层优先级（口径与编排层的挂载判据**对齐**）：
+
+        1. `hint["generic_industry_focus"]` —— **本次子运行**被钉住的行业
+           （逐行业各出一节时由本类自己写入，编排层不写它）；
+        2. `requested_industries()` 的**首元素** —— "本次要兜底的第一个行业"。
+           必须有这一层：问句里第一个行业有主（`煤炭开采` → A15）、
+           第二个行业没人管（`银行`）时，单值解析器返回的是**有主的那个**
+           ⇒ 若不看这一层，A20 会拿 A15 的行业去做兜底分析（**挂的是 A、写的是 B**）；
+        3. 原单值三路解析（`resolve_industry_from_text`）—— **逐字保留**：
+           `requested_industries()` 为空（无行业/都有人管）时的行为与修复前一致，
+           既有测试与单行业路径不受影响。
         """
+        forced = payload.hint.get(self.FOCUS_HINT_KEY) or {}
+        if isinstance(forced, dict) and forced.get("industry"):
+            return str(forced["industry"]), str(forced.get("basis") or "")
+        requested = self.requested_industries(payload)
+        if requested:
+            return requested[0]
         from src.infrastructure.catalog.industry_of import (
             resolve_industry_from_text,
         )
 
         return resolve_industry_from_text(self._text(payload))
+
+    def requested_industries(self, payload) -> list[tuple[str, str]]:
+        """本次请求要 A20 兜底的**全部**行业 `[(行业名, 依据), …]`（保序去重）。
+
+        ## 判据与编排层**同源**（不另写一套）
+
+        `supervisor.needs_generic_industries(self._text(payload))`
+        = 「并集解析出的行业」−「已有 A13–A16 之一接管的行业」。
+        编排层用它决定**挂不挂** A20；本类用它决定**逐哪几个行业各出一节**。
+        两处若各写一份，"挂的是 A、写的是 B"**不会报错**，只会静默写错行业。
+
+        ## 为什么过滤掉"有主的行业"
+
+        `煤炭开采`（601088）归 A15、`白酒` 归 A14 —— 它们的中观结论由专属
+        Agent 产出。A20 只补**没人管**的那些（否则同一个行业会被两个 Agent
+        各写一份，用户看到两份口径不同的结论）。
+        """
+        from src.orchestration.supervisor import (
+            needs_generic_industries,
+            resolve_focus_industries,
+        )
+
+        text = self._text(payload)
+        names = [n for n in needs_generic_industries(text) if n]
+        basis = {
+            str(n): str(h)
+            for n, h in resolve_focus_industries(text)
+            if n
+        }
+        return [(n, basis.get(n, "")) for n in names if n not in _NOISE_INDUSTRIES]
+
+    # ------------------------------------------------------------------
+    # 多行业：逐行业各出一节（单行业走原文路径，逐字不变）
+    # ------------------------------------------------------------------
+
+    async def execute(self, input: AgentInput) -> AgentOutput:  # type: ignore[override]
+        """★ ≥2 个"没人管"的行业 ⇒ 逐行业各跑一次既有路径，合并成一份输出。
+
+        ⚠️ **0 或 1 个行业 ⇒ `return await super().execute(input)`**：
+        执行的就是修复前那一条路径（同一个 `input`、同一份 prompt、同一个
+        输出契约）—— "单行业逐字不变"是**结构保证**，不是靠断言维持。
+        """
+        payload = self._parse_payload(input.payload)
+        industries = self.requested_industries(payload)
+        if len(industries) < 2:
+            return await super().execute(input)
+        truncated = industries[_MAX_SECTIONS:]
+        sections: list[tuple[str, str, AgentOutput]] = []
+        for name, how in industries[:_MAX_SECTIONS]:
+            # 每个行业一份**子 payload**（hint 是新建的 dict ⇒ 不污染原 payload，
+            # 也保证并发/连续请求之间不串行业）。
+            sub_payload = payload.model_copy(update={
+                "hint": {
+                    **(payload.hint or {}),
+                    self.FOCUS_HINT_KEY: {"industry": name, "basis": how},
+                },
+            })
+            sub_input = input.model_copy(
+                update={"payload": sub_payload.model_dump()})
+            sections.append((name, how, await super().execute(sub_input)))
+        return self._merge_industry_sections(
+            input, sections, truncated=[n for n, _h in truncated])
+
+    def _merge_industry_sections(
+        self, input: AgentInput,
+        sections: list[tuple[str, str, AgentOutput]],
+        *, truncated: list[str],
+    ) -> AgentOutput:
+        """N 节结论 → 一份 `AgentOutput`（每节结构 = 既有单行业输出）。"""
+        blocks: list[str] = []
+        per_section: list[dict[str, Any]] = []
+        resolutions: list[dict[str, Any]] = []
+        data_refs: list[str] = []
+        tokens_in = 0
+        tokens_out = 0
+        for index, (name, how, out) in enumerate(sections, 1):
+            head = f"### [{index}/{len(sections)}] {name}"
+            if how:
+                head += f"（行业判定依据：{how}）"
+            blocks.append(f"{head}\n{out.conclusion}")
+            section_result = dict(out.result or {})
+            resolution = section_result.get("generic_industry_resolution") or {}
+            if isinstance(resolution, dict) and resolution:
+                resolutions.append({"industry": name, "basis": how, **resolution})
+            try:
+                tokens_in += int(section_result.get("tokens_in") or 0)
+                tokens_out += int(section_result.get("tokens_out") or 0)
+            except (TypeError, ValueError):
+                pass
+            per_section.append({
+                "industry": name,
+                "basis": how,
+                "confidence": out.confidence.value,
+                "conclusion": out.conclusion,
+                "skipped": bool(section_result.get("skipped")),
+                "skip_kind": str(section_result.get("skip_kind") or ""),
+                "model_used": str(section_result.get("model_used") or ""),
+                "industry_signal_calc": section_result.get("industry_signal_calc"),
+            })
+            for ref in out.data_refs:
+                if ref not in data_refs:
+                    data_refs.append(ref)
+        # 置信度取**最弱**一节：逐行业结论里只要有一节不可信，
+        # 整份交付就不该声称 high（与 A12 的"等级取最坏"同一条纪律）。
+        merged_conf = min(
+            (out.confidence for _n, _h, out in sections),
+            key=lambda c: _CONF_RANK.get(c, 1))
+        result: dict[str, Any] = {
+            # 形状与单行业兼容：既有键仍在（取**第一节**，即主行业那份）
+            "generic_industry_resolution": (
+                resolutions[0] if resolutions
+                else dict(sections[0][2].result.get(
+                    "generic_industry_resolution") or {})),
+            # 新增（加法）：逐行业各一份
+            "generic_industry_resolutions": resolutions,
+            "generic_industry_sections": per_section,
+            "model_used": str(
+                (sections[0][2].result or {}).get("model_used") or ""),
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "multi_industry": True,
+            "industries": [n for n, _h, _o in sections],
+        }
+        if truncated:
+            result["industries_truncated"] = truncated
+            result["industries_truncated_reason"] = (
+                f"一节一个行业 = 一次推理调用，超过 {_MAX_SECTIONS} 个行业时"
+                "只分析前几个（显式截断，不静默少写）")
+        return AgentOutput(
+            task_id=input.task_id, agent_id=self.agent_id,
+            conclusion="\n\n".join(blocks),
+            confidence=merged_conf,
+            data_refs=data_refs, trace_id=input.task_id,
+            reasoning_steps=[
+                TraceStep(
+                    step=index, step_type="llm_inference",
+                    description=(
+                        f"逐行业分析[{name}]："
+                        f"model={(out.result or {}).get('model_used') or '?'} "
+                        f"skipped={bool((out.result or {}).get('skipped'))}"))
+                for index, (name, _how, out) in enumerate(sections, 1)
+            ],
+            result=result,
+        )
 
     # ------------------------------------------------------------------
     # 覆盖基类的两个扩展点

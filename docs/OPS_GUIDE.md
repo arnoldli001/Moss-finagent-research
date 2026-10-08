@@ -392,6 +392,147 @@ $t = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8)
 
 自检：文件前 3 字节应为 `239,187,191`。
 
+### 2.9 ★★ 自启/值守**存在性**自检 + 外部监控（`CHG-0168`，2026-10-05 全站 502 事故）
+
+**事故经过（一句话）**：不是"自启失败"，是**自启任务已经不存在了**。
+`MossPilotAutostart` / `MossPilotWatchdog` 两个计划任务被删除，只剩 `MossFrpEnsure`
+照常每 5 分钟一跳 —— 它探到"本机后端 8110 返回 000"就按设计**主动放手**
+（日志原话：`跳过隧道处置（归 PilotWatchdog）`），而它托付的那个值守**不存在**。
+于是日志里写着一句看起来完全正常的话，实际无人负责，**客户先发现打不开**。
+
+**为什么查不到是谁删的**：`Microsoft-Windows-TaskScheduler/Operational` 当时是
+**关闭**的（本次已开启）。**结构变更自带静默失效** —— 这是本项目反复出现的形状。
+
+#### ① 唯一事实源 + 一条命令体检
+
+```bash
+uv run python scripts/moss_autostart.py --check      # 三态体检（退出码见下）
+uv run python scripts/moss_autostart.py --json       # 机器可读
+uv run python scripts/moss_autostart.py --install    # 按**同一张表**幂等重建（需人点头）
+uv run python scripts/moss_autostart.py --self-test  # 检查器自证（喂已知答案）
+```
+
+`REQUIRED_TASKS`（`scripts/moss_autostart.py`）是**唯一事实源**：`--check` 与
+`--install` 读同一张表，所以"装了什么"和"查什么"不可能漂移。
+
+| 任务 | 作用 | 间隔 |
+|---|---|---|
+| `MossPilotAutostart` | 开机（+30s）/登录拉起 pilot 8110 | — |
+| `MossPilotWatchdog` | 运行期 `ensure`（全项目唯一运行期值守入口） | 60s |
+| `MossFrpEnsure` | hk 公网链路（SSH 隧道 + frpc）自愈 | 300s |
+| `MossAutostartGuard` | **核对上表**；不达标发信（本文件存在的理由） | 1800s |
+
+**退出码是三态，不是两态**：`0` OK · `1` 确认坏了（缺失/停用/动作或间隔不符）·
+`2` **读不到**（探针故障，**不是"通过"**）。把 `2` 当 `0` 就是假绿；
+把"读不到"说成"不存在"则会让人去重建一个本来好好的任务。
+
+> `MossFrpEnsure` 由本表**只核对、不代装**：它的动作必须是 `wscript.exe` +
+> 交互式 Administrator 身份（SYSTEM 身份下 `Path.home()` 变了、SSH 密钥找不到、
+> 隧道直接起不来 —— 见 `scripts/frp_watchdog.ps1` 头部）。这类承重细节，
+> 通用安装器代装只会把它装坏。
+
+#### ② 计划任务审计日志（本次开启，别关回去）
+
+```powershell
+wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
+wevtutil sl Microsoft-Windows-TaskScheduler/Operational /ms:33554432   # 32 MB
+```
+
+开启后可以**区分两种触发**（实测：同一个任务的两次运行）：
+`事件 110` = 有人手动触发；**`事件 107` = 时间触发器自己启动**；
+`201/102` = 动作完成。看谁在什么时候把任务删掉，也终于有据可查。
+
+#### ③ 外部监控（跑在香港 VPS 上，**不依赖本机**）
+
+本机上的任何脚本都没法告诉自己"我挂了"（整机没开、断网时更是一行都不跑），
+所以这一层刻意放在另一台机器上 —— 只看一个外部事实：公网入口还能不能拿到 200。
+
+```bash
+ssh -i ~/.ssh/moss_hk_tunnel ubuntu@43.128.5.94 \
+  "tail -5 ~/moss-monitor/monitor.log"          # 每 1 分钟一行心跳
+ssh -i ~/.ssh/moss_hk_tunnel ubuntu@43.128.5.94 \
+  "python3 ~/moss-monitor/moss_vps_monitor.py --status"
+```
+
+* 连续失败 **≥ 3 次**才算故障（单次抖动不叫人）；恢复时**也发一封**；
+* 每一跳都写流水（**含健康心跳**）—— 否则"在跑且没事"与"早就没了"长得一样；
+* 闸门三层（去重/速率/静默）与 `moss_autostart.py` **import 同一份代码**
+  （`scripts/moss_ops_alert.py`），判据是"同一个函数对象"，见单测。
+
+**通知通道（默认未配 = 只写日志，会明确记 `notify=unconfigured`，绝不假装通知过）**，
+二选一即可激活：
+
+```bash
+# A. webhook（凭据面最小，推荐）：写进 ~/moss-monitor/notify.env
+MOSS_ALERT_WEBHOOK=https://<你的机器人 webhook>
+
+# B. 邮件（复用既有 QQ 邮箱授权码）：同样写进 notify.env（chmod 600）
+ALERT_SMTP_USER=...        # 只写在这个 0600 文件里，不进命令行、不进日志
+ALERT_SMTP_AUTH_CODE=...
+ALERT_EMAIL_TO=...
+```
+
+> ⚠️ 两个监控必须**互相独立**：本机自检看见"任务被删"，VPS 看见"整机/链路挂"。
+> 只做其中一个，都会留下另一半盲区。
+
+---
+
+### 2.10 ★★★ 改 venv（`uv sync`）**必须在停服务时做**（`CHG-0237`，2026-10-08 又一次全站 502）
+
+> 本节每条时间都是实测；完整事故分析见 `docs/PRD.md` §41.45。
+
+**现象**：`https://hk.wujiaitool.cn/` 全站 502（nginx），而本机 8100/8110 **都 200**。
+坏在「VPS nginx → 上游」那一跳：`frp_ssh_tunnel` 与 `frpc.exe` **一个进程都没有**，
+而 `import paramiko` 当场失败：
+
+```
+ImportError: cannot import name 'default_backend'
+             from 'cryptography.hazmat.backends' (unknown location)
+```
+
+★ `(unknown location)` = **命名空间包**（目录在、`__init__.py` 不在）⇒ **这份安装是半装的**，
+**不是版本不兼容**。（反证：同版本 wheel 装到临时目录，`default_backend` 可用。）
+
+**根因**：有人在**服务正在运行**时跑了 `uv sync`。带原生 DLL 的三个包
+（`cryptography` / `bcrypt` / `lightgbm`）文件被进程锁住，uv 卸不掉也写不完
+⇒ `dist-info` 连 `METADATA`/`RECORD` 都没有、包目录被掏空。
+
+**为什么当时没人发现**：**在跑的进程把已 import 的模块留在内存里**。
+venv **11:51** 就坏了，隧道一直跑到 **18:19** 那批进程死掉、需要重新 import 时才炸
+（18:19 → 22:11 客户可见中断 **3 小时 52 分**）⇒ **半装的 venv 是定时故障，不是立即故障**；
+反过来也成立：**修好也必须重启才算生效**（同 §2.3b 的 `models.yaml` 那条）。
+
+**铁律三条**
+
+1. **改 venv 就走「停服务 → sync → 起服务」**；不能停的时候，就不要 sync。
+2. ★ **先禁用值守任务再动手**（`MossPilotWatchdog` / `MossFrpEnsure`）：
+   它们每 1~5 分钟把服务拉回来，会在你 sync 到一半时**再锁一次**、装出第二份半装。
+   修完记得 `schtasks /change /tn <任务名> /enable` 恢复。
+3. 包目录被掏空时 `uv sync` **不会**修它（它认为"已安装"，实测只打印
+   `Checked 126 packages` 而什么都没做）。必须**按名字删掉那个包目录**再 sync。
+
+**部署/修复命令（必须带 extras）**
+
+```powershell
+uv sync --all-extras              # ★ 隧道要的 paramiko 在 tunnel extra 里，漏了就 502
+uv sync --all-extras --dry-run    # 判据：期望 "Would make no changes"
+```
+
+**两个"承重件"已声明**（`CHG-0237` 之前它们只是"临时装的"，一次 `uv sync` 就会被清掉）
+
+| 包 | 谁在用 | 没声明时的症状 |
+|---|---|---|
+| `paramiko`（`tunnel` extra） | `scripts/frp_ssh_tunnel.py` | **全站 502** |
+| `bcrypt`（core） | `auth_sqlite_repo.verify_password()` | pilot 34 个账号里 **21 个是 `$2b$`**，而校验**按前缀派发**且"任何异常都返回 False" ⇒ 用户看到的是**「密码错误」**（与真输错密码**无法区分**） |
+
+**健康判据**
+
+```powershell
+.venv\Scripts\python.exe -c "import bcrypt,paramiko,cryptography,nacl; from cryptography.hazmat.backends import default_backend; print('ok')"
+powershell -File scripts\frpc_start.ps1
+curl.exe -s -o NUL -w "%{http_code}`n" https://hk.wujiaitool.cn/     # 期望 200
+```
+
 ---
 
 ## 3. 隧道（cloudflared）

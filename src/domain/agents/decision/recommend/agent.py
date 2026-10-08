@@ -11,8 +11,13 @@ from src.core.base_agent import BaseAgent
 from src.core.exceptions import AgentExecutionError
 from src.core.models import AgentInput, AgentOutput
 from src.core.schemas import Confidence, TraceStep, coerce_confidence
-from src.domain.agents.analysis.base import parse_llm_json
+from src.domain.agents.analysis.base import (
+    PER_ITEM_MISSING,
+    enforce_per_item_rows,
+    parse_llm_json,
+)
 from src.infrastructure.llm import LLMGateway
+from src.infrastructure.llm.cache import cache_anchor, cache_data_key
 from src.infrastructure.llm.hallucination_guard import HallucinationGuard
 
 
@@ -25,6 +30,22 @@ class RecommendationPayload(BaseModel):
     user_query: str = ""
     hint: dict[str, Any] = Field(default_factory=dict)
     """本地计算参考（market_liquidity：流动性周期skill研判），LLM只解读不计算"""
+    subjects: list[dict[str, Any]] = Field(default_factory=list)
+    """★★ `CHG-0230`：**本次要逐只表态的标的** `[{"code":…,"name":…}, …]`。
+
+    ## 为什么必须有它（§41.36 审计的 A17 项）
+
+    用户问「…未来半年能否持有高股息的**宁波银行**和**中国神华**？」时，
+    A17 原来的输入只有**单值** `focus`（= 中国神华），输出也只有**一套**
+    `stance` / `position_advice` / `expected_return_3_6m{bull,base,bear}`
+    ⇒ **两只票共用一个立场**，用户无法知道"中性偏多"是针对哪只；
+    若模型只挑了最像的那只写，**另一只在最终交付里根本不存在**。
+
+    ⚠️ 与 `focus` 的分工：`focus` 表达"**主题/主焦点**"（可以是行业或综合），
+    `subjects` 是"**要逐只表态的清单**"。两者不能合并 ——
+    合并会把"主题"这个语义丢掉（宏观问的 focus 是空的，但它仍可能夹带个股）。
+    ⚠️ **空列表 = 单标的口径 ⇒ 输出与修复前逐字一致**（既有调用方不受影响）。
+    """
 
 
 class RecommendationAgent(BaseAgent):
@@ -174,10 +195,10 @@ class RecommendationAgent(BaseAgent):
             )
         return "（本次无大盘流动性量化参考；如问题涉及买卖时点/仓位，需说明数据缺口）"
 
-    def build_prompt(self, payload: RecommendationPayload, *,
-                     react_mode: bool = False,
-                     compact: bool = False) -> str:
-        """构建A17任务prompt。
+    def _render_prompt(self, payload: RecommendationPayload, *,
+                       react_mode: bool = False,
+                       compact: bool = False) -> tuple[str, str, str]:
+        """构建A17任务prompt → `(prompt, anchor, scope_extra)`（见 `CHG-0180`）。
 
         react_mode=True 时输出格式为 {"action": {...}} 或 {"final_answer": {...}}，
         供ReAct执行器解析工具调用；否则直接输出conclusion等字段（execute单次调用用）。
@@ -229,18 +250,99 @@ class RecommendationAgent(BaseAgent):
                 "expected_return_3_6m必填(三档情景+假设+证伪信号)；其余给null。"
                 "可选action调工具追问(最多2轮)。\n"
             )
+        # ★★ `CHG-0230`：多标的时**追加**逐只表态要求。**只在多标的时追加** ——
+        #   单标的的 output_spec 与修复前**逐字相同**（既有测试与调用方不受影响）。
+        output_spec = output_spec + self._multi_subject_clause(
+            payload, inside_final_answer=react_mode)
         # ★ ReAct 模式下用压缩上下文（−91% tokens_in，配合 incremental=True）
         context_fn = self._build_compact_context if compact else self._build_context
-        return (
-            f"## 投研标的/主题\n{payload.focus or '综合'}\n"
+        context = context_fn(payload)
+        hint = self._render_hint(payload)
+        subjects = self._multi_subjects(payload)
+        focus_section = payload.focus or "综合"
+        if subjects:
+            listing = "、".join(
+                f"{s.get('name') or s.get('code')}（{s.get('code')}）"
+                for s in subjects)
+            focus_section = f"{focus_section}\n★ 本次为**多标的**，需逐只表态：{listing}"
+        prompt = (
+            f"## 投研标的/主题\n{focus_section}\n"
             f"## 用户问题（conclusion必须直接回答，禁止绕开问题写模板点评）\n"
             f"{payload.user_query or '无'}\n\n"
-            f"## 上游分析结论\n{context_fn(payload)}\n\n"
-            f"## 本地量化参考（流动性周期skill）\n{self._render_hint(payload)}\n\n"
+            f"## 上游分析结论\n{context}\n\n"
+            f"## 本地量化参考（流动性周期skill）\n{hint}\n\n"
             f"## 任务要求\n{output_spec}\n"
             "注意：本分析仅供研究参考，不构成投资建议。"
         )
+        # ★ 缓存的两半（`CHG-0180`）：
+        #   `anchor`       = **只放问句与焦点**（语义可比，"换个说法该复用"）；
+        #   `scope_extra`  = **上游结论 + 量化参考的指纹**（必须完全一致才能复用）。
+        #
+        # ⚠️ 数据/上游结论**不能**只靠 anchor 区分：实测同一问句只改一个数字，
+        #    embedding 余弦仍 ≥0.80 会照命中，返回上一批数据算出的结论。
+        #    精确性交给 scope（数据一变，L1/L2/L3 整条路径一起失效）。
+        # ★ `CHG-0230`：anchor 里**加上标的清单** —— 否则"宁波银行+中国神华"与
+        #   "宁波银行"两次问句会共用同一个 anchor（focus 都是中国神华），
+        #   语义层复用会把**只覆盖一只**的旧结论发给要两只的那次。
+        anchor = cache_anchor(
+            " ".join([payload.focus or ""]
+                     + [str(s.get("code") or "") for s in subjects]).strip(),
+            payload.user_query or "")
+        scope_extra = cache_data_key(context, hint)
+        return prompt, anchor, scope_extra
 
+    @staticmethod
+    def _multi_subjects(payload: RecommendationPayload) -> list[dict[str, Any]]:
+        """★ `CHG-0230`：**要逐只表态的标的**；`< 2` 只时返回空列表。
+
+        ★ **门槛是 2**（不是 1）—— 单标的时"一套 stance"本来就正确，
+        返回空列表才能让输出规格与修复前**逐字一致**。
+        """
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for s in payload.subjects or []:
+            if not isinstance(s, dict):
+                continue
+            code = str(s.get("code") or "").strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            out.append({"code": code, "name": str(s.get("name") or "")})
+        return out if len(out) >= 2 else []
+
+    def _multi_subject_clause(self, payload: RecommendationPayload, *,
+                              inside_final_answer: bool) -> str:
+        """多标的时追加的逐只表态要求（单标的返回空串 ⇒ 规格逐字不变）。"""
+        subjects = self._multi_subjects(payload)
+        if not subjects:
+            return ""
+        listing = "、".join(
+            f"{s['code']}{('(' + s['name'] + ')') if s['name'] else ''}"
+            for s in subjects)
+        item = ('{"code": "…", "name": "…", "stance": "…", '
+                '"position_advice": "…", '
+                '"expected_return_3_6m": {"bull":"…","base":"…","bear":"…"}, '
+                '"key_logic": [...], "risks": [...]}')
+        target = "final_answer 内" if inside_final_answer else "顶层"
+        return (
+            f"\n★★★ 本次是**多标的**（{listing}）：除上述字段外，"
+            f'**必须在{target}再给 "per_subject": [{item}, …]** —— '
+            f"**{len(subjects)} 只各一条、数量必须相等、不许合并、不许只写一只**。"
+            "顶层的 stance/position_advice/expected_return_3_6m 只表达"
+            "**整体（组合）层面**的判断；每只票的立场一律以 per_subject 为准。"
+            "若某只票的数据不足，就在它那条里写 stance=\"数据不足\"并说明缺什么，"
+            "**仍然要给出那一条**。\n"
+        )
+
+    def build_prompt(self, payload: RecommendationPayload, *,
+                     react_mode: bool = False,
+                     compact: bool = False) -> str:
+        """向后兼容入口：只要 prompt（ReAct 执行器等既有调用方用）。
+
+        要同时拿到缓存比较文本请用 `_render_prompt()`。
+        """
+        return self._render_prompt(
+            payload, react_mode=react_mode, compact=compact)[0]
     async def execute(self, input: AgentInput) -> AgentOutput:
         payload = self._parse_payload(input.payload)
         if not payload.analyses:
@@ -250,10 +352,11 @@ class RecommendationAgent(BaseAgent):
                 confidence=Confidence.LOW, trace_id=input.task_id,
             )
 
-        prompt = self.build_prompt(payload)
+        prompt, anchor, scope_extra = self._render_prompt(payload)
         response = await self._gateway.complete(
             "decision", self.system_prompt, prompt,
             agent_id=self.agent_id, trace_id=input.task_id, json_mode=True,
+            anchor=anchor, scope_extra=scope_extra,
         )
         try:
             data = parse_llm_json(self.agent_id, response.content)
@@ -271,14 +374,41 @@ class RecommendationAgent(BaseAgent):
             data = parse_llm_json(self.agent_id, response.content)
 
         # 幻觉防护：校验A17综合结论中的数字/代码是否grounded于上游分析+prompt
+        #
+        # ⚠️ **不要在这里传 `check_citations=`**（`CHG-0173`，2026-10-05）。
+        #    三档开关的单一真值源是 `MOSS_HALLUCINATION_TIERS`（Settings），
+        #    在调用点写死字面量会让 `.env` 的开关**静默失效**。
         conclusion_text = str(data.get("conclusion", ""))
-        hg_report = HallucinationGuard.verify(
-            conclusion_text, prompt, check_citations=False,
-        )
+        hg_report = HallucinationGuard.verify(conclusion_text, prompt,)
         if not hg_report.passed:
             data["conclusion"] = conclusion_text + " " + hg_report.render_warning()
             if hg_report.confidence < 0.7:
                 data["confidence"] = "low"
+
+        # ★★ `CHG-0236`：多标的的**运行时**等长校验（**契约层之外的第二道**）。
+        #
+        # `CHG-0230` 只把"必须逐只给 per_subject"写进了 prompt —— 那是**请求**。
+        # 这里才是**判据**：模型少给一只、合并成一条、或干脆不写这个键时，
+        # 修复前**静默通过**（`parse_llm_json` 不做 schema 校验），
+        # 用户看到"已逐只分析"的外观 + 缺一只的内容。
+        #
+        # ⚠️ 顺序很重要：**放在幻觉护栏之后** —— 护栏校验的是**模型原文**
+        #    的 grounded 性，把这句自带代码的告警混进去会污染护栏的判据。
+        #
+        # ⚠️ 真正的生产路径是 **ReAct**（见 `supervisor` 的 `react.run`），
+        #    它绕过 `execute()` ⇒ 那里**必须**再调一次同一个函数
+        #    （`enforce_per_item_rows` 是**唯一实现**，两处只是调用点）。
+        enforce_per_item_rows(
+            data, "per_subject", [s["code"] for s in self._multi_subjects(payload)],
+            where="A17_recommend/execute",
+            label="标的",
+            placeholder_fields={
+                "stance": PER_ITEM_MISSING,
+                "position_advice": None,
+                "_placeholder": "A17 未返回该标的的逐只结论",
+            },
+            warning_prefix="A17 未按标的逐只返回结论",
+        )
 
         return AgentOutput(
             task_id=input.task_id, agent_id=self.agent_id,
@@ -294,10 +424,7 @@ class RecommendationAgent(BaseAgent):
                           )),
                 TraceStep(
                     step=2, step_type="cross_validation",
-                    description=(
-                        f"幻觉防护: passed={hg_report.passed} "
-                        f"confidence={hg_report.confidence:.2f}"
-                    ),
+                    description=hg_report.trace_line(),
                 ),
             ],
             result={**data, "stance": data.get("stance", "中性"),

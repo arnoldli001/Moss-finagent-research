@@ -168,6 +168,56 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .refs { font-size: 12px; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }
 details summary { cursor: pointer; font-size: 12px; color: var(--accent); }
 
+/*
+ * 投研分析 · 逐只结论（多标的）—— `components/MultiSubjectPanel.tsx`
+ *
+ * ⚠️ 这块 DOM **只在多标的时存在**：单标的（新字段缺席或只有 1 条）时组件
+ * `return null`，React 不产生任何节点 ⇒ 下面的 `grid-column: 1 / -1` 对
+ * 修复前的布局**没有任何影响**（单标的下 AgentTimeline 仍是第 1 格 1fr、
+ * TracePanel 仍是第 2 格 380px）。
+ * 多标的时它跨满两列排在最上面，**下面那两格的位置不变** ——
+ * 所以它必须是网格里的第 1 个孩子（排在 AgentTimeline 之后会把 380px 那格挤错位）。
+ */
+.multi-subject { grid-column: 1 / -1; }
+
+.ms-section { margin-bottom: 14px; }
+.ms-section:last-child { margin-bottom: 0; }
+/* 出处（Agent 中文名 + 字段名）：投研结论必须能对回源头，所以常显而不是 tooltip */
+.ms-source {
+  margin-left: 8px; font-size: 11px; font-weight: 400; color: var(--muted);
+  font-family: ui-monospace, Consolas, monospace;
+}
+.ms-note { margin: 4px 0; font-size: 12px; color: var(--medium); }
+.ms-unreadable { margin: 4px 0; font-size: 12px; color: var(--muted); }
+
+.ms-rows { list-style: none; margin: 0; padding: 0; }
+.ms-row {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px; margin-bottom: 8px;
+}
+.ms-row:last-child { margin-bottom: 0; }
+.ms-row-head {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px;
+}
+.ms-row-title { font-weight: 600; }
+
+/* 徽标底色按语义分档；`.ms-tone-muted` 是"没量到/中性"——不能读成好消息或坏消息 */
+.ms-tone-ok { background: var(--high); }
+.ms-tone-warn { background: var(--medium); color: #222; }
+.ms-tone-bad { background: var(--low); }
+.ms-tone-info { background: var(--accent); }
+.ms-tone-muted { background: var(--border); color: var(--text); }
+
+/* 字段槽位：**标签固定宽度**，逐只对比时左列对齐（不然两行数字会错位） */
+.ms-fields { margin: 0; font-size: 12px; }
+.ms-field { display: flex; gap: 8px; line-height: 1.6; }
+.ms-field dt { flex: 0 0 auto; min-width: 96px; color: var(--muted); }
+.ms-field dd { margin: 0; }
+.ms-list { margin: 6px 0 0; font-size: 12px; line-height: 1.6; }
+.ms-list b, .ms-body b { color: var(--muted); font-weight: 500; }
+.ms-body { margin: 6px 0 0; font-size: 12px; line-height: 1.7; }
+
+
 .chain-info { margin-bottom: 8px; font-size: 13px; }
 .audit-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .audit-table th, .audit-table td {

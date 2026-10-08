@@ -34,7 +34,8 @@
  * ## 与"面板自己取数"的分工
  *
  * 这里只管**把数据放进缓存**，不碰任何 React 状态。
- * 面板挂载时照旧 `readAlerts/readIntelFeed` 立刻画、再后台核对 ——
+ * 面板挂载时照旧 `readAlerts/readIntelFeed/readMainlineSnapshot` 立刻画、
+ * 再后台核对 ——
  * 于是"预取成功"= 挂载即有内容，"预取失败"= 退回原来的行为（不会更差）。
  */
 
@@ -42,6 +43,12 @@ import { Alert, AlertSettings, api } from "./api";
 import { preloadAlerts } from "./alertsCache";
 import { feedCacheKeyOf, readIntelFeed, writeIntelFeed } from "./intelCache";
 import { fetchIntelFeed } from "./intelApi";
+import { mainlineApi } from "./mainlineApi";
+import {
+  mainlineSnapshotParams,
+  readMainlineSnapshot,
+  writeMainlineSnapshot,
+} from "./mainlineCache";
 import { readQuantFactors, writeQuantFactors } from "./quantCache";
 
 /** 保活续期间隔。要**小于**两个缓存的 TTL（告警 5 分钟 / 情报 10 分钟），
@@ -107,14 +114,39 @@ async function prefetchQuantFactors(force: boolean): Promise<void> {
 }
 
 /**
- * 预取三个面板的数据。**绝不抛** —— 预取失败只等于"回到优化前的行为"。
+ * 预取主线挖掘快照（`/mainline/snapshot`）。★ 2026-10-08 新增。
+ *
+ * 报障原话：「为什么每次打开 主线挖掘，热加载 切界面也要等 2-3 秒？」
+ * 量出来的账：**服务端只花 19 ms**（今天 27 次的 p50），
+ * 但这条公网链路上**每次请求固定 ~1.0~1.2 s**（64 字节的探针也一样），
+ * 而 `MainlinePanel` 在三元链里、切走即卸载 ⇒ 没有缓存就是每切一次等一趟。
+ *
+ * 与 alerts 同款的 `force` 语义：登录/刷新时受新鲜度保护，
+ * 保活续期必须真的重取。
+ *
+ * ★ 参数走 `mainlineSnapshotParams()`、**不许在这里写死数字**：
+ * 后端 `mainline.py::WARM_TOP/WARM_ALERT_LIMIT` 是同一组值，
+ * 前端一旦漂移，落盘热快照就永远命中不了，而**这个失效不报错** ——
+ * 只表现为"第一个打开面板的人等一次全市场重算（8~23 秒）"。
+ */
+async function prefetchMainline(force: boolean): Promise<void> {
+  if (!force) {
+    const existing = readMainlineSnapshot();
+    if (existing && Date.now() - existing.at < KEEPALIVE_MS) return;
+  }
+  writeMainlineSnapshot(
+    await mainlineApi.snapshot(mainlineSnapshotParams()));
+}
+
+/**
+ * 预取四个面板的数据。**绝不抛** —— 预取失败只等于"回到优化前的行为"。
  *
  * @param force 绕过新鲜度去重，用于保活续期
  */
 export async function prefetchPanels(force = false): Promise<void> {
   if (inFlight) return inFlight;
   inFlight = (async () => {
-    // 三个目标互相独立：一个失败不该拖累另一个（各自 catch）。
+    // 四个目标互相独立：一个失败不该拖累另一个（各自 catch）。
     await Promise.allSettled([
       prefetchAlerts(force).then(
         () => { lastDone.alerts = Date.now(); },
@@ -124,6 +156,9 @@ export async function prefetchPanels(force = false): Promise<void> {
         () => { /* 同上 */ }),
       prefetchQuantFactors(force).then(
         () => { lastDone.quant = Date.now(); },
+        () => { /* 同上 */ }),
+      prefetchMainline(force).then(
+        () => { lastDone.mainline = Date.now(); },
         () => { /* 同上 */ }),
     ]);
   })();
@@ -171,6 +206,7 @@ const PANEL_CHUNKS: Array<() => Promise<unknown>> = [
   () => import("./components/TracePanel"),          // 投研分析 · 推理轨迹
   () => import("./components/AgentChatView"),       // 投研分析 · Agent 对话
   () => import("./components/AgentTimeline"),       // 投研分析 · 事件时间线
+  () => import("./components/MultiSubjectPanel"),   // 投研分析 · 逐只结论（多标的）
 ];
 
 let warmed = false;
@@ -261,6 +297,7 @@ export function resetPrefetchState(): void {
   lastDone.alerts = 0;
   lastDone.intel = 0;
   lastDone.quant = 0;
+  lastDone.mainline = 0;
   inFlight = null;
 }
 

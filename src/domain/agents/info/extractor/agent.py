@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from src.core.models import AgentInput, AgentOutput
@@ -20,6 +21,9 @@ _ITEM_TEXT_CHARS = 500
 
 _MAX_EVENTS = 30
 """单次提取事件数上限（超出部分丢弃，防止幻觉刷屏）"""
+
+#: 6 位 A 股代码（**只认这个形状**：多标的归属判据用它，名称/主题词不算代码）
+_CODE_RE = re.compile(r"\d{6}")
 
 
 class ExtractorAgent:
@@ -69,13 +73,37 @@ class ExtractorAgent:
                                                 "negative": 0, "neutral": 0}},
             )
 
+        # ★ 2026-10-08：**多标的**时给每条带上"它来自哪只票"（`stock_code`）。
+        #
+        # 采集层现在按 `focus_stock_codes` **逐只**取新闻、并把代码标在条目上
+        # （`supervisor._fetch_news_per_code`）。归属若在这里丢掉，下游 A07 只能
+        # 把两只票的事件**混算成一个情绪分** —— 用户读到的"情绪偏暖"
+        # 不知道是针对宁波银行还是中国神华。
+        #
+        # ⚠️ **单标的时一个字都不变**：`multi_items` 为假 ⇒ 条目行格式、
+        #    prompt 正文、事件字段与修复前**逐字相同**（有回归护栏钉住）。
+        code_by_item_id = {
+            str(item.get("item_id", "")): str(item.get("stock_code") or "")
+            for item in raw_items
+        }
+        item_codes = {c for c in code_by_item_id.values() if _CODE_RE.fullmatch(c)}
+        multi_items = len(item_codes) >= 2
         lines = []
         for item in raw_items:
             text = str(item.get("text", ""))[:_ITEM_TEXT_CHARS]
             title = item.get("title", "")
+            code = code_by_item_id.get(str(item.get("item_id", "")), "")
+            prefix = f"({code}) " if (multi_items and code) else ""
             lines.append(
-                f"- [{item.get('item_id', '?')}] {title} | {text}"
+                f"- [{item.get('item_id', '?')}] {prefix}{title} | {text}"
             )
+        #: 只多标的时追加（单标的时为空串 ⇒ prompt 逐字不变）
+        multi_note = (
+            "\n★ 本次是**多标的**问句：条目前缀 `(6位代码)` 是**该条目所属的标的**。"
+            "请把事件的 `subject` 写成对应的标的（公司简称或该 6 位代码），"
+            "**禁止**把两只标的的事件合并成一个主体，也禁止把 A 标的的事件写到 B 上。"
+            if multi_items else ""
+        )
 
         skill_text = self._load_default_skill()
         skill_block = (
@@ -83,7 +111,7 @@ class ExtractorAgent:
             if skill_text else ""
         )
         prompt = (
-            "## 待提取信息条目\n" + "\n".join(lines) +
+            "## 待提取信息条目\n" + "\n".join(lines) + multi_note +
             skill_block +
             "\n\n## 任务要求\n"
             "从上述条目中提取全部可确认的事件（每条信息可提取0-3个事件）。输出JSON对象：\n"
@@ -103,6 +131,19 @@ class ExtractorAgent:
             "你是财经信息结构化专家，负责从新闻/公告/研报中提取可验证的事件。"
             "严格依据给定文本，禁止编造事件或数值。",
             prompt, agent_id=self.agent_id, trace_id=input.task_id, json_mode=True,
+            # ★★ **禁语义复用，只留精确层**（`CHG-0182`）。
+            #
+            # 与 `intel_extract`（`CHG-0181`）**同一条规则**：本 Agent 的输出里
+            # 有 `evidence_quote`，而它的契约就写在上面的 schema 里 ——
+            # 「支撑该事件的原文片段（**必须逐字来自输入**，30字内）」
+            # 且「**硬性要求：evidence_quote 禁止改写或编造**」。
+            #
+            # ⇒ 把 A 条资讯的抽取结果复用给 B 条，引文在 B 里根本不存在
+            #   ⇒ 下游按"逐字可核对"消费时拿到的是**假证据**。
+            #
+            # 规则见 PRD §41.13.5：**只有当"输出不逐字引用输入"时，语义复用才安全。**
+            # 精确层照常保留（同一条资讯重跑仍命中）。
+            semantic_cache=False,
         )
         data = parse_llm_json(self.agent_id, response.content)
 
@@ -118,7 +159,7 @@ class ExtractorAgent:
                 confidence = min(1.0, max(0.0, float(raw.get("confidence", 0.5))))
             except (TypeError, ValueError):
                 confidence = 0.5
-            events.append({
+            event = {
                 "item_id": item_id,
                 "event_type": normalize_event_type(str(raw.get("event_type", ""))),
                 "subject": str(raw.get("subject", ""))[:60],
@@ -127,7 +168,12 @@ class ExtractorAgent:
                 "event_date": str(raw.get("event_date", ""))[:10],
                 "evidence_quote": str(raw.get("evidence_quote", ""))[:60],
                 "confidence": round(confidence, 3),
-            })
+            }
+            if multi_items:
+                # ★ 归属继承自**来源条目**（不是让模型自己写代码：模型写的代码
+                #   无法核对，而条目上的代码是采集层按 `fetch_news(code)` 盖的章）。
+                event["stock_code"] = code_by_item_id.get(item_id, "")
+            events.append(event)
 
         stats = {
             "total": len(events),

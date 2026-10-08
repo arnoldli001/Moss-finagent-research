@@ -150,3 +150,88 @@ async def resolve_stock(text: str) -> tuple[str, str] | None:
     except (TimeoutError, asyncio.TimeoutError):
         logger.warning("证券名称解析整体超时(%ss): %s", _ASYNC_TIMEOUT_S, text[:30])
         return None
+
+
+def resolve_stocks_sync(text: str) -> list[tuple[str, str]]:
+    """★ 文本里出现的**全部**个股，按**出现顺序**去重返回（`CHG-0216`）。
+
+    ## 为什么需要它（用户报障）
+
+    > 用户输入含有 **2 个及以上**的个股…此时采集数据会存在**漏掉一些股票**的信息获取。
+    > 例：「…未来半年能否持有高股息的**宁波银行**和**中国神华**？」标的 `601088`
+    > —— 反馈中国神华缺个股估值与股息、宁波银行没有任何可引用的估值，
+    > 而本地数据库里明显有数据。
+
+    `resolve_stock_sync` 只返回**一个**（最长匹配）—— 那对"这一轮分析谁"是对的，
+    但**不足以**回答"要采几只股票的数据"。于是规划层只能给一只排个股指标，
+    另一只**一个指标都没有**，症状是"该股没有估值/股息数据"。
+
+    ## 匹配规则与 `resolve_stock_sync` **同源**（不新造一套）
+
+    * 只用同一份 `_name_pairs()` 名称表；
+    * 同样**最长优先**（防"长城"误命中"长城汽车"）；
+    * 差别只是**聚合方式**：这里从左到右扫一遍、命中即**跳过该段**
+      （所以"长城汽车"不会被再拆出"长城"），而 `resolve_stock_sync`
+      取全局最长的那**一个**。
+
+    ⚠️ 6 位数字走**名称表核对**（不重复实现 `extract_code` 的前缀规则）：
+    表里有这个代码才算个股 —— 表本身就是"A 股全集"的单一真值源。
+    """
+    if not text:
+        return []
+    try:
+        pairs = _name_pairs()
+    except Exception as exc:  # noqa: BLE001 名称表不可用 ⇒ 宁可返回空，不猜
+        logger.warning("证券名称表不可用，无法做多标的解析 '%s': %s",
+                       text[:30], brief(exc, BRIEF_TIGHT))
+        return []
+
+    by_code = {c: n for c, n in pairs if c}
+    #: 首字 → 该字开头的名称（按长度降序 ⇒ 每步先试最长）
+    by_first: dict[str, list[str]] = {}
+    for _c, n in pairs:
+        if n and len(n) >= 2:
+            by_first.setdefault(n[0], []).append(n)
+    for names in by_first.values():
+        names.sort(key=len, reverse=True)
+    name_to_code = {n: c for c, n in pairs if n}
+
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    i = 0
+    n_len = len(text)
+    while i < n_len:
+        # ① 6 位代码（表里认得的才算）
+        chunk = text[i:i + 6]
+        if len(chunk) == 6 and chunk.isdigit() and chunk in by_code:
+            if chunk not in seen:
+                seen.add(chunk)
+                found.append((chunk, by_code[chunk]))
+            i += 6
+            continue
+        # ② 名称（最长优先；命中即跳过整段，避免子串再命中）
+        hit = ""
+        for name in by_first.get(text[i], ()):
+            if text.startswith(name, i):
+                hit = name
+                break
+        if hit:
+            code = name_to_code.get(hit, "")
+            if code and code not in seen:
+                seen.add(code)
+                found.append((code, hit))
+            i += len(hit)
+            continue
+        i += 1
+    return found
+
+
+async def resolve_stocks(text: str) -> list[tuple[str, str]]:
+    """`resolve_stocks_sync` 的异步入口（同 `resolve_stock` 的超时与线程池口径）。"""
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(resolve_stocks_sync, text), timeout=_ASYNC_TIMEOUT_S
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.warning("多标的解析整体超时(%ss): %s", _ASYNC_TIMEOUT_S, text[:30])
+        return []

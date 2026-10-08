@@ -18,13 +18,17 @@ from src.api.tasks import TaskStore, new_task_id
 from src.core.budget import get_budget
 from src.core.cancel import CancellationToken, TaskCancelledError
 from src.core.config import get_settings
+from src.core import deadline as deadline_mod
 from src.core.errors import (
     BRIEF_DEFAULT,
     BRIEF_LOG,
     brief,
 )
 from src.core.executors import run_infra
-from src.infrastructure.connectors.security_resolver import resolve_stock
+from src.infrastructure.connectors.security_resolver import (
+    resolve_stock,
+    resolve_stocks,
+)
 from src.orchestration.supervisor import plan_run, query_needs_stock_resolution
 from src.scheduler.registry import alert_scan_schedule
 
@@ -87,13 +91,25 @@ def _ollama_status(url: str) -> str:
 _ACCUMULATE_LIST_KEYS = frozenset({
     "agent_outputs", "data_refs", "trace_ids", "raw_points",
     "cleaned_points", "validated_points", "errors", "progress",
+    # ★ 2026-10-07（`CHG-0190` ②）：自修复待办是**列表通道**（add reducer），
+    #   漏进这张白名单的后果是"最后一个节点的写入把前面的整体覆盖" ——
+    #   本项目在 `agent_outputs` 上真实踩过一次（见 `FinalReport` 那段注释）。
+    "self_heal_pending",
 })
 
 # ====== 投研分析结果缓存 ======
 # key = hash(query + analysis_type + target) → (expiry, result_dict)
 # TTL 10 分钟：相同查询直接返回缓存，不重跑 LangGraph 管线
 _RESULT_CACHE: dict[str, tuple[float, dict]] = {}
-_RESULT_CACHE_TTL = 600  # 10 分钟
+#: 结果缓存的 TTL（秒）。默认 600（10 分钟）。
+#:
+#: ★ 为什么可配（`MOSS_RESULT_CACHE_TTL`，2026-10-05 保障）：
+#: 它决定"**一次能管多久**"。默认 10 分钟要求与挨着做；
+#: 展示/客户常要提前半小时甚至一小时 ⇒ 档取 7200（2 小时）。
+#: 放宽**不改变**缓存语义（同问 → 同一份报告），只延长有效窗口；
+#: 代价是"同问但数据已更新"时必须显式 `options.force_refresh=true` 才会重算。
+#: 判据见 `tests/unit/test_demo_profile_knobs.py`。
+_RESULT_CACHE_TTL = max(0, int(os.environ.get("MOSS_RESULT_CACHE_TTL", "600") or 600))
 #: 结果缓存条目上限。原实现无上限：条目虽小，但长跑进程会单调增长
 #: （每个条目含完整 final_report 字符串）。
 _RESULT_CACHE_MAX = max(32, int(os.environ.get("MOSS_RESULT_CACHE_MAX", "500")))
@@ -177,6 +193,23 @@ def capacity_snapshot() -> dict:
     }
 
 
+def _deadline_stamp() -> dict:
+    """限时模式的**如实标注**（未启用时也给一个明确的 `enabled: false`）。
+
+    为什么要标在结果里而不是只写日志：结果会被写进结果缓存、再发给下一个人。
+    把"被期限压出来的报告"当完整结果复用，就是把压缩说成完整 ——
+    本项目最贵的一类缺陷（静默降级）的教科书形态。
+    """
+    if not deadline_mod.active():
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "budget_sec": round(deadline_mod.total_seconds(), 1),
+        "remaining_sec": round(deadline_mod.remaining(), 1),
+        "expired": deadline_mod.expired(),
+    }
+
+
 def _query_hash(query: str, analysis_type: str, target: str) -> str:
     """归一化 query 生成缓存 key。"""
     normalized = f"{query.strip().lower()}|{analysis_type}|{target.strip()}"
@@ -215,6 +248,9 @@ class AnalysisSubject:
     target_display: str = ""
     focus_stock_code: str = ""
     focus_stock_name: str = ""
+    #: ★ `CHG-0216`：问句里点名的**全部**个股（按出现顺序、去重）。
+    #: 采集要**每一只都排一份**个股指标，否则另一只会显示"没有估值/股息数据"。
+    focus_stock_codes: tuple[str, ...] = ()
     #: 人话说明：解析结果或**冲突改判**（空 = 无需说明）。
     note: str = ""
 
@@ -269,6 +305,25 @@ async def resolve_analysis_subject(
     if not resolved:
         return subject
 
+    # ★★ `CHG-0216`：问句里点名的**全部**个股（不是只有一只）。
+    #
+    # 【报障现场】「…未来半年能否持有高股息的**宁波银行**和**中国神华**？」
+    #   标的 `601088` ⇒ 反馈**中国神华**缺个股估值与股息、**宁波银行**没有任何
+    #   可引用的估值，**而本地库里明明有**。
+    # 【根因】下面那段"冲突改判"在问句点名了**另一只**时，把 `target` 整个改成
+    #   问句里那只（`resolve_stock` 只返回**一个**，取的是文本里**最先**出现的）
+    #   ⇒ **用户明确填的标的被静默丢弃**，另一只也从没进过任何字段。
+    #   再加上个股指标只能挂**一个**代码 ⇒ 两只股票**至少一只必然全空**。
+    # 【判据】只有**恰好点名 1 只**时才沿用既有的改判行为（那条有实测依据，
+    #   见下面 docstring：输入框残留代码会让人答错标的，比缺数据更危险）。
+    #   **点名 ≥2 只时没有"那一只"可改判** —— 改成任何一只都会丢掉另一只，
+    #   所以此时保留用户标的为主焦点，并把**全部**点名个股纳入采集。
+    try:
+        named_all = await resolve_stocks(query)
+    except Exception as exc:  # noqa: BLE001 解析失败 ⇒ 退回单只口径，不阻断
+        logger.warning("问句多标的解析失败(%s): %s", query[:40], exc)
+        named_all = []
+
     note = ""
     if target and re.fullmatch(r"\d{6}", target) and resolved[0] == target:
         try:
@@ -277,13 +332,24 @@ async def resolve_analysis_subject(
             logger.warning("问句标的解析失败(%s): %s", query[:40], exc)
             named = None
         if named and named[0] and named[0] != resolved[0]:
-            logger.warning(
-                "输入标的 %s(%s) 与问句点名的 %s(%s) 冲突 → 以问句为准",
-                target, resolved[1], named[0], named[1])
-            note = (f"输入标的 {target}({resolved[1]}) 与问句点名的 "
-                    f"{named[1]}({named[0]}) 不一致 → 已按问句分析 {named[1]}")
-            resolved = named
-            target = named[0]
+            if len(named_all) >= 2:
+                others = "、".join(f"{n}({c})" for c, n in named_all)
+                note = (f"问句点名了 {len(named_all)} 只个股（{others}）→ "
+                        f"**全部纳入采集**；主焦点仍按输入标的 "
+                        f"{target}({resolved[1]})")
+                logger.info(
+                    "问句点名 %d 只个股 → 不再冲突改判（保留输入标的 %s），"
+                    "全部纳入个股指标采集：%s",
+                    len(named_all), target, [c for c, _n in named_all])
+            else:
+                logger.warning(
+                    "输入标的 %s(%s) 与问句点名的 %s(%s) 冲突 → 以问句为准",
+                    target, resolved[1], named[0], named[1])
+                note = (f"输入标的 {target}({resolved[1]}) 与问句点名的 "
+                        f"{named[1]}({named[0]}) 不一致 → 已按问句分析 {named[1]}")
+                resolved = named
+                target = named[0]
+                named_all = [named]
 
     if analysis_type == "stock" or note:
         # 个股任务：`target` 必须是这只股票的**代码**（既有行为不变）；
@@ -294,11 +360,18 @@ async def resolve_analysis_subject(
         target_display = resolved[1] or subject.target_display or target
     else:
         target_display = subject.target_display
+    #: ★ `CHG-0216` 采集覆盖面 = **主焦点 + 问句点名的全部**（保序去重）。
+    #: 主焦点放第一位，保证"用户填的标的"**永远**被采到 —— 这正是原来丢掉的那只。
+    codes: list[str] = []
+    for _c in (resolved[0], *(c for c, _n in named_all)):
+        if _c and _c not in codes:
+            codes.append(_c)
     return AnalysisSubject(
         target=target,
         target_display=target_display,
         focus_stock_code=resolved[0],
         focus_stock_name=resolved[1],
+        focus_stock_codes=tuple(codes),
         note=note,
     )
 
@@ -414,11 +487,14 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
         target_display = target
         focus_stock_code = ""
         focus_stock_name = ""
+        focus_stock_codes: tuple[str, ...] = ()
         subject = await resolve_analysis_subject(
             target, body.query, body.analysis_type)
         target, target_display = subject.target, subject.target_display
         focus_stock_code, focus_stock_name = (
             subject.focus_stock_code, subject.focus_stock_name)
+        # ★ `CHG-0216`：问句点名的**全部**个股 —— 采集要为每一只各排一份指标。
+        focus_stock_codes = tuple(subject.focus_stock_codes)
 
         plan = plan_run(body.analysis_type, target, body.info_items, query=body.query)
 
@@ -444,6 +520,10 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
             #   focus_stock_code 表达"顺带要看的标的"，两者语义不同。
             "focus_stock_code": focus_stock_code,
             "focus_stock_name": focus_stock_name,
+            # ★ `CHG-0216`：全部点名个股。规划层按它**为每只各排一份**个股指标
+            #   —— 只有单个 `focus_stock_code` 时，另一只一个指标都没有，
+            #   用户看到的是"该股没有估值/股息数据"。
+            "focus_stock_codes": focus_stock_codes,
             "plan": [], "raw_points": [], "cleaned_points": [],
             # ★ 2026-09-29：必须在这里也给出初值。
             #   `_planned_indicators` 是 supervisor 写入、采集节点读取的 channel；
@@ -457,6 +537,15 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
             "info_items": body.info_items, "verified_items": {}, "extracted_events": {},
             "agent_outputs": [], "data_refs": [], "trace_ids": [], "errors": [],
             "final_report": None,
+            # ★ 2026-10-07（`CHG-0190` ②）：自修复待办的初值 —— 理由与
+            #   `_planned_indicators` 那条**完全一样**（`:478-485`）：声明在
+            #   `ResearchState` 里的 channel，组装 state 时也要给初值，
+            #   让"键一定存在"成为契约的一部分；消费方 `.get()` 拿到 `None`
+            #   会在下游变成"没有缺口"的假绿。
+            "self_heal_pending": [],
+            # 审计三态：A18 是链路末端节点，写在这里是为了让"没审过"与
+            # "审过了"在任务记录上**可区分**（`CHG-0190` ①）。
+            "audit": {},
             # ★ 2026-09-29：标的**改判说明**作为第一条进度下发（`progress` 是
             #   `operator.add` 聚合通道 ⇒ 预置项会保留在最前面）。
             #   为什么必须让用户看见：`target=300068` + 问句问"招商银行"时，
@@ -490,6 +579,8 @@ async def submit_analyze(body: AnalyzeRequest, request: Request) -> dict:
             #   避免"我填了 300068，为什么分析的是招商银行"的困惑。
             "target": target, "target_display": target_display,
             "focus_stock_code": focus_stock_code,
+            # ★ `CHG-0216`：问句点名的全部个股（前端/排障可直接看到采集覆盖面）
+            "focus_stock_codes": list(focus_stock_codes),
             "subject_note": subject.note}
 
 
@@ -529,6 +620,20 @@ async def _run(task_id: str, qhash: str, body: AnalyzeRequest, plan: dict,
 
     try:
         store.update(task_id, status="running")
+        # ★ 任务级期限（`src/core/deadline.py`，2026-10-05）：
+        #   口径来源 = 请求显式 `options.deadline_sec` > 环境 `MOSS_ANALYSIS_DEADLINE_SEC` > 关闭。
+        #   设在这里的意义：contextvar 会被 `astream` 内部的子任务继承，
+        #   于是**网关的每一跳**、**采集防撞钟**、**A17 的 ReAct 步数**同时看见同一个剩余时间。
+        requested = float((body.options or {}).get("deadline_sec") or 0.0)
+        deadline_sec = requested or deadline_mod.configured_seconds()
+        if deadline_sec > 0:
+            deadline_mod.set_deadline(deadline_sec)
+            logger.info("限时模式启用：端到端 %.0fs（task=%s；到点后每一跳不再等，"
+                        "收尾如实标注）", deadline_sec, task_id)
+            store.set_live_state(task_id, {
+                **(store.get_live_state(task_id) or {}),
+                "deadline_sec": deadline_sec,
+            })
         try:
             final = {}
             # 用astream而非ainvoke：每个node的return值实时更新live state
@@ -564,6 +669,10 @@ async def _run(task_id: str, qhash: str, body: AnalyzeRequest, plan: dict,
                 errors=final.get("errors", []),
                 final_report=final.get("final_report"),
                 progress=final.get("progress", []),
+                # ★ `CHG-0190` ①②：两个此前"没有出口"的东西在这里获得出口 ——
+                #   审计三态（原先只活在报告正文里）与自修复待办（原先只是注释里的名字）。
+                audit=final.get("audit") or {},
+                self_heal_pending=final.get("self_heal_pending", []),
             )
             # ====== 结果缓存写入 ======
             # 只缓存成功的、有 final_report 的任务
@@ -578,6 +687,13 @@ async def _run(task_id: str, qhash: str, body: AnalyzeRequest, plan: dict,
                     "agent_outputs": final.get("agent_outputs", []),
                     "progress": final.get("progress", []),
                     "errors": final.get("errors", []),
+                    # ★ 缓存也要带上审计三态，否则"缓存命中"的任务在接口上
+                    #   看起来像**没审过**（`verdict` 缺字段）—— 那是另一种假绿。
+                    "audit": final.get("audit") or {},
+                    "self_heal_pending": final.get("self_heal_pending", []),
+                    # ★ 限时模式的**如实标注**：结果可能是被期限压出来的，
+                    #   缓存把它当"完整结果"再发给下一个人就是欺骗。
+                    "deadline": _deadline_stamp(),
                 }
                 _cache_put(qhash, cache_result)
                 logger.info("结果缓存写入(qhash=%s, TTL=%ds)",
@@ -592,6 +708,10 @@ async def _run(task_id: str, qhash: str, body: AnalyzeRequest, plan: dict,
             store.update(task_id, status="failed", error=brief(exc, BRIEF_LOG))
     finally:
         store.clear_live_state(task_id)
+        # ★ 期限上下文在最外层 finally 清掉：`_run` 是独立 asyncio 任务，
+        #   它的 context 是副本，但同一任务里在管线之后还有装配/写缓存，
+        #   留着会让那些步骤继续读到"本次运行"的剩余时间。
+        deadline_mod.clear()
         # 定期淘汰已完成任务（TTL + 容量），避免长跑内存单调增长
         store.evict()
         await _finish()
@@ -614,6 +734,11 @@ async def research_capacity(request: Request) -> dict:
       持续增长说明淘汰阈值要调小（见 `api/tasks.py` 的 TTL/容量双阈值）。
     - `llm_cache`：语义索引是否已建（`index_built`）。未建时首次语义查找
       要付一次建索引代价（本机 3108 文件约 0.7s，走线程池不阻塞事件循环）。
+    - **`semantic_cache`**：语义层的**降级结论**（`CHG-0203`）——
+      `state` ∈ `{ok, degraded, no_traffic}`，外加**病因**与**该做什么**。
+      加它的原因（`CHG-0199` 现场）：余额耗尽时三级缓存**静默退化成两级**，
+      而唯一能看出来的地方是一个要人主动去翻的计数。
+      ⚠️ **不新增告警通道** —— 只把结论算出来，由这个既有面呈现。
     """
     runtime = _runtime(request)
     store = _store(request)
@@ -628,6 +753,19 @@ async def research_capacity(request: Request) -> dict:
             cache_stats = {"error": brief(exc, BRIEF_DEFAULT)}
     snap["task_store"] = store.stats()
     snap["llm_cache"] = cache_stats
+    # ★ 降级**结论**（不是又一堆计数）：状态 + 病因 + 该做什么（`CHG-0203`）。
+    #   与 `llm_cache` 并存是刻意的：前者给"能不能据此行动"，
+    #   后者给"要深挖时看哪个原始数"。观测量失败不影响接口。
+    try:
+        from src.infrastructure.llm.degradation import describe
+
+        snap["semantic_cache"] = describe(cache_stats) if cache_stats else {
+            "state": "no_traffic", "why": "缓存未装配（cache_stats 为空）",
+            "action": "确认 llm_cache_enabled 与 gateway 装配", "counters": {}}
+    except Exception as exc:  # noqa: BLE001 观测量失败不影响接口
+        snap["semantic_cache"] = {"state": "unknown",
+                                  "why": f"结论计算失败：{brief(exc, BRIEF_DEFAULT)}",
+                                  "action": "看服务日志", "counters": {}}
     snap["budget"] = get_budget().snapshot()
     return snap
 
@@ -664,6 +802,12 @@ async def get_task(task_id: str, request: Request) -> dict:
         "agent_messages": agent_messages,
         "progress": progress,
         "errors": record.errors, "error": record.error,
+        # ★ 2026-10-07（`CHG-0190` ①②）：这两项此前**没有任何出口**——
+        #   `audit` 是 A18 的机器可读三态（通过/不通过/未量到 + 链状态），
+        #   `self_heal_pending` 是本轮待自修复的真实缺口。
+        #   放在任务详情里，前端/调用方才能对"审计未通过"做点什么。
+        "audit": getattr(record, "audit", {}) or {},
+        "self_heal_pending": getattr(record, "self_heal_pending", []) or [],
         "created_at": record.created_at,
     }
 
@@ -970,6 +1114,38 @@ async def health(request: Request) -> dict:
         except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
             return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
 
+    def _local_gate() -> dict:
+        """本地（Ollama）单槽的排队观测 —— **唯一能回答"本地槽位忙不忙"的面**。
+
+        ## 为什么必须挂在这里（2026-10-05 实测）
+
+        实测 `provider=ollama` 的 12,651 次调用：p50 **4.5s**，但 p90 23.4s、
+        p99 74.2s、**max 210.1s**。210 = `local_gate` 的 **90s** 排队上限
+        + HTTP 的 **120s** 超时 —— 两个常量由两个模块各自定义，**从未相加**。
+
+        而在这之前，"本地槽位此刻被谁占着、排了多深"**没有任何可见面**：
+        `LocalModelGate.stats()` 写好了，但全仓唯一读它的是**测试**
+        （`tests/unit/test_local_llm_gate.py`）。运维只能靠日志里
+        一句 `本地模型排队 %.1fs 后开始` 后知后觉。
+
+        ## ⚠️ 口径：`scope: "process"` —— **只覆盖本进程**
+
+        这道闸是进程内单例，而本机能同时独立打 Ollama 的常驻进程**不止一个**
+        （uvicorn API + 调度 worker；容器形态 `Dockerfile` 还是 `--workers 2`），
+        外加任意 CLI 脚本各持一份。⇒ "整机并发 1"是假的。
+        **读这个面板时必须连带读 `scope`**，否则会把"这个进程没排队"
+        读成"整机不挤"（"没量到" ≠ "量到 0"）。
+
+        纯内存读（几个整数），**不新增任何探测/IO** —— 这是 `/health` 被前端
+        20 秒轮询的硬约束（同 `_rate_limit_guard` 的处置）。
+        """
+        try:
+            from src.infrastructure.llm.local_gate import get_local_gate
+
+            return {"available": True, **get_local_gate().stats()}
+        except Exception as exc:  # noqa: BLE001 健康检查不能因此崩
+            return {"available": False, "error": brief(exc, BRIEF_DEFAULT)}
+
     def _query_data_hops() -> dict:
         """四跳取数的**跳级命中计数**（`src/core/hop_stats.py` 是唯一事实源）。
 
@@ -1108,6 +1284,9 @@ async def health(request: Request) -> dict:
             # 免费档限流熔断（siliconflow/dashscope）：锁定期内该跳被**跳过**。
             # 判据区分「未量到」与「量到 0」——读不到时 available=False。
             "rate_limit_guard": _rate_limit_guard(),
+            # ★ 本地单槽排队（2026-10-05）：p50 4.5s / max 210.1s 的那个槽位。
+            # `scope: "process"` 是必须读的口径（跨进程无观测面），见 `_local_gate`。
+            "local_gate": _local_gate(),
         },
         "audit_chain": {"valid": chain["valid"], "records": chain["count"]},
         # ★ 四跳取数的**跳级命中计数**（哪一跳答出来的 / 缺口多少）。

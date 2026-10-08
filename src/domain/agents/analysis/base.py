@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field, ValidationError
@@ -19,6 +20,7 @@ from src.core.models import AgentInput, AgentOutput
 from src.core.schemas import Confidence, TraceStep, coerce_confidence
 from src.domain.skills.library import SkillLibrary
 from src.infrastructure.llm import LLMGateway, TaskTier
+from src.infrastructure.llm.cache import cache_anchor, cache_data_key
 from src.infrastructure.llm.hallucination_guard import HallucinationGuard
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,174 @@ def parse_llm_json(agent_id: str, content: str) -> dict[str, Any]:
         raise AgentExecutionError(f"{agent_id} LLM输出非合法JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise AgentExecutionError(f"{agent_id} LLM输出JSON非对象: {type(data)}")
+    return data
+
+
+# ============================================================
+# 多标的输出的**运行时等长校验**（`CHG-0236`，2026-10-08）
+# ============================================================
+#
+# ## 为什么"写进 prompt"不算数（本项目的实测结论）
+#
+# 「多标的必须逐只返回一条」这件事，`CHG-0230`（A17）/`CHG-0231`（A12）已经
+# 写进了 prompt 与 `_requirements` —— 那是**契约层**。契约层只是一种**请求**：
+#
+#   · 模型可以只写一只（最常见：它觉得另一只"没什么可说"）；
+#   · 可以把两只合并成一条（"宁波银行与中国神华均…"）；
+#   · 可以干脆不写这个键（长上下文里它把这段要求读丢了）；
+#   · 可以写一个**不在本次标的里**的代码（串了上一轮的上下文）。
+#
+# 而 `parse_llm_json()` **只保证"是合法 JSON 对象"，不做任何 schema 校验**
+# ⇒ 上述四种情况**全都静默通过**。用户看到的是"已按逐只给结论"的外观
+# （结论里确实提到了两只票），外加**少一只**的内容 —— 少的那只票
+# 在界面上与"这只票没问题"长得一模一样。这是本项目反复出现的
+# 「护栏假绿 / 数据进得去、结论出不来」在**多标的**上的具体形态。
+#
+# ## 判据（不是"有没有"，而是"等不等长"）
+#
+#   · 期望集合 = `expected_codes`（**顺序即顺序**：用户先问的排前面）；
+#   · 实际集合 = 每次结果里的 `code` 字段（不是"数组长度"—— 长度对不上
+#     与"长度对得上但代码全错"是两回事，必须按代码核对）。
+#
+# ## 补位策略：**补空位，不补内容**
+#
+# 缺失的标的**按顺序补一条占位**（`_missing=True` + 调用方给的占位字段），
+# 而不是丢掉、也不是拿另一只的内容顶替。理由：
+#   ① 条数相等是下游与前端的前提 —— 少一条时"第 i 条 = 第 i 只"这个
+#      约定**悄悄失效**（用户会按位置去读）;
+#   ② 拿别的标的顶替 = **编数据**，比缺失更糟。
+# 占位 + `*_missing` + 结论尾部告警**三处同时可见** ⇒ 不可能被当成"已量到"。
+
+#: 逐只结果里"这一只模型没返回"时，占位行的人话立场值。
+PER_ITEM_MISSING = "未返回"
+
+
+def _row_code(row: Any) -> str:
+    """取一行的代码：容忍 `{"code": …}` / `{"stock_code": …}` 两种写法。
+
+    `600036.SH` / `sh600036` 这类带市场后缀的写法统一抽成那 6 位数字 ——
+    否则同一只票会因为写法不同被判成"该给的没给 + 给了没要的"（两边都错）。
+    """
+    if not isinstance(row, dict):
+        return ""
+    for field in ("code", "stock_code", "ts_code"):
+        value = str(row.get(field) or "").strip()
+        if value:
+            matched = re.search(r"\d{6}", value)
+            return matched.group(0) if matched else value
+    return ""
+
+
+def enforce_per_item_rows(
+    data: dict[str, Any],
+    key: str,
+    expected_codes: Sequence[str],
+    *,
+    where: str,
+    label: str,
+    placeholder_fields: dict[str, Any],
+    warning_prefix: str,
+) -> dict[str, Any]:
+    """★ `CHG-0236`：多标的的**运行时**等长校验。**就地**改写 `data`。
+
+    Args:
+        data: LLM 解析出来的结果字典（就地改写）。
+        key: 逐只结果所在的键（A17=`per_subject` / A12=`compliance_by_code`）。
+        expected_codes: 期望的标的代码，**顺序即最终顺序**。
+        where: 审计用的调用点标识（如 `A17_recommend/execute`）。
+        label: 人话标的称呼（"标的"/"标的票"），用于告警文案。
+        placeholder_fields: 占位行除 `code` 外的字段（各 Agent 不同）。
+        warning_prefix: 告警句的前缀（各 Agent 不同，句式**共用**）。
+
+    Returns:
+        同一个 `data`（便于链式调用）。
+
+    ## 写入的键（`<key>` = `key` 的实参）
+    `key`（**等长**、顺序同 `expected_codes`）、`<key>_checked`（= `where`，
+    ★ 有它才能区分"校验通过"与"压根没跑校验"）、`<key>_expected`、
+    `<key>_returned`；仅在有异常时出现：`<key>_missing`（该给没给）、
+    `<key>_unexpected`（给了没要的代码/重复代码）、`<key>_malformed`
+    （条目不是对象，数不出来是谁）。有异常时还会把告警句追加到
+    `conclusion` 尾部并把 `confidence` 降为 `low`
+    （沿用本文件 `HallucinationGuard` 的既有先例）。
+
+    ## 门槛是 2
+    `len(expected_codes) < 2` 时**原样返回、一个键都不加** ——
+    单标的的"一套结论"本来就正确，加字段只会污染既有输出
+    （与本项目"单标的路径逐字不变"的纪律一致）。
+    """
+    codes = [str(c).strip() for c in expected_codes if str(c).strip()]
+    # 去重但**保序**（同一个代码问两遍时，期望也只有一条）
+    codes = list(dict.fromkeys(codes))
+    if len(codes) < 2:
+        return data
+
+    raw = data.get(key)
+    shape = "list" if isinstance(raw, list) else (
+        "dict" if isinstance(raw, dict) else ("missing" if raw is None else "other"))
+    # 容错：模型偶尔给 `{"601088": {...}}` 这种按代码索引的对象。
+    # **接受它但留痕**（`<key>_shape="dict"`）—— 否则一份内容其实齐全的输出
+    # 会被整体判成"一只都没给"，那才是真正的误报。
+    if isinstance(raw, dict):
+        raw = [{**v, "code": k} if isinstance(v, dict) else {"code": k, "value": v}
+               for k, v in raw.items()]
+
+    by_code: dict[str, dict[str, Any]] = {}
+    unexpected: list[str] = []
+    malformed = 0
+    if isinstance(raw, list):
+        for row in raw:
+            if not isinstance(row, dict):
+                malformed += 1
+                continue
+            code = _row_code(row)
+            if code in codes and code not in by_code:
+                by_code[code] = row
+            else:
+                unexpected.append(code or "?")
+
+    missing = [c for c in codes if c not in by_code]
+    rows: list[dict[str, Any]] = []
+    for code in codes:
+        if code in by_code:
+            row = dict(by_code[code])
+            # ★ 归一化：**不许**把 `601088.SH` / `stock_code` 这类写法带出去 ——
+            #   下游（前端、审计、A17 的 anchor）一律按 6 位代码索引，
+            #   带后缀的行会**索引不到**，且与另一只票的写法不一致。
+            row["code"] = code
+            rows.append(row)
+        else:
+            rows.append({"code": code, "_missing": True, **placeholder_fields})
+
+    data[key] = rows
+    data[f"{key}_checked"] = where
+    data[f"{key}_expected"] = len(codes)
+    data[f"{key}_returned"] = len(codes) - len(missing)
+    if shape not in ("list",):
+        data[f"{key}_shape"] = shape
+    if missing:
+        data[f"{key}_missing"] = missing
+    if unexpected:
+        data[f"{key}_unexpected"] = unexpected
+    if malformed:
+        data[f"{key}_malformed"] = malformed
+
+    if missing or unexpected or malformed:
+        detail = []
+        if missing:
+            detail.append(f"缺 {len(missing)} 只（{'、'.join(missing)}）")
+        if unexpected:
+            detail.append(f"多出/重复 {'、'.join(unexpected)}")
+        if malformed:
+            detail.append(f"{malformed} 条不是对象")
+        warn = (
+            f"⚠️ {warning_prefix}：本次{label}共 {len(codes)} 只，"
+            f"逐只结果实际可用 {len(codes) - len(missing)} 只（{'; '.join(detail)}）。"
+            f"缺失的已按「{PER_ITEM_MISSING}」占位，**不要**读成"
+            "「这只没有问题」。"
+        )
+        data["conclusion"] = (str(data.get("conclusion") or "") + " " + warn).strip()
+        data["confidence"] = "low"
     return data
 
 
@@ -476,11 +646,12 @@ class AnalysisAgentBase(BaseAgent):
         grounding = (
             f"### 时效红线\n今天{today_str}。只用上方数据，引用须带period_date；"
             "上方没有即「数据缺口」，不得使用任何训练记忆的年份/数值。")
+        context_block = self._build_context(payload)
         prompt = (
             f"{query_block}\n"
             f"{rule_block}\n"
             f"{grounding}\n\n"
-            f"## 输入数据\n{self._build_context(payload)}\n\n"
+            f"## 输入数据\n{context_block}\n\n"
             f"## 信息层事件\n{event_lines}\n\n"
             f"## 已核验原文\n{verified_lines}\n\n"
             f"## 本地计算参考\n{hint}\n\n"
@@ -491,6 +662,19 @@ class AnalysisAgentBase(BaseAgent):
         response = await self._gateway.complete(
             self.task_tier, self.system_prompt, prompt,
             agent_id=self.agent_id, trace_id=input.task_id, json_mode=True,
+            # ★ 缓存的两半（`CHG-0180`）：
+            #
+            # `anchor` = **只放问句** —— 语义可比的那部分（"换个说法该复用"）。
+            # `scope_extra` = **数据指纹** —— 必须完全一致才能复用。
+            #
+            # ⚠️ 第一版把数据也塞进 anchor，并断言"换数据就不会命中"。
+            #    **端到端实测推翻了它**：同一问句、只改一个数（CPI 0.5→9.9），
+            #    embedding 余弦仍 ≥0.80 ⇒ 照命中 ⇒ 返回上一批数据的结论。
+            #    原因是一个数字几乎不移动 1024 维语义向量。
+            #    ⇒ "内容变了" ≠ "语义向量变了"：精确性靠 scope，模糊性才靠 anchor。
+            anchor=cache_anchor(query_block),
+            scope_extra=cache_data_key(context_block, event_lines,
+                                       verified_lines, hint),
         )
         try:
             data = self._parse_llm_json(response.content)
@@ -510,10 +694,13 @@ class AnalysisAgentBase(BaseAgent):
             data = self._parse_llm_json(response.content)
 
         # 幻觉防护：校验输出数字/股票代码是否grounded于输入数据
+        #
+        # ⚠️ **不要在这里传 `check_citations=`**（`CHG-0173`，2026-10-05）。
+        #    三档开关的单一真值源是 `MOSS_HALLUCINATION_TIERS`（Settings）；
+        #    在调用点写死一个字面量，会让 `.env` 里改的开关**静默失效** ——
+        #    而"开关没接上"与"护栏正常"在日志里长得一模一样。
         conclusion_text = str(data.get("conclusion", ""))
-        hg_report = HallucinationGuard.verify(
-            conclusion_text, prompt, check_citations=False,
-        )
+        hg_report = HallucinationGuard.verify(conclusion_text, prompt,)
         if not hg_report.passed:
             data["conclusion"] = conclusion_text + " " + hg_report.render_warning()
             if hg_report.confidence < 0.7:
@@ -540,10 +727,7 @@ class AnalysisAgentBase(BaseAgent):
                   if skill_hits else []),
                 TraceStep(
                     step=4, step_type="cross_validation",
-                    description=(
-                        f"幻觉防护: passed={hg_report.passed} "
-                        f"confidence={hg_report.confidence:.2f}"
-                    ),
+                    description=hg_report.trace_line(),
                 ),
             ],
             result={**result, "model_used": response.model_used,

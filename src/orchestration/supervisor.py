@@ -35,6 +35,28 @@ from src.core.state import ResearchState
 from src.domain.skills.library import SkillLibrary
 from src.orchestration.planner import INDICATOR_CATALOG, LLMSupervisorPlanner
 
+#: A17 走多步 ReAct 所需的**最低剩余时间**（秒）。低于它就当场降到单步直答：
+#: 实测多步是 3 次串行 34.7s，而单步直答约 6~11s —— 期限已经很紧时，
+#: "多一步自我校验"换来的不是质量而是超时。
+_A17_REACT_MIN_SEC: float = 12.0
+
+
+def _a17_max_steps(configured: int) -> int:
+    """A17 实际步数 = `configured`，但**限时模式下剩余不够就降到 1**。
+
+    抽成独立函数是为了能被**行为判据**钉住（而不是把规则埋在节点函数里，
+    只能靠读代码确认）。未启用期限 ⇒ 原样返回（默认行为逐字不变）。
+    """
+    from src.core import deadline as _deadline
+
+    if not _deadline.active() or _deadline.remaining() >= _A17_REACT_MIN_SEC:
+        return configured
+    if configured > 1:
+        logger.info("限时模式：A17 ReAct 步数 %d → 1（剩余 %.1fs < %.0fs）",
+                    configured, _deadline.remaining(), _A17_REACT_MIN_SEC)
+    return 1
+
+
 logger = logging.getLogger(__name__)
 
 # ======================================================================
@@ -54,13 +76,31 @@ _HEAL_BLACKLIST: tuple[str, ...] = (
 )
 _HEAL_FAIL_CACHE: dict[str, float] = {}
 _HEAL_FAIL_TTL = 3600.0  # 失败指标 1 小时内不再尝试
+#: ★ 2026-10-07（`CHG-0190` ②）：在飞的自修复后台任务的**强引用**。
+#:
+#: 为什么必须有：`asyncio.create_task` 只保留**弱**引用，任务对象被 GC 之后
+#: 会被**静默取消**（本项目已在 `src/api/routes/intel.py:419` 记过这条）。
+#: 放在模块级是刻意的 —— 闭包内的局部集合会随节点返回而失去意义。
+_HEAL_TASKS: set[asyncio.Task] = set()
+#: 单轮最多登记多少条"待自修复"缺口（防刷屏；与 A17 报缺口的 `gaps[:10]` 对齐）。
+_SELF_HEAL_MAX_PER_ROUND = 10
 _HEAL_QUOTA_WINDOW: list[float] = []
 _HEAL_QUOTA_MAX = 5       # 60 秒内最多 5 次自修复尝试
 _HEAL_QUOTA_WINDOW_S = 60.0
 
 
-def _self_heal_allowed(indicator: str, error_ctx: str) -> bool:
+def _self_heal_allowed(indicator: str, error_ctx: str, *,
+                       consume: bool = True) -> bool:
     """自修复入口闸门：白名单黑名单 + 失败缓存 + 限频。
+
+    Args:
+        consume: **是否消耗限频配额**（默认 True，保持原语义）。
+            ★ 2026-10-07（`CHG-0190` ②）：后台调度路径必须先做一次**不消耗**的预检 ——
+            原先这道闸门"返回 True 就把 now 记进 `_HEAL_QUOTA_WINDOW`"，
+            于是"先判据、再 `create_task`"会在**任务真正跑起来之前**就把
+            5 次/60s 的配额吃掉（判据与实际尝试解耦 = 静默烧配额）。
+            预检用 `consume=False`，真正的尝试由 `_try_self_heal` 内部那次消耗 ——
+            **判断仍然只有一份实现**。
 
     Returns:
         True = 允许走自修复流程；False = 直接跳过（节省 LLM 调用）。
@@ -90,7 +130,8 @@ def _self_heal_allowed(indicator: str, error_ctx: str) -> bool:
             "A19 自修复限频触发：60s 内已尝试 %d 次（限 %d），本次跳过",
             len(_HEAL_QUOTA_WINDOW), _HEAL_QUOTA_MAX)
         return False
-    _HEAL_QUOTA_WINDOW.append(now)
+    if consume:
+        _HEAL_QUOTA_WINDOW.append(now)
     return True
 
 
@@ -104,7 +145,64 @@ def _record_heal_success(indicator: str) -> None:
     """成功时清掉失败缓存。"""
     _HEAL_FAIL_CACHE.pop(indicator, None)
 
+
+def _note_self_heal_candidate(updates: dict[str, Any], indicator: str,
+                              miss_stage: str,
+                              miss_reason: str) -> dict[str, Any] | None:
+    """把一个**真缺口**登记进 `self_heal_pending`，并回答"要不要调度自修复"。
+
+    Returns:
+        要调度 ⇒ 返回登记条目；不调度 ⇒ `None`（条目可能仍被登记，见 `guarded`）。
+
+    ★ 抽成模块级纯函数是刻意的（`CHG-0190` ②）：这三条规则
+    （单轮上限、护栏预检、`guarded` 标记）原先埋在 `_live_fetch_one` 的闭包里，
+    **除了跑整张图没有别的办法验证** —— 而"没法单测的规则"正是它当初能变成
+    一句注释的原因。现在它们是纯函数，`tests/unit/test_self_heal_wiring.py` 直接测。
+
+    ⚠️ 预检必须 `consume=False`：`_self_heal_allowed` 是"检查即记账"的闸门
+    （返回 True 就把 now 写进 60s 窗口），先判后调度会在**任务真正跑起来之前**
+    把 5 次/60s 的配额吃掉；真正的尝试由 `_try_self_heal` 内部那次消耗。
+    """
+    pending = updates.setdefault("self_heal_pending", [])
+    if len(pending) >= _SELF_HEAL_MAX_PER_ROUND:
+        return None
+    entry: dict[str, Any] = {
+        "indicator": indicator,
+        "stage": miss_stage,
+        "reason": str(miss_reason)[:200],
+    }
+    if not _self_heal_allowed(indicator, str(miss_reason), consume=False):
+        # 被护栏拦下（黑名单 / 1h 失败缓存 / 限频）⇒ **登记但不去试**：
+        # "没量到"与"量到不值得试"必须分开，且都不静默。
+        entry["guarded"] = True
+        pending.append(entry)
+        return None
+    pending.append(entry)
+    return entry
+
+
+def _enqueue_self_heal_gap(indicator: str, *, reason: str, task_id: str) -> bool:
+    """自修复没成 ⇒ 把缺口交给**盘后**（`gap_drain`）。
+
+    与 A17 报缺口（`_enqueue_data_gaps`）**共用同一个队列**：队列自带
+    24h 去重、`MAX_ATTEMPTS=3` 退避、`ROUTE_PROSE` 兜底（A19 无从下手的形态
+    只登记不烧钱）。**不允许出现第二套"缺口"实现**。
+    """
+    from src.domain.agents.decision.gap_queue import get_gap_queue
+
+    return bool(get_gap_queue().enqueue(
+        _resolve_gap_indicator(indicator) or indicator,
+        reason=f"自修复未成功（{str(reason)[:80]}）",
+        status="fetchable", source="self_heal", trace_id=task_id))
+
 ANALYSIS_AGENTS = ("A08_macro", "A09_meso", "A10_micro", "A11_fin_risk", "A12_compliance")
+#: `ask_agent` 工具的**每 Agent 追问上限**（模块级：工具描述与执行逻辑共用同一常量）。
+#:
+#: ★ 曾经是 `recommend_node` 内的局部变量，而工具描述里**手写**了"最多追问2次" ——
+#: 同一件事两个数。提到模块级后，`ask_agent_tool_description()` 用插值生成描述，
+#: 判据 `tests/unit/test_ask_agent_tool_contract.py` 断言两者一致。
+#: 收紧到 1 次的理由：实测 LLM 会绕着重问同一 Agent，而追问代价是真金白银的 LLM 调用。
+MAX_ASKS_PER_AGENT = 1
 #: 行业层 Agent。⚠️ **A20 是兜底**：它不靠关键词命中，而是在
 #: "问句/标的有明确行业，但没有任何专属 Agent 覆盖它"时由
 #: `needs_generic_industry()` 补挂（如银行/非银/公用事业/交运）。
@@ -579,6 +677,59 @@ def _ensure_item_ids(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _news_focus_codes(state: ResearchState) -> list[str]:
+    """★ 要**逐只取新闻**的 6 位代码（`focus_stock_codes`，保序去重）。
+
+    ## 为什么需要它（用户 2026-10-08 报障的"舆情版"）
+
+    采集节点原来只读**单值** `state["target"]`（`re.fullmatch(r"\\d{6}", target)`）
+    ⇒ 一条问两只票的问句里，**第二只票的新闻一条都不取**，
+    A05/A06/A07 拿到零输入整体空跳过 —— 用户看到"该股近期无消息"，
+    而真相是**根本没去取**（与"宁波银行没有任何可引用的估值"同一形状）。
+
+    ⚠️ 只认 6 位数字代码：名称/主题词交给既有的 `fetch_topic_news` 那条路
+    （不在这里混两种语义）。拿不到任何代码 → 返回 `[]`，调用方走原文路径。
+    """
+    out: list[str] = []
+    for raw in (state.get("focus_stock_codes") or ()):
+        code = str(raw or "").strip()
+        if re.fullmatch(r"\d{6}", code) and code not in out:
+            out.append(code)
+    return out
+
+
+async def _fetch_news_per_code(news_fetcher: Any, codes: list[str]) -> list[dict]:
+    """**逐只** `fetch_news(code)`，并把代码标到每条 `item["stock_code"]` 上。
+
+    ## 为什么必须标代码
+
+    下游 A07 原来是**把所有事件混算成一个情绪分**（`info/sentiment/logic.py`）
+    ⇒ 两只票的利好/利空互相抵消，用户读到的"情绪偏暖"不知道是针对哪只。
+    代码随条目下发后：A06 把它带到事件上、A07 按代码分组出分。
+
+    ## 取数失败的边界
+
+    单只取失败（返回空）**不影响**另一只 —— 逐只循环，一只一条都不丢地累加。
+    `stock_code` 用**我们要的那个 6 位代码**覆盖（上游 `news_df_to_items` 用
+    东财的"关键词"列填这个字段，值可能是**股票名**，不能当代码用）。
+    """
+    items: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for code in codes:
+        got = await news_fetcher.fetch_news(code)
+        for raw in got or ():
+            if not isinstance(raw, dict):
+                continue
+            entry = {**raw, "stock_code": code}
+            key = (code, str(entry.get("source_url") or ""),
+                   str(entry.get("title") or entry.get("text") or "")[:120])
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(entry)
+    return items
+
+
 def _verified_texts(state: ResearchState, *, limit: int = 10) -> list[str]:
     """从 verified_items 取可信原文（A08-A12 通用）。模块级函数，
     不依赖任何闭包状态，便于单元测试。
@@ -609,6 +760,28 @@ def _verified_texts(state: ResearchState, *, limit: int = 10) -> list[str]:
         if len(texts) >= limit:
             break
     return texts
+
+
+def ask_agent_tool_description(available_agents: list[str]) -> str:
+    """★ `ask_agent` 工具描述的唯一构造点（抽成模块级，为的是**可判据**）。
+
+    ## 为什么必须抽出来（`CHG-0192` 的真实缺陷）
+
+    原实现把描述写在 `tools.register(...)` 的参数里，其中**手写**了
+    "每个Agent最多追问2次"；而代码常量是 `MAX_ASKS_PER_AGENT = 1`。
+    同一件事两个数 —— 工具描述**会进 LLM 的 system prompt**，
+    于是模型按 2 次去试、第二次被拒，而它不知道为什么（描述与行为不符）。
+
+    抽成工厂之后，`tests/unit/test_ask_agent_tool_contract.py` 可以**直接调它**，
+    断言"描述里的数字 == 常量值"；把 `{MAX_ASKS_PER_AGENT}` 改回手写数字即红。
+    """
+    return (
+        f"向指定上游分析Agent提问。可用Agent：{', '.join(available_agents)}。"
+        "参数receiver=上述agent_id之一, question=具体问题。"
+        f"规则：每个Agent最多追问{MAX_ASKS_PER_AGENT}次，"
+        "不要对同一Agent重复提出相同或"
+        "高度相似的问题；数据层Agent(A01-A04)不可提问，指标数值用query_data。"
+    )
 
 
 def _build_analyze_payload_fn(agent_id: str):
@@ -663,6 +836,27 @@ def _build_analyze_payload_fn(agent_id: str):
                 "macro_required_total": len(required),
                 "macro_required_got": len([i for i in required if i in got]),
             }
+        # ★★ 2026-10-08：**多行业问句的行业清单随数据下发**（A09_meso 消费）。
+        #
+        # 现场（同一条用户报障）：一条问句里同时有「煤炭开采」（601088）与
+        # 「银行」（宁波银行）时，A09 的输出契约只有**一组**
+        # `industry_cycle`/`chain_position` ⇒ 它只写一个行业，另一个行业的
+        # 中观结论**不存在**（用户读到"只有中国神华有行业结论"）。
+        #
+        # 为什么在编排层算：`resolve_focus_industries` 是 `CHG-0217` 的**唯一**
+        # 多值实现（与挂 Agent 的判据同源）；领域层只**渲染**，不重新解析
+        # （两份解析必然漂移，而漂移的表现是"挂的是 A、写的是 B"，不报错）。
+        #
+        # ⚠️ **只在 ≥2 个行业时才写这个键** —— 单行业时 `hint` 与修复前
+        #    逐字相同 ⇒ A09 的 prompt（含 `json.dumps(hint)` 那段）也逐字相同，
+        #    "单行业逐字不变"是**结构保证**而不是靠断言维持。
+        if agent_id == "A09_meso":
+            _multi_industries = [
+                name for name, _how in resolve_focus_industries(
+                    f"{state.get('target') or ''} {state.get('user_query') or ''}")
+                if name]
+            if len(_multi_industries) >= 2:
+                hint = {**hint, "focus_industries": _multi_industries}
         return {
             "focus": focus,
             "user_query": state["user_query"],
@@ -1378,6 +1572,7 @@ _NEAR_TERM_KEYWORDS: tuple[str, ...] = (
 def augment_plan_by_query_signals(
     text: str, target: str, agents: list[str], indicators: list[str],
     *, resolved_code: str = "", analysis_type: str = "",
+    resolved_codes: tuple[str, ...] = (),
 ) -> tuple[list[str], list[str], list[str]]:
     """按问句领域信号**增补** Agent 与指标。返回 `(agents, indicators, notes)`。
 
@@ -1390,6 +1585,16 @@ def augment_plan_by_query_signals(
     `resolved_code`：API 层已解析出的 6 位代码（`state["focus_stock_code"]`）。
     有它时，个股类**裸指标**会在这里补上后缀 —— 因为 `sanitize_indicators`
     只认 `target`（宏观问的 target 是空的，补不出后缀）。
+
+    ★★ `resolved_codes`（`CHG-0216`）：**问句里点名的全部个股**。
+    > 用户报障：「用户输入含有 **2 个及以上**的个股…此时采集数据会存在
+    > **漏掉一些股票**的信息获取」——例：「…能否持有高股息的**宁波银行**和
+    > **中国神华**？」标的 `601088`，反馈中国神华缺个股估值与股息、
+    > 宁波银行没有任何可引用的估值，**而本地库里明明有**。
+    根因：这一段原来只有**单个** `code` ⇒ 个股指标只能挂到一只上，
+    **另一只一个指标都没有**（症状是"该股没有估值/股息数据"）。
+    ⇒ 现在为**每一个**代码各排一份。`resolved_code` 保留为单值回退
+    （既有调用点与测试不受影响）。
 
     `analysis_type`：**只有 `news` 会改变行为** —— news 管线不采数据
     （信息层 A05/A06/A07 串行链，A01-A04 整体跳过，见
@@ -1420,9 +1625,16 @@ def augment_plan_by_query_signals(
     #      在这里另写一套模糊匹配，必然演成"路由认为归 A 管、增补按 B 取数"；
     #   ② 这一节**不受 `signals` 有无支配**（问句只提行业名、没命中任何领域信号时
     #      同样要接），所以它放在下面那个 `if not signals` 提前返回**之前**。
-    focus_industry, industry_how = resolve_focus_industry(
+    # ★★ `CHG-0217`：**全部**命中行业，不是一个。
+    #
+    # 用户报障原话包含「…**或 2 个及以上的概念板块**…此时采集数据会存在
+    # **漏掉一些股票或板块**的信息获取」。与个股侧（`CHG-0216`）是**同一个缺陷**：
+    # 原来 `focus_industry` 是单值 ⇒ 问句提到两个板块时，只给一个补
+    # `行业拥挤度`/`板块资金流`/`行业轮动`，**另一个板块一个指标都没有**。
+    focus_industries = resolve_focus_industries(
         f"{target or ''} {text}".strip())
-    if focus_industry and collects_data:
+    for focus_industry, industry_how in (
+            focus_industries if collects_data else ()):
         # ★ 「找不到就不提示」的**正确落法**（用户口径 + 链路实测，2026-09-29）：
         #   用户明确说「如果找不到就不提示未找到数据」，而 `fetch()` 返回 `[]`
         #   **做不到"不提示"** —— 空结果会在两处冒出来：
@@ -1461,6 +1673,10 @@ def augment_plan_by_query_signals(
     if not signals:
         return new_agents, new_indicators, notes
 
+    # ★ `CHG-0216`：个股信号要覆盖**所有**被点名的股票。
+    #   单值回退：没给 `resolved_codes` 时用 `resolved_code`（既有调用点不变）。
+    codes: tuple[str, ...] = tuple(resolved_codes) or (
+        (resolved_code,) if resolved_code else ())
     for sig in sorted(signals):
         sig_agents, sig_indicators = _SIGNAL_AGENT_INDICATORS.get(sig, ((), ()))
         if not collects_data:
@@ -1471,8 +1687,10 @@ def augment_plan_by_query_signals(
             if aid not in new_agents:
                 new_agents.append(aid)
                 notes.append(f"问句命中「{sig}」→ 补挂 {aid}")
+        #: 这一个信号要覆盖的代码集合。只有 `stock` 是"按股票各排一份"，
+        #: 其余信号走原来的单次（`("",)`）—— 逐字保持既有行为。
+        ind_codes: tuple[str, ...] = codes if sig == "stock" else ("",)
         for ind in sig_indicators:
-            code = resolved_code if sig == "stock" else ""
             # 拿不到代码时**不要**把裸个股指标塞进计划：裸名（`PE(TTM)`）
             # 没有任何连接器 supports，A01 会白撞一次网络后必然失败，
             # 用户看到"估值数据缺失"——**看起来像数据源坏了，其实是契约不满足**。
@@ -1481,15 +1699,18 @@ def augment_plan_by_query_signals(
             # ⚠️ 这个判断必须留在**本函数内部**（而不是让调用方自己再处理一遍）：
             #   否则每个新调用点都要记得这件事，而漏掉的那次**不会报错**，
             #   只会在用户面前表现为"数据缺失"。本项目已登记过太多这类缺陷。
-            if code == "" and _needs_code_suffix(ind):
+            if not ind_codes and _needs_code_suffix(ind):
                 continue
-            fixed = (f"{ind.split(':', 1)[0]}:{code}"
-                     if (code and _needs_code_suffix(ind) and ":" not in ind)
-                     else ind)
-            if fixed not in new_indicators:
-                new_indicators.append(fixed)
-                if fixed != ind:
-                    notes.append(f"个股指标补标的代码：{ind} → {fixed}")
+            for code in (ind_codes or ("",)):
+                if code == "" and _needs_code_suffix(ind):
+                    continue
+                fixed = (f"{ind.split(':', 1)[0]}:{code}"
+                         if (code and _needs_code_suffix(ind) and ":" not in ind)
+                         else ind)
+                if fixed not in new_indicators:
+                    new_indicators.append(fixed)
+                    if fixed != ind:
+                        notes.append(f"个股指标补标的代码：{ind} → {fixed}")
 
     # 行业信号：按问句路由到的行业 Agent，补它的产业指标
     if "industry" in signals:
@@ -1508,13 +1729,19 @@ def augment_plan_by_query_signals(
     # 「600036 非本行业覆盖标的，无法给出结论」。
     # 这里用**确定性解析**（代码→本地名录 / 简称→代码 / 文本直述行业名）
     # 补挂 A20；它的行业名与关注指标都在 Agent 内部按请求解析。
+    # ★ 2026-10-08：判据改成**逐行业**的并集（`needs_generic_industries`）。
+    #   「整条问句有没有行业」是错的问题 —— 问句里两个行业时，第一个有主
+    #   （煤炭开采 → A15）就会让判据说"有人管"，而**第二个行业（银行）
+    #   一个人都没管**。现在：**每一个**没有 A13–A16 接管的行业都要求补挂 A20
+    #   （A20 自己按 `requested_industries` 逐行业各出一节）。
+    #   ⚠️ 单行业时 notes 文案与修复前**逐字相同**（`'、'.join([x]) == x`）。
     if "stock" in signals or "industry" in signals:
-        generic_industry = needs_generic_industry(
+        generic_industries = needs_generic_industries(
             f"{target or ''} {text}", resolved_code)
-        if generic_industry and "A20_generic_industry" not in new_agents:
+        if generic_industries and "A20_generic_industry" not in new_agents:
             new_agents.append("A20_generic_industry")
             notes.append(
-                f"标的属「{generic_industry}」行业且无专属行业 Agent → "
+                f"标的属「{'、'.join(generic_industries)}」行业且无专属行业 Agent → "
                 f"补挂 A20_generic_industry（兜底）")
 
     # 高股息/红利主题：银行属金融，当前没有金融行业 Agent。
@@ -1566,6 +1793,113 @@ def resolve_focus_industry(text: str) -> tuple[str, str]:
         return "", ""
 
 
+def _a17_subjects(state: ResearchState) -> list[dict[str, Any]]:
+    """★ `CHG-0230`：A17 的**逐只表态清单** —— 从 `focus_stock_codes` 来。
+
+    ## 为什么需要（§41.36 审计的 A17 项）
+
+    用户问「…未来半年能否持有高股息的**宁波银行**和**中国神华**？」时，
+    A17 的输入只有**单值** `focus`，输出也只有**一套** `stance`/`position_advice`/
+    `expected_return_3_6m` ⇒ **两只票共用一个立场**，用户不知道"中性偏多"是针对哪只；
+    若模型只挑了最像的那只写，**另一只在最终交付里根本不存在**。
+
+    ⚠️ **三处注入点共用本函数**（`CHG-0087` 为"同一件事写两遍"付过代价）：
+    写三遍必然漂移，而漂移的方向是"某条路径下 A17 又退回单标的"——
+    **不报错，只是又少了一只票**。
+
+    ⚠️ **少于 2 只 ⇒ 返回 `[]`** ⇒ A17 走单标的口径，输出与修复前**逐字一致**。
+
+    ⚠️ 已知边界：非主焦点的**中文名拿不到** —— API 层只把代码写进了
+    `focus_stock_codes`（`AnalysisSubject.focus_stock_codes` 是 `tuple[str, ...]`）。
+    这里只保证**代码齐全**；名称由 A17 从问句与上游结论里读。
+    要补名称得同时改 `AnalysisSubject` 与 `ResearchState`，不在本轮半径内。
+    """
+    codes = [str(c) for c in (state.get("focus_stock_codes") or ()) if c]
+    if len(codes) < 2:
+        return []
+    primary_name = str(state.get("focus_stock_name") or "")
+    primary_code = str(state.get("focus_stock_code") or "")
+    return [
+        {"code": c, "name": primary_name if c == primary_code else ""}
+        for c in codes
+    ]
+
+
+def resolve_focus_industries(text: str) -> list[tuple[str, str]]:
+    """★ 文本 → **全部**命中行业 `[(行业名, 依据说明), …]`（`CHG-0217`）。
+
+    与 `resolve_focus_industry` 的关系：同一个唯一实现
+    （`catalog/industry_of.resolve_industries_from_text`）、同一条"确定性优先"
+    的三路优先级，只是**收全部**而不是取第一个。
+
+    为什么需要（用户报障原话）：「…用户输入含有2个及以上的个股**或2个及以上的
+    概念板块**…此时采集数据会存在**漏掉一些股票或板块**的信息获取」——
+    单值入口下，问句提到两个板块时只有**一个**会被补 `行业拥挤度`/`板块资金流`/
+    `行业轮动`，另一个板块**一个指标都没有**。
+
+    ⚠️ 拿不到与"拿到空"必须区分：本函数返回 `[]` 表示**三路都不中**（不猜行业），
+    调用方据此不排任何板块族 —— 与单值版返回 `("", "")` 同一条纪律。
+    """
+    probe = str(text or "").strip()
+    if not probe:
+        return []
+    try:
+        from src.infrastructure.catalog.industry_of import (
+            resolve_industries_from_text,
+        )
+
+        return list(resolve_industries_from_text(probe))
+    except Exception as exc:  # noqa: BLE001 名录不可用 → 不阻断任务，只是不补板块
+        logger.debug("多行业解析失败（不阻断）：%s", exc)
+        return []
+
+
+def needs_generic_industries(text: str, focus_code: str = "") -> list[str]:
+    """★ 问句里**每一个"没有专属行业 Agent 接管"的行业**（保序去重；拿不到 → 空列表）。
+
+    ## 报障现场（用户 2026-10-08，与 `CHG-0216`/`CHG-0217` 同一条原话）
+
+    > 「…基于当前板块拥挤度和能源重点项目与新业态投资20万亿的政策，
+    >   未来半年能否持有高股息的**宁波银行**和**中国神华**？**标的 601088**」
+
+    修前实测（标的 601088 + 用户原句）：
+
+        resolve_focus_industries(txt)          = ['煤炭开采'(601088), '银行'(002142)]
+        needs_generic_industry(txt, '601088')  = ''      ← **空**
+        route_industry(txt)                    = []      ← 一个行业 Agent 都不挂
+
+    根因：判据是**逐问句**的 —— 单值入口 `resolve_focus_industry` 是"确定性优先"
+    （路径①从 601088 解出 `煤炭开采` 就返回），而 `煤炭开采` 已被 A15（周期，
+    关键词含"煤炭"）覆盖 ⇒ 判据说"这条问句有行业、有人管" ⇒ **A20 不挂**；
+    可问句里**还有第二个行业「银行」**，它没有任何 A13–A16 接管
+    ⇒ 宁波银行没有行业结论（"没有任何可引用的估值"的行业版）。
+
+    ## 判据（**逐行业**判，不是逐问句判）
+
+    对 `resolve_focus_industries`（`CHG-0217` 的**并集**解析器）里的每一个行业：
+    `route_industry(行业名)` 为空 ⇒ 该行业没有 A13–A16 之一接管 ⇒ 收进结果。
+    行业名与"谁管它"都取自既有单一事实源（本地名录 + `INDUSTRY_KEYWORDS`），
+    本函数**不新增清单、不重写行业解析**。
+
+    ⚠️ 与单值版的分工（两个问题，不是一个）：
+      · 本函数 = **"要兜底几个行业"** ⇒ A20 的输出契约按它**逐行业各出一节**；
+      · `needs_generic_industry`（单值）= **"第一个没人管的行业是谁"** ⇒
+        `industry_scope_for` 用它渲染"行业结论由谁负责"。
+      两者同源：单值版就是本函数的首元素（拿不到 → `""`）。
+
+    ⚠️ 单行业问句下本函数 == `[单值版的结果]`（并集解析器在只有一个行业时
+    与单值版逐字同源）⇒ 挂载/裁剪/输出**逐字不变**（有回归护栏钉住）。
+    """
+    out: list[str] = []
+    for name, _how in resolve_focus_industries(f"{text} {focus_code}".strip()):
+        if not name or name in out:
+            continue
+        if route_industry(name):
+            continue        # 已有专属 Agent 覆盖，不需要兜底
+        out.append(name)
+    return out
+
+
 def needs_generic_industry(text: str, focus_code: str = "") -> str:
     """这个问句/标的是不是需要一个**兜底行业 Agent**？返回要分析的行业名（否则空串）。
 
@@ -1587,13 +1921,14 @@ def needs_generic_industry(text: str, focus_code: str = "") -> str:
 
     拿不到行业 → 返回空串（**不猜**）。猜一个行业的代价是
     "用一个错误的框架分析"，比"没有行业结论"更糟。
+
+    ★ 2026-10-08：本函数改为 `needs_generic_industries()`（**并集**判据）的
+      **首元素** —— 修前它自己走单值入口，于是"第一个行业有主、第二个行业
+      没人管"时返回空串（A20 不挂；见并集版的报障现场）。
+      单行业问句下两者结果相同 ⇒ 本函数的对外行为**逐字不变**。
     """
-    industry, _how = resolve_focus_industry(f"{text} {focus_code}".strip())
-    if not industry:
-        return ""
-    if route_industry(industry):
-        return ""   # 已有专属 Agent 覆盖，不需要兜底
-    return industry
+    industries = needs_generic_industries(text, focus_code)
+    return industries[0] if industries else ""
 
 
 def industry_scope_for(
@@ -1659,17 +1994,24 @@ def prune_industry_agents_by_focus(
     ## 判据（三条，全部来自既有的单一事实源，不新增清单）
 
     1. 问句**点名**的行业 Agent（`route_industry(问句+标的)`）留下；
-    2. 标的**所属行业**的专属 Agent（`route_industry(行业名)`）留下；
-    3. 没有专属 Agent 覆盖该标的行业 → 留下 A20（`needs_generic_industry`）。
+    2. **每一个**被点到的行业各自的专属 Agent（`route_industry(行业名)`）留下；
+    3. 没有专属 Agent 覆盖的行业 → 留下 A20（`needs_generic_industries`）。
 
     三条都不成立（**行业判不出来、也没点名**）→ **原样返回**：
     宁可多跑几个 Agent，也不要凭猜测砍掉可能相关的那一个。
+
+    ★ 2026-10-08：`owners` 改为按**并集**算（`CHG-0217` 的多值解析器）。
+      修前这里是**单值**行业 ⇒ 问句 `标的 601088 + …宁波银行和中国神华？` 里
+      第一个行业 `煤炭开采` 有主（A15）、第二个行业 `银行` 没主，
+      于是 `owners` 里没有 A20 ⇒ **A20 刚被挂上就被这条裁剪裁掉**
+      （实测 `prune_industry_agents_by_focus(['A20_generic_industry'], txt, '601088') == []`）。
     """
     owners = set(route_industry(text))
-    industry, _how = resolve_focus_industry(f"{text} {focus_code}".strip())
-    if industry:
-        owners |= set(route_industry(industry))
-    if needs_generic_industry(text, focus_code):
+    for industry, _how in resolve_focus_industries(
+            f"{text} {focus_code}".strip()):
+        if industry:
+            owners |= set(route_industry(industry))
+    if needs_generic_industries(text, focus_code):
         owners.add("A20_generic_industry")
     if not owners:
         return planned
@@ -2038,10 +2380,17 @@ def _apply_query_signal_augmentation(
     Returns: `(agents, indicators, notes)`。
     """
     code = str(state.get("focus_stock_code") or "")
+    # ★ `CHG-0216`：问句里点名的**全部**个股（API 层解析好放进 state）。
+    #   单值回退 `focus_stock_code` ⇒ 既有行为与既有测试逐字不变。
+    codes: tuple[str, ...] = tuple(
+        str(c) for c in (state.get("focus_stock_codes") or ()) if c)
+    if not codes and code:
+        codes = (code,)
     focus = target_for_focus or state.get("target", "")
     text = f"{focus} {state.get('user_query', '')}"
     agents, indicators, notes = augment_plan_by_query_signals(
         text, focus, agents, indicators, resolved_code=code,
+        resolved_codes=codes,
         # ★ 2026-09-29：`analysis_type` 必须传下去 —— **`news` 管线不采数据**
         #   （信息层 A05/A06/A07 串行链，A01-A04 整体跳过，见
         #   `tests/integration/test_supervisor_graph.py::test_news_graph_info_pipeline`）。
@@ -2049,7 +2398,7 @@ def _apply_query_signal_augmentation(
         #   ——实测就是这样把那条集成测试打红的（"数据管线在 news 下整体跳过"）。
         analysis_type=str(state.get("analysis_type") or ""),
     )
-    if not code and "stock" in _query_agent_signals(text, focus):
+    if not codes and "stock" in _query_agent_signals(text, focus):
         notes.append("问句命中个股信号但没有 6 位代码，个股指标已摘除"
                      "（由 A17 如实登记缺口）")
     return agents, indicators, notes
@@ -2144,6 +2493,104 @@ def _summary(output: AgentOutput) -> dict[str, Any]:
         "data_refs": output.data_refs,
         "result": output.result,
     }
+
+
+# ======================================================================
+# ★★★ 2026-10-07：A18 审计结论的**机器可读三态**（`CHG-0190` ① / PRD §46）
+# ======================================================================
+
+#: 审计结论的两个正常取值。
+AUDIT_VERDICT_PASS = "通过"
+AUDIT_VERDICT_FAIL = "不通过"
+#: ⚠️ 第三个取值：**审计没跑成**。绝不是"通过"。
+#: 本项目纪律：「没量到」≠「量到 0」——一张**伪造的合格证**比缺结论危险得多。
+AUDIT_VERDICT_UNMEASURED = "未量到"
+
+
+def _audit_summary(output: AgentOutput | None, *, error: str = "") -> dict[str, Any]:
+    """把 A18 的结论压成一段**能被代码读**的字段（写进 `state["audit"]` 与任务记录）。
+
+    为什么需要它（本轮报障，`CHG-0190` ①）：A18 判出"不通过"之后，**没有任何自动化
+    消费方** —— 它只影响 A18 自己的 confidence 档位，外加 `_render_report` 把
+    `conclusion` 抄进 Markdown。于是"审计能判不通过"与"不通过会改变交付"是两件事，
+    中间缺的正是这个字段。
+
+    三态口径（**必须三态**）：`通过` / `不通过` / `未量到`。
+    审计异常、没产出结论时给 `未量到` —— 不许把"没审"写成"通过"。
+    """
+    if output is None:
+        return {
+            "verdict": AUDIT_VERDICT_UNMEASURED,
+            "failed": True,
+            "chain_valid": None,
+            "chain_count": None,
+            "chain_broken_at": None,
+            "completeness_issues": [],
+            "issue_count": 0,
+            "exempt_count": 0,
+            "collection_gap_count": 0,
+            "llm_calls": None,
+            "sealed_seq": None,
+            "error": error,
+        }
+    result = dict(output.result or {})
+    issues = [str(x) for x in (result.get("completeness_issues") or [])]
+    verdict = str(result.get("verdict") or "").strip() or AUDIT_VERDICT_UNMEASURED
+    return {
+        "verdict": verdict,
+        #: `failed` 把三态压成一问"这份交付有没有被审计背书"（未量到 = 没有背书）
+        "failed": verdict != AUDIT_VERDICT_PASS,
+        "chain_valid": result.get("chain_valid"),
+        "chain_count": result.get("chain_count"),
+        "chain_broken_at": result.get("chain_broken_at"),
+        "completeness_issues": issues,
+        "issue_count": len(issues),
+        "exempt_count": int(result.get("exempt_count") or 0),
+        "collection_gap_count": int(result.get("collection_gap_count") or 0),
+        "llm_calls": result.get("llm_calls"),
+        "sealed_seq": result.get("sealed_seq"),
+        "error": error,
+    }
+
+
+def _audit_banner(summary: dict[str, Any] | None) -> list[str]:
+    """审计不通过/未量到时，在报告**标题正下方**给一句显式警告；通过则**什么都不加**。
+
+    位置选在标题下方是刻意的：报告是用户唯一会读的交付物，而原先"审计不通过"
+    只出现在**文末**的「## 审计」段里 —— 读到那里的人早就读完结论了。
+    通过时**一个字都不加**：否则"警告"会因为天天出现而变成背景噪音。
+    """
+    if not summary:
+        return []
+    verdict = summary.get("verdict")
+    if verdict == AUDIT_VERDICT_PASS:
+        return []
+    if verdict == AUDIT_VERDICT_UNMEASURED:
+        reason = str(summary.get("error") or "审计未产出结论")
+        return [f"> ⚠️ **审计未完成（未量到，不等于通过）**：{reason}", ""]
+    bits = [f"完整性问题 {summary.get('issue_count', 0)} 项"]
+    if summary.get("chain_valid") is False:
+        bits.append(f"哈希链在 seq={summary.get('chain_broken_at')} 断链")
+    return [f"> ⚠️ **审计未通过**：{'；'.join(bits)}。详见文末「审计」。", ""]
+
+
+def _log_audit_verdict(summary: dict[str, Any], *, task_id: str) -> None:
+    """审计不通过/未量到时出声（管理员侧可见）。通过时保持安静。
+
+    为什么必须有：A18 原先的结论**没有下游消费者**，所以"链断了"这种事
+    在日志里也看不出来 —— 只有下一次有人手动 verify 才会发现。
+    """
+    if not summary.get("failed"):
+        logger.info("A18 审计通过：链 %s 条，问题 0 项（task=%s）",
+                    summary.get("chain_count"), task_id)
+        return
+    logger.warning(
+        "★ A18 审计未通过（task=%s）：verdict=%s 链valid=%s 断链位=%s "
+        "完整性问题=%s 项 未量到=%s",
+        task_id, summary.get("verdict"), summary.get("chain_valid"),
+        summary.get("chain_broken_at"), summary.get("issue_count"),
+        summary.get("verdict") == AUDIT_VERDICT_UNMEASURED,
+    )
 
 
 # ======================================================================
@@ -2900,33 +3347,15 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     """
     if skill_library is None:
         skill_library = SkillLibrary("skills")
-    # 实时源失败时从存储降级读取的行数（序列类指标保留趋势所需长度）
-    _STORAGE_FALLBACK_LIMITS = {
-        "mkt:turnover:hist": 60,
-        "mkt:margin_balance:hist": 10,
-        "mkt:north_flow": 30,
-        "idx_val:snapshot:all": 8,
-    }
-
-    async def _storage_fallback(indicator: str) -> list[dict[str, Any]]:
-        """实时采集无数据时，读统一数据层最近入库快照（禁止连接器直连数据库）。"""
-        if repo is None:
-            return []
-        try:
-            rows = await repo.query_points(indicator)
-        except Exception as exc:  # noqa: BLE001 降级失败不阻断主链路
-            logger.warning("存储降级读取失败(%s): %s", indicator, exc)
-            return []
-        if not rows:
-            return []
-        limit = _STORAGE_FALLBACK_LIMITS.get(indicator, 1)
-        stale = [p.model_dump() for p in rows[-limit:]]
-        for p in stale:
-            p.setdefault("extra", {})
-            p["extra"]["storage_fallback"] = "live_empty_or_failed"
-        return stale
 
     # ========== 数据缺口自修复 ==========
+    #
+    # ⚠️ 2026-10-07（`CHG-0192` ①）：这里**删掉了** `_STORAGE_FALLBACK_LIMITS` 与
+    #    `_storage_fallback()` —— 它们唯一的调用点在 `_collect_one`，而那个函数
+    #    **全仓零引用**（AST 实证）。活路径的空结果由 `SmartFetcher` 的 DB-only
+    #    分支承担（见 `src/infrastructure/catalog/smart_fetch.py` 模块 docstring
+    #    第 2/5 条），留在这里只会让下一个人以为"存储降级有两条实现"。
+    #    纪律出处：`CHG-0185` 的「否决一个方案不等于删掉它；半截尸体比从未实现更危险」。
 
     _gap_resolver: Any | None = None  # 延迟初始化（需要 gateway）
 
@@ -2951,7 +3380,8 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
         "not_covered": "该专题未收录本主体（非缺陷）",
     }
 
-    def _record_exempt_gap(ind: str, gap_kind: str, exc: BaseException) -> None:
+    def _record_exempt_gap(ind: str, gap_kind: str, exc: BaseException,
+                           state: ResearchState) -> None:
         """把"这条缺口属于豁免类"记进**缺口台账**（`CHG-0155`）。
 
         为什么要有这一跳：豁免结论原先只活在**这一处的 progress 文案**里，
@@ -2962,6 +3392,21 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
 
         取值优先用取数侧挂在异常上的结构化字段（拿不到才用 `miss_stage` 映射），
         **绝不抛**：观测失败不该影响采集（与 `audit.record` 同一条纪律）。
+
+        ## ★ `state` 是**显式参数**，不许靠闭包（`CHG-0185`）
+
+        第一版把 `state` 当闭包变量用 —— 而**定义处的外层作用域里没有它**
+        （`build_research_graph` 的 128 个赋值名里没有 `state`），
+        **有它的是调用点所在的 `_live_fetch_one`**（那是另一个函数）。
+        ⇒ 每次调用都 `NameError`，被下面的 `except Exception` 吞掉 ⇒
+        **台账一条都没写过**（真实探针实测：无 `state` 写入 **0** 条、
+        有 `state` 写入 **1** 条），而 PRD 里还写着"`_live_fetch_one` 已写入"。
+
+        这与 `CHG-0109`（`_fallback_fetch(state=state)` 的 `TypeError` 被
+        `logger.debug` 吞掉）是**同一形状、同一个文件、第二次** ⇒ 所以这里
+        同时做两件事：**参数显式**（`ruff F821` 与
+        `tests/unit/test_no_undefined_names.py` 盯着）+ **日志提到 `warning`**
+        （`debug` 默认不可见，等于没有；本项目记过"INFO 曾被整体丢弃"）。
         """
         try:
             from src.domain.agents.data.collector.gap_ledger import (
@@ -2977,7 +3422,10 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 source="supervisor._live_fetch_one",
             )
         except Exception:  # noqa: BLE001 观测失败绝不影响采集
-            logger.debug("豁免缺口台账记录失败（忽略）", exc_info=True)
+            # ⚠️ `warning` 而不是 `debug`：这条日志是"台账没写进去"的**唯一**迹象，
+            #    用 `debug` 就等于把静默失效制度化（`CHG-0109` 的原现场）。
+            logger.warning("豁免缺口台账记录失败（观测缺失，不影响采集）",
+                           exc_info=True)
 
     async def _live_fetch_one(
         collector: Any, state: ResearchState, ind: str,
@@ -2988,11 +3436,11 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
 
         ## 为什么必须抽成一处（本轮实测的教训）
 
-        第一版把防撞钟与联网兜底接在 `_collect_one` 上，而**真正跑的是
+        第一版把防撞钟与联网兜底接在**旧路径** `_collect_one` 上，而**真正跑的是
         SmartFetcher 快批**那条路（`collect_node` → `SmartFetcher.fetch_many`
         → `live_fetch` 适配器）⇒ 实测端到端仍然 284.6s、质押整表照样 258s，
         防撞钟**一次都没触发**。判决式：**判据接在没人走的路上 = 没接**。
-        两条路径（快批适配器 / 旧 `_collect_one`）现在共用本函数。
+        （`_collect_one` 已于 2026-10-07 删除：AST 实证零引用的死代码。）
 
         返回 `DataPoint` 列表（已反序列化，供 SmartFetcher 写库用）。
         """
@@ -3071,7 +3519,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 #   互相矛盾的话 —— 实测现场：豁免类会同时显示
                 #   「ℹ️ …不适用（非缺陷，已跳过）」与
                 #   「⚠️ …缺口（实时失败 + DB 无快照）」。用户读到后者会以为系统坏了。
-                _record_exempt_gap(ind, miss_stage, exc)
+                _record_exempt_gap(ind, miss_stage, exc, state=state)
             logger.warning("%s", format_gap_note_for_log(ind, exc))
 
         if miss_reason and not points and miss_stage not in (
@@ -3125,6 +3573,13 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 updates["progress"] = (
                     updates.get("progress", []) + [
                         f"⚠️ {ind} 本地与联网均未取到（已登记缺口，不阻断本轮）"])
+                # ⚠️ 自修复**不挂在这里**（2026-10-07 实测纠正，`CHG-0197`）：
+                #   这一支只在"走了 live_fetcher"时才执行，而连接器路径下
+                #   `live_fetcher` 根本不会被调用 ⇒ 带计数器实测**被调用 0 次**，
+                #   缺口照样产生。真正的汇合点是 `collect_node` 里
+                #   `got_empty` + `result.missing` 那两个循环（见那里的说明）。
+                #   教训与 `_live_fetch_one` docstring 里那句**逐字相同**：
+                #   **判据接在没人走的路上 = 没接。**
         return points
 
     async def _network_lookup_for_collection(
@@ -3271,6 +3726,66 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
 
         return []
 
+    # ------------------------------------------------------------------
+    # ★★ 2026-10-07（`CHG-0190` ② / `CHG-0192` ①）：把自修复**接回活路径**
+    #
+    # 修的是什么：`_try_self_heal`（上面那个函数）原先只有一个调用点，而那个
+    # 调用点位于 `_collect_one` —— AST 实证**全仓零引用**的死代码。也就是说
+    # 整条"缺数据 → LLM 生成连接器 → 沙箱 → 重试"在图内**从未发生过一次**，
+    # 而注释却声称"结果写到 `self_heal_pending` 标记，由盘后批量作业回填"。
+    # 判决式沿用本文件 `_live_fetch_one` 的那句教训：**判据接在没人走的路上 = 没接**。
+    #
+    # 现在的形状（三条纪律，缺一条就会退化成新的假绿）：
+    #   ① **只读判据**：先做一次 `consume=False` 的预检（不烧配额），
+    #      真正的尝试由 `_try_self_heal` 内部那次消耗 —— 判断仍只有一份实现；
+    #   ② **绝不 await**：`create_task` 后台跑，否则会拖长 `live_fetch` 持有的
+    #      `live_lock`（那是所有指标采集的串行点）；
+    #   ③ **结果落持久载体**：成功 → 连接器已注册定时采集（下一轮命中）；
+    #      失败 → 进 `gap_queue`，交盘后 `gap_drain`（**唯一**能读不到 state 的消费者）。
+    # ------------------------------------------------------------------
+
+    def _schedule_self_heal(ind: str, state: ResearchState, reason: str,
+                            ct: Any) -> None:
+        """把一次自修复丢到后台，并保留强引用（见 `_HEAL_TASKS` 的说明）。"""
+        try:
+            task = asyncio.create_task(_heal_bg(ind, state, reason, ct))
+        except RuntimeError:      # 没有运行中的事件循环（同步单测/脚本）
+            logger.debug("自修复调度跳过（无事件循环）：%s", ind)
+            return
+        _HEAL_TASKS.add(task)
+        task.add_done_callback(_HEAL_TASKS.discard)
+
+    async def _heal_bg(ind: str, state: ResearchState, reason: str,
+                       ct: Any) -> None:
+        """后台自修复尝试；**失败不静默** —— 入缺口队列交给盘后。
+
+        ⚠️ 这里**不**再调 `_self_heal_allowed`（那会二次消耗配额）：
+        闸门由 `_try_self_heal` 内部那一次负责；调度前的预检走
+        `consume=False`（见 `_schedule_self_heal` 的调用点）。
+        """
+        try:
+            points = await _try_self_heal(ind, reason)
+        except Exception as exc:  # noqa: BLE001 后台任务不许把异常抛给事件循环
+            logger.warning("自修复异常(%s): %s", ind, exc)
+            points = []
+        if points:
+            logger.info("自修复成功(%s)：%d 条，连接器已注册定时采集", ind, len(points))
+            if ct is not None:
+                ct.push_progress(
+                    f"🔧 {ind} 自修复成功（{len(points)} 条），连接器已注册定时采集，"
+                    "下一轮可直接命中")
+            return
+        # 自修复也没成 ⇒ **交给盘后**（与 A17 报缺口共用同一个队列，
+        # 不允许出现第二套"缺口"实现）
+        try:
+            if _enqueue_self_heal_gap(ind, reason=reason,
+                                      task_id=str(state.get("task_id") or "")):
+                logger.info("自修复未成功(%s) ⇒ 已入缺口队列（盘后 gap_drain 补取）", ind)
+                if ct is not None:
+                    ct.push_progress(f"📋 {ind} 自修复未成功，已入缺口队列（盘后自动补取）")
+        except Exception as exc:  # noqa: BLE001 缺口登记失败不阻断交付
+            logger.warning("缺口入队失败(%s): %s", ind, exc)
+
     async def _run_agent(
         agent: Any, state: ResearchState, payload: dict[str, Any]
     ) -> dict[str, Any]:
@@ -3415,7 +3930,9 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             #   而"行业问法保留命中的"那条也会把它一起剥掉（它是兜底，
             #   本来就命中不了关键词）。用常量就同时解决两处。
             industry_agents = set(INDUSTRY_AGENTS)
-            generic_industry = needs_generic_industry(
+            # ★ 2026-10-08：并集判据（`needs_generic_industries`）——
+            #   "第一个行业有主、第二个行业没人管"时也必须挂 A20。
+            generic_industries = needs_generic_industries(
                 text_for_route, str(state.get("focus_stock_code") or ""))
             if llm_plan["analysis_type"] == "macro":
                 # 宏观问法：行业 Agent 几乎用不上（A08 已覆盖宏观面）
@@ -3425,7 +3942,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 # 行业问法：只保留 route_industry 命中的（关键词 → 行业）+
                 # 兜底 Agent（当标的确有行业、但没人覆盖它时）
                 routed = set(route_industry(text_for_route))
-                if generic_industry:
+                if generic_industries:
                     routed.add("A20_generic_industry")
                 planned_agents = [
                     a for a in planned_agents
@@ -3529,86 +4046,19 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 query=state.get("user_query", ""))["indicators"]
         return {"indicators": indicators}
 
-    async def _collect_one(indicator: str, state: ResearchState,
-                           updates_sink: dict[str, Any],
-                           lock: asyncio.Lock) -> None:
-        """单指标采集（异常隔离 + 存储降级），所有共享写入走lock。
-
-        ★ 2026-09-28 第十轮：每个指标完成/失败时即时 push_progress，
-        解决"A01 启动后黑屏 30-60s 才出下一条进度"问题（之前只在
-        collect_node 开头 push 一次）。单条 push 用更新进度计数，无需
-        等待所有 asyncio.gather 任务结束。
-        """
-        collector = agents["A01_data_collector"]
-        live_points: list = []
-        ct = state.get("cancellation_token")
-        # 指标开始（前台立即可见"哪条在跑"，避免 60s 静默）
-        if ct is not None:
-            ct.push_progress(f"🔄 A01 开始采集 {indicator}")
-        # ★ 防撞钟 + 联网兜底都在 `_live_fetch_one`（与 SmartFetcher 快批**同一实现**）——
-        #   第一版在这里各写一份，而真正跑的是快批那条路 ⇒ 防撞钟一次都没触发
-        #   （实测端到端仍 284.6s）。**判据接在没人走的路上 = 没接。**
-        try:
-            async with lock:
-                live_points = await _live_fetch_one(
-                    collector, state, indicator, updates_sink,
-                    set(), ct)
-        except AgentExecutionError as exc:
-            async with lock:
-                updates_sink["errors"].append(
-                    f"A01_data_collector({indicator}): {exc}")
-        except Exception as exc:  # noqa: BLE001
-            async with lock:
-                updates_sink["errors"].append(
-                    f"A01_data_collector({indicator}): 意外异常 {exc}")
-
-        if not live_points:
-            stale = await _storage_fallback(indicator)
-            if stale:
-                live_points = stale
-                async with lock:
-                    logger.info(
-                        "指标%s实时采集无数据，存储降级使用最近%d条快照",
-                        indicator, len(stale))
-
-        # 存储降级也无数据 → 自修复（★ 第十轮：fire-and-forget 不再阻塞 collect）
-        if not live_points:
-            err_ctx = ""
-            async with lock:
-                for e in updates_sink["errors"]:
-                    if f"({indicator})" in e:
-                        err_ctx = e
-                        break
-            logger.info("指标%s采集+降级均无数据，调度自修复（异步）…", indicator)
-            # 第十轮改造：原 await 同步阻塞 collect 阶段（最长等 30s + sandbox_test 15s）。
-            # 改为 asyncio.create_task 后台跑；结果写到 "self_heal_pending" 标记，
-            # 由盘后批量作业或下次同指标重试时回填。当下流程继续走，wall-clock 不被它拖死。
-            async def _heal_bg() -> None:
-                try:
-                    healed = await _try_self_heal(indicator, err_ctx)
-                    if healed:
-                        logger.info(
-                            "指标%s异步自修复成功（%d条），下次重试可命中",
-                            indicator, len(healed))
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("异步自修复异常(%s): %s", indicator, exc)
-            asyncio.create_task(_heal_bg())
-            # 自修复失败不阻断：当下先把"缺口"诚实上报给 A17。
-            async with lock:
-                updates_sink["progress"] = (
-                    updates_sink.get("progress", []) + [
-                        f"⚠️ {indicator} 实时无数据（自修复已转后台，下次请求命中）"
-                    ])
-
-        async with lock:
-            updates_sink["raw_points"] += live_points
-            # 即时推送：单条进度独立可见（不依赖 collect 整体完成）
-            # 注：不要在这里数"已完成指标总数" —— raw_points 是数据点列表
-            # （每条指标可能贡献 N 条），该计数语义不对；总数由 collect_node
-            # 结束时统一推送。
-            if ct is not None:
-                ct.push_progress(
-                    f"✅ A01 已采 {indicator}（{len(live_points)} 条）")
+    # ★★ 2026-10-07（`CHG-0192` ①）：这里**删掉了 `_collect_one`**。
+    #
+    # 它曾经是"单指标采集（异常隔离 + 存储降级）"的旧路径，但活路径早已换成
+    # `collect_node → SmartFetcher.fetch_many → live_fetch → _live_fetch_one`，
+    # 于是它成了**全仓零引用**的死代码（AST 判据：定义 1 处、`Load` 引用 0 处）。
+    # 它的存在本身造成过真实缺陷：
+    #   · `_try_self_heal` 的**唯一**调用点在它里面 ⇒ 图内自修复从未发生过一次；
+    #   · 注释声称"结果写到 `self_heal_pending` 标记" —— 而那个键当时**根本不存在**
+    #     （全仓 `grep self_heal_pending` 只命中那句注释）。**带着证据的失效声明
+    #     比从未实现更危险**，因为它会说服下一个人当它存在（`CHG-0185` 的教训）。
+    # 现在：自修复接在**活路径**上（见 `_live_fetch_one` 的"本地与联网均未取到"分支
+    # + `_schedule_self_heal`/`_heal_bg`），标记也是真实声明的 channel。
+    # 判据：`tests/unit/test_self_heal_wiring.py`（可达性 + reducer + 真入队）。
 
     # ★ 2026-09-28 第十轮："懒指标"清单
     # 已知慢 / 不可达 / 不阻塞决策的指标 → 移到后台跑，wall-clock 不被拖死。
@@ -3621,10 +4071,10 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     })
 
     # ★ 2026-09-28 第十一轮：SmartFetcher 单指标返回条数上限
-    # （替代旧 _STORAGE_FALLBACK_LIMITS 的语义；保留旧 dict 以兼容其他场景）
+    # ⚠️ 2026-10-07：旧 `_STORAGE_FALLBACK_LIMITS` dict（含逐指标精确上限）
+    #   已随死代码 `_collect_one`/`_storage_fallback` 一起删除 —— 活路径统一用
+    #   本默认值（`SmartFetcher.fetch_many(limit_per_indicator=…)`）。
     _STORAGE_FALLBACK_LIMITS_DEFAULT: int = 60  # 序列类指标保留趋势
-    # 注：特殊指标的精确上限仍由旧 _STORAGE_FALLBACK_LIMITS dict 维护，
-    # 这里给的是统一默认。SmartFetcher 调用时统一传默认。
 
     async def _collect_lazy(state: ResearchState, lazy: list[str],
                             ct: Any | None) -> None:
@@ -3713,7 +4163,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 #
                 # ★★ 2026-09-29：**这里才是真正的交互采集路径**（SmartFetcher 快批），
                 #   所以防撞钟与联网兜底都必须接在**这里** —— 第一版只接在
-                #   `_collect_one`（旧路径）上，实测端到端仍然跑了 284.6s、
+                #   **旧路径** `_collect_one`（已于 2026-10-07 删除）上，实测端到端仍然跑了 284.6s、
                 #   质押整表照样 258s：**判据接在没人走的那条路上**。
                 #   现在与 `_collect_one` 共用 `_live_fetch_one`（单一实现）。
                 async with live_lock:
@@ -3755,7 +4205,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             for _ind, pts in result.data.items():
                 for dp in pts:
                     updates["raw_points"].append(dp.model_dump(mode="json"))
-            # missing 推进度（不进 errors —— 与旧 _collect_one 行为一致：
+            # missing 推进度（不进 errors —— 与已删除的旧路径行为一致：
             # 旧实现 live 返回空时 silently 走 storage_fallback，不计硬错误）。
             # 真正的硬错误（agent 抛异常）已在 live_fetch 里被吞，仅记日志。
             # A17 综合分析时若需提示数据缺口，通过 "数据缺口" 字段在结论中显式声明。
@@ -3821,6 +4271,24 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             logger.info("%s", format_round_summary(
                 str(state.get("task_id") or ""), fast, got_ok, got_empty,
                 list(result.missing)))
+            # ★★ 2026-10-07（`CHG-0190` ② / `CHG-0192` ①）：**真缺口 → 自修复**
+            #
+            # ⚠️ 挂点是被实测**纠正**过来的：第一版挂在 `_live_fetch_one` 的
+            #   "本地与联网均未取到"分支上，而带计数器跑真实链路时发现它
+            #   **被调用 0 次**，13 条缺口照样产生 —— 因为连接器路径下
+            #   `live_fetcher` **根本不会被调用**（SmartFetcher 自己取完就返回空）。
+            #   也就是说：那一版又踩了本文件 `_live_fetch_one` docstring 里记着的
+            #   同一句话 —— **判据接在没人走的路上 = 没接**。
+            #   现在挂在**两条空结果路径的唯一汇合处**（`got_empty` + `missing`），
+            #   它同时覆盖"连接器返回空"与"实时源失败且 DB 无快照"。
+            for ind, why in (
+                [(i, "连接器返回空列表（没量到 ≠ 量到 0）") for i in got_empty]
+                + [(i, "实时源失败且 DB 无快照") for i in result.missing]
+            ):
+                if _note_self_heal_candidate(
+                        updates, ind, "missing", why) is not None:
+                    # 只调度、不等待（`live_fetch` 持有 live_lock，等它=串行化所有指标）
+                    _schedule_self_heal(ind, state, why, ct)
             # 进度细分
             if result.from_db:
                 updates["progress"] += [
@@ -3849,7 +4317,23 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             items = []
             target = state.get("target") or ""
             try:
-                if re.fullmatch(r"\d{6}", target):
+                # ★★ 2026-10-08：**多标的逐只取新闻**（`focus_stock_codes`）。
+                #
+                # 报障原文：「…未来半年能否持有高股息的**宁波银行**和**中国神华**？
+                #   标的 601088 —— **宁波银行没有任何可引用的估值**」。
+                # 估值那一半由 `CHG-0216`/`CHG-0229` 修掉；**新闻/事件/舆情这一半
+                # 仍然只按单值 `target` 取** ⇒ 第二只票的信息层输入**静默为 0**
+                # （A05/A06/A07 拿到零输入、全部空跳过，用户读到"该股近期无消息"，
+                # 看起来像数据源坏了，其实是**根本没去取**）。
+                #
+                # ⚠️ 判据放在 `len(codes) >= 2` 的分支里：**单标的走下面那条原文
+                #    路径**（同一个 `fetch_news(target)`、条目一个字段都不改）⇒
+                #    "单标的逐字不变"是结构保证（`tests/unit/test_multi_focus_news.py`
+                #    有回归护栏：集成测试 `fetcher.calls == ["600519"]` 也不许变）。
+                _focus_codes = _news_focus_codes(state)
+                if len(_focus_codes) >= 2:
+                    items = await _fetch_news_per_code(news_fetcher, _focus_codes)
+                elif re.fullmatch(r"\d{6}", target):
                     items = await news_fetcher.fetch_news(target)
                 else:
                     keywords = state.get("topic_keywords") or extract_topic_keywords(
@@ -3888,8 +4372,8 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
         askable_prefixes = tuple(f"A{n:02d}" for n in range(8, 17))
         available_agents = [a for a in state.get("plan", [])
                             if a.startswith(askable_prefixes)]
-        # 幂等：同一Agent同一问题只真正追问一次；每Agent追问次数封顶，防止LLM绕着重问
-        MAX_ASKS_PER_AGENT = 1  # 收紧：每Agent最多追问1次
+        # 幂等：同一Agent同一问题只真正追问一次；每Agent追问次数封顶，防止LLM绕着重问。
+        # 上限是**模块级常量**（`MAX_ASKS_PER_AGENT`）—— 工具描述由同一常量插值生成。
         asked_cache: dict[tuple[str, str], str] = {}
         ask_counts: dict[str, int] = {}
 
@@ -3959,11 +4443,12 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             return await query_data_for_agent(indicator, limit, state=state,
                                               agents=agents)
 
+        # ★ 工具描述**只能**由 `ask_agent_tool_description()` 生成（模块级唯一构造点）：
+        #   曾经在这里手写"最多追问2次"，与常量 `MAX_ASKS_PER_AGENT=1` 冲突 ——
+        #   描述会进 system prompt，模型按 2 次去试、第二次被拒且不知原因。
+        #   判据：`tests/unit/test_ask_agent_tool_contract.py`（改回手写即红）。
         tools.register("ask_agent", _ask_agent,
-                       f"向指定上游分析Agent提问。可用Agent：{', '.join(available_agents)}。"
-                       "参数receiver=上述agent_id之一, question=具体问题。"
-                       "规则：每个Agent最多追问2次，不要对同一Agent重复提出相同或"
-                       "高度相似的问题；数据层Agent(A01-A04)不可提问，指标数值用query_data。")
+                       ask_agent_tool_description(available_agents))
         tools.register("query_data", _query_data,
                        "查询已采集的数据点，参数indicator=指标名, limit=条数")
 
@@ -4015,6 +4500,8 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             "focus": state.get("target_display") or state["target"],
             "user_query": state["user_query"],
             "hint": state.get("analysis_hint", {}),
+            # ★ `CHG-0230`：逐只表态清单（<2 只时为空 ⇒ 输出与修复前逐字一致）
+            "subjects": _a17_subjects(state),
         })
         # ★ 第十轮：MOSS_DECISION_USE_PRO=1 强制用 v4-pro（默认走 flash，详见
         # configs/models.yaml 的 decision 路由注释）
@@ -4033,6 +4520,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
             _max_steps = int(_os.environ.get("MOSS_REACT_MAX_STEPS", "2"))
         except (TypeError, ValueError):
             _max_steps = 2
+        _max_steps = _a17_max_steps(_max_steps)
 
         # ★ 2026-09-28 第十三轮：A17 思维链强度（实测裁定后设为 `none`）
         #
@@ -4090,6 +4578,8 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                         "focus": state.get("target_display") or state["target"],
                         "user_query": state["user_query"],
                         "hint": state.get("analysis_hint", {}),
+                        # ★ `CHG-0230`：逐只表态清单（三处注入点共用一份实现）
+                        "subjects": _a17_subjects(state),
                     },
                 )
                 # 把 output 折成 react.run() 的 final_answer 形状
@@ -4130,11 +4620,35 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                         "focus": state.get("target_display") or state["target"],
                         "user_query": state["user_query"],
                         "hint": state.get("analysis_hint", {}),
+                        # ★ `CHG-0230`：逐只表态清单（三处注入点共用一份实现）
+                        "subjects": _a17_subjects(state),
                     })
                     return {**update, "agent_messages": collected_messages,
                             "final_report": None}
                 except AgentExecutionError as exc2:
                     return {"errors": [f"A17_recommend: {exc2}"], "final_report": None}
+            # ★★ `CHG-0236`：**ReAct 路径绕过 `A17.execute()`** ——
+            #    它把 `final_answer` 直接返回给编排层，不经过 `execute()` 里
+            #    那道逐只等长校验。而多标的（>1 只票、分析条数多）恰恰**就是**
+            #    走这条路的典型场景 ⇒ 不在这里补一次，等于校验只覆盖了少数路径。
+            #    两处调用的是**同一个** `enforce_per_item_rows`（唯一实现），
+            #    这里只是第二个调用点。
+            from src.domain.agents.analysis.base import (  # noqa: PLC0415
+                PER_ITEM_MISSING,
+                enforce_per_item_rows,
+            )
+            enforce_per_item_rows(
+                data, "per_subject",
+                [s["code"] for s in _a17_subjects(state)],
+                where="A17_recommend/supervisor-react",
+                label="标的",
+                placeholder_fields={
+                    "stance": PER_ITEM_MISSING,
+                    "position_advice": None,
+                    "_placeholder": "A17 ReAct 未返回该标的的逐只结论",
+                },
+                warning_prefix="A17 未按标的逐只返回结论",
+            )
 
         from src.core.models import AgentOutput
         from src.core.schemas import TraceStep, coerce_confidence
@@ -4248,9 +4762,15 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 "llm_audit_path": llm_audit_path,
             })
         except AgentExecutionError as exc:
-            return {"errors": [f"A18_audit: {exc}"]}
-        report = _render_report(state, output)
-        return {**update, "final_report": report}
+            # ★ 2026-10-07（`CHG-0190` ①）：审计**没跑成**也要留下机器可读的三态
+            #   —— 否则"没审"与"审过了"在交付物上长得一模一样。
+            summary = _audit_summary(None, error=f"A18_audit: {exc}")
+            _log_audit_verdict(summary, task_id=str(state.get("task_id") or ""))
+            return {"errors": [f"A18_audit: {exc}"], "audit": summary}
+        summary = _audit_summary(output)
+        _log_audit_verdict(summary, task_id=str(state.get("task_id") or ""))
+        report = _render_report(state, output, summary)
+        return {**update, "final_report": report, "audit": summary}
 
     g = StateGraph(ResearchState)
     g.add_node("supervisor", supervisor_node)
@@ -4324,10 +4844,12 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
     return g.compile()
 
 
-def _render_report(state: ResearchState, audit_output: AgentOutput) -> str:
+def _render_report(state: ResearchState, audit_output: AgentOutput,
+                   audit_summary: dict[str, Any] | None = None) -> str:
     """把各Agent结论拼装成带溯源与免责声明的最终Markdown报告。"""
     title = state.get("target_display") or state["target"] or state["user_query"]
     lines = [f"# 投研分析报告：{title}", ""]
+    lines += _audit_banner(audit_summary)
     info_outs = [o for o in state["agent_outputs"] if o["agent_id"] in INFO_AGENTS]
     if info_outs:
         lines += ["## 信息核验与舆情"]

@@ -177,5 +177,83 @@ def resolve_industry_from_text(text: str) -> tuple[str, str]:
     return "", ""
 
 
+def resolve_industries_from_text(text: str) -> list[tuple[str, str]]:
+    """★ 从文本解析出**全部**行业（按确定性优先、保序去重）（`CHG-0217`）。
+
+    ## 为什么需要它（与个股侧 `CHG-0216` 是**同一个缺陷**）
+
+    用户报障原话包含「**或 2 个及以上的概念板块**」：
+      > …用户输入含有2个及以上的个股**或2个及以上的概念板块**…
+      >   此时采集数据会存在**漏掉一些股票或板块**的信息获取。
+
+    `resolve_industry_from_text` **只返回一个**行业 ⇒ 问句里提到两个板块时，
+    只会给一个补 `行业拥挤度`/`板块资金流`/`行业轮动`，**另一个板块一个指标都没有**，
+    用户看到的是"该板块没有数据"。
+
+    ## ★★ 与单值版的关键差别：这里是**并集**，不是"确定性优先"
+
+    第一版照搬了单值版的「三路确定性优先（高优先级路只要有结果就不再往下走）」，
+    **实测被它挡掉了**：用户原句 `标的 601088 + 问句` ——
+    路径①从 `601088` 解出 `煤炭开采` 就返回，**永远走不到路径②**
+    （那里才能从「宁波银行」解出 `银行`）⇒ 两个板块里只排了一个，
+    **正是要修的那个 bug**。
+
+    ⇒ 两个入口回答的是**两个不同的问题**，规则本就不该一样：
+
+      · `resolve_industry_from_text`（单值）：**归属判定** —— "这条问句属于哪个行业"，
+        必须**唯一**，所以确定性优先；
+      · 本函数（多值）：**采集覆盖** —— "要为哪些板块取数"，
+        **多取一个板块只是多查一次，漏一个板块就是用户看到"该板块没有数据"**
+        ⇒ 取**并集**（按 ①②③ 顺序、按行业名去重）。
+
+    三路各自仍与单值版**逐字同源**（同一份名录、同一份简称字典、同一套最长匹配）。
+    """
+    text = str(text or "")
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(name: str, how: str) -> None:
+        if name and name not in seen:
+            seen.add(name)
+            out.append((name, how))
+
+    # ① **全部** 6 位代码（单值版在这里就 return 了）
+    for code in _CODE_RE.findall(text):
+        _add(industry_of(code),
+             f"个股代码 {code} → 本地名录（Tushare stock_basic）")
+
+    # ② 简称 → 代码（全部候选）
+    try:
+        from src.infrastructure.catalog.synonym_dict import resolve_entity
+
+        hits = resolve_entity(text) if text else []
+    except Exception as exc:  # noqa: BLE001 字典不可用不该拖垮行业解析
+        logger.debug("行业解析：简称字典不可用 %s", exc)
+        hits = []
+    for code in hits[:5]:
+        _add(industry_of(code), f"简称解析 {code} → 本地名录")
+
+    # ③ 文本直述行业名：最长优先、命中即跳过整段（不重叠）
+    by_first: dict[str, list[str]] = {}
+    for v in industry_vocabulary():
+        if v:
+            by_first.setdefault(v[0], []).append(v)
+    for names in by_first.values():
+        names.sort(key=len, reverse=True)
+    i = 0
+    while i < len(text):
+        hit = ""
+        for v in by_first.get(text[i], ()):
+            if text.startswith(v, i):
+                hit = v
+                break
+        if hit:
+            _add(hit, f"文本直述行业名「{hit}」")
+            i += len(hit)
+        else:
+            i += 1
+    return out
+
+
 __all__ = ["industry_of", "industry_vocabulary", "resolve_industry_from_text",
-           "reset_cache"]
+           "resolve_industries_from_text", "reset_cache"]

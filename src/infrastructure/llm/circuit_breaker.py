@@ -69,6 +69,55 @@ _KEY_SEP: Final[str] = ":"
 #: 无租户身份时的作用域标记。它**只进快照，不进 key** —— 理由见 `breaker_key`。
 GLOBAL_SCOPE: Final[str] = "global"
 
+# ============================================================================
+# ★ 判定客户端的熔断策略（`RerankClient` / `EmbeddingClient` **共用这一份**）
+#
+# 为什么单独一套、不复用 `_DEFAULTS` 里的 provider 参数：那套是给**生成**路径的。
+# 生成失败还有降级链（`gateway.complete` 的 for 循环）兜底，判定失败只是
+# "这一次语义未命中"，两者对**误熔断**的容忍度不同，阈值不该共用一个数。
+#
+# 为什么放在这里而不是各自的客户端里：两个客户端要的是**同一条策略**。
+# 写在两处就是「同一判断两份实现」—— 实测代价：`RerankClient` 有熔断、
+# `EmbeddingClient` 没有，于是端点变成网络黑洞（不是 402 那种立即返回的错误）时，
+# 一次缓存查找要等满 **1.5 + 3.0 = 4.5 s**；一次投研分析有 4~15 次查找
+# ⇒ 改后最坏 **18~69 s** 只花在缓存上（改前只有 embedding，1.5 s ⇒ 6~23 s）。
+# **改后把最坏情况放大了 3 倍，而且 embedding 侧永不恢复**（每次都重付）。
+# ============================================================================
+
+#: 连续失败多少次后熔断。
+JUDGE_FAILURES_TO_OPEN: Final[int] = 3
+
+#: 熔断后的冷却时长（秒）。一次投研分析里缓存查找的间隔是秒级，
+#: 60 s 足够覆盖"这一波抖动"，又不会让一个已恢复的端点被冷落一整轮演示。
+JUDGE_COOLDOWN_SEC: Final[float] = 60.0
+
+#: 失败计数窗口（秒）。取值**远大于**连续失败的实际间隔即可 ——
+#: 配合 `reset_on_success=True`，语义就是"**连续**失败"
+#: （成功会把窗口清空，见 `record_success`）。不取 `inf` 是为了让
+#: `_failure_ts` 有界：熔断后每个冷却周期最多再追加 1 条。
+JUDGE_FAILURE_WINDOW_SEC: Final[float] = 600.0
+
+
+def judge_breaker(name: str) -> TimeWindowCircuitBreaker:
+    """建一个**判定客户端**用的熔断器（`RerankClient` / `EmbeddingClient` 共用）。
+
+    `name` 只进快照（`"rerank"` / `"embed"`）—— 两个客户端的桶**必须分开**：
+    合桶的话"rerank 挂了"会顺手把 embedding 也熔断掉，
+    而那正是 `_recall_and_judge` 用来兜底的那一层（fail-open 链会整条失效）。
+
+    `half_open_success_needed=1`：判定层**误熔断的代价**是"语义层这段不工作"，
+    而它的兜底是 3-gram/阈值（仍有答案，只是差些）⇒ 宁可从宽恢复。
+    这与生成路径取 2 的取舍方向相反，理由就是兜底成本不同。
+    """
+    return TimeWindowCircuitBreaker(
+        name=str(name),
+        failure_threshold=JUDGE_FAILURES_TO_OPEN,
+        failure_window_sec=JUDGE_FAILURE_WINDOW_SEC,
+        recovery_cooldown_sec=JUDGE_COOLDOWN_SEC,
+        half_open_success_needed=1,
+        reset_on_success=True,
+    )
+
 
 def breaker_key(provider: str, tenant: str = "") -> str:
     """熔断桶 key 的**唯一构造点**：`provider` 或 `provider:tenant`。
@@ -165,6 +214,7 @@ class TimeWindowCircuitBreaker:
         failure_window_sec: float = 60.0,
         recovery_cooldown_sec: float = 30.0,
         half_open_success_needed: int = 2,
+        reset_on_success: bool = False,
     ) -> None:
         self.name = name
         self.provider = str(provider or "")
@@ -173,6 +223,11 @@ class TimeWindowCircuitBreaker:
         self.failure_window_sec = failure_window_sec
         self.recovery_cooldown_sec = recovery_cooldown_sec
         self.half_open_success_needed = half_open_success_needed
+        #: ★ `False`（默认）= 窗口内失败数达到阈值就熔断 —— 生成路径要的语义，
+        #: **默认值即护栏**：不改这个位，所有既有调用方行为逐位不变。
+        #: `True` = 成功即清空失败窗口 ⇒ 语义变成"**连续**失败"
+        #: （抖动不累积成假熔断）。判定客户端走 `judge_breaker()` 用这个。
+        self.reset_on_success = bool(reset_on_success)
         self._state = CircuitState(name=name)
         self._failure_ts: deque[float] = deque()
         self._lock = threading.Lock()
@@ -195,6 +250,12 @@ class TimeWindowCircuitBreaker:
     def record_success(self) -> None:
         with self._lock:
             self._state.total_successes += 1
+            if self.reset_on_success and self._state.state == "CLOSED":
+                # ★ "连续失败"语义：一次成功就把失败窗口清空。
+                #   不清的话，抖动的端点（失败/成功交替）会在窗口内攒够
+                #   `failure_threshold` 次失败 ⇒ 假熔断，症状是
+                #   "语义层莫名不工作"（有实测教训：`test_success_resets_the_failure_streak`）。
+                self._failure_ts.clear()
             if self._state.state == "HALF_OPEN":
                 self._state.half_open_successes += 1
                 if self._state.half_open_successes >= self.half_open_success_needed:
@@ -376,6 +437,10 @@ def reset_circuit_registry_for_test() -> CircuitBreakerRegistry:
 
 
 __all__ = [
+    "GLOBAL_SCOPE",
+    "JUDGE_COOLDOWN_SEC",
+    "JUDGE_FAILURES_TO_OPEN",
+    "JUDGE_FAILURE_WINDOW_SEC",
     "CircuitBreakerRegistry",
     "CircuitState",
     "TimeWindowCircuitBreaker",
@@ -383,5 +448,6 @@ __all__ = [
     "breaker_provider",
     "caller_tenant_id",
     "get_circuit_registry",
+    "judge_breaker",
     "reset_circuit_registry_for_test",
 ]

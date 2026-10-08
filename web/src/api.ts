@@ -2,6 +2,7 @@ import {
   ApiError,
   apiErrorFromResponse,
   networkError as makeNetworkError,
+  timeoutError,
 } from "./errors";
 import { notifyUnauthorized } from "./unauthorized";
 
@@ -14,6 +15,106 @@ export type AgentOutputSummary = {
   data_refs: string[];
   result: Record<string, unknown>;
 };
+
+// ── 投研分析 · 「多标的（逐只）」结果字段 ──────────────────────────────
+//
+// ★ 2026-10-08：后端 5 个 agent 修完"多标的"缺陷，新增下面这 5 个字段，
+//   界面此前**一个都没读**（用户只能看到逐只结论被合并后的一句话，
+//   或者展开 `<details>` 里的一坨原始 JSON）。
+//
+// 这里只声明**响应形状**；"取字段 + 判在场 + 转展示模型"的唯一实现在
+// `multiSubject.ts`，渲染在 `components/MultiSubjectPanel.tsx`。
+//
+// ⚠️ 三态（缺席 / 读得出 / **在场但读不出**）是刻意的：
+//   · 单标的时这些键**不存在**，或（`compliance_per_code`）只有 1 条 ⇒
+//     界面必须走原路径，不许冒出空标题（门槛写在 `MultiSubjectPanel`：≥2 条才渲染）；
+//   · 字段在场但形状不对 ⇒ 如实显示"（未提供）"，既不崩也不整块消失。
+
+/** A10_micro `result.valuation_calc_by_code[代码]` 的**一只票**的估值判定。 */
+export type ValuationCalc = {
+  /** 「低估」/「合理」/「高估」/「历史低位」/「历史偏高」/「历史区间内」/「数据不足」 */
+  valuation: string;
+  /** 「行业均值对比」/「自身历史分位」/「无」 */
+  basis: string;
+  detail: string;
+  /** 0=历史最便宜；只有"自身历史分位"口径才有 */
+  pe_percentile?: number | null;
+  pb_percentile?: number | null;
+};
+
+/** A10_micro `result.valuation_calc_by_code`：键 = 6 位代码。**单标的时该键不存在**。 */
+export type ValuationCalcByCode = Record<string, ValuationCalc>;
+
+/** A17_recommend `per_subject[i].expected_return_3_6m`（三档情景）。 */
+export type SubjectExpectedReturn = {
+  bull?: string | null;
+  base?: string | null;
+  bear?: string | null;
+  assumptions?: string[] | null;
+  invalid_signals?: string[] | null;
+};
+
+/** A17_recommend `result.per_subject[i]`：**一只票**的立场/仓位/三档情景。 */
+export type PerSubjectRecommendation = {
+  code: string;
+  name?: string | null;
+  /** 「买入」/「增持」/「中性」/「减持」/「数据不足」… */
+  stance?: string | null;
+  /** 仓位区间 + 节奏；买卖问题才有，其余为 null */
+  position_advice?: string | null;
+  expected_return_3_6m?: SubjectExpectedReturn | null;
+  key_logic?: string[] | null;
+  risks?: string[] | null;
+};
+
+/**
+ * A12_compliance `result.compliance_per_code[i]`：**一只票**的合规判定。
+ *
+ * ⚠️ `flags` 含占位旗标（"未量到"/"未见异常"），`risk_flags` 才是真实风险旗标 ——
+ * 两者**不许**在展示层合并（见 `compliance/logic.py`）。
+ */
+export type CompliancePerCode = {
+  code: string;
+  /** 代码为空时后端给的中文占位（如"未具名标的"） */
+  label: string;
+  /** 「高」/「中」/「无」/「未量到」 */
+  level: string;
+  flags: string[];
+  risk_flags: string[];
+  families_measured: string[];
+  families_unmeasured: string[];
+  /** false = 这一只票一个族都没量到（≠ 量到 0，界面必须分开表达） */
+  measured: boolean;
+  severe_flag_count: number;
+  event_flags: number;
+};
+
+/** A20_generic_industry `result.generic_industry_sections[i]`：**一个行业**一节。 */
+export type GenericIndustrySection = {
+  industry: string;
+  /** 行业判定依据（为什么把它当成一个行业） */
+  basis: string;
+  confidence: string;
+  conclusion: string;
+  skipped: boolean;
+  skip_kind: string;
+  model_used: string;
+  /** 后端结构未固定（多为 `{...}` 或 null）⇒ 展示层只做"有/无" */
+  industry_signal_calc: unknown;
+};
+
+/** A07_sentiment 情绪指标（总体与逐标的是**同一个函数**算的，口径一致）。 */
+export type SentimentMetrics = {
+  /** [-1,1]，越大越乐观 */
+  weighted_sentiment: number;
+  event_count: number;
+  /** 方向 → 条数，如 `{positive: 2, negative: 1}` */
+  distribution: Record<string, number>;
+  top_subjects: { subject: string; net_score: number }[];
+};
+
+/** A07_sentiment `result.sentiment_metrics_by_group`：键 = 6 位代码或 subject。 */
+export type SentimentMetricsByGroup = Record<string, SentimentMetrics>;
 
 export type LlmAuditEntry = {
   ts: string;
@@ -205,6 +306,9 @@ export type RunRecord = {
   status: "running" | "success" | "failed" | "skipped";
   records_processed: number;
   error_message: string | null;
+  /** 这次干了什么 / 为什么没干（成功也要有）。
+   *  可选：2026-10-07 之前写下的记录没有这个字段。 */
+  detail?: string | null;
   retries: number;
 };
 
@@ -1615,7 +1719,21 @@ export type IntradayDailySnapshot = {
  * 只有**调用方知道**这件事，所以必须显式声明，不能猜：
  * "创建自选池"重放一次会多一个池，"把套餐改成 vip"重放一次毫无变化。
  */
-type RetryInit = RequestInit & { retrySafe?: boolean };
+type RetryInit = RequestInit & { retrySafe?: boolean; timeoutMs?: number };
+
+/** 所有 `request()` 调用的**默认超时上限**：2 分钟（见 `request` 里的长注释）。
+ *
+ * 为什么是"语义上界"而不是"性能预算"：它唯一的职责是让
+ * **一个永远不返回的请求**变成一次可读的错误，而不是让界面永远转圈。
+ */
+const DEFAULT_TIMEOUT_MS = 120_000;
+
+/** `fetch` 被 abort 时抛的是 `DOMException(name="AbortError")`，**不是** `TypeError`，
+ *  所以它不会掉进 `request()` 那个"重试一次"的分支 —— 取消与超时都不该重试。 */
+function isAbortError(e: unknown): boolean {
+  return typeof e === "object" && e !== null
+    && (e as { name?: string }).name === "AbortError";
+}
 
 /** 幂等键（`X-Idempotency-Key`）。
  *
@@ -1702,8 +1820,25 @@ async function networkError(url: string): Promise<ApiError> {
 }
 
 async function request<T>(url: string, init?: RetryInit): Promise<T> {
-  // `retrySafe` 是本模块自己的标记，不能传给 `fetch`（会变成未知字段）。
-  const { retrySafe, ...rest } = init ?? {};
+  // 这两个是本模块自己的标记，不能传给 `fetch`（会变成未知字段）。
+  const { retrySafe, timeoutMs, ...rest } = init ?? {};
+
+  // ★★ 超时护栏（2026-10-05，`CHG-0166`）。
+  //
+  // 缺陷形态（用户报障「左侧自选股切换会卡住右侧」）：本函数**原来没有超时**，
+  // 而 `await fetch(...)` 一旦挂住就**永不返回** ⇒ 调用方的 `finally` 不执行
+  // ⇒ `loading` 永远为 true ⇒ 面板永远停在「正在取日线并跑量价规则…」。
+  // 全文件此前只有健康探针 `pingServer` 有超时，业务请求一条都没有。
+  //
+  // 为什么默认给到 2 分钟：本参数是**语义上界**，不是性能预算 ——
+  //   · 读接口实测毫秒~2 秒级，2 分钟永远不会碰到；
+  //   · 提交型接口（`/research/analyze`、`/backtest/run`）后端**立刻返回 task_id**，
+  //     也不会碰到；
+  //   · 唯一会碰到的是"连接卡死"，而那正是我们要让它失败的东西。
+  // 所以它**不改变任何正常路径的行为**，只把"永久转圈"换成一条可读的超时错误。
+  // 真要更严的预算，由**调用方**传入（本项目的性能纪律判据写成次数与 KB，
+  // 不写毫秒；毫秒级预算换条线路就不成立 —— 不该锁在这一层）。
+  const limitMs = timeoutMs === undefined ? DEFAULT_TIMEOUT_MS : timeoutMs;
 
   const method = (rest.method ?? "GET").toUpperCase();
   const idempotent = method === "GET" || method === "HEAD" || method === "OPTIONS";
@@ -1737,42 +1872,70 @@ async function request<T>(url: string, init?: RetryInit): Promise<T> {
   }
 
   let resp: Response | undefined;
-  // 最多两次：第一次失败后立刻重试一次。
-  // 为什么值得重试：后端重启/休眠唤醒后，浏览器**仍然持有一条到旧进程的
-  // keep-alive 连接**，写请求打上去会立刻拿到 `ERR_EMPTY_RESPONSE`。
-  // 换一条新连接就好了 —— 这正是"再点一次就成功"的原因，那就自动做掉。
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      resp = await fetch(url, {
-        // `credentials: "include"` 是认证能在前端生效的前提：会话令牌
-        // （`moss_sid`）与"记住我"（`moss_rt`）都是 HttpOnly Cookie，
-        // 浏览器只在请求声明带上凭据时才会回发。默认值 `"same-origin"`
-        // 在同源下也带，但本应用有两条路径不是"同源直连"：
-        //   ① `vite dev`（:5173）经 proxy 转发；② 将来的独立前端域名。
-        credentials: "include",
-        ...rest,
-        headers,
-      });
-      break;
-    } catch (e) {
-      if (!(e instanceof TypeError)) throw e;
-      if (mayRetry && attempt === 0) {
-        await sleep(400);
-        continue;
-      }
-      throw await networkError(url);
-    }
-  }
-  if (!resp) throw await networkError(url);
+  // ★ 超时与"调用方取消"共用**同一个** controller，但语义必须分开：
+  //   · `timedOut=true` → 抛 `timeoutError`（`NET_9003`，提示"后端在忙，重试一次"）；
+  //   · `finalSignal.aborted` 而没超时 → 是**调用方主动取消**（切标的/卸载），
+  //     原样抛出 `AbortError` 让调用方**静默忽略** —— 绝不能显示成"请求失败"。
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = limitMs > 0
+    ? setTimeout(() => { timedOut = true; ac.abort(); }, limitMs)
+    : null;
+  // 调用方也可以自己传 `signal`（面板切标的时用），两者取"任一触发即 abort"。
+  const callerSignal = rest.signal ?? undefined;
+  const finalSignal: AbortSignal = callerSignal
+    ? (typeof AbortSignal.any === "function"
+        ? AbortSignal.any([ac.signal, callerSignal])
+        : ac.signal)
+    : ac.signal;
 
-  if (!resp.ok) {
-    if (resp.status === 401) notifyUnauthorized(url);
-    // 统一走报错码契约：后端 envelope → ApiError；**不再透传响应体原文**
-    const bodyText = await resp.text();
-    throw apiErrorFromResponse(resp.status, bodyText);
+  try {
+    // 最多两次：第一次失败后立刻重试一次。
+    // 为什么值得重试：后端重启/休眠唤醒后，浏览器**仍然持有一条到旧进程的
+    // keep-alive 连接**，写请求打上去会立刻拿到 `ERR_EMPTY_RESPONSE`。
+    // 换一条新连接就好了 —— 这正是"再点一次就成功"的原因，那就自动做掉。
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        resp = await fetch(url, {
+          // `credentials: "include"` 是认证能在前端生效的前提：会话令牌
+          // （`moss_sid`）与"记住我"（`moss_rt`）都是 HttpOnly Cookie，
+          // 浏览器只在请求声明带上凭据时才会回发。默认值 `"same-origin"`
+          // 在同源下也带，但本应用有两条路径不是"同源直连"：
+          //   ① `vite dev`（:5173）经 proxy 转发；② 将来的独立前端域名。
+          credentials: "include",
+          ...rest,
+          signal: finalSignal,
+          headers,
+        });
+        break;
+      } catch (e) {
+        // 取消/超时**不重试**：超时那条请求在服务端可能仍在跑，重试只会
+        // 变成两条在途请求；而调用方取消的意思就是"不要了"。
+        if (isAbortError(e)) {
+          if (timedOut) throw timeoutError(url, limitMs);
+          throw e;
+        }
+        if (!(e instanceof TypeError)) throw e;
+        if (mayRetry && attempt === 0) {
+          await sleep(400);
+          continue;
+        }
+        throw await networkError(url);
+      }
+    }
+    if (!resp) throw await networkError(url);
+
+    if (!resp.ok) {
+      if (resp.status === 401) notifyUnauthorized(url);
+      // 统一走报错码契约：后端 envelope → ApiError；**不再透传响应体原文**
+      const bodyText = await resp.text();
+      throw apiErrorFromResponse(resp.status, bodyText);
+    }
+    noteApiOk();
+    return await (resp.json() as Promise<T>);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
   }
-  noteApiOk();
-  return resp.json() as Promise<T>;
 }
 
 
@@ -2829,10 +2992,22 @@ export const api = {
     request<{ scanned: number; triggered: number;
               items: IntradayWatchItem[]; all: IntradayWatchItem[] }>(
       "/api/v1/intraday/scan", { method: "POST" }),
-  intradayDaily: (code: string, refresh = false) =>
+  /** 日K快照。
+   *
+   * `signal`：供面板在**切标的/卸载**时取消在途请求 —— 取消是"不要了"，
+   *   不是失败：调用方必须把 `AbortError` 静默忽略（见 `IntradayDailyPanel`
+   *   的请求序号守卫）。
+   * `timeoutMs`：本接口的**显式上限**。为什么不靠 `DEFAULT_TIMEOUT_MS`（120 秒）：
+   *   日K实测冷 1.2~2.3 秒、热 0.01~0.03 秒，让用户为一个卡死的连接等 2 分钟
+   *   毫无意义。30 秒 ≈ 实测最坏值的 13 倍，只切"不可达/病态慢"，
+   *   绝不误杀正常请求（与 `mainlineApi.ts` 的 `REQUEST_TIMEOUT_MS` 同款取值）。
+   */
+  intradayDaily: (code: string, refresh = false, signal?: AbortSignal,
+                  timeoutMs = 30_000) =>
     request<IntradayDailySnapshot>(
       `/api/v1/intraday/daily?code=${encodeURIComponent(code)}`
-      + (refresh ? "&refresh=true" : "")),
+      + (refresh ? "&refresh=true" : ""),
+      { timeoutMs, ...(signal ? { signal } : {}) }),
 
   // ---- 多因子（策略回测 · 多因子模式）----
   quantFactors: () => request<QuantFactorList>("/api/v1/quant/factors"),

@@ -22,6 +22,7 @@ import KeepAlive from "./components/KeepAlive";
 import LoginScreen from "./components/LoginScreen";
 import ServerStatusBanner from "./components/ServerStatusBanner";
 import StockProfilePanel from "./components/StockProfilePanel";
+import { StockPicker } from "./components/StockPicker";
 import AlertsPanel from "./components/AlertsPanel";
 import IntelPanel from "./components/intel/IntelPanel";
 // 保活外的重组件 → lazy
@@ -35,6 +36,9 @@ const BacktestPanel = lazy(() => import("./components/BacktestPanel"));
 const FundFlowPanel = lazy(() => import("./components/FundFlowPanel"));
 const MainlinePanel = lazy(() => import("./components/MainlinePanel"));
 const MetricsPanel = lazy(() => import("./components/MetricsPanel"));
+// ★ 2026-10-08：投研分析 · 多标的「逐只结论」（`multiSubject.ts` 的展示层）。
+//   单标的时它 return null（不产生 DOM），所以挂在研究页里是零成本的。
+const MultiSubjectPanel = lazy(() => import("./components/MultiSubjectPanel"));
 const QuantTabContainer = lazy(() => import("./components/QuantTabContainer"));
 const ReportView = lazy(() => import("./components/ReportView"));
 const SchedulerPanel = lazy(() => import("./components/SchedulerPanel"));
@@ -604,12 +608,22 @@ const running = task !== null && (task.status === "queued" || task.status === "r
                   <option key={t.value} value={t.value}>{t.label}</option>
                 ))}
               </select>
-              <input
-                className="target-input"
+              {/*
+                ★ 标的输入框换成 `StockPicker`（`CHG-0215`）。
+                原来这里是裸 `<input placeholder="标的（如 600519）">` ——
+                **只认 6 位数字**，想分析"平安银行"必须先自己去查出 601398。
+                项目里「量化交易 → 行情」、「单标的做T」早在用 `StockPicker`
+                （代码 / 中文名 / 拼音首字母 / 全拼 四路联想），
+                这里只是**接上同一份实现**，没有第二套联想逻辑。
+                ⚠️ 它自带 180ms 防抖、输入法组字守卫（组字期间不发查询）
+                与请求序号守卫（丢弃过期响应）—— 这三条都是别处踩过坑才加的，
+                换成裸 input 会一起丢。 */}
+              <StockPicker
                 value={target}
-                onChange={(e) => setTarget(e.target.value)}
-                placeholder="标的（如 600519）"
+                onChange={setTarget}
+                placeholder="标的（代码 / 拼音首字母 / 中文名）"
                 disabled={running}
+                width={220}
               />
               <button onClick={submit} disabled={running || submitting || !query.trim()}>
                 {running ? "分析中…" : submitting ? "提交中…" : "开始分析"}
@@ -664,6 +678,18 @@ const running = task !== null && (task.status === "queued" || task.status === "r
 
             {trace && (
               <div className="grid">
+                {/*
+                  ★ 2026-10-08：多标的（逐只）结论面板。问句里点名多只票/多个板块时，
+                  A10/A12/A17/A20/A07 各自的逐只结果此前在界面上读不到
+                  （只能展开 `<details>` 看原始 JSON）。读字段的唯一实现在
+                  `multiSubject.ts`，门槛也是它在管：**单标的（字段缺席或只有 1 条）
+                  时 `buildMultiSubjectView()` 返回空数组 ⇒ 本组件 return null
+                  ⇒ 不多出任何标题/分组/空容器**，页面与改动前逐字一致
+                  （这条有自检：`web/src/multiSubjectRenderCheck.tsx`）。
+                  ⚠️ 它是网格里的第 1 个孩子且**跨满两列**（`.multi-subject`）——
+                  不能改成排在 AgentTimeline 之后：那样 1fr/380px 两列会被挤错位。
+                */}
+                <MultiSubjectPanel outputs={trace.agent_outputs} />
                 <AgentTimeline outputs={trace.agent_outputs} errors={trace.errors} />
                 <TracePanel trace={trace} />
               </div>

@@ -32,6 +32,29 @@ A12 直接以纯规则结果返回（跳过 LLM 调用），同时把 `model_use
 连 LLM 都不会有异议。现在两条分支仍然都省 token，但输出严格分开：
 `_rule_only_reason` 取值 `measured_clean` / `no_input`，后者
 `compliance_level="未量到"`、`confidence="low"`、`burst_risk` 明写"无法判定"。
+
+## ★★★ 2026-10-02：多标的（一次问句 ≥2 只票）不许共用一张合格证
+
+`CHG-0216` 之后个股指标按 `resolved_codes` **逐只**排，所以 A12 的
+`payload.data_points` 里同时躺着两只票的同名指标（`商誉占净资产比:601088`
+与 `商誉占净资产比:002142`）。本地规则原先把整份输入当成**一只票**在扫，
+于是能凭"首个命中"把 A 的 `货币资金` 与 B 的 `有息负债` 拼成一条
+**两家合起来才有**的「存贷双高」，并把两只票各 3 个族并成"6/6 族"。
+
+规则侧修法见 `logic.py`（按代码分组、逐只判定）。本文件的四处配合：
+
+1. `_should_skip_llm()`：**多标的一律不跳 LLM**。纯规则路径的文案是
+   **单数口径**的（"已量到 2/6 族"），多标的时填谁的数都是错的、填并集
+   就是那张假合格证 —— 所以不是"并集看起来齐全就跳过"，
+   而是多标的**根本没有单数结论可跳过**；
+2. `_build_rule_only_result()`：加 `multi_target_guard` 兜底
+   （正常到不了，绕过了那道门也不许输出统一等级）；
+3. `_requirements()`：补逐只口径约束 —— 那句原话「LLM结论须与
+   `compliance_level_calc` 自洽」在汇总值上**单独存在就是危险的**，
+   会把"最坏的那只票"复制给所有标的；多标的时改为**逐只自洽**
+   ＋追加 `compliance_by_code` 逐票 JSON 字段；
+4. `_enrich_result()`：把 `compliance_per_code` 等 per-code 字段随结果下发
+   （扁平三件套是**汇总**：族清单取交集，不是任何一只票的读数）。
 """
 
 from __future__ import annotations
@@ -39,7 +62,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.domain.agents.analysis.base import AnalysisAgentBase, AnalysisPayload
+from src.domain.agents.analysis.base import (
+    AnalysisAgentBase,
+    AnalysisPayload,
+    enforce_per_item_rows,
+)
 from src.domain.agents.analysis.compliance.logic import (
     FLAG_NO_SIGNAL,
     LEVEL_UNMEASURED,
@@ -48,6 +75,13 @@ from src.domain.agents.analysis.compliance.logic import (
 from src.domain.agents.analysis.unlock_teaching import render_unlock_teaching
 
 logger = logging.getLogger(__name__)
+
+
+def _families_coverage(row: dict[str, Any]) -> str:
+    """`3/6 族` —— **逐只**的族覆盖率（多标的 prompt 里必须逐只报，不许报并集）。"""
+    measured = list(row.get("families_measured") or [])
+    unmeasured = list(row.get("families_unmeasured") or [])
+    return f"{len(measured)}/{len(measured) + len(unmeasured)} 族"
 
 
 class ComplianceAnalysisAgent(AnalysisAgentBase):
@@ -63,7 +97,8 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
         "严重程度自洽，不得弱化严重旗标。"
         # ★★★ 2026-10-01 CHG-0155（用户口径）：**预期差**驱动股价。
         + (
-            "\n\n★★★ 投研分析核心原则：**概念板块与个股的股价上涨动力来自「预期差」，不是预期本身**。\n"
+            "\n\n★★★ 投研分析核心原则：**概念板块与个股的股价上涨动力来自「预期差」，"
+            "不是预期本身**。\n"
             "- 预期 = 市场已有共识 ⇒ 已被定价 = 中位线（**不构成涨跌动力**）；\n"
             "- **预期差 = 市场已有预期 vs 数据/事件推断的实际预期** 之差 ⇒ 涨跌的**真正动力**；\n"
             "- 正向预期差（实际 > 市场）⇒ 资金流入 / 估值上修；\n"
@@ -102,25 +137,53 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
     #   「未见明显合规风险信号」+ confidence=high（伪造的体检合格证）。
     #   现在两支都跳过 LLM（都省 18.5k tokens/轮），但**结果文案完全不同**，
     #   见 `_build_rule_only_result()`。
+    #
+    # ★★ 2026-10-02：**多标的一律不跳 LLM**。
+    #   纯规则路径的整套文案（`_build_rule_only_result`）是**单数口径**的：
+    #   "本地合规规则扫描完成：…已量到 2/6 族…" —— 它描述的是"这一家公司"。
+    #   多标的时这句话无论填哪只票的数都是错的，而填并集就是那张
+    #   "A 量到 3 族 + B 量到 3 族 = 6/6"的假合格证（见 `logic.py` 的
+    #   2026-10-02 一节）。所以这里不是"并集看起来齐全就跳过"，
+    #   而是**多标的根本没有单数结论可跳过**：宁可花一次 reasoning tokens，
+    #   也不许省出一张无归属的合格证。
     def _should_skip_llm(self, payload: AnalysisPayload) -> bool:
         calc = payload.hint.get("compliance_calc", {}) or {}
         level = str(calc.get("compliance_level_calc", ""))
         events = payload.events or []
         if events:
             return False
+        if self._is_multi_target(calc):
+            return False
         # 「量到了且没超阈值」→ 纯规则；
         # 「未量到」→ 也纯规则（LLM 同样没有输入，调它只会得到一段无据的定性）。
         return level in ("无", LEVEL_UNMEASURED)
 
+    @staticmethod
+    def _is_multi_target(calc: dict[str, Any]) -> bool:
+        """本次判定是不是**多标的**（≥2 只票各有自己的合规结论）。
+
+        判据取 `compliance_multi_target`（logic 侧的权威值）；
+        `compliance_per_code` 只是交叉校验 —— 两个字段漂移时按"多"处理（保守）。
+        """
+        if calc.get("compliance_multi_target"):
+            return True
+        return len(calc.get("compliance_per_code") or []) > 1
+
     def _build_rule_only_result(self, payload: AnalysisPayload) -> dict[str, Any]:
         """纯规则结果：跳过 LLM 调用，直接输出。
 
-        ## 两种 `_rule_only_reason`（审计里必须能分开）
+        ## 三种 `_rule_only_reason`（审计里必须能分开）
 
         · `measured_clean`：真的量过了，都没超阈值 → 可以报「无」。
         · `no_input`：6 个族一条都没量到、也没有诉讼/监管事件 →
           **只能报「未量到」**，且 `confidence=low`、`burst_risk` 不许写
           "未见明确爆雷路径"（那也是一句无据的结论）。
+        · `multi_target_guard`：**多标的**（★ 2026-10-02）。这条分支是**兜底**，
+          正常路径到不了 —— `_should_skip_llm()` 对多标的直接返回 False。
+          留着它是为了"有人绕过那道门"时**仍然不许**输出一张收下全部标的的
+          合格证：上面两支的文案都是**单数口径**的（"这一家公司已量到 2/6 族"），
+          套到多标的上，无论填哪只票的数都是错的，填并集就是那张
+          "A 3 族 + B 3 族 = 6/6"的假合格证。
 
         为什么把 reason 也落进结果：没有它，"走了纯规则"与"压根没跑"
         在审计里长得一模一样，排查方向会被带偏（本项目 2026-09-28 实测过
@@ -131,6 +194,9 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
         measured = list(calc.get("compliance_families_measured") or [])
         unmeasured = list(calc.get("compliance_families_unmeasured") or [])
         flags = list(calc.get("compliance_flags") or [])
+
+        if self._is_multi_target(calc):
+            return self._build_multi_target_guard_result(calc, flags)
 
         if level == LEVEL_UNMEASURED:
             conclusion = (
@@ -202,6 +268,43 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
             "model_used": "rule-only",
         }
 
+    @staticmethod
+    def _build_multi_target_guard_result(
+        calc: dict[str, Any], flags: list[str]
+    ) -> dict[str, Any]:
+        """★ 2026-10-02：多标的的**兜底**输出（正常到不了，见 `_should_skip_llm`）。
+
+        它不许做的事很清楚：**不许给出一个收下全部标的的合规等级**。
+        所以 `compliance_level` 固定填「未量到」（= 本次没有可用的统一结论），
+        逐只结果放在 `conclusion` 里并原样随 `compliance_per_code` 下发。
+        """
+        rows = list(calc.get("compliance_per_code") or [])
+        summary = "；".join(
+            f"{row.get('label') or row.get('code') or '?'}={row.get('level')}"
+            for row in rows
+        ) or "无逐只结果"
+        return {
+            "conclusion": (
+                f"本地合规规则按标的**分别**判定：{summary}。"
+                "多标的**不得**合成一个合规等级，本结论只是一个占位，"
+                "逐只明细见 compliance_per_code。"
+            )[:200],
+            "confidence": "low",
+            "compliance_level": LEVEL_UNMEASURED,
+            "burst_risk": "无法判定（多标的未逐只复核，非「无爆雷路径」）",
+            # 占位旗标不是风险明细，不许放进 red_flags
+            "red_flags": [f for f in flags if f != FLAG_NO_SIGNAL],
+            "key_points": [
+                f"标的数 {len(rows)}（逐只判定，禁止合并）",
+                f"合规旗标 {len(flags)} 条",
+                "多标的兜底：未输出统一等级",
+                "纯规则判定，未调 LLM",
+            ],
+            "_rule_only": True,
+            "_rule_only_reason": "multi_target_guard",
+            "model_used": "rule-only",
+        }
+
     def _enrich_result(self, payload: AnalysisPayload, data: dict[str, Any]) -> dict[str, Any]:
         calc = payload.hint.get("compliance_calc", {})
         data["compliance_flags_calc"] = calc.get("compliance_flags")
@@ -212,6 +315,40 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
         data["compliance_measured"] = calc.get("compliance_measured")
         data["compliance_families_measured"] = calc.get("compliance_families_measured")
         data["compliance_families_unmeasured"] = calc.get("compliance_families_unmeasured")
+        # ★ 2026-10-02：per-code 维度随结果下发 —— 多标的时**唯一诚实**的表达方式。
+        #   扁平三件套是逐只结果的汇总（族清单取交集），没有它，
+        #   汇总字段会被读成"这家公司量到了 6/6 族"。
+        data["compliance_per_code"] = calc.get("compliance_per_code")
+        data["compliance_codes"] = calc.get("compliance_codes")
+        data["compliance_multi_target"] = calc.get("compliance_multi_target")
+        data["compliance_unattributed_event_flags"] = calc.get(
+            "compliance_unattributed_event_flags")
+        # ★★ `CHG-0236`：多标的**运行时**等长校验（与 A17 的 `per_subject`
+        #   共用 `enforce_per_item_rows` —— 「同一判断只允许一份实现」）。
+        #
+        # 为什么挂在 `_enrich_result` 而不是 `execute`：基类的 LLM 解析在
+        # `AnalysisAgent.execute()` 里，子类没有那个钩子；而 `_enrich_result`
+        # 是**两条路径（LLM / 纯规则）都要过**的唯一收口 ⇒ 挂这里才不会漏。
+        #
+        # ⚠️ **纯规则路径显式跳过**：那条分支（`multi_target_guard`）
+        #    **压根没调 LLM**，要求它给 `compliance_by_code` 是**无中生有**，
+        #    补出来的占位行会把"规则逐只判定过"误标成"模型没返回"。
+        #    它是否安全由 `_build_multi_target_guard_result()` 保证
+        #    （固定不许输出统一等级），不靠这一层。
+        if self._is_multi_target(calc) and not data.get("_rule_only"):
+            enforce_per_item_rows(
+                data, "compliance_by_code",
+                [str(c) for c in (calc.get("compliance_codes") or [])],
+                where="A12_compliance/_enrich_result",
+                label="标的",
+                placeholder_fields={
+                    "level": LEVEL_UNMEASURED,
+                    "burst_risk": "该标的未返回逐只结论（非「无爆雷路径」）",
+                    "red_flags": [],
+                    "_placeholder": "A12 未返回该标的的逐只合规结论",
+                },
+                warning_prefix="A12 未按标的逐只返回合规结论",
+            )
         return data
 
     def _requirements(self, payload: AnalysisPayload) -> str:
@@ -229,6 +366,7 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
         return (
             f"本地规则爆雷等级为「{calc_level}」，LLM结论须与此自洽。\n"
             f"{gap_note}"
+            f"{self._multi_target_note(calc)}"
             "输出JSON：\n"
             '- "conclusion": 合规与爆雷可能性评估，120字内，须引用具体旗标/事件\n'
             '- "confidence": high|medium|low\n'
@@ -236,4 +374,48 @@ class ComplianceAnalysisAgent(AnalysisAgentBase):
             '- "burst_risk": 爆雷路径简述（质押平仓/商誉减值/立案处罚；无则填"未见明确爆雷路径"）\n'
             '- "red_flags": 风险明细数组（与本地旗标呼应）\n'
             '- "key_points": 2-4条'
+            f"{self._multi_target_json_note(calc)}"
         )
+
+    @staticmethod
+    def _multi_target_note(calc: dict[str, Any]) -> str:
+        """★ 2026-10-02：多标的时给 LLM 的**逐票口径**约束（单标的不加，逐字不变）。
+
+        prompt 里还有一句原话是「LLM结论须与此自洽」——它单独存在时是**危险**的：
+        多标的的 `compliance_level_calc` 是**汇总**（取最坏），一只票的读数
+        与它对齐就等于把另一个标的的处境也算到自己头上。所以这里必须补一句
+        "自洽"是**逐只**自洽，不是让所有票共用一个等级。
+        """
+        rows = list(calc.get("compliance_per_code") or [])
+        if len(rows) < 2:
+            return ""
+        detail = "；".join(
+            f"{row.get('label') or row.get('code') or '?'}={row.get('level')}"
+            f"（量到 {_families_coverage(row)}）"
+            for row in rows
+        )
+        return (
+            "\n★★★ 本次是**多标的**（同一份上下文里有 "
+            f"{len(rows)} 个标的）：{detail}。\n"
+            "硬性要求：\n"
+            "1. **逐只给结论**，每只票的等级/旗标只能引用**它自己**的数据"
+            "（旗标已带 `[代码]` 前缀标明归属，禁止把 A 的旗标写到 B 头上）；\n"
+            "2. 上面的「本地规则爆雷等级」是**汇总值（取最坏）**，"
+            "**不是**每只票的读数 —— 禁止把汇总值复制给所有标的；\n"
+            "3. 某只票「未量到」时，对该票只能说**数据缺口**，"
+            "不许说它「未见合规风险」；\n"
+            "4. 汇总层计数（`compliance_families_measured`）是**交集**"
+            "（每只票都量到的族），**不许**读成「这家公司量到了 6/6 族」。\n"
+        )
+
+    @staticmethod
+    def _multi_target_json_note(calc: dict[str, Any]) -> str:
+        """多标的时追加一个**逐票**JSON 字段（单标的不加，逐字不变）。"""
+        if len(calc.get("compliance_per_code") or []) < 2:
+            return ""
+        return (
+            '\n- "compliance_by_code": 逐只结论数组（多标的**必填**），'
+            '每项 {"code": "6位代码", "level": "高|中|无|未量到", '
+            '"burst_risk": "该票的爆雷路径", "red_flags": ["该票自己的旗标"]}'
+        )
+

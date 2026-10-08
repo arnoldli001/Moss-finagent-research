@@ -37,6 +37,24 @@ class ResearchState(TypedDict):
     focus_stock_name: str
     """`focus_stock_code` 对应的中文简称（展示用，可空）"""
 
+    focus_stock_codes: tuple[str, ...]
+    """★★ `CHG-0216`：问句里点名的**全部**个股代码（按出现顺序，去重）。
+
+    为什么不能只有 `focus_stock_code` 一个（用户报障）：
+      > 「用户输入含有 **2 个及以上**的个股…此时采集数据会存在**漏掉一些股票**
+      >   的信息获取」—— 例：「…能否持有高股息的**宁波银行**和**中国神华**？」
+      >   标的 `601088`，反馈中国神华缺个股估值与股息、宁波银行没有任何可引用的估值，
+      >   **而本地库里明明有**。
+
+    个股指标（`PE(TTM)` / `股息率TTM` / …）是**按代码各排一份**的。
+    只有单个代码时，规划层只能给一只排 ⇒ **另一只一个指标都没有**，
+    而症状是"该股没有估值/股息数据"（看起来像数据源坏了）。
+
+    ⚠️ 与 `focus_stock_code` 的关系：后者是**主焦点**（兼容既有行为，
+    等于本元组的第 0 项），本字段是**采集覆盖面**。两者**不能合并** ——
+    合并会把"主焦点"这个语义丢掉。
+    """
+
     # Supervisor计划（本run要执行的agent_id列表）
     plan: list[str]
 
@@ -99,3 +117,29 @@ class ResearchState(TypedDict):
     cancellation_token: Any
 
     final_report: str | None
+
+    # ★★★ 2026-10-07：**A18 审计结论的机器可读载体**（`CHG-0190` ① / PRD §46）。
+    #
+    # 报障形状（本轮实测）：`audit_node` 拿到了 `verdict="不通过"`、`completeness_issues`
+    # 与断链位置，但**没有任何自动化消费方** —— 它只影响 A18 自己的 confidence 档位，
+    # 外加 `_render_report` 把 `conclusion` 抄进 Markdown。结论是：
+    # **审计能判"不通过"，而"不通过"不改变任何交付行为**。
+    #
+    # 为什么载体是 state channel 而不是"在报告里写一句"：
+    #   · 报告是给人读的，**没法被断言**；"不通过"必须有一个可被代码读取的字段，
+    #     否则下一次改动会再次把它变成一句谁都不看的话；
+    #   · ⚠️ 同一个文件 `:43-69` 记着那条教训：**未在 schema 里声明的键会被 LangGraph
+    #     静默丢弃**（`_planned_indicators` 就是这么丢过一次）。所以这里必须声明。
+    audit: dict[str, Any]
+
+    # ★★★ 2026-10-07：**自修复待办（真实存在的标记）**（`CHG-0190` ② / PRD §46）。
+    #
+    # 报障形状：`supervisor.py` 的注释曾声称"结果写到 `self_heal_pending` 标记，
+    # 由盘后批量作业回填"，而全仓库 `grep self_heal_pending` **只命中那句注释** ——
+    # 键不存在、也从没被写过。按上面那条教训，它**不可能**生效。
+    #
+    # 现在它是真的：真缺口（本地与联网均未取到）时写入本轮待自修复的指标，
+    # 由 `collect` 阶段的后台任务尝试 A19 自愈；失败则进缺口队列交盘后 `gap_drain`。
+    # 列表通道用 add reducer —— 与 `errors`/`progress` 同一约定，
+    # 并发采集的多路写入不会互相覆盖。
+    self_heal_pending: Annotated[list[dict[str, Any]], operator.add]

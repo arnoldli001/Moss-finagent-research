@@ -29,6 +29,14 @@ dependencies = [
     # 登录人机校验验证码图片；资金流/板块缓存落盘读回（parquet）
     "Pillow>=10.0",
     "pyarrow>=15.0",
+    # 口令哈希（`CHG-0237`）：**不是"可选的加强项"，是承重件** ——
+    #   pilot 库 34 个账号里 **21 个是 `$2b$`（bcrypt）**哈希，而
+    #   `verify_password()` 是**按哈希前缀派发算法**的，且"任何异常都返回 False"
+    #   ⇒ 环境里没有 bcrypt 时，那 21 个账号的校验直接落到 False，
+    #   用户在界面上看到的是**「密码错误」** —— 与真的输错密码**长得一模一样**。
+    #   （`_pick_algo()` 仍有 argon2id > bcrypt > pbkdf2 的降级顺序，
+    #     所以"新哈希用哪个算法"仍随环境变；但"已有哈希能不能验"不能随环境变。）
+    "bcrypt>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +45,34 @@ data = [
     "tushare>=1.4",
     "baostock>=0.8",
     "xtquant>=250807",  # 迅投QMT本地行情（需XtMiniQmt运行；未运行时自动回退）
+]
+# 分布式追踪（`CHG-0174`）。**刻意做成可选**：
+#   ① 本项目默认零依赖可跑（SQLite + 本地模型），追踪只是"调用树"这一块的补强；
+#   ② 没装时 `tracing.init_tracing()` 如实返回 `no_sdk` 并**完全不影响应用**
+#      （fail-open），不是静默降级成假绿；
+#   ③ 装了才生效 —— `uv sync --extra otel`。
+otel = [
+    "opentelemetry-api>=1.30",
+    "opentelemetry-sdk>=1.30",
+    # HTTP 而非 gRPC：本地 sink / collector 只需一个 POST 端点，
+    # 少一层端口与 TLS 面（gRPC 还要 4317 与额外的 HTTP/2 依赖）。
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.50b0",
+    "opentelemetry-instrumentation-httpx>=0.50b0",
+]
+# 公网入口 `hk.wujiaitool.cn` 的 SSH 隧道依赖（`scripts/frp_ssh_tunnel.py`）。
+#
+# ★ `CHG-0237` 把它**从"临时装的"变成"声明的"** —— 事故根因正是这一条：
+#   隧道要 paramiko，而 paramiko **不在任何依赖组里**，只被手工装进 venv；
+#   于是任何一次裸 `uv sync` 都会把 paramiko（连同它带进来的
+#   bcrypt / cryptography / pynacl）当作"多余的包"清掉 ⇒
+#   `import paramiko` 失败 ⇒ 隧道退出 ⇒ VPS nginx 上游为空 ⇒ **全站 502**，
+#   而这一切在应用日志里**一行都没有**（故障发生在应用之外）。
+#
+# ★ 做成 extra 而不是 core：保持"默认零依赖可跑"（本地/测试/CI 不需要隧道）。
+#   ⇒ 部署侧的正确命令是 `uv sync --all-extras`（见 docs/OPS_GUIDE.md）。
+tunnel = [
+    "paramiko>=3.4",
 ]
 
 [dependency-groups]

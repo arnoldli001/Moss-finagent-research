@@ -54,9 +54,15 @@ class FakeGraph:
         }}
 
 
-def _client(graph: FakeGraph) -> tuple[TestClient, TaskStore]:
+def _client(graph: FakeGraph, gateway=None) -> tuple[TestClient, TaskStore]:
+    """`gateway=None` 是绝大多数用例的默认（不需要模型层）。
+
+    `gateway` 可注入 —— `/capacity` 是从 `runtime.gateway._cache` 取缓存统计的
+    （`research.py` @696），所以"**复用率经接口可见**"这条只能在注入了网关的
+    客户端上验（`CHG-0208`）。
+    """
     store = TaskStore()
-    runtime = SimpleNamespace(graph=graph, gateway=None, data_health=None)
+    runtime = SimpleNamespace(graph=graph, gateway=gateway, data_health=None)
     app = FastAPI()
     app.include_router(R.router)
     app.state.runtime = runtime
@@ -273,6 +279,56 @@ def test_capacity_endpoint_is_reachable_and_not_shadowed():
     assert "max_inflight" in data and "inflight" in data
     assert data["task_store"]["tasks"] == 0
     assert "budget" in data and "spent_cny" in data["budget"]
+    # 没注入网关 ⇒ 缓存未装配。这是**正确的**结论，不是故障
+    # （`counters` 为空 + `why` 说明未装配）；复用率那一组见下一个用例。
+    assert data["semantic_cache"]["state"] == "no_traffic", data["semantic_cache"]
+    assert data["semantic_cache"]["counters"] == {}
+    c.__exit__(None, None, None)
+
+
+def test_capacity_endpoint_exposes_the_reuse_rate(tmp_path):
+    """★★ **复用率必须经真实接口可见**（`CHG-0208`）。
+
+    ## 为什么这条断言值得单独一个用例
+
+    `describe()` 的 `counters` 是**白名单**：缓存层把 `lookups / hits_exact /
+    hits_semantic / misses / reuse_rate` 算得再对，忘了放进白名单，
+    面板上也**永远看不到**，而且不报错。
+
+    这条链路一共四跳：
+        `LLMCache` 计数 → `stats()` → `describe().counters` → `/capacity` JSON
+    前三跳各有单测（`test_cache_reuse_rate.py` / `test_semantic_degradation.py`），
+    这里钉的是**第四跳**（`research.py` 从 `gateway._cache` 取数并透传）。
+    """
+    from src.infrastructure.llm.cache import LLMCache
+    from src.infrastructure.llm.models import LLMResponse
+
+    cache = LLMCache(cache_dir=str(tmp_path), ttl_hours=1.0)
+    sys_p, prompt = "SYS", "今天A股市场怎么样？"
+    cache.put(sys_p, prompt, LLMResponse(
+        content="答案", model_used="m", provider="p",
+        prompt_hash="ph", response_hash="rh"), agent_id="A08_macro", scope="s")
+    assert cache.get(sys_p, prompt, agent_id="A08_macro", scope="s") is not None
+    assert cache.get(sys_p, "另一个问句", agent_id="A08_macro", scope="s") is None
+
+    c, _ = _client(FakeGraph(), gateway=SimpleNamespace(_cache=cache))
+    data = c.get("/api/v1/research/capacity").json()
+    counters = data["semantic_cache"]["counters"]
+    assert counters["lookups"] == 2, counters
+    assert counters["hits_exact"] == 1, counters
+    assert counters["misses"] == 1, counters
+    assert counters["reuse_rate"] == 0.5, counters
+    # ★★ 复用**年龄**也必须经这条链路可见（`CHG-0209`）——它是 TTL 的唯一依据。
+    #    `describe().counters` 是**白名单**：不加进来，缓存层算得再对也看不到。
+    assert "reuse_age_exact" in counters, counters
+    assert sum(counters["reuse_age_exact"].values()) == 1, counters
+    assert counters["reuse_age_unknown"] == 0, counters
+    # 原始数也要在场（面板要能深挖到"分母是多少"）
+    assert data["llm_cache"]["lookups"] == 2
+    import json
+
+    assert "created_at" in json.loads(
+        next(tmp_path.glob("*.json")).read_text(encoding="utf-8"))
     c.__exit__(None, None, None)
 
 
