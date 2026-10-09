@@ -2,81 +2,78 @@
 #
 # 为什么有这份文件：`.gitignore` **不会** untrack 已经跟踪的文件。
 # 实测：343 个文件的路径已经命中'私有'规则，却仍然在公开仓库里
-# （面试复盘、主线策略文档、非白名单脚本、私有 skill 副本……）。
+# （展示复盘、主线策略文档、非白名单脚本、私有 skill 副本……）。
 # 这些是历史债；本基线把它们**冻结**下来，于是'又漏了一个'会当场变红。
 #
 # 用法：`tests/unit/test_privacy_tracking_policy.py` 断言'当前集合 ⊆ 基线'。
 # 想放宽？只能删条目（撤下文件），不能加条目 —— 加条目要在 code review 里
 # 被看见。重新生成：`uv run python scripts/_gen_privacy_baseline.py --write`
 # （生成脚本会连同**归因规则**一起写下来，便于按规则成批处理）。
-frozen_count: 343
+frozen_count: 339
 
 # ── 归因：每个数量对应哪一条 .gitignore 规则 ──
 by_rule:
   - rule: ".gitignore:88  /scripts/*"
-    count: 202
+    count: 200
     sample: ["scripts/_audit_llm_coverage.py", "scripts/_audit_purification.py", "scripts/_backfill_extract.py"]
-  - rule: ".gitignore:137  /docs/MAINLINE_*"
+  - rule: ".gitignore:159  /docs/MAINLINE_*"
     count: 69
     sample: ["docs/MAINLINE_ALERT_EPISODES.md", "docs/MAINLINE_ALERT_PRECISION_2023.md", "docs/MAINLINE_ALERT_PRECISION_OLD.md"]
-  - rule: ".gitignore:135  /docs/INTERVIEW_*.md"
+  - rule: ".gitignore:141  /docs/INTERVIEW_*.md"
     count: 23
     sample: ["docs/INTERVIEW_ARCHIVE_CLEANUP.md", "docs/INTERVIEW_DEFENSE_ETF_FLOW.md", "docs/INTERVIEW_FAQ_AND_PITFALLS.md"]
-  - rule: ".gitignore:130  /.trae/skills/*"
+  - rule: ".gitignore:136  /.trae/skills/*"
     count: 10
     sample: [".trae/skills/a-share-liquidity-cycle/SKILL.md", ".trae/skills/ai-dev-rules/SKILL.md", ".trae/skills/ai-dev-rules/references/agent-interface-spec.md"]
-  - rule: ".gitignore:140  /docs/mainline_iterations/"
+  - rule: ".gitignore:162  /docs/mainline_iterations/"
     count: 7
     sample: ["docs/mainline_iterations/01_pure055.json", "docs/mainline_iterations/02_v23.json", "docs/mainline_iterations/03_v24.json"]
-  - rule: ".gitignore:128  /.trae/*"
+  - rule: ".gitignore:134  /.trae/*"
     count: 5
     sample: [".trae/specs/event-alert-system/review.md", ".trae/specs/event-alert-system/spec.md", ".trae/specs/event-alert-system/tasks.md"]
-  - rule: ".gitignore:138  /docs/ETF_*.md"
+  - rule: ".gitignore:160  /docs/ETF_*.md"
     count: 5
     sample: ["docs/ETF_BOARD_MAPPING.md", "docs/ETF_FLOW_BACKTEST.md", "docs/ETF_FLOW_DATA_QUALITY.md"]
-  - rule: ".gitignore:187  /docs/_*.txt"
+  - rule: ".gitignore:209  /docs/_*.txt"
     count: 4
     sample: ["docs/_alt_source_probe.txt", "docs/_calendar_source_probe.txt", "docs/_compliance_check.txt"]
-  - rule: ".gitignore:150  /docs/interview/链路审计*"
+  - rule: ".gitignore:172  /docs/interview/链路审计*"
     count: 3
     sample: ["docs/interview/链路审计/pipeline-redundancy-audit.md", "docs/interview/链路审计/后端Spark 或 Flink 作业.bat", "docs/interview/链路审计（发现冗余链路的判断过程，从依赖推理变成依赖规则和工具输出）SKILL (2).md"]
-  - rule: ".gitignore:136  /docs/面试准备_*"
-    count: 2
-    sample: ["docs/面试准备_竞价选股量化项目.archived.md", "docs/面试准备_竞价选股量化项目.md"]
   - rule: ".gitignore:49  /web/dist-pilot/"
     count: 2
     sample: ["web/dist-pilot/favicon.svg", "web/dist-pilot/index.html"]
-  - rule: ".gitignore:139  /docs/PLATFORM_MULTI_TENANCY_DESIGN.md"
+  - rule: ".gitignore:161  /docs/PLATFORM_MULTI_TENANCY_DESIGN.md"
     count: 1
     sample: ["docs/PLATFORM_MULTI_TENANCY_DESIGN.md"]
-  - rule: ".gitignore:183  /tests/unit/test_alert_models.py"
+  - rule: ".gitignore:205  /tests/unit/test_alert_models.py"
     count: 1
     sample: ["tests/unit/test_alert_models.py"]
-  - rule: ".gitignore:182  /tests/unit/test_alert_thresholds.py"
+  - rule: ".gitignore:204  /tests/unit/test_alert_thresholds.py"
     count: 1
     sample: ["tests/unit/test_alert_thresholds.py"]
-  - rule: ".gitignore:173  /tests/unit/test_daily_auction_tick.py"
+  - rule: ".gitignore:195  /tests/unit/test_daily_auction_tick.py"
     count: 1
     sample: ["tests/unit/test_daily_auction_tick.py"]
-  - rule: ".gitignore:178  /tests/unit/test_intel_alert_copy_trial.py"
+  - rule: ".gitignore:200  /tests/unit/test_intel_alert_copy_trial.py"
     count: 1
     sample: ["tests/unit/test_intel_alert_copy_trial.py"]
-  - rule: ".gitignore:177  /tests/unit/test_mainline_layer_compose.py"
+  - rule: ".gitignore:199  /tests/unit/test_mainline_layer_compose.py"
     count: 1
     sample: ["tests/unit/test_mainline_layer_compose.py"]
-  - rule: ".gitignore:174  /tests/unit/test_mainline_layer_scale.py"
+  - rule: ".gitignore:196  /tests/unit/test_mainline_layer_scale.py"
     count: 1
     sample: ["tests/unit/test_mainline_layer_scale.py"]
-  - rule: ".gitignore:184  /tests/unit/test_notifiers.py"
+  - rule: ".gitignore:206  /tests/unit/test_notifiers.py"
     count: 1
     sample: ["tests/unit/test_notifiers.py"]
-  - rule: ".gitignore:176  /tests/unit/test_rescore_purge.py"
+  - rule: ".gitignore:198  /tests/unit/test_rescore_purge.py"
     count: 1
     sample: ["tests/unit/test_rescore_purge.py"]
-  - rule: ".gitignore:179  /tests/unit/test_script_cost_guard.py"
+  - rule: ".gitignore:201  /tests/unit/test_script_cost_guard.py"
     count: 1
     sample: ["tests/unit/test_script_cost_guard.py"]
-  - rule: ".gitignore:180  /tests/unit/test_sector_crowding.py"
+  - rule: ".gitignore:202  /tests/unit/test_sector_crowding.py"
     count: 1
     sample: ["tests/unit/test_sector_crowding.py"]
 
@@ -208,8 +205,6 @@ paths:
   - "docs/mainline_iterations/head_quality.json"
   - "docs/mainline_iterations/per_board_fit.json"
   - "docs/mainline_iterations/pool_quality.json"
-  - "docs/面试准备_竞价选股量化项目.archived.md"
-  - "docs/面试准备_竞价选股量化项目.md"
   - "scripts/_audit_llm_coverage.py"
   - "scripts/_audit_purification.py"
   - "scripts/_backfill_extract.py"
@@ -332,8 +327,6 @@ paths:
   - "scripts/frp_watchdog_hidden.vbs"
   - "scripts/frpc.toml.example"
   - "scripts/frpc_start.ps1"
-  - "scripts/gen_resume_v2.py"
-  - "scripts/gen_resume_v3.py"
   - "scripts/gen_sector_blacklist.py"
   - "scripts/head_vol_gate_report.py"
   - "scripts/import_mainline_backtests.py"

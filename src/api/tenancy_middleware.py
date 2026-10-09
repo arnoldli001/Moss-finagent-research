@@ -214,13 +214,97 @@ def _principal_from_headers(request: Request) -> Principal | None:
                      auth_source="header-dev")
 
 
-def resolve_principal(request: Request) -> Principal | None:
-    """从请求派生身份。凭证优先，请求头仅在开发开关打开时兜底。"""
+async def principal_from_session(request: Request) -> Principal | None:
+    """★ **会话 Cookie → Principal 的桥**（`CHG-0192` / 债 #10）。
+
+    ## 为什么必须有它
+
+    本项目有**两套凭证**，各自只认自己那套：
+
+    | 层 | 认什么 | 作用 |
+    |---|---|---|
+    | `LoginGateMiddleware` | 会话 Cookie（`moss_sid`） | "这个浏览器登录了吗" |
+    | `TenancyMiddleware` | `Authorization: Bearer <签名令牌>` | "这个请求的身份是谁" |
+
+    于是 `MOSS_TENANCY_ENFORCE=1` **不能直接打开**：浏览器带着合法会话 Cookie 进来，
+    而租户中间件看不到 Bearer ⇒ 认不出身份 ⇒ 按"默认拒绝"回 **401**。
+    表现是"登录成功但每个接口都 401"，且没有任何报错线索。
+
+    ## 三个复用（不另写第二份判断）
+
+    1. **会话有效性** —— 走 `LoginGateMiddleware._session_is_alive()`（它已封装
+       "未撤销 ＋ 未超滑动期 ＋ 未超 12h 绝对上限 ＋ 账号 active"）；
+    2. **租户口径** —— 用 `SessionRecord.tenant_id`（仓储里就有），
+       与运维页的租户列同源；
+    3. **"谁是管理员"** —— 用 `admin.ADMIN_TIER`（那是管理端 `require_admin`
+       的判据），**不在这里重新定义一次**。
+
+    ## 权限映射（最小权限原则）
+
+    * `applied_tier == ADMIN_TIER` ⇒ `Role.ADMIN`；否则**只给 `Role.RESEARCHER`**；
+    * `clearance` 给 `INTERNAL`（不是 CONFIDENTIAL/RESTRICTED —— 那些要显式授予）；
+    * `wall_group` 给 `platform`（不是 research —— 研究墙要求更严）。
+
+    ⚠️ 这里**不写**"tier=vip 就给 PM/TRADER"这类映射：那一层属于业务授权，
+    应当在 `policy.authorize()` 的动作表里表达，而不是在这里按套餐猜角色。
+    """
+    from src.api.routes.admin import ADMIN_TIER
+    from src.api.routes.auth import COOKIE_SESSION, get_auth_service
+
+    session_id = request.cookies.get(COOKIE_SESSION, "")
+    if not session_id:
+        return None
+    try:
+        session, user = await get_auth_service().validate_session(session_id)
+    except Exception:  # noqa: BLE001 身份解析异常按"未认证"处理（fail-closed）
+        logger.warning("会话身份解析异常，按未认证处理", exc_info=True)
+        return None
+    if session is None or user is None:
+        return None
+    if str(getattr(user, "status", "")) != "active":
+        # 停用/过期账号的旧会话：立刻失效，不等 30 分钟
+        return None
+
+    tier = str(getattr(user, "applied_tier", "") or "")
+    roles = (frozenset({Role.ADMIN}) if tier == ADMIN_TIER
+             else frozenset({Role.RESEARCHER}))
+    tenant_id = str(getattr(session, "tenant_id", "") or tier)
+    return Principal(
+        user_id=str(user.user_id),
+        tenant_id=tenant_id,
+        session_id=str(getattr(session, "session_id", "") or session_id),
+        roles=roles,
+        clearance=DataClass.INTERNAL,
+        wall_group=WallGroup.PLATFORM,
+        auth_source="session",
+    )
+
+
+async def resolve_principal(request: Request) -> Principal | None:
+    """从请求派生身份。**三层**：Bearer 令牌 → 会话 Cookie → 开发用请求头。
+
+    ③ 请求头那层只在 `MOSS_ALLOW_HEADER_IDENTITY=1` 时生效（单机开发），
+    且带 `auth_source=header-dev` 标记，审计里一眼能区分。
+
+    ⚠️ `async` 是 `CHG-0192` 改的：会话校验要查库（`await`）。
+    这是**唯一的身份入口**，所以改它的签名要同步改唯一调用点
+    （`TenancyMiddleware.dispatch`）。
+
+    ⚠️ **对外部调用方的迁移提示**：本函数在 `CHG-0192` 之前是**同步**的。
+    仓库内唯一调用点已改；若仓库外还有调用方（脚本/私有模块），
+    必须补 `await` —— 不补的话拿到的是一个 **coroutine 对象（恒真）**，
+    于是"每个请求都被当成有身份"，而 `principal.user_id` 之类的访问会抛错
+    或静默给出错误身份（**静默提权**这一点有判据钉住：
+    `test_dispatch_awaits_the_principal_resolution`）。
+    """
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
         principal = principal_from_token(auth[7:].strip())
         if principal is not None:
             return principal
+    principal = await principal_from_session(request)
+    if principal is not None:
+        return principal
     return _principal_from_headers(request)
 
 
@@ -242,7 +326,7 @@ class TenancyMiddleware(BaseHTTPMiddleware):
         if path in self._public or path.startswith(("/assets/", "/static/")):
             return await call_next(request)
 
-        principal = resolve_principal(request)
+        principal = await resolve_principal(request)
         bypass = principal is None and not enforcement_enabled()
         if bypass:
             principal = _LOCAL_DEV
@@ -283,6 +367,7 @@ __all__ = [
     "TenantAuditLog",
     "describe_enforcement",
     "enforcement_enabled",
+    "principal_from_session",
     "principal_from_token",
     "resolve_principal",
 ]

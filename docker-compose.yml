@@ -1,4 +1,13 @@
-# Demo本地依赖：PostgreSQL + Redis（DEPLOYMENT.md 3.2）
+# 本地依赖 + 应用服务（DEPLOYMENT.md 3.2）
+#
+# ★ `CHG-0192`（债 #17）：补上 `app` 服务 —— 原先 compose 里**只有中间件**，
+#   于是"`docker compose up -d` 之后应用在哪"没有答案（只能自己去写 `docker run`，
+#   而那条命令的参数与 Dockerfile 的约定（探针路径 / 非 root 用户 / 卷权限）
+#   很容易漂移）。现在两者同源。
+#
+# ⚠️ 已知冲突（债 #5，未修）：`app` 用 `--workers 2`，而图形码 / IP 限流 / 幂等 /
+#   WS 告警广播 / 熔断桶都是**进程内状态** ⇒ 多 worker 下各自计数（静默失效，
+#   不报错）。要把 `app` 当生产用，先做那件事（外置到 Redis）。
 
 services:
   postgres:
@@ -18,6 +27,34 @@ services:
     container_name: moss-finagent-redis
     ports:
       - "6379:6379"
+
+  app:
+    build: .
+    container_name: moss-finagent-app
+    # 依赖只保证"先起"，**不保证"可用"** —— 应用侧对不可达的中间件是
+    # fail-open/降级（见 repositories/cached_repo.py），所以这里用 depends_on
+    # 就够了；用 healthcheck 条件反而会把启动顺序变成硬失败。
+    depends_on:
+      - postgres
+      - redis
+    environment:
+      # ★ 默认仍是 SQLite（零依赖好部署）；要用 PG 就设 DATA_BACKEND=postgres，
+      #   但**必须先完成 RLS 会话变量接线**，否则启动期会明确拒绝
+      #   （见 security/rls.py:session_vars_supported() 与 api/main.py 的守卫）。
+      DATA_BACKEND: ${DATA_BACKEND:-sqlite}
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgresql://moss_finagent:moss_finagent@postgres:5432/moss_finagent}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # 凭据一律从宿主环境注入，**不写进本文件**（本文件会入库）
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      MOSS_SQLITE_PATH: /app/data/moss_finagent.db
+    ports:
+      - "8100:8100"
+    volumes:
+      # ⚠️ 容器以非特权用户（uid 10001）运行 ⇒ 宿主 ./data 必须可写：
+      #    mkdir -p ./data && sudo chown -R 10001:10001 ./data
+      - ./data:/app/data
+      - ./configs:/app/configs:ro
+    restart: unless-stopped
 
 volumes:
   pgdata:

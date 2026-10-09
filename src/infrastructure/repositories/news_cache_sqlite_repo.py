@@ -63,8 +63,12 @@ class NewsCacheRepository(ABC):
         """写入/更新某键缓存。"""
 
     @abstractmethod
-    async def prune(self, before_fetch_time: str) -> int:
-        """删除 fetch_time 早于给定 ISO 时间的行，返回删除行数。"""
+    async def prune(self, before_fetch_time: str, *,
+                    dry_run: bool = False) -> int:
+        """删除 fetch_time 早于给定 ISO 时间的行，返回行数。
+
+        `dry_run=True`：**只数不改**（与删除共用同一 WHERE）。
+        """
 
 
 class NewsCacheSqliteRepository(NewsCacheRepository):
@@ -142,17 +146,28 @@ class NewsCacheSqliteRepository(NewsCacheRepository):
             self._upsert_sync, cache_key, scope, items,
             fetch_time, latest_publish_time)
 
-    def _prune_sync(self, before_fetch_time: str) -> int:
+    #: 保留期口径的 WHERE —— **删除与计数共用同一份**（理由见 ABC 的 `prune`）。
+    _PRUNE_WHERE = "fetch_time < ?"
+
+    def _prune_sync(self, before_fetch_time: str, *,
+                    dry_run: bool = False) -> int:
         self._ready_once()
         with self._connect() as conn:
+            if dry_run:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM news_cache WHERE {self._PRUNE_WHERE}",
+                    (before_fetch_time,)).fetchone()
+                return int(row[0] or 0) if row else 0
             cursor = conn.execute(
-                "DELETE FROM news_cache WHERE fetch_time < ?",
+                f"DELETE FROM news_cache WHERE {self._PRUNE_WHERE}",
                 (before_fetch_time,),
             )
             return cursor.rowcount
 
-    async def prune(self, before_fetch_time: str) -> int:
-        return await asyncio.to_thread(self._prune_sync, before_fetch_time)
+    async def prune(self, before_fetch_time: str, *,
+                    dry_run: bool = False) -> int:
+        return await asyncio.to_thread(self._prune_sync, before_fetch_time,
+                                       dry_run=dry_run)
 
 
 def now_iso() -> str:

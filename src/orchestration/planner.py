@@ -8,7 +8,9 @@ PRD要求"Supervisor通过LLM动态决策任务执行顺序"。本模块用LLM�
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
 
 from src.domain.agents.analysis.base import parse_llm_json
 from src.infrastructure.llm import LLMGateway
@@ -20,14 +22,30 @@ logger = logging.getLogger(__name__)
 #: 不另造数字 —— `_ATTEMPT_BUDGET["light"]` 的 20s 是 2026-09-26 实测定的
 #: （比云端 p90 18.3s 略宽、又远小于本地模型的 45s）。
 #:
-#: **为什么必须显式给**（2026-09-28 实测）：`light` 层钉了 `local_only: true`
-#: （防静默降级到付费云端），`complete()` 在 `pin_local` 时把降级链**裁到 1 跳**
+#: **为什么必须显式给**（2026-09-28 实测）：~~`light` 层钉了 `local_only: true`
+#: （防静默降级到付费云端），`complete()` 在 `pin_local` 时把降级链**裁到 1 跳**~~
 #: —— 而延迟预算的启发式写着"最后一跳不设预算"（怕把"慢但正确"变成"必然失败"）。
 #: 两者交叉出的结果：本地模型挂死时，规划层**裸调到 HTTP 120s 超时**。
 #:
-#:     实测（`scripts/_e2e_timing_probe.py`，astream 逐节点计时）：
+#: ⚠️ **前提已废止，但这条修复一分都不能撤**（2026-10-05 核对，`CHG-0175`）：
+#: `light` 层的 `local_only: true` 早在 2026-09-28 就被移除了
+#: （见 `configs/models.yaml` 里那一行"⚠️ 原 `local_only: true` 已移除"）
+#: ⇒ "降级链被裁到 1 跳"这个**初始条件不存在了**。
+#: **但病因只是换了入口**：现行规划链是
+#: `qwen-dashscope-flash → deepseek-flash → local_light`，**链尾就是本地**，
+#: 而 `gateway.py` 的 `(has_next or explicit)` 仍然放行链尾裸调 ——
+#: "没有显式预算 ⇒ 本地挂死 ⇒ 拿满 HTTP 120s"这条路**原样成立**。
+#: 判据：这条守的是「**链尾必须有预算**」，不是「**单跳链必须有预算**」。
+#: （同款缺口在 A05–A17 上仍在：它们不传 `attempt_budget_sec`，而它们的链尾
+#:  同样是 `local_medium`。实测 A09/A11/supervisor_planner 各出现过
+#:  一次"等满 120.3s 且零产出"。见 `CHG-0175` 的取证。）
+#:
+#:     实测（`scripts/e2e_timing_probe.py`，astream 逐节点计时）：
 #:       supervisor_planner  in=0 out=0  120294ms
 #:       端到端 123.45s，其中这一个节点吃掉 120.31s，后面 19 个节点共 3.1s
+#:     ⚠️ 文件名是 `e2e_timing_probe.py`（**没有前导下划线**）。此处原写作
+#:        `_e2e_timing_probe.py`，而那个名字 `git log --all` 里**从未存在过** ——
+#:        等于把一个可复跑的数字挂在一个查不到的引证上（`CHG-0175` 一并修正）。
 #:
 #: 显式传入后，超时被 `asyncio.wait_for` 在预算处中断 → 落到下面的规则式规划兜底。
 #: 实测端到端 **123.45s → 12.22s**（10 倍）。
@@ -326,12 +344,18 @@ _PLAN_SCHEMA = (
 #:
 #: 调大上限治不了 —— 它只决定"截在哪"。受约束解码从**语法**上禁止
 #: 失控输出（枚举锁死 analysis_type、字符串不许逃逸），既治截断也治解析失败。
+#: `analysis_type` 的合法取值 —— **唯一来源**：schema 的 enum 与 `PlanResult`
+#: 的字面量联合都从它派生（判据 `test_planner_contract.py` 钉住三方一致）。
+_PLAN_ANALYSIS_TYPES: tuple[str, ...] = (
+    "macro", "industry", "stock", "news", "full",
+)
+
 _PLAN_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "analysis_type": {
             "type": "string",
-            "enum": ["macro", "industry", "stock", "news", "full"],
+            "enum": list(_PLAN_ANALYSIS_TYPES),
         },
         "target": {"type": "string"},
         "agents": {"type": "array", "items": {"type": "string"}},
@@ -340,6 +364,36 @@ _PLAN_JSON_SCHEMA: dict[str, Any] = {
     },
     "required": ["analysis_type", "agents"],
 }
+
+
+class PlanResult(BaseModel):
+    """规划结果的**类型契约**（`CHG-0192`）。
+
+    ## 为什么需要一个模型，而不是继续返回裸 dict
+
+    `plan()` 的返回值被 `supervisor` 按**键名**逐处消费（`plan` / `indicators` /
+    `analysis_type` / `target` / `reasoning`）。在此之前它有**两份各自手写的口径**：
+
+      1. `_PLAN_JSON_SCHEMA`（给受约束解码用的 JSON Schema）；
+      2. `plan()` 末尾手写的 `return {...}` 字面量。
+
+    两者**没有任何机器判据保证一致** —— 往一处加字段、另一处忘了改，不会有任何报错，
+    只会在下游表现为"某个字段是 None"。实测：它们当前**恰好一致**（5 键对 5 键），
+    但那是**巧合**，不是约束。
+
+    现在模型成为类型与校验的落点，判据
+    `tests/unit/test_planner_contract.py` 断言**三方一致**：
+    模型字段 == schema properties == `plan()` 实际返回的键。
+
+    ⚠️ `analysis_type` 用字面量联合（与 schema 的 `enum` 同一份取值）——
+    多一个取值就会在模型层报错，而不是在 supervisor 里静默走 `else`。
+    """
+
+    analysis_type: Literal["macro", "industry", "stock", "news", "full"]
+    target: str = ""
+    agents: list[str] = Field(default_factory=list)
+    indicators: list[str] = Field(default_factory=list)
+    reasoning: str = ""
 
 
 class LLMSupervisorPlanner:
@@ -485,10 +539,18 @@ class LLMSupervisorPlanner:
         if not isinstance(indicators, list):
             indicators = []
         indicators = [str(i) for i in indicators if isinstance(i, str)][:20]
-        return {
-            "analysis_type": str(data.get("analysis_type", "full")),
-            "target": str(data.get("target", target or "")),
-            "agents": agents_plan,
-            "indicators": indicators,
-            "reasoning": str(data.get("reasoning", ""))[:200],
-        }
+        # ★ 经**类型契约**收口（`CHG-0192`）：字段名与取值不再靠手写对齐 schema。
+        #   `analysis_type` 不在枚举里时回落到 `"full"`（与 `_PLAN_JSON_SCHEMA` 的
+        #   enum 同一份取值；受约束解码本就该保证它在枚举内，这里是**兜底**）。
+        #   返回 `.model_dump()` 而不是模型本身：下游按键消费，dict 是既有契约。
+        raw_type = str(data.get("analysis_type", "full"))
+        if raw_type not in _PLAN_ANALYSIS_TYPES:
+            logger.warning("规划返回未知 analysis_type=%r，回落 full", raw_type)
+            raw_type = "full"
+        return PlanResult(
+            analysis_type=raw_type,            # type: ignore[arg-type]
+            target=str(data.get("target", target or "")),
+            agents=agents_plan,
+            indicators=indicators,
+            reasoning=str(data.get("reasoning", ""))[:200],
+        ).model_dump()

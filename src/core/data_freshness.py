@@ -1,6 +1,6 @@
 """数据新鲜度评估模块——指数衰减置信度 + 五级分级 + 行业周期倍数。
 
-参考设计文档：C:\\Users\\Administrator\\Desktop\\简历\\投研分析系统\\数据时效性设计.md
+参考设计文档：`docs/DATA_FRESHNESS_ARCHITECTURE.md`
 
 核心公式：
   confidence = exp(-λ × days_since / (publish_cycle_days × industry_multiplier))

@@ -168,11 +168,30 @@ async def _ensure_etf_shares_later(delay: float = 3.0) -> None:
 #: 预热与首屏抢磁盘，把 `/health` 从 3.7 秒拖成 54~142 秒、把一次 27 秒的
 #: 选股拖成 828 秒）。重启后的头几秒正是"一波用户同时打开面板"的时刻。
 #:
-#: 取 60 秒（比 `_BACKGROUND_WARM_DELAY=600` 短得多）的理由：本条预热的代价
-#: 只有**一次 15 GiB 行情仓的冷打开**（实测 3.87 秒，之后重算仅 231 ms），
-#: 比"akshare 子进程 + 十几个板块网络取数"轻一个数量级；60 秒已足够让
-#: 首屏那一波过去，而预热仍然落在同一次重启窗口内、对用户有意义。
-_FUNDFLOW_WARM_DELAY = 60.0
+#: ## ★ 2026-10-02：从 60 秒降到 8 秒（真机实测依据）
+#:
+#: 原值 60 秒的理由是"这条预热只有一次行情仓冷打开、很轻"，于是**排在首屏之后**。
+#: 但它排得太靠后了。带 Cookie 打真实接口实测（`/api/v1/fundflow/snapshot`）：
+#:
+#:     首次（进程内缓存冷）        3578 ms  ← 15 GiB 行情仓冷打开，**一个进程只付一次**
+#:     缓存命中（TTL 内）            31 ms
+#:     强制重建 #1（仓已热）         360 ms
+#:     强制重建 #2 / #3          297 / 359 ms
+#:
+#: 即 **3.5 秒是"每进程一次"的成本，重算只要 0.3 秒**。原实现把这唯一一次成本
+#: 留给"重启后第一个打开资金流页签的用户" —— 而用户报障正是
+#: 「板块资金流、个股资金流 也一样等待很久才刷出数据」。
+#: 预热的全部意义就是**让这 3.5 秒发生在没人等的时刻**；60 秒等于没做
+#: （资金流是二级页签，用户常在几秒内就点进去）。
+#:
+#: 取 8 秒：与本仓库既有预热档位同一区间（`_warm_llm_cache_index`=5、
+#: `_warm_external_sources`=8、`_warm_column_index`=8、`_warm_quant_data_status`=12）。
+#:
+#: ⚠️ **它不会堵事件循环**（这是敢把时间提前的前提）：`_build` 的重活都在工作
+#: 线程里 —— `provider.sector_snapshot()` 走
+#: `asyncio.to_thread(self._sector_frame_sync)`，`stock_frame` 同理。
+#: 所以这里要防的是**磁盘/CPU 争抢**，不是循环阻塞。
+_FUNDFLOW_WARM_DELAY = 8.0
 
 
 async def _warm_fundflow(runtime: Any,
@@ -198,6 +217,44 @@ async def _warm_fundflow(runtime: Any,
         logger.info("资金流快照预热失败（忽略，按需自算）：%s", type(exc).__name__)
         return
     logger.info("资金流快照预热完成：%.2fs", time.monotonic() - t0)
+
+
+async def _warm_mainline_win_rates(*, delay: float = 8.0) -> None:
+    """后台预热主线「板块 20 日胜率」（`/api/v1/mainline/board-win-rates`）。
+
+    ## 实测依据（2026-10-02，真机 + Cookie）
+
+        主线·板胜率 #1（进程内缓存冷）    781 ms
+        主线·板胜率 #2（缓存命中）          32 ms
+
+    0.78 秒不算灾难，但它**每进程只冷一次**、且正好落在用户点开
+    「告警流水」或「回测报告」页签的那一刻 —— 切页签先卡 0.8 秒。
+    预热把它挪到没人等的时刻。
+
+    ## 两条纪律
+
+    1. **参数必须与路由同源**：它调 `warm_board_win_rates()`，而后者与
+       `/board-win-rates` 路由共用 `_win_rate_request()`。本项目在
+       `_warm_quant_data_status` 上踩过"预热键写死 → 静默失效"的坑。
+    2. **失败只记日志**：预热是增益，不是启动的前置条件。
+
+    延迟 8 秒：与本仓库其它预热档位同一区间，够首屏那一波过去。
+    """
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        raise
+    started = time.monotonic()
+    try:
+        from src.api.routes.mainline import warm_board_win_rates  # noqa: PLC0415
+
+        info = await warm_board_win_rates()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 预热失败不影响任何业务功能
+        logger.info("主线板块胜率预热失败（忽略，按需自算）：%s", type(exc).__name__)
+        return
+    logger.info("主线板块胜率预热完成：%.2fs %s", time.monotonic() - started, info)
 
 
 async def _warm_quant_data_status(*, delay: float = 12.0) -> None:
@@ -651,6 +708,20 @@ async def lifespan(app: FastAPI):
             logger.warning("启动自愈：%s %s", outcome.path, outcome.reason)
         elif not outcome.healthy:
             logger.error("启动检查：%s 不可用（%s）", outcome.path, outcome.reason)
+    # ★ `CHG-0192`：**拒绝"PG 后端 + RLS 会话变量未接线"的组合**。
+    #
+    # 为什么必须在启动期拦：`security/rls.postgres_rls_ddl()` 生成的策略依赖
+    # `SET LOCAL app.tenant_id`，而那个前提在代码里**不存在**。运维若照 DDL 建策略，
+    # `current_setting('app.tenant_id', true)` 返回 NULL ⇒ 每条
+    # `USING (tenant_id = NULL)` 都不成立 ⇒ **应用一行都查不到**
+    # （不是"隔离了"，是"数据不可见"）。这类静默故障只能在启动期变成显式失败。
+    #
+    # 判据是**单一实现**（`assert_backend_can_start`），另一个调用点在
+    # `manage.py::_prepare_environment`（更便宜的失败点，且覆盖不启动 API 的命令）。
+    # 这里再查一次是为了兜住"绕过 manage 直接起 uvicorn"的路径。
+    from src.infrastructure.security.rls import assert_backend_can_start
+
+    assert_backend_can_start(getattr(settings, "data_backend", ""))
     runtime = build_runtime()
     app.state.runtime = runtime
     # 个股「关联板块 / 海外映射」绑定**启动时热加载**（用户口径 2026-09-23）。
@@ -881,6 +952,11 @@ async def lifespan(app: FastAPI):
     # 冷算实测 7.18s（公网首屏 13.09s）。它已经不在事件循环上（不会再拖累别人），
     # 这里再把"第一个用户"这一次也摘掉。见 _warm_quant_data_status。
     _bg_run("quant-data-status-warm", _warm_quant_data_status())
+    # ★ 主线「板块 20 日胜率」预热（2026-10-02）：冷算实测 781 ms、命中 32 ms。
+    #   它落在"点开「告警流水」/「回测报告」页签"那一刻，切页签先等 0.8 秒
+    #   就是"这个页签有点卡"。预热参数与 `/board-win-rates` 路由**同源**
+    #   （`_win_rate_request`），否则缓存键对不上、预热静默失效。
+    _bg_run("mainline-win-rates-warm", _warm_mainline_win_rates())
     # ★ 列级数据资产索引预热：**查询本身是微秒级**（0.029ms），
     #   代价全在首次建索引的 ~1.7s（扫 204 张表的 列×行数×MAX(时间)）。
     #   不预热的话，A17 的 query_data 走"本地库兜底"时第一个用户要等这一下。
@@ -961,18 +1037,16 @@ async def lifespan(app: FastAPI):
     # 中断 —— 后面的 `repo.close()` 与**WAL checkpoint 全部没执行**，
     # 于是下次启动又读到脏 `-wal`/`-shm`，前端又要等一分钟。
     # 关停是"尽力而为"，任何一句失败都不该影响其余收尾。
-    for label, closer in (
-        ("事件告警仓储", getattr(runtime.event_repo, "close", None)),
-        ("做T权重档案仓储", getattr(runtime.intraday_profile_repo, "close", None)),
-        ("资金流选择列表仓储", getattr(runtime.fundflow_repo, "close", None)),
-        ("主数据点仓储", getattr(runtime.repo, "close", None)),
-    ):
-        if closer is None:
-            continue                      # 未装配、或该仓储不需要显式关闭
-        try:
-            await closer()
-        except Exception:  # noqa: BLE001 关停尽力而为，绝不互相拖累
-            logger.warning("%s 关闭失败（继续关停收尾）", label, exc_info=True)
+    #
+    # ★ `CHG-0192`：清单从"这里手写 4 个仓储"收口到 `Runtime.aclose()` ——
+    #   因为**真正持有资源的是 Agent**（A19 会建连接、将来的插件会持句柄），
+    #   而手写清单在新增 Agent 时没人会想起来改。
+    #   `exclude=("intraday",)`：做T是在取消在飞任务**之前**显式关的（见上），
+    #   这里跳过它 —— 清单收口但**关停顺序一点没变**。
+    failed = await runtime.aclose(exclude=("intraday",))
+    if failed:
+        logger.warning("关停：以下对象关闭失败（已跳过，继续收尾）：%s",
+                       ", ".join(failed))
     # 关停收尾：把所有登记过的 SQLite 连接 checkpoint 后关闭，并把主库的 WAL
     # 收干。硬杀（taskkill /F）时这段不会执行 —— 那正是下次启动读到陈旧
     # `-wal`/`-shm` 的原因；能走到这里的优雅关停至少要留下一个干净的库。
@@ -987,6 +1061,15 @@ async def lifespan(app: FastAPI):
                     released, cleaned)
     except Exception:  # noqa: BLE001 checkpoint 失败不能把关停搞崩
         logger.warning("关停 checkpoint 失败（不影响进程退出）", exc_info=True)
+    # ★ `CHG-0174`：追踪要 flush 再关 —— `BatchSpanProcessor` 里还有未导出的
+    #   span，直接退出会把最后 2 秒（`_SCHEDULE_DELAY_MS`）的活动**静默丢掉**。
+    #   失败不影响退出（观测器的故障不许变成进程的故障）。
+    try:
+        from src.infrastructure.observability.tracing import shutdown_tracing
+
+        shutdown_tracing()
+    except Exception:  # noqa: BLE001
+        logger.debug("OTel 关停收尾失败（忽略）", exc_info=True)
     shutdown_infra_executors()
 
 
@@ -1082,6 +1165,19 @@ app.add_middleware(TenancyMiddleware)
 # 放在最外层的原因：它要把上下文包住下面所有中间件与路由（含它们
 # `create_task` 出来的后台任务），这样"钱花在哪个功能上"才是精确的。
 app.add_middleware(AccountingMiddleware)
+# ★ `CHG-0174`：把 `trace_id` 回写到响应头（排障时"把 X-Trace-Id 给我"）。
+#
+# ⚠️ **注册顺序是语义，不是风格**：Starlette「后注册的在更外层」，所以本行
+#    必须在下面 `init_tracing(app)` **之前**，否则它跑在 span 之外、
+#    `current_trace_id()` 恒为 None、响应头永远不出现 —— 而且不报错。
+#    实证见 `scripts/_otel_e2e_verify.py`（它按响应头取 trace_id）。
+try:
+    from src.infrastructure.observability.tracing import TraceIdHeaderMiddleware
+
+    app.add_middleware(TraceIdHeaderMiddleware)
+except Exception:  # noqa: BLE001 观测器装不上不许影响应用
+    logger.warning("X-Trace-Id 中间件装配失败（追踪仍可用，只是响应头缺失）",
+                   exc_info=True)
 # ★ `CHG-0146`：**唯一**的 API 挂载点，顺手把"在飞登记"依赖挂上。
 #
 # 为什么必须挂在这里（而不是 `api_router.dependencies.append(...)`）：
@@ -1092,6 +1188,20 @@ app.add_middleware(AccountingMiddleware)
 #   ① 依赖挂在**唯一的 include 点**上；
 #   ② 判据改成**行为**判据（真发一个请求、断言登记被调用），不看形状。
 app.include_router(api_router, dependencies=[Depends(_mark_inflight)])
+
+# ★ `CHG-0174`：OpenTelemetry 追踪。**最后注册 ⇒ 最外层** ⇒ span 覆盖
+#   上面全部中间件与所有路由（否则 OTel 的 span 里看不到 tenancy/记账/在飞）。
+#
+# 默认**关闭**（`MOSS_OTEL_ENABLED` 未设即为空）：本项目默认零依赖可跑。
+# 开了但没装 `--extra otel` 时，`init_tracing()` 如实返回 `no_sdk` 并
+# **完全不影响应用**（fail-open）；状态可用 `tracing.status()` 现读。
+try:
+    from src.infrastructure.observability.tracing import init_tracing
+
+    _OTEL_STATUS = init_tracing(app)
+except Exception:  # noqa: BLE001 追踪坏掉不许带走应用
+    _OTEL_STATUS = None
+    logger.warning("OTel 追踪装配失败（应用不受影响）", exc_info=True)
 
 
 # ============ 根级存活探针 `/healthz`（`CHG-0128`）============

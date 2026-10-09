@@ -295,7 +295,7 @@ PCB/散热。跟着产业链逻辑找低位关联方向，比跟着涨幅追高�
 | fedwatch_daily | `30 9 * * *` | CME FedWatch（空结果记成功+缺口） |
 
 作业经完整 A01→A02→A03→A04 链路入库；单指标失败不阻断其余指标，错误逐个记录到
-作业运行结果。零依赖演示模式由 `src/scheduler/service.py` 进程内 CronScheduler 随
+作业运行结果。零依赖试运行模式由 `src/scheduler/service.py` 进程内 CronScheduler 随
 FastAPI 启动（分钟对齐、防重叠、连续失败自动暂停）；生产用 Celery Beat
 （`src/scheduler/celery_app.py`，Redis broker）。cron 单一事实源为
 `src/scheduler/registry.py`，运行记录见 `/api/v1/scheduler` 与 `data/scheduler/`。

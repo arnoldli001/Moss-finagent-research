@@ -111,9 +111,49 @@ def test_json_mode_is_part_of_scope(tmp_dir):
 
 
 def test_scope_defaults_to_legacy_behaviour_for_audit_hash():
-    """不传 scope 时退化为只看 (system, prompt) —— 审计用的 prompt_hash 依赖这点。
+    """不传 scope 时只按 (system, prompt) 定键，且能被 scope 区分开。
 
-    `prompt_hash` 要标识 **prompt 本身**，与调用条件无关，不能带 scope。
+    ⚠️ 这个返回值是**缓存键**，不是审计的 `prompt_hash`（`CHG-0176` 之后
+    审计走 `cache.prompt_fingerprint()`，见 `test_prompt_fingerprint.py`）。
+    本用例只钉"同一输入恒等 + scope 有效"。
     """
     assert cache_key("系统", "问题") == cache_key("系统", "问题", scope="")
     assert cache_key("系统", "问题") != cache_key("系统", "问题", scope="light")
+
+
+# ======================================================================
+# 命中行不许回放原始的排队/模型侧耗时（`CHG-0177`）
+# ======================================================================
+
+def test_cache_hit_clears_wait_and_model_ms(tmp_dir):
+    """★ 命中时 `wait_ms` / `model_ms` 必须是 `None`，**不许**回放原始那次的数。
+
+    ## 为什么（这条会防一个方向反了的统计）
+
+    存进缓存的是**原始那次调用**的响应。它的 `wait_ms` 描述的是那一次，
+    而这一次**根本没碰模型** —— 既没排队也没让模型干活。若原样回放，任何
+    "本地平均排队时长"的统计会把命中行也算进去 ⇒
+    **命中越多、面板上的排队越显得严重**，方向完全反了，且没有任何报错。
+
+    ## 为什么 `latency_ms` 故意**不**一起清
+
+    它已有消费者（`metrics` 的延迟分位）依赖"命中行回放原始耗时"这一既有口径；
+    改它属于另一件事，不在本次半径内。这条断言只钉新增的两个字段，
+    并**显式记录** `latency_ms` 的口径未变（免得下一个人以为漏改了）。
+    """
+    cache = LLMCache(cache_dir=tmp_dir, ttl_hours=1)
+    resp = LLMResponse(
+        content="答案", model_used="qwen3.5:4b", provider="ollama",
+        prompt_hash="ph", response_hash="rh",
+        latency_ms=210_136, wait_ms=90_000, model_ms=120_136,
+    )
+    cache.put("系统", "问题", resp)
+
+    hit = cache.get("系统", "问题")
+    assert hit is not None
+    assert hit.wait_ms is None, (
+        f"命中行回放了原始排队耗时 {hit.wait_ms}ms —— 会把命中算成排队，"
+        "统计方向反了")
+    assert hit.model_ms is None
+    # 既有口径逐字不变：命中行仍然回放原始 latency_ms（有消费者依赖它）
+    assert hit.latency_ms == 210_136

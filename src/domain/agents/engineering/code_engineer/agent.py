@@ -144,9 +144,13 @@ _SYSTEM_PROMPT = (
 class CodeEngineerAgent(BaseAgent):
     """A19：数据缺口自动发现与连接器代码生成。"""
 
-    def __init__(self, gateway: LLMGateway, agent_id: str = "A19_code_engineer") -> None:
+    def __init__(self, gateway: LLMGateway, agent_id: str = "A19_code_engineer",
+                 *, router: Any = None) -> None:
         super().__init__(agent_id)
         self._gateway = gateway
+        #: 活的路由表（`ConnectorRouter`）。**必须注入**才能让新连接器真的生效 ——
+        #: 见 `_attach_to_live_router` 与 `CHG-0192`。
+        self._router = router
 
     def get_capabilities(self) -> dict[str, Any]:
         return {
@@ -271,8 +275,16 @@ class CodeEngineerAgent(BaseAgent):
         if not registered:
             raise AgentExecutionError("连接器写入后未能加载")
         connector = registered[0]
-        steps.append(TraceStep(step=5, step_type="data_retrieval",
-                               description=f"已写入{file_name}并加载到路由"))
+        # ★★ 最后一公里：把新连接器挂到**活路由表**上（`CHG-0192` 修的缺陷）。
+        #   原先只调 `loader.reload()` —— 那只是**返回了一个新列表**，而活 router
+        #   的 `self._routes` 在构造期就固定了 ⇒ 这个进程永远路由不到新连接器
+        #   （要重启才生效），可结论文案却写着"下次采集即可使用"。
+        attached = self._attach_to_live_router(routes, connector)
+        steps.append(TraceStep(
+            step=5, step_type="data_retrieval",
+            description=(f"已写入{file_name}并加载到路由"
+                         if attached else
+                         f"已写入{file_name}（未注入活路由表，需重建路由后生效）")))
 
         # --- Step 6: 实测fetch ---
         sample = await self._test_fetch(connector, indicator_hint)
@@ -288,7 +300,10 @@ class CodeEngineerAgent(BaseAgent):
             f"已为「{gap_description or indicator_hint}」生成并注册动态连接器"
             f"{class_name}，实测获取{len(sample)}条数据。"
             f"数据源: {source_hint}，建议更新频率: {schedule}。"
-            "连接器已热加载到数据路由，下次采集即可使用。"
+            + ("连接器已挂上活路由表（链尾，顺序即优先级），本次进程内即可路由到它。"
+               if attached else
+               "连接器已写入并加载，但**本进程未注入活路由表** —— "
+               "需重建路由（重启或显式 refresh_routes）后才会被路由到。")
         )
 
         return AgentOutput(
@@ -311,6 +326,43 @@ class CodeEngineerAgent(BaseAgent):
         )
 
     # ---------- 内部方法 ----------
+
+    def _attach_to_live_router(
+        self,
+        routes: list[tuple[Any, Any]],
+        connector: Any,
+    ) -> bool:
+        """把新加载的连接器挂到活路由表。返回**是否真的挂上了**。
+
+        ## 为什么返回值必须如实反映"挂没挂上"
+
+        这是本仓库最贵的一类缺陷的形状：**声称与行为不一致**。
+        没有注入 router 时（装配期未接线 / 独立调用该 Agent），
+        我们必须能对外说"没生效"，而不是继续复用"已热加载"那句话 ——
+        所以调用方拿这个布尔值改写结论文案（见 `execute` 的 Step 5 与总结）。
+
+        ## 顺序语义
+
+        挂到**链尾**：新连接器只为**一个指标**服务，而链首是 AkShare/腾讯等
+        主力源；插到前面会把存量指标的取数路径改掉（那是另一件事）。
+        """
+        if self._router is None:
+            logger.warning(
+                "A19 未持有活路由表句柄：连接器 %s 已写入并加载，"
+                "但**本进程不会路由到它**（需重建路由后生效）",
+                getattr(connector, "source_name", "") or type(connector).__name__)
+            return False
+        try:
+            added = self._router.refresh_routes([(connector, connector.supports)])
+            if not added:
+                # 同名已在链上 ⇒ 视为已生效（自修复幂等重跑的场景）
+                logger.info("连接器 %s 已在活路由表上（同名去重）",
+                            getattr(connector, "source_name", ""))
+            return True
+        except Exception:  # noqa: BLE001 挂路由失败不能让整条自修复白做
+            logger.warning("连接器挂活路由表失败（文件已落盘，需重建路由）",
+                           exc_info=True)
+            return False
 
     def _recommend_source(self, gap: str, indicator: str) -> str:
         """基于缺口关键词推荐已知免费数据源。"""

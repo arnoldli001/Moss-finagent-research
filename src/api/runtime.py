@@ -126,6 +126,56 @@ class Runtime:
     # 量化选股（3 档模型定时选股 + 自定义板块；装配失败时为None，接口返回503）
     quant_select: Any = None
 
+    async def aclose(self, *, exclude: tuple[str, ...] = ()) -> list[str]:
+        """统一关停：**逐个 Agent 与子系统尽力关闭**，返回失败的标签清单。
+
+        ## 为什么要在 Runtime 上收口（而不是继续写在 lifespan 里）
+
+        关停清单原先手写在 `api/main.py` 的 lifespan 里，只覆盖 4 个仓储 +
+        几个子系统；而**真正持有资源的是 Agent**（A19 的 `DataGapResolverAgent`
+        会建连接、未来的插件会持句柄）—— 清单在别处，新增 Agent 时没人会想起来改。
+
+        ## 三条纪律（都是本仓库踩过的）
+
+        1. **逐条隔离**：任何一句失败都不中断其余收尾。实测事故见
+           `api/main.py` lifespan 里那段注释（`fundflow_repo` 没有 `close()`
+           ⇒ AttributeError 让整个关停段中断 ⇒ 后面的 WAL checkpoint 全没执行）。
+        2. **没有 `close()` 不算错**：用 `getattr(x, "close", None)` 探测，
+           未装配/不需要显式关闭的对象**静默跳过**（这是"不适用"，不是"失败"）。
+        3. **失败要留痕**：返回标签清单供调用方 warning，不许静默吞掉。
+
+        Args:
+            exclude: 要**跳过**的标签（调用方已经自己关过、且不保证幂等的对象）。
+                lifespan 里 `runtime.intraday` 是显式提前关的（在取消在飞任务之前），
+                所以传 `exclude=("intraday",)` —— 收口清单但**不改关停顺序**。
+        """
+        labels: list[str] = []
+        targets: list[tuple[str, Any]] = [
+            *((f"agent:{aid}", ag) for aid, ag in sorted(self.agents.items())),
+            ("news_fetcher", self.news_fetcher),
+            ("event_repo", self.event_repo),
+            ("event_service", self.event_service),
+            ("intraday", self.intraday),
+            ("intraday_profile_repo", self.intraday_profile_repo),
+            ("fundflow", self.fundflow),
+            ("fundflow_repo", self.fundflow_repo),
+            ("quant_select", self.quant_select),
+            ("repo", self.repo),
+        ]
+        for label, obj in targets:
+            if obj is None or label in exclude:
+                continue
+            closer = getattr(obj, "aclose", None) or getattr(obj, "close", None)
+            if closer is None:
+                continue          # 不适用 ≠ 失败
+            try:
+                result = closer()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:  # noqa: BLE001 关停尽力而为，绝不互相拖累
+                labels.append(label)
+        return labels
+
 
 def build_daily_connector_chain(
     *,
@@ -398,7 +448,7 @@ def build_runtime() -> Runtime:
         "A20_generic_industry": GenericIndustryAgent(gateway),
         "A17_recommend": RecommendationAgent(gateway),
         "A18_audit": AuditAgent(),
-        "A19_code_engineer": CodeEngineerAgent(gateway),
+        "A19_code_engineer": CodeEngineerAgent(gateway, router=backend),
     }
     # 技能库（PTD三级加载）：注入到支持技能的分析层/信息层Agent（_skill_library属性），
     # A17由图内ReAct工具按L0索引自主加载；技能目录缺失时全部静默降级。

@@ -253,8 +253,77 @@ class SkillLibrary:
 
     # ---------- 质量门 ----------
 
+    #: ★ **非引擎形态**的技能白名单（`CHG-0192`）：这些 `SKILL.md` 在磁盘上、
+    #: 有合法 frontmatter，但**不在** `*/*/SKILL.md` 这个引擎形态里
+    #: （一级主题型 `skills/<name>/SKILL.md`，或文件名不是 `SKILL.md`）。
+    #:
+    #: ## 为什么必须显式列出（而不是"扫不到就算了"）
+    #:
+    #: 原先 `validate_all()` 只 glob 两级路径 ⇒ 磁盘上 **32 个** SKILL.md 里
+    #: **7 个从不被校验**，而报告是"0 problems" —— **假绿**：
+    #: 它们可以有语法坏的 frontmatter、可以有不存在的 references，没人会发现。
+    #: 判据 `tests/unit/test_skill_coverage.py` 会断言"磁盘上的 SKILL.md
+    #: == 已校验的 + 本白名单"，所以**盲区不能再静默增长**。
+    #:
+    #: ## 为什么本轮不把它们并进引擎（诚实登记）
+    #:
+    #: 这 7 个用的是**另外两种 frontmatter 方言**（`whenToUse`/`metadata`/
+    #: `allowed-tools`），且逐个超引擎的正文预算（160~810 行 vs `<5000 token`）。
+    #: 强行纳入会一次报 7 条问题 —— 那是**内容改造**（要逐个改 31 个文件），
+    #: 属于用户的素材，不该由本轮顺手改。所以这里只把盲区**变可见**，
+    #: 显式登记为待办。
+    NON_ENGINE_SKILLS: tuple[str, ...] = (
+        "ai-dev-loop-discipline/SKILL.md",
+        "auction-selection/SKILL.md",
+        "intraday-call-auction-data-pipeline/SKILL.md",
+        "intraday-sell-points/SKILL.md",
+        "jianmen-shortterm/SKILL.md",
+        "pipeline-redundancy-audit/SKILL.md",
+        "finagent-lessons/踩坑清单与举一反三规则SKILL.md",
+    )
+
+    def coverage_report(self) -> dict[str, list[str]]:
+        """**覆盖对账**：磁盘上的 `SKILL.md` 分别落在哪里。
+
+        返回 `{"validated": [...], "non_engine": [...], "unknown": [...]}`：
+
+        * `validated` —— 引擎形态（`*/*/SKILL.md`），`validate_all()` 会逐个检查；
+        * `non_engine` —— 命中 `NON_ENGINE_SKILLS` 白名单的（已登记，不校验）；
+        * `unknown` —— **既不在引擎形态、也没登记** ⇒ 谁都没看过它。
+          这就是"盲区"本身，非空即缺陷。
+
+        为什么要有这个方法：`validate_all()` 返回"0 problems"时，
+        调用方**无法区分**"全都好"与"大部分根本没看"。这个对账把它分开。
+        """
+        root = self._root
+        if not root.is_dir():
+            return {"validated": [], "non_engine": [], "unknown": []}
+
+        validated = sorted(
+            str(p.relative_to(root)).replace("\\", "/")
+            for p in root.glob("*/*/SKILL.md")
+        )
+        # 磁盘上所有"看起来是技能"的文件：任何层级、文件名以 SKILL.md 结尾
+        on_disk = sorted(
+            str(p.relative_to(root)).replace("\\", "/")
+            for p in root.rglob("*.md")
+            if p.name.endswith("SKILL.md")
+        )
+        allow = set(self.NON_ENGINE_SKILLS)
+        validated_set = set(validated)
+        non_engine = [p for p in on_disk if p in allow and p not in validated_set]
+        unknown = [p for p in on_disk
+                   if p not in validated_set and p not in allow]
+        return {"validated": validated, "non_engine": non_engine,
+                "unknown": unknown}
+
     def validate_all(self) -> list[str]:
-        """扫描库root下全部 ``*/*/SKILL.md``，返回问题清单（空=全部通过）。"""
+        """扫描库root下全部 ``*/*/SKILL.md``，返回问题清单（空=全部通过）。
+
+        ⚠️ **覆盖面**：只校验**引擎形态**（两级、文件名 `SKILL.md`）。
+        磁盘上另外那批（一级主题型 / 非标准文件名）在 `NON_ENGINE_SKILLS` 里
+        显式登记、**不校验** —— 想知道"到底覆盖了多少"，用 `coverage_report()`。
+        """
         problems: list[str] = []
         if not self._root.is_dir():
             return [f"技能库root不存在：{self._root}"]

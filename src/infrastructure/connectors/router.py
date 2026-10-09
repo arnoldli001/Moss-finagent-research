@@ -368,6 +368,75 @@ class ConnectorRouter(BaseConnector):
         return [connector for connector, supports in self._routes
                 if supports(indicator)]
 
+    # ---------- 运行期增补路由（动态连接器 / A19 自修复的"最后一公里"） ----------
+
+    def add_route(self,
+                  route: tuple[BaseConnector, Callable[[str], bool]],
+                  *, at_front: bool = False) -> None:
+        """把一个连接器挂到活路由表上（**顺序即优先级**）。
+
+        ## 为什么必须有这个方法（`CHG-0192` 修的真实缺陷）
+
+        A19 生成连接器后调的是 `DynamicConnectorLoader.reload()` —— 它返回一个
+        **新列表**，而活 router 的 `self._routes` 只在构造时赋值一次、
+        类内**没有任何增补方法**。于是：文件写进 `data/dynamic_connectors/`、
+        加载器也确实认它，但**这个进程的取数链永远路由不到它**（要重启才生效）。
+        而 A19 的结论文案却写着"连接器已热加载到数据路由，下次采集即可使用" ——
+        **声称与行为不一致，且没有任何报错**。
+
+        `at_front=True` 用于"这个源就是为这个指标生成的、应当优先命中"；
+        默认追加到链尾（保持既有源的优先级不变 ⇒ 不改变存量行为）。
+
+        ⚠️ 只挂路由，**不改** `_failure_cache` / `_stale_floor`：那是"当前链上
+        各源的短期记忆"，新增一个源不需要清空别人的记忆。
+        """
+        connector, supports = route
+        if at_front:
+            self._routes.insert(0, (connector, supports))
+        else:
+            self._routes.append((connector, supports))
+        logger.info("路由表增补：%s（当前 %d 条，位置=%s）",
+                    getattr(connector, "source_name", type(connector).__name__),
+                    len(self._routes), "链首" if at_front else "链尾")
+
+    def refresh_routes(
+        self,
+        routes: list[tuple[BaseConnector, Callable[[str], bool]]],
+        *,
+        keep_existing: bool = True,
+    ) -> int:
+        """用一批新路由替换/合并活路由表，返回**新增**条数。
+
+        `keep_existing=True`（默认）：保留既有路由、只追加新的（按
+        `source_name` 去重）—— 这是 A19 的用法：它是**增补**，不是重装整条链。
+        `keep_existing=False`：整体替换（用于运维显式重装，慎用）。
+
+        ⚠️ 替换时会顺带清理 `_failure_cache` / `_stale_floor` 里**已不在链上**
+        的源名 —— 否则被移除的源留下的冷却/陈旧记忆会变成"永远命不中的墓碑"。
+        """
+        existing = {getattr(c, "source_name", "") for c, _ in self._routes}
+        if not keep_existing:
+            self._routes = list(routes)
+            alive = {getattr(c, "source_name", "") for c, _ in self._routes}
+            for key in [k for k in self._failure_cache if k.split("|")[0] not in alive]:
+                self._failure_cache.pop(key, None)
+            for name in [n for n in self._stale_floor if n not in alive]:
+                self._stale_floor.pop(name, None)
+            logger.info("路由表重装：%d 条", len(self._routes))
+            return len(self._routes)
+
+        added = 0
+        for connector, supports in routes:
+            name = getattr(connector, "source_name", "")
+            if name and name in existing:
+                continue                    # 同名视为同一个源，不重复挂
+            self._routes.append((connector, supports))
+            existing.add(name)
+            added += 1
+        if added:
+            logger.info("路由表增补：+%d 条（共 %d 条）", added, len(self._routes))
+        return added
+
     def supports(self, indicator: str) -> bool:
         """★ 聚合判据：链上**有没有连接器认这个指标**（单一实现 = `_matched`）。
 

@@ -83,12 +83,17 @@ class DataPointRepository(ABC):
         """
 
     @abstractmethod
-    async def prune_before(self, cutoff_date: str) -> int:
-        """保留策略：删除所有 period_date 早于截止线的数据点，返回删除行数。
+    async def prune_before(self, cutoff_date: str, *,
+                           dry_run: bool = False) -> int:
+        """保留策略：删除所有 period_date 早于截止线的数据点，返回行数。
 
         用于「最多保留最近 N 年」。仅删除可定期间（period_date 非空）且早于
         cutoff_date（`YYYY-MM-DD`）的行；period_date 为空/无法定期间的行不在
         日期型保留范围内，避免误删无期间快照。
+
+        `dry_run=True`：**只数不改**，返回"会被删除的行数"。
+        ⚠️ 实现必须让计数与删除**共用同一个 WHERE** —— 各写一份必然漂移，
+        而漂移的症状是"dry-run 说 0 行、真跑删掉一堆"，且不报错。
         """
 
     async def close(self) -> None:

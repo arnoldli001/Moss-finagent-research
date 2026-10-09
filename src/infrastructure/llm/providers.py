@@ -10,12 +10,14 @@ import hashlib
 import logging
 import os
 import time
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 import httpx
 
 from src.core.config import get_settings
 from src.core.exceptions import LLMGatewayError
+from src.infrastructure.llm.cache import prompt_fingerprint
+from src.infrastructure.llm.local_budget import LOCAL_MODEL_TIMEOUT_SEC
 from src.infrastructure.llm.models import LLMResponse, ModelSpec
 
 logger = logging.getLogger(__name__)
@@ -171,7 +173,26 @@ def _wrap_response(
     started: float,
     *,
     reasoning_tokens: int = 0,
+    wait_ms: int | None = None,
 ) -> LLMResponse:
+    """把 provider 的原始返回包成统一响应。
+
+    ## `wait_ms` / `model_ms`：排队与模型侧必须分开（`CHG-0177`）
+
+    `latency_ms` 是**墙钟**，它把"在闸里排队"和"模型在干活"算在一起。
+    实测本地调用 max **210,136ms**，而那个数 = `local_gate` 的 90s 排队上限
+    + HTTP 的 120s 超时 —— 合并计量时**无法归因**（见 `LLMResponse.wait_ms`）。
+
+    ⚠️ 字段叫 `model_ms` 而**不是** `gen_ms`：它含**模型加载/换入**。
+    实测冷调用 2,383ms 只出了 3 个 token —— 那是加载，不是生成。
+
+    `wait_ms` 由**走闸的** provider 传入（目前只有 Ollama）。
+    **不传 = 该 provider 没有闸 = 不适用**，此时 `model_ms` 也必须是 `None`：
+    填 `latency_ms` 会把"不适用"伪装成"零排队"，正是本项目明令禁止的
+    「用 0 糊过去」。
+    """
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    model_ms = None if wait_ms is None else max(0, latency_ms - wait_ms)
     return LLMResponse(
         content=content,
         model_used=spec.model_name,
@@ -179,8 +200,10 @@ def _wrap_response(
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         reasoning_tokens=reasoning_tokens,
-        latency_ms=int((time.perf_counter() - started) * 1000),
-        prompt_hash=_sha256(system + "\x00" + prompt),
+        latency_ms=latency_ms,
+        wait_ms=wait_ms,
+        model_ms=model_ms,
+        prompt_hash=prompt_fingerprint(system, prompt),
         response_hash=_sha256(content),
     )
 
@@ -196,8 +219,18 @@ class OllamaProvider:
     DEFAULT_KEEP_ALIVE_SEC = 24 * 3600  # 模型常驻内存
 
     def __init__(self, timeout: float | None = None) -> None:
-        settings = get_settings()
-        self._timeout = timeout or settings.llm_timeout_seconds
+        # ★ 本地跳的 HTTP 超时**从 ceiling 派生**，不用全局 `llm_timeout_seconds`
+        #   （`CHG-0179`）。
+        #
+        #   原先这里取 `settings.llm_timeout_seconds = 120.0`，而排队上限是
+        #   `local_gate` 里的另一处 `90.0` —— **两者相加 = 210.1 秒**，
+        #   正是实测到的本地调用最大值，而**没有任何地方声明过这个数**。
+        #   现在两者同源于 `local_budget.LOCAL_HOP_CEILING_SEC`。
+        #
+        #   ⚠️ 这意味着 `llm_timeout_seconds` **不再作用于本地跳**。
+        #      要缩短本地预算请改 `local_budget.LOCAL_HOP_CEILING_SEC`
+        #      （它会把排队与模型侧**一起**缩短，保持自洽）。
+        self._timeout = timeout or LOCAL_MODEL_TIMEOUT_SEC
         # HTTP 连接池复用：同 session 复用 TCP 连接，避免每次都握手
         self._client = httpx.AsyncClient(timeout=self._timeout)
 
@@ -238,8 +271,14 @@ class OllamaProvider:
         #   生成时间，而不是"排队排到 120 秒"被记成调用失败。
         from src.infrastructure.llm.local_gate import get_local_gate
 
+        #: ★ 本跳的**纯排队**时长（毫秒）。只在走闸时有意义 ⇒ 初值 `None`
+        #: 而不是 0（"没量到" ≠ "量到 0"）。
+        wait_ms: int | None = None
         try:
-            async with get_local_gate().slot(spec.model_name):
+            # `slot()` 产出**等待时长（秒）**—— 取到它的那一刻还没发 HTTP，
+            # 所以它正好是"排队"与"生成"的分界线（`CHG-0177`）。
+            async with get_local_gate().slot(spec.model_name) as waited:
+                wait_ms = int(waited * 1000)
                 resp = await self._client.post(
                     f"{spec.base_url}/api/chat", json=payload)
                 resp.raise_for_status()
@@ -260,6 +299,7 @@ class OllamaProvider:
             # 且 /api/chat 非流式响应不返回细分）→ 显式 0，表示"未量到"。
             # ⚠️ 不要把它当"没有思考"：这是"这个后端不提供该字段"。
             reasoning_tokens=0,
+            wait_ms=wait_ms,
         )
 
     async def close(self) -> None:
@@ -458,12 +498,64 @@ class OpenAICompatProvider:
         )
 
 
+#: ★ 提供商自声明表（`CHG-0192` 修）：`name → (是否计费, 是否跑在本机)`。
+#:
+#: ## 为什么必须由**提供商自己**声明，而不是网关里的两个硬编码集合
+#:
+#: 网关原先把 `PAID_PROVIDERS = {"deepseek"}` / `LOCAL_PROVIDERS = {"ollama"}`
+#: 写死在自己文件里。后果是：**新增一个付费提供商时没有任何机制提醒你去登记它**
+#: ⇒ `uses_paid` 对它恒为 `False` ⇒ **它花掉的钱不进 token 预算**，
+#: 而预算检查、降级链裁剪、付费只做链首这几条护栏**全部静默失效**。
+#: 这与本仓库"白名单要单一事实源 + 新增即注册"的纪律冲突。
+#:
+#: ## 两个谓词各司其职（别合并）
+#:
+#: * `paid` —— **成本**：决定 token 预算是否累积、付费是否只做链首；
+#: * `local` —— **位置**：决定是否受显存检查、是否算"跑在本机"。
+#:
+#: 2026-09-28 实测过把它们混用的代价：免费云端（dashscope/siliconflow/zhipu）
+#: 不在 `PAID_PROVIDERS` 里 ⇒ **被误判成本地模型** ⇒ 一接进来就被显存检查拦掉
+#: （报错是"qwen-flash 拉不起来"，而它根本不在本机）。
+#:
+#: ⚠️ 网关对**未声明**的提供商回退到既有的两个硬编码集合（向后兼容）：
+#: 注入 Fake provider 的测试、以及第三方直接实现 `BaseProvider` 的场景不受影响。
+PROVIDER_DECLARATIONS: Final[dict[str, tuple[bool, bool]]] = {
+    # name: (paid, 本机)
+    "ollama": (False, True),
+    "deepseek": (True, False),
+    # 下面三个是**免费云端**：既不付费、也不在本机。
+    # ⚠️ 必须显式声明（不能靠"不在 PAID_PROVIDERS 里"来推断本地）——
+    #    2026-09-28 实测过那个推断的代价：免费云端被当成"跑在本机"，
+    #    一接进来就被显存检查拦掉（报错还写着"拉不起来"，而它不在本机）。
+    "zhipu": (False, False),
+    "dashscope": (False, False),
+    "siliconflow": (False, False),
+}
+
+
+def declare_provider(provider: Any) -> Any:
+    """把自声明打到 provider 实例上（`paid` / `local`），返回同一个对象。
+
+    为什么落在**实例属性**而不是加进 `BaseProvider` 协议：
+    Protocol 加类属性会让所有既有实现（含测试里的 Fake）都不再满足协议 ——
+    那是"为了新能力打破旧契约"。实例属性是纯增量：没声明的走网关回退。
+    """
+    paid, local = PROVIDER_DECLARATIONS.get(
+        getattr(provider, "name", ""), (False, False))
+    provider.paid = paid
+    provider.local = local
+    return provider
+
+
 def build_providers() -> dict[str, BaseProvider]:
     """按已配置能力实例化提供商表（缺API key时仍注册，调用时报错触发降级）。
 
     为什么要注册"缺 key"的 provider：调用时报错可以走**降级链**，
     而"未注册"只会得到 `提供商未注册` 并直接跳过 —— 后者会让
     "忘了配 key"看起来像"这个模型不可用"，排查方向完全错。
+
+    ★ 每个实例都会带上**自声明**（`paid` / `local`，见 `PROVIDER_DECLARATIONS`）——
+    新增提供商时**只改这一张表**，网关侧不需要再改任何集合。
     """
     from src.core.config import get_settings as _gs
 
@@ -504,4 +596,7 @@ def build_providers() -> dict[str, BaseProvider]:
             api_key_env="MOSS_SILICONFLOW_API_KEY",
             api_key=settings.siliconflow_api_key,
         )
+    # ★ 统一打自声明（新增提供商只需在 `PROVIDER_DECLARATIONS` 里加一行）
+    for provider in providers.values():
+        declare_provider(provider)
     return providers

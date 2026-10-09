@@ -171,6 +171,93 @@ def test_runtime_wires_the_router_into_a19():
     )
 
 
+def test_add_route_at_front_takes_priority():
+    """★ `at_front=True` 必须真的插到链首（我的实现有这条分支，就必须有判据）。
+
+    ## 为什么必须测它
+
+    `at_front` 是我为了让"这个源就是为这个指标生成的、应当优先命中"成为
+    一个**显式选择**而留的参数。没有判据的话它就是"写了但没验过"的代码 ——
+    而本仓库的纪律是：**没被判据覆盖的分支等于不存在**（且更糟：
+    下一个人会以为它验过了）。
+
+    语义边界：默认挂链尾（不抢存量优先级），`at_front=True` 才抢。
+    """
+    ind = "ind:shared"
+    old = _ExistingConnector(ind)
+    new = _FakeConnector(ind, source_name="new_priority_source")
+
+    # 默认：老源仍在链首（存量优先级不变）
+    r_default = _router(_route(old))
+    r_default.add_route(_route(new))
+    assert r_default._resolve(ind) is old, "默认不该抢存量优先级"
+
+    # at_front：新源插链首 ⇒ 它先命中
+    r_front = _router(_route(old))
+    r_front.add_route(_route(new), at_front=True)
+    assert r_front._resolve(ind) is new, (
+        "at_front=True 没有插到链首 ⇒ 这个参数是死代码"
+    )
+    # 链上两个源都还在（是"优先"而不是"替换"）
+    assert [c for c, _ in r_front._routes] == [new, old]
+
+
+def test_loader_to_router_end_to_end(tmp_path):
+    """★ 端到端：**写文件 → loader 加载 → 挂活路由 → fetch 取到数**。
+
+    ## 为什么必须有这一条
+
+    本轮修的缺陷正是"链路断在最后一公里"：loader 认、文件在、`_test_fetch`
+    也能取到数，而**活路由永远看不见它**。上面几条用的是手造替身 +
+    手调 `refresh_routes`，**没有一条**把 loader 真实产物喂给 router。
+
+    这条判据走完整链路：落盘一个真实连接器文件 → `get_dynamic_loader().reload()`
+    → 把新路由挂到活 router → `supports()` / `fetch()` 都必须命中。
+    """
+    import textwrap
+
+    from src.infrastructure.connectors.dynamic_loader import DynamicConnectorLoader
+    from src.infrastructure.connectors.router import ConnectorRouter as _CR
+
+    (tmp_path / "dyn_e2e_probe.py").write_text(textwrap.dedent('''
+        from src.infrastructure.connectors.base import BaseConnector
+        from src.core.schemas import DataPoint
+
+        class DynE2EProbeConnector(BaseConnector):
+            source_name = "dyn_e2e_probe"
+            source_url = "https://example.invalid/e2e"
+
+            @staticmethod
+            def supports(indicator: str) -> bool:
+                return indicator == "ind:e2e_probe"
+
+            def get_capabilities(self) -> dict:
+                return {"indicators": ["ind:e2e_probe"]}
+
+            async def fetch(self, indicator, start_date=None, end_date=None):
+                return [DataPoint(indicator=indicator, period_date="2026-01-01",
+                                  value=1.0, source_name=self.source_name)]
+    '''), encoding="utf-8")
+
+    loader = DynamicConnectorLoader(directory=tmp_path)
+    routes = loader.reload()
+    assert routes, "loader 没加载出新连接器（前提不成立）"
+
+    router = _CR([], disable_cache=True, disable_db=True)
+    ind = "ind:e2e_probe"
+    assert router.supports(ind) is False, "前提：router 初始不认识它"
+
+    added = router.refresh_routes(routes)
+    assert added == 1
+    assert router.supports(ind) is True, (
+        "★ 端到端断了：loader 加载成功但活路由看不见（正是本轮修的缺陷形状）"
+    )
+    points = asyncio.run(router.fetch(ind))
+    assert points and points[0].source_name == "dyn_e2e_probe", (
+        f"取数链没走到新连接器：{points!r}"
+    )
+
+
 def test_refresh_survives_a_broken_route() -> None:
     """挂路由失败不能把整条自修复搞崩（文件已落盘，只是没生效）。"""
     class _Broken:

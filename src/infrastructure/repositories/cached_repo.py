@@ -140,10 +140,13 @@ class CachedRepository(DataPointRepository):
             await self._invalidate_all()
         return deleted
 
-    async def prune_before(self, cutoff_date: str) -> int:
+    async def prune_before(self, cutoff_date: str, *,
+                           dry_run: bool = False) -> int:
         # 跨指标删除：委托内层后，best-effort 清空全部数据点查询缓存。
-        deleted = await self._inner.prune_before(cutoff_date)
-        if deleted:
+        # ⚠️ dry-run 不失效缓存：一行都没删，失效它是无谓的抖动
+        #    （而"缓存失效了但数据没变"会让下一次查询白跑一遍库）。
+        deleted = await self._inner.prune_before(cutoff_date, dry_run=dry_run)
+        if deleted and not dry_run:
             await self._invalidate_all()
         return deleted
 

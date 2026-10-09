@@ -27,9 +27,27 @@ def _lib() -> SkillLibrary:
 
 @router.get("/skills/quality")
 async def skill_quality() -> dict[str, object]:
-    """技能库质量门：frontmatter完整性/token预算/references存在性。"""
-    problems = _lib().validate_all()
-    return {"ok": not problems, "problems": problems, "total": len(problems)}
+    """技能库质量门：frontmatter完整性/token预算/references存在性 **+ 覆盖对账**。
+
+    ## 为什么要带 `coverage`（`CHG-0192`）
+
+    `problems == []` 单独看**区分不了**两件事：
+      · 所有技能都合格；
+      · 大部分技能**根本没被扫到**（引擎只认 `*/*/SKILL.md` 这一种形态）。
+    实测：磁盘上 32 个 SKILL.md，质量门只看 25 个 —— 而它报"0 problems"。
+    这是"护栏护的是死文件"那一类假绿：**保护了 78%，报告说 100%**。
+
+    `coverage.unknown` 非空 = 有技能谁都没看过；`coverage.non_engine` 是
+    **已显式登记**（`SkillLibrary.NON_ENGINE_SKILLS`）暂不校验的那批。
+    """
+    lib = _lib()
+    problems = lib.validate_all()
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "total": len(problems),
+        "coverage": lib.coverage_report(),
+    }
 
 
 @router.get("/skills")

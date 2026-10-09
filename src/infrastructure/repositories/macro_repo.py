@@ -21,7 +21,10 @@ from typing import Any
 from src.core.schemas import DataPoint, DataSourceType, FetchMethod
 from src.infrastructure.repositories._mapping import COLUMNS, point_to_row
 from src.infrastructure.repositories.base import DataPointRepository
-from src.infrastructure.repositories.event_sqlite_base import connect_sqlite
+from src.infrastructure.repositories.event_sqlite_base import (
+    connect_sqlite,
+    retry_on_locked,
+)
 
 # ★ 2026-09-29 补：本模块原先**没有** logger，而 `query_many()` 的降级分支
 #   （SQLite < 3.25 无窗口函数 → 退回全量拉取）里写着 `logger.warning(...)`
@@ -98,13 +101,24 @@ class MacroRepository(DataPointRepository):
         await asyncio.to_thread(self._ensure_schema_sync)
 
     def _save_sync(self, points: list[DataPoint], task_id: str) -> dict[str, int]:
-        inserted = 0
-        with self._connect() as conn:
-            for p in points:
-                row = point_to_row(p, task_id)
-                cursor = conn.execute(_INSERT_SQL, tuple(row[c] for c in COLUMNS))
-                inserted += cursor.rowcount
-        return {"inserted": inserted, "skipped": len(points) - inserted, "total": len(points)}
+        """批量入库（幂等 upsert）—— **锁竞争重试**，别把数据丢掉。
+
+        2026-10-05 实测事故的同类现场：pilot 启动期在重建索引（持写锁 >20s），
+        此时任何写都会在 `busy_timeout` 之后抛 `database is locked`。
+        索引写失败可以降级（`smart_fetch._safe_upsert_meta`），**数据写不行** ——
+        丢了就是"采到了但没落库"，所以这里按项目既有范式重试（幂等 ⇒ 安全）。
+        """
+        def _write() -> dict[str, int]:
+            inserted = 0
+            with self._connect() as conn:
+                for p in points:
+                    row = point_to_row(p, task_id)
+                    cursor = conn.execute(_INSERT_SQL, tuple(row[c] for c in COLUMNS))
+                    inserted += cursor.rowcount
+            return {"inserted": inserted, "skipped": len(points) - inserted,
+                    "total": len(points)}
+
+        return retry_on_locked(_write)
 
     async def save_points(self, points: list[DataPoint], task_id: str) -> dict[str, int]:
         """批量入库；同键(指标,期间,哈希)重复自动跳过（幂等）。"""
@@ -284,20 +298,36 @@ class MacroRepository(DataPointRepository):
         """按来源删除数据点（源退役/坏点清理），返回删除行数。"""
         return await asyncio.to_thread(self._delete_by_source_sync, source_name)
 
-    def _prune_before_sync(self, cutoff_date: str) -> int:
+    #: 保留期口径的 WHERE —— **删除与计数共用同一份**。
+    #: 分成两份必然漂移，而漂移的症状是"dry-run 说 0 行、真跑删掉一堆"，
+    #: 且不报错。见 `prune_before` 的 `dry_run` 说明。
+    _PRUNE_WHERE = ("period_date IS NOT NULL AND period_date != '' "
+                    "AND period_date < ?")
+
+    def _prune_before_sync(self, cutoff_date: str, *,
+                           dry_run: bool = False) -> int:
         # 仅删可定期间且早于截止线的行；空 period_date 不参与日期型保留。
         with self._connect() as conn:
+            if dry_run:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM fact_data_points "
+                    f"WHERE {self._PRUNE_WHERE}",
+                    (cutoff_date,)).fetchone()
+                return int(row[0] or 0) if row else 0
             cursor = conn.execute(
-                "DELETE FROM fact_data_points "
-                "WHERE period_date IS NOT NULL AND period_date != '' "
-                "AND period_date < ?",
+                f"DELETE FROM fact_data_points WHERE {self._PRUNE_WHERE}",
                 (cutoff_date,),
             )
             return cursor.rowcount
 
-    async def prune_before(self, cutoff_date: str) -> int:
-        """保留策略：删除所有早于 cutoff_date（YYYY-MM-DD）的数据点。"""
-        return await asyncio.to_thread(self._prune_before_sync, cutoff_date)
+    async def prune_before(self, cutoff_date: str, *,
+                           dry_run: bool = False) -> int:
+        """保留策略：删除所有早于 cutoff_date（YYYY-MM-DD）的数据点。
+
+        `dry_run=True`：**只数不改**（与删除共用同一个 WHERE）。
+        """
+        return await asyncio.to_thread(self._prune_before_sync, cutoff_date,
+                                       dry_run=dry_run)
 
     def _count_sync(self) -> dict[str, int]:
         with self._connect() as conn:

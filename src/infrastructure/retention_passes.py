@@ -423,25 +423,90 @@ def _run_dereference(conn: sqlite3.Connection, pass_: RetentionPass,
     ⚠️ `cutoff` 必须由调用方传入**同一个**值（而不是在这里重算），
     否则"置空的范围"与"即将删除的范围"会因跨零点而错开一行。
     """
+def _dereference_where(conn: sqlite3.Connection, pass_: RetentionPass,
+                       table: str, column: str, cutoff: str,
+                       ) -> tuple[str, list[Any]] | None:
+    """解引用 UPDATE 的 WHERE 片段与参数（`None` = 该表/列不适用）。
+
+    抽出来的理由：**计数与执行必须用同一个 WHERE** —— 复制一份必然漂移，
+    而漂移的症状是"dry-run 说 0 行、真跑却改了 3 行"（先看后做就失去意义）。
+
+    `cutoff` 显式传参（不用模块级变量）：本模块跑在 `asyncio.to_thread`
+    的线程池里，用可变全局会被并发的另一张表污染，且症状是"偶发多改一行"。
+    """
     if not pass_.dereference:
-        return 0
+        return None
     key = _primary_key(conn, pass_.name)
     if not key:
-        return 0
-    tables = _existing_tables(conn)
+        return None
+    if table not in _existing_tables(conn):
+        return None
+    cols = {str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")')}
+    if column not in cols:
+        return None
     sub = f"SELECT {key} FROM {pass_.name} WHERE {_where_for(pass_)}"
+    where = (f"{column} IS NOT NULL AND {column} != '' "
+             f"AND {column} IN ({sub})")
+    return where, _params_for(pass_, cutoff)
+
+
+def _count_candidates(conn: sqlite3.Connection, pass_: RetentionPass,
+                      cutoff: str, *, limit: int) -> tuple[int, int]:
+    """`(待删行数, 待解引用行数)` —— **只读**，不修改任何数据。
+
+    `limit` 与真跑的单轮批量上限一致：dry-run 报的是"**这一轮会动多少**"，
+    而不是"理论上总共多少"。两者混用会让人以为一次能清完。
+    """
+    where = _where_for(pass_)
     params = _params_for(pass_, cutoff)
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM (SELECT rowid FROM {pass_.name} "
+        f"WHERE {where} LIMIT {int(limit)})", params).fetchone()
+    pending = int(row[0] or 0) if row else 0
+
+    touched = 0
+    for table, column in (pass_.dereference or ()):
+        spec = _dereference_where(conn, pass_, table, column, cutoff)
+        if spec is None:
+            continue
+        dwhere, dparams = spec
+        r = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {dwhere}",
+                         dparams).fetchone()
+        touched += int(r[0] or 0) if r else 0
+    return pending, touched
+
+
+def _run_dereference(conn: sqlite3.Connection, pass_: RetentionPass,
+                     cutoff: str, *, count_only: bool = False) -> int:
+    """按 parent 主键把子表/同表的悬空引用置空。返回受影响行数。
+
+    `count_only=True`（dry-run）：**只数不改**。
+
+    ## 为什么要"置空"而不是"级联删除"
+
+    这些引用指向的是**仍然有效的业务记录**（如告警指向的事件）。清理时
+    不能因为它挂的那个事件到期了就把告警一起删掉 —— 那是删业务数据，
+    不是清理。所以只摘掉悬空引用。
+
+    ⚠️ `cutoff` 必须由调用方传入**同一个**值（而不是在这里重算），
+    否则"置空的范围"与"即将删除的范围"会因跨零点而错开一行。
+    """
+    if not pass_.dereference:
+        return 0
     touched = 0
     for table, column in pass_.dereference:
-        if table not in tables:
+        spec = _dereference_where(conn, pass_, table, column, cutoff)
+        if spec is None:
             continue
-        cols = {str(r[1]) for r in conn.execute(f'PRAGMA table_info("{table}")')}
-        if column not in cols:
+        dwhere, dparams = spec
+        if count_only:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {dwhere}",
+                dparams).fetchone()
+            touched += int(row[0] or 0) if row else 0
             continue
-        cursor = conn.execute(
-            f"UPDATE {table} SET {column} = '' "
-            f"WHERE {column} IS NOT NULL AND {column} != '' "
-            f"AND {column} IN ({sub})", params)
+        cursor = conn.execute(f"UPDATE {table} SET {column} = '' WHERE {dwhere}",
+                              dparams)
         touched += int(cursor.rowcount or 0)
     return touched
 
@@ -454,11 +519,17 @@ def _primary_key(conn: sqlite3.Connection, table: str) -> str:
     return ""
 
 
-def _prune_sync(settings: Settings, pass_: RetentionPass) -> dict[str, Any]:
-    """同步清理一张表（由 `prune_table` 在线程池里调）。"""
+def _prune_sync(settings: Settings, pass_: RetentionPass, *,
+                dry_run: bool = False) -> dict[str, Any]:
+    """同步清理一张表（由 `prune_table` 在线程池里调）。
+
+    `dry_run=True`：**只统计不修改**，用于"先看后做"。
+    """
     value = int(getattr(settings, pass_.setting, 0) or 0)
     out: dict[str, Any] = {"table": pass_.name, "deleted": 0,
                            "cascaded": 0, "cutoff": "", "skipped": ""}
+    if dry_run:
+        out["dry_run"] = True
     if value <= 0:
         out["skipped"] = "保留期未开启（0 = 不清理）"
         return out
@@ -482,6 +553,18 @@ def _prune_sync(settings: Settings, pass_: RetentionPass) -> dict[str, Any]:
             out["skipped"] = "表不存在"
             return out
         tables = _existing_tables(conn)      # 查一次，供级联判断复用
+        if dry_run:
+            # ★ "先看后做"：**只数不改**。三个动作（解引用 / 删主表 / 级联删子表）
+            #   全部走计数分支，且计数与真跑共用同一个 WHERE（见 `_dereference_where`）。
+            #   报的是"**这一轮**会动多少"（受 max_batches × batch 限制），
+            #   不是"理论上总共多少" —— 两者混用会让人以为一次能清完。
+            pending, deref = _count_candidates(
+                conn, pass_, cutoff, limit=batch * max_batches)
+            out["dereferenced"] = deref
+            out["deleted"] = pending
+            if pending >= batch * max_batches:
+                out["truncated"] = True
+            return out
         if pass_.dereference:
             out["dereferenced"] = _run_dereference(conn, pass_, cutoff)
         where = _where_for(pass_)
@@ -507,25 +590,37 @@ def _prune_sync(settings: Settings, pass_: RetentionPass) -> dict[str, Any]:
         conn.close()
 
 
-async def prune_table(settings: Settings, pass_: RetentionPass) -> dict[str, Any]:
-    """异步清理一张表（逐表隔离失败：抛错也不影响其它表）。"""
+async def prune_table(settings: Settings, pass_: RetentionPass, *,
+                      dry_run: bool = False) -> dict[str, Any]:
+    """异步清理一张表（逐表隔离失败：抛错也不影响其它表）。
+
+    `dry_run=True`：只报告"这一轮会删/会改多少"，**不动任何数据**。
+    """
     allowed, why = destructive_allowed(settings)
-    if not allowed:
+    if not allowed and not dry_run:
         # 不是错误、也不抛：被防护挡住时如实回报原因，便于观测
         # （"清理没跑"必须看得见，否则会静默失效）。
         logger.info("保留清理被跳过：%s", why)
         return {"table": pass_.name, "deleted": 0, "cascaded": 0,
                 "cutoff": "", "skipped": why}
     try:
-        return await asyncio.to_thread(_prune_sync, settings, pass_)
+        return await asyncio.to_thread(_prune_sync, settings, pass_,
+                                       dry_run=dry_run)
     except Exception as exc:  # noqa: BLE001 保留是增强能力，不能拖垮主链路
         logger.warning("保留清理失败 table=%s: %s", pass_.name, exc)
         return {"table": pass_.name, "deleted": 0, "cascaded": 0,
                 "cutoff": "", "error": type(exc).__name__}
 
 
-async def run_passes(settings: Settings) -> list[dict[str, Any]]:
-    """跑全部启用的清理口径，返回逐表结果。"""
+async def run_passes(settings: Settings, *,
+                     dry_run: bool = False) -> list[dict[str, Any]]:
+    """跑全部启用的清理口径，返回逐表结果。
+
+    ⚠️ `dry_run=True` 时**刻意绕过 `destructive_allowed` 的 pytest 防护**：
+    防护的目的是"别让测试把真库删了"，而 dry-run 本来就不写 ——
+    若它也被挡，测试就**无法验证 dry-run 本身**（判据会变成假绿）。
+    写路径的防护一点没放松。
+    """
     results: list[dict[str, Any]] = []
     for pass_ in PASSES:
         value = int(getattr(settings, pass_.setting, 0) or 0)
@@ -533,11 +628,12 @@ async def run_passes(settings: Settings) -> list[dict[str, Any]]:
             # 未开启的表**不进结果**：否则每次保留作业都返回十几条
             # "skipped"，真正删了东西的信息会被淹没。
             continue
-        result = await prune_table(settings, pass_)
+        result = await prune_table(settings, pass_, dry_run=dry_run)
         results.append(result)
         if result.get("deleted") or result.get("cascaded"):
             logger.info(
-                "保留清理 %s：删除 %s 行（级联 %s），截止 %s",
+                "保留清理%s %s：删除 %s 行（级联 %s），截止 %s",
+                "（dry-run）" if dry_run else "",
                 result["table"], result["deleted"], result.get("cascaded", 0),
                 result.get("cutoff", ""))
         # 批间让出事件循环，别让清理把 WS/HTTP 饿死。

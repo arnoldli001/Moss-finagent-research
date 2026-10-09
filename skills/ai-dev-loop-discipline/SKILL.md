@@ -367,7 +367,7 @@ git add -A -- . ':(exclude)docs/_*' ':(exclude)scripts/_*' ':(exclude)web/dist-p
 ```
 
 > **规则**：**以 `_` 开头的目录默认视为草稿**，永不入库。
-> 这是最低成本的个人信息防线 —— 草稿文件天然带真实数据（手机号、邮箱、简历原文）。
+> 这是最低成本的个人信息防线 —— 草稿文件天然带真实数据（手机号、邮箱、个人材料原文）。
 
 ### 6.2 push 前必须摸清远端性质（**本次踩到的坑**）
 
@@ -752,7 +752,7 @@ test "$(git hash-object <file>)" = "$(git rev-parse origin/main:<file>)"   # 必
 
 ```
 公开线 origin/main： alert_email_to = "your_qq_number@qq.com"   ✅ 已脱敏
-私有树（快照源）  ： alert_email_to = "2693888583@qq.com"        ❌ 真邮箱
+私有树（快照源）  ： alert_email_to = "<真实个人邮箱>"        ❌ 真邮箱
 而且：字符串 "your_qq_number" 在私有树里【一次都不存在】
 ```
 

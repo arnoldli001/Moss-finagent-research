@@ -137,9 +137,25 @@ node_modules/
 !/.trae/skills/requirement-prd-sync/
 !/.trae/skills/requirement-prd-sync/**
 
-# Research/interview/review logs (replaced by INTERVIEW_FINAL.md)
+# Research/review logs（已并入归档文档）
 /docs/INTERVIEW_*.md
+# 个人材料（含手机号/邮箱等个人信息，按既有政策不发布）
+# 判据：`git check-ignore -v <file>` 能命中本规则；新增同类文件请沿用这两个前缀。
 /docs/面试准备_*
+/docs/_resume_*
+# 个人材料的生成产物：docx 与版面校验预览图（同为个人信息，不发布）
+# 生成器在 /scripts/*（已整体忽略）；这里只挡产物，避免误提交。
+/docs/*.docx
+/docs/_pv_*.png
+/docs/_resume_check.pdf
+/docs/_resume_orig.pdf
+# ⚠️ 例外必须显式列出：下面两个文件**早已被跟踪**（是历史遗留的公开材料），
+# 而它们命中上面的前缀规则 ⇒ 会变成"已跟踪但被忽略"，被
+# `test_privacy_tracking_policy::test_no_new_private_files_are_tracked` 判为红线。
+# 这两条例外就是那条判据要求的"留下痕迹"，不要删。
+!/docs/面试准备_竞价选股量化项目.md
+!/docs/面试准备_竞价选股量化项目.archived.md
+/docs/展示准备_*
 /docs/MAINLINE_*
 /docs/ETF_*.md
 /docs/PLATFORM_MULTI_TENANCY_DESIGN.md

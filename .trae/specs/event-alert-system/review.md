@@ -115,7 +115,7 @@
 | SQL 全参数化 | **合规** | 所有值入参均为 `?` 占位（event_sqlite_repo.py L188、L200、L223、L254、L269、L298、L307-L309、L319-L322、L330-L331、L339-L341）；f-string 仅拼接静态表名/列名/等量占位符（L151-L155、L219-L221、L253-L254、L293），无外部值拼接 |
 | 免责声明 | **基本合规** | 后端全通道携带；前端仅详情页固定展示，列表 Tab 缺失（D9） |
 | 密钥处理 | **合规** | SMTP 账号/授权码仅从环境变量读（[config.py:84-85](file:///d:/code/Moss-finagent-research/src/core/config.py#L84-L85)），.env.example 为空占位；代码与日志均不输出授权码（email_notifier.py 日志只记 alert_id/异常摘要）；硬编码收件人 your_qq_number@qq.com 系规格指定业务值，非密钥 |
-| 多租户 tenant_id 隔离 | **部分合规** | 表含 tenant_id，list/get/mark_read/mark_all_read/count/list_unanalyzed 均带租户条件，get_alert 跨租户 404 有测试；但 `existing_event_keys`、`mark_events_analyzed`、`last_alert_time` 三个端口方法无 tenant 参数（端口文档自称"所有方法按租户隔离"），WS/导入的 tenant_id 为无鉴权查询参数（N7 单租户演示可接受）。见 D4 |
+| 多租户 tenant_id 隔离 | **部分合规** | 表含 tenant_id，list/get/mark_read/mark_all_read/count/list_unanalyzed 均带租户条件，get_alert 跨租户 404 有测试；但 `existing_event_keys`、`mark_events_analyzed`、`last_alert_time` 三个端口方法无 tenant 参数（端口文档自称"所有方法按租户隔离"），WS/导入的 tenant_id 为无鉴权查询参数（N7 单租户试运行可接受）。见 D4 |
 | 单文件 ≤300 行 / 函数 ≤50 行 | **1 处超标** | [event_sqlite_repo.py](file:///d:/code/Moss-finagent-research/src/infrastructure/repositories/event_sqlite_repo.py) 353 行 > 300；其余最大 analyzer.py 258 行；函数均 ≤50 行（最大 `_analyze_and_alert` 25 行）。见 D10 |
 | 外部调用全部 try/except + to_thread | **合规** | akshare（news_flash/calendar）、SMTP、SQLite 均 to_thread 且异常隔离；单源/单事件/单邮件/单通道失败不阻断批次，有对应用例 |
 
@@ -148,7 +148,7 @@
 
 **D4｜三个仓储端口方法缺 tenant_id，多租户隔离不完整**
 - 位置：[repository.py:33](file:///d:/code/Moss-finagent-research/src/domain/alerts/repository.py#L33)（existing_event_keys）、L43（mark_events_analyzed）、L79（last_alert_time）；实现 [event_sqlite_repo.py:214-226、247-258、345-353](file:///d:/code/Moss-finagent-research/src/infrastructure/repositories/event_sqlite_repo.py#L214-L258)
-- 问题：跨租户同内容事件会互相判定"已存在/已分析/冷却中"；端口注释声明全部方法租户隔离但签名不一致。单租户演示无实际泄露，按红线"接口预留多租户字段"衡量为缺口。
+- 问题：跨租户同内容事件会互相判定"已存在/已分析/冷却中"；端口注释声明全部方法租户隔离但签名不一致。单租户试运行无实际泄露，按红线"接口预留多租户字段"衡量为缺口。
 - 修复建议：三方法补 tenant_id 参数与 WHERE 条件；导入端点也允许透传 tenant_id。
 
 **D5｜默认配置下 low 档阈值永不产生告警，与 FR-7/G5 文字不一致**
@@ -184,7 +184,7 @@
 
 **D12｜外部 URL 未做 scheme 校验，存在自注入 javascript: 链接 / 邮件 HTML 注入面**
 - 位置：导入端点 [routes/alerts.py:213](file:///d:/code/Moss-finagent-research/src/api/routes/alerts.py#L213)（仅截断长度）、前端 [AlertDetail.tsx:102-106](file:///d:/code/Moss-finagent-research/web/src/components/AlertDetail.tsx#L102-L106)（直接入 href）、邮件 [email_notifier.py:127-128,129-145](file:///d:/code/Moss-finagent-research/src/infrastructure/notifiers/email_notifier.py#L122-L145)（title/url 未 HTML 转义进 f-string 模板）
-- 问题：单用户演示且导入无鉴权，实际风险低（自伤型）；但 akshare 来源的 title/url 同样不经转义进 HTML 邮件。
+- 问题：单用户试运行且导入无鉴权，实际风险低（自伤型）；但 akshare 来源的 title/url 同样不经转义进 HTML 邮件。
 - 修复建议：导入与 normalize 阶段校验 source_url 仅允许 http/https；邮件 HTML 用 html.escape 处理 title/name/url。
 
 ### 建议（Suggestion）
@@ -194,7 +194,7 @@
 - **S3** 候选截断按 `publish_time or fetch_time` 字符串倒序（service.py L107-L108），而时间串格式混用（"2026-09-14 08:00:00" 与 ISO 带时区），字典序在混格式时可能错排；建议统一解析为 datetime 排序。
 - **S4** AlertHub.broadcast 返回值是"当前连接数"而非"成功推送数"（alert_hub.py L52），语义与 docstring 不一致；当前无人消费该返回值。
 - **S5** TR-7.1 要求断言邮件正文含免责声明、TR-7.2 要求两租户广播隔离用例，目前均缺失；WS 实时推送（连接保持中触发扫描）建议补 TestClient 集成用例（fixture 需让 service 与 runtime 共用同一 AlertHub）。
-- **S6** 手动扫描状态存 app.state 内存（routes/alerts.py L43-L47），多进程/多 worker 部署不共享；演示单进程可接受，建议在 settings/文档注明。
+- **S6** 手动扫描状态存 app.state 内存（routes/alerts.py L43-L47），多进程/多 worker 部署不共享；试运行单进程可接受，建议在 settings/文档注明。
 - **S7** 邮件 send 在广播之后、在 dispatch 内 await（service.py L153-L159），SMTP 超时最长 20s 会顺延扫描作业收尾；不影响结果正确性，如后续接多个收件人建议邮件改后台 task。
 - **S8** WS 心跳客户端 onmessage 的 TS 联合类型未含 heartbeat 分支（useAlertsWs.ts L41-L49），靠 try/if 隐式忽略，运行无碍，建议补类型分支避免后续维护误用。
 
@@ -255,4 +255,4 @@
 | S4 hub返回值 | ✅ | broadcast 返回成功推送连接数 |
 | S5 实时/隔离/邮件用例 | ✅ | fixture 共用同一 AlertHub；新增 WS 连接保持期间扫描→实时收 alert 全字段帧、两租户广播隔离、邮件正文免责+转义三组用例 |
 | S8 心跳类型 | ✅ | useAlertsWs 联合类型补 heartbeat 分支 |
-| S6/S7 | 保留 | 手动扫描状态为 app.state 内存态（单进程演示可接受）；邮件 await 在 dispatch 内 20s 超时失败降级不阻断 |
+| S6/S7 | 保留 | 手动扫描状态为 app.state 内存态（单进程试运行可接受）；邮件 await 在 dispatch 内 20s 超时失败降级不阻断 |

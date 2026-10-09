@@ -7,6 +7,10 @@
 #       moss-finagent
 #
 #   # 带数据卷（审计链、缓存持久化）
+#   # ⚠️ 容器以非特权用户（uid 10001）运行（`CHG-0192`）⇒ 宿主目录必须可写，
+#   #    否则启动后写 SQLite/审计链会 PermissionError。两种做法：
+#   #      mkdir -p ./data && sudo chown -R 10001:10001 ./data     # 方案 A
+#   #      docker run --user "$(id -u):$(id -g)" …                 # 方案 B（用自己的 uid）
 #   docker run -p 8100:8100 -v ./data:/app/data \
 #       -e DEEPSEEK_API_KEY=xxx moss-finagent
 #
@@ -45,7 +49,15 @@ COPY manage.py .
 COPY README.md .
 
 # 创建数据目录（审计链、缓存、sqlite）
-RUN mkdir -p data/audit data/llm_cache data/repos \
+#
+# ★ `CHG-0192`（债 #17）：**不再以 root 运行**。
+#   原先没有 `USER` 指令 ⇒ 容器内进程 uid=0 ⇒ 一旦应用被 RCE，
+#   攻击者在容器内就是 root（配合 `--privileged`/挂载的 docker.sock 可直接逃逸）。
+#   现在建一个非特权用户 `moss`（uid 10001），并把**数据目录的属主**一并给它 ——
+#   否则应用写 SQLite/审计链时会 PermissionError（这正是"改 USER 要连卷权限一起改"的原因）。
+RUN useradd --create-home --shell /bin/bash --uid 10001 moss \
+    && mkdir -p data/audit data/llm_cache data/repos \
+    && chown -R moss:moss /app/data \
     && chmod 755 data
 
 EXPOSE 8100
@@ -58,8 +70,17 @@ EXPOSE 8100
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD .venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8100/healthz')" || exit 1
 
+# ★ 切到非特权用户（`CHG-0192`）。放在 HEALTHCHECK / CMD 之前：
+#   HEALTHCHECK 里的 `urlopen` 只需要网络，不需要 root。
+USER moss
+
 # 生产启动（ASGI 多 worker，比同步 FastAPI 更能扛）
 # --no-access-log 减小日志体积，生产日志走 JSON
+#
+# ⚠️ 已知冲突（债 #5，未修）：`--workers 2` 与若干**进程内状态**不兼容
+#   （图形码 / IP 限流 / 幂等表 / WS 告警广播 / 熔断桶都各自进程一份）。
+#   真要横向扩展，得先把它们外置到 Redis；在那之前
+#   **多 worker 会让限流与幂等各自计数**（不是报错，是静默失效）。
 CMD [".venv/bin/python", "-m", "uvicorn", "src.api.main:app", \
      "--host", "0.0.0.0", "--port", "8100", \
      "--workers", "2", "--loop", "uvloop", \

@@ -836,14 +836,38 @@ def test_whitelist_does_not_over_reach(agent_id: str, indicator: str) -> None:
     assert _passes_whitelist(agent_id, indicator) is False
 
 
+def _inject_industry(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """★ 把"注入一个行业"这件事**同时打到两个入口**上（`CHG-0232`）。
+
+    ## 为什么必须两个都打
+
+    `CHG-0217` 把「行业三族」的生产路径从**单值** `resolve_focus_industry`
+    改成了**多值** `resolve_focus_industries`。而下面三条用例仍然只 patch 单值入口
+    ⇒ 注入**不再生效**，它们转而调用**真实解析器**。
+
+    ★★ **症状比"全红"更危险**：实测三条里**只有一条变红**
+    （`test_plan_augmentation_always_plans_crowding` 注入的 `查无此行业` 真实解析不出来），
+    另两条**碰巧还是绿的** —— 因为它们注入的 `银行` 在真实文本里**恰好也能被解出来**。
+    ⇒ **"注入失效但断言照过"是最坏的一类假绿：它看起来在测注入，其实在测真实解析。**
+
+    ⚠️ 这也解释了为什么"改生产代码走哪个入口"必须回头搜**谁在 patch 旧入口** ——
+      patch 目标换了，测试不会报"没打到"，只会**静默测别的东西**。
+    """
+    from src.orchestration import supervisor as sv
+
+    monkeypatch.setattr(sv, "resolve_focus_industry",
+                        lambda _text: (name, "测试注入"))
+    monkeypatch.setattr(sv, "resolve_focus_industries",
+                        lambda _text: [(name, "测试注入")])
+
+
 def test_plan_augmentation_adds_industry_families(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """规划期增补：行业名 + 近期意图 → 三族（判据是**指标在计划里**）。"""
     from src.orchestration import supervisor
 
-    monkeypatch.setattr(supervisor, "resolve_focus_industry",
-                        lambda _text: ("银行", "测试注入"))
+    _inject_industry(monkeypatch, "银行")
     monkeypatch.setattr(supervisor, "_industry_crowding_available", lambda _i: True)
     _agents, indicators, notes = supervisor.augment_plan_by_query_signals(
         "银行板块近期怎么走", "", [], [])
@@ -866,8 +890,7 @@ def test_plan_augmentation_always_plans_crowding(
     """
     from src.orchestration import supervisor
 
-    monkeypatch.setattr(supervisor, "resolve_focus_industry",
-                        lambda _text: ("查无此行业", "测试注入"))
+    _inject_industry(monkeypatch, "查无此行业")
     monkeypatch.setattr(supervisor, "_industry_crowding_available", lambda _i: False)
     _agents, indicators, notes = supervisor.augment_plan_by_query_signals(
         "查无此行业近期怎么走", "", [], [])
@@ -893,8 +916,7 @@ def test_industry_crowding_probe_exception_is_conservative(
     monkeypatch.setattr(PlatformDataConnector, "has_related_board", _boom)
     assert supervisor._industry_crowding_available("银行") is True   # noqa: SLF001
 
-    monkeypatch.setattr(supervisor, "resolve_focus_industry",
-                        lambda _text: ("银行", "测试注入"))
+    _inject_industry(monkeypatch, "银行")
     _agents, indicators, _notes = supervisor.augment_plan_by_query_signals(
         "银行近期怎么走", "", [], [])
     assert "行业拥挤度:银行" in indicators

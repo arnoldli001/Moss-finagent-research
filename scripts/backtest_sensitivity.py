@@ -1,6 +1,6 @@
 """回测参数敏感性分析：网格搜索 eps_pct × PE_watermark × 成本。
 
-面试可以讲：我们不是只跑一组参数，而是做了 robustness check 验证过拟合风险。
+可讲点：我们不是只跑一组参数，而是做了 robustness check 验证过拟合风险。
 输出一个 CSV（eps_pct, pe_watermark, cost_rate → 累计收益/夏普/最大回撤）。
 
 用法：

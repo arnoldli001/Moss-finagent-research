@@ -376,3 +376,102 @@ def test_guard_allows_outside_pytest(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings("/var/lib/moss/moss_finagent.db")
     allowed, why = destructive_allowed(settings)
     assert allowed is True, f"生产库必须放行清理，实际被拒：{why}"
+
+
+# ==================== 6. dry-run（先看后做） ====================
+
+
+def test_dry_run_reports_but_does_not_touch_anything(db) -> None:
+    """★ dry-run 报出的行数必须与**真跑**一致，且自己一行都不动。
+
+    ## 为什么这条判据必须同时钉两件事
+
+    · 只钉"没删" ⇒ 计数写错也过（报 0 行照样"没删"，dry-run 变成安慰剂）；
+    · 只钉"计数" ⇒ 真跑被 dry-run 顺手删了也看不出。
+    所以：先 dry-run 记数并断言库**完全没变**，再真跑，断言两者行数相等。
+    """
+    import asyncio
+
+    _exec(db, "CREATE TABLE fact_notify_log (id INTEGER PRIMARY KEY, at TEXT)")
+    # 一次插 7 行旧数据（原来用 for 循环逐行插，循环变量没用上，且多 6 次开库）
+    _exec(db, "INSERT INTO fact_notify_log (at) "
+              "VALUES ('2000-01-01'),('2000-01-01'),('2000-01-01'),('2000-01-01'),"
+              "('2000-01-01'),('2000-01-01'),('2000-01-01')")
+    _exec(db, "INSERT INTO fact_notify_log (at) VALUES ('2999-01-01')")
+    settings = _settings(db, retention_notify_log_days=180)
+    pass_notify = next(p for p in rp.PASSES if p.name == "fact_notify_log")
+
+    before = _scalar(db, "SELECT COUNT(*) FROM fact_notify_log")
+
+    dry = asyncio.run(prune_table(settings, pass_notify, dry_run=True))
+    assert dry.get("dry_run") is True, "结果里必须能看出这是 dry-run"
+    assert dry["deleted"] == 7, f"dry-run 计数错：{dry}"
+    assert _scalar(db, "SELECT COUNT(*) FROM fact_notify_log") == before, \
+        "★ dry-run 动了数据（那它就不是 dry-run）"
+
+    real = asyncio.run(prune_table(settings, pass_notify))
+    assert real["deleted"] == dry["deleted"], (
+        f"★ dry-run 说 {dry['deleted']} 行、真跑删了 {real['deleted']} 行 —— "
+        "先看后做失去意义（计数与执行的 WHERE 漂移了）"
+    )
+    assert _scalar(db, "SELECT COUNT(*) FROM fact_notify_log") == before - real["deleted"]
+
+
+def test_dry_run_does_not_dereference_either(db) -> None:
+    """★ dry-run 也不许做**解引用**（那是一条 UPDATE，会改业务数据）。
+
+    这是最容易漏的一半：只把 DELETE 变成 SELECT COUNT 就宣布"dry-run 做好了"，
+    而 `fact_alerts.event_id` 的置空照样执行 —— 用户以为"只是看看"，
+    业务数据已经被改了。
+    """
+    import asyncio
+
+    _exec(db, "CREATE TABLE fact_events (id INTEGER PRIMARY KEY, created_at TEXT)")
+    _exec(db, """CREATE TABLE fact_alerts (
+        alert_id INTEGER PRIMARY KEY, event_id TEXT, created_at TEXT)""")
+    _exec(db, "INSERT INTO fact_events (id, created_at) VALUES (1, '2000-01-01')")
+    _exec(db, "INSERT INTO fact_alerts (alert_id, event_id, created_at) "
+              "VALUES (10, '1', '2999-01-01')")
+    settings = _settings(db, retention_event_days=730)
+    pass_events = next(p for p in rp.PASSES if p.name == "fact_events")
+    assert pass_events.dereference, "本用例前提：fact_events 带解引用"
+
+    dry = asyncio.run(prune_table(settings, pass_events, dry_run=True))
+    assert dry["dereferenced"] == 1, f"dry-run 没数出待解引用行：{dry}"
+    assert _scalar(db, "SELECT event_id FROM fact_alerts WHERE alert_id=10") == "1", (
+        "★ dry-run 把 fact_alerts.event_id 置空了 —— 它改了业务数据"
+    )
+    assert _scalar(db, "SELECT COUNT(*) FROM fact_events") == 1
+
+
+def test_dry_run_is_not_blocked_by_the_pytest_guard(db) -> None:
+    """dry-run **不受** pytest 防护拦截（否则测试无法验证它，判据变假绿）。
+
+    防护的目的是"别让测试把真库删了"，而 dry-run 不写任何东西。
+    写路径的防护一点没松 —— 反向断言就在下面一行。
+    """
+    import asyncio
+    import os
+
+    from src.infrastructure.retention_passes import destructive_allowed
+
+    _exec(db, "CREATE TABLE fact_notify_log (id INTEGER PRIMARY KEY, at TEXT)")
+    _exec(db, "INSERT INTO fact_notify_log (at) VALUES ('2000-01-01')")
+    settings = _settings(db, retention_notify_log_days=180)
+    pass_notify = next(p for p in rp.PASSES if p.name == "fact_notify_log")
+
+    saved = os.environ.pop(rp.ALLOW_IN_TEST_ENV, None)
+    try:
+        allowed, why = destructive_allowed(settings)
+        assert allowed is False, "本用例前提：pytest 防护生效"
+
+        dry = asyncio.run(prune_table(settings, pass_notify, dry_run=True))
+        assert dry["deleted"] == 1, f"dry-run 被防护挡住了：{dry}"
+
+        blocked = asyncio.run(prune_table(settings, pass_notify))
+        assert blocked["deleted"] == 0 and "拒绝" in blocked["skipped"], \
+            "★ 写路径的防护被放松了（只该给 dry-run 开口子）"
+    finally:
+        if saved is not None:
+            os.environ[rp.ALLOW_IN_TEST_ENV] = saved
+

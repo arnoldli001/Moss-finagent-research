@@ -61,8 +61,14 @@ def _points_cutoff(years: int) -> str:
         return base.replace(month=2, day=28, year=base.year - max(1, years)).isoformat()
 
 
-async def run_retention(settings: Settings | None = None) -> dict[str, Any]:
-    """执行一次保留清理，返回各档删除行数与说明（异常不外抛）。"""
+async def run_retention(settings: Settings | None = None, *,
+                        dry_run: bool = False) -> dict[str, Any]:
+    """执行一次保留清理，返回各档删除行数与说明（异常不外抛）。
+
+    `dry_run=True`：**全档只读** —— 报出的行数就是"真跑会删的行数"。
+    三档都做了（数据点 / 新闻缓存 / 增量流水表），因为只做一部分的
+    dry-run 比没有更危险：命令看起来是"看一眼"，实际已经在删数据。
+    """
     settings = settings or get_settings()
     result: dict[str, Any] = {
         "points_deleted": 0,
@@ -70,6 +76,7 @@ async def run_retention(settings: Settings | None = None) -> dict[str, Any]:
         "alerts_cutoff": "",
         "points_cutoff": "",
         "errors": [],
+        "dry_run": bool(dry_run),
     }
 
     # —— 数据点：按保留年限 ——
@@ -79,7 +86,11 @@ async def run_retention(settings: Settings | None = None) -> dict[str, Any]:
         repo = build_repository(settings)
         try:
             await repo.ensure_schema()
-            result["points_deleted"] = int(await repo.prune_before(cutoff_points))
+            # ⚠️ dry-run 必须对**所有档**只读：仓储层的 `prune_before(dry_run=True)`
+            #    与真删共用同一个 WHERE（各写一份必然漂移，症状是
+            #    "dry-run 说 0 行、真跑删一堆"且不报错）。
+            result["points_deleted"] = int(
+                await repo.prune_before(cutoff_points, dry_run=dry_run))
         finally:
             await repo.close()
     except Exception as exc:  # noqa: BLE001 保留失败不阻断另一档/主链路
@@ -94,7 +105,8 @@ async def run_retention(settings: Settings | None = None) -> dict[str, Any]:
         try:
             news_repo = build_news_cache_repository(settings)
             await news_repo.ensure_schema()
-            result["news_deleted"] = int(await news_repo.prune(cutoff_news))
+            result["news_deleted"] = int(
+                await news_repo.prune(cutoff_news, dry_run=dry_run))
         except Exception as exc:  # noqa: BLE001
             logger.warning("新闻缓存保留清理失败", exc_info=True)
             result["errors"].append(f"news: {type(exc).__name__}")
@@ -136,7 +148,7 @@ async def run_retention(settings: Settings | None = None) -> dict[str, Any]:
     # —— 增量流水表：认证/告警/通知 + 可选的历史行情台账 ——
     # 逐表隔离失败已在 `run_passes` 内部处理；这里只汇总。
     try:
-        passes = await run_passes(settings)
+        passes = await run_passes(settings, dry_run=dry_run)
         result["passes"] = passes
         result["passes_deleted"] = sum(
             int(p.get("deleted") or 0) for p in passes)
