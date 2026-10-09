@@ -13517,16 +13517,27 @@ A05/A06/A07 **零调用**；与此同时 `_fetch_news_per_code()` 单独实测**
   ⇒ **354 passed**（唯一红是 `test_ps1_encoding` 对 **untracked** PS1 的 BOM 要求，已修）；
 * `ruff` 干净；`pyproject.toml` 仍可解析（`description` 已去掉"（Demo版）"）。
 
-#### 41.47.4 诚实边界（三条**没做**的，都需要你拍板）
+#### 41.47.4 诚实边界（都没做，都需要你拍板）
 
 * ★★ **提交历史里的 PII 抹不掉**：真实姓名与桌面路径**早已在历史提交里**
   （`scripts/gen_resume_v2.py` 由 `8dbe816` 引入）。本次只是"**移出跟踪集合**"。
   真要清除必须**改写历史**（`git filter-repo` / BFG）+ 强推，会影响所有协作者与已克隆仓库 ⇒ **没做**。
+* ★ **一处措辞要说准**：`.trae/skills/ai-dev-playbook/SKILL.md`（含 8 处本机绝对路径与
+  其它项目名）与 `.trae/skills/claim-evidence-consistency/SKILL.md` 都是 **`.gitignore` 忽略、
+  `git ls-files` 查不到**的文件 ⇒ 那 8 处路径**本来就不在仓库里**，本次脱敏**只作用于本机磁盘**。
+  同一轮里**真正入库**的是 `.trae/skills/ai-dev-rules/SKILL.md` 与
+  `.trae/skills/requirement-prd-sync/SKILL.md` 两个文件（各 1 处措辞）。
 * **`docs/` 按指示保留这些词**（含 `docs/interview/**`；另有 `docs/_calendar_source_probe.txt`
   里一条形似 token 的占位值，属脱敏门禁的豁免路径）。
+* ★ **`docs/` 里仍有真实姓名**（`docs/SESSION_ROOTCAUSE_AND_FIXES_20260927.md` 1 处、
+  `docs/interview/项目总览架构.md` 7 处）。姓名**不属于**用户点名的三个词，但它就是 PII ⇒
+  **没有自作主张删**（改 docs 超出本轮指示），列在这里请你定。
 * **两处功能性路径保留**：`.gitignore` 的 `/docs/面试准备_*`（ignore 规则要匹配真实文件名）、
   `configs/privacy_tracking_baseline.yaml` 里指向 `docs/interview/…` 的条目（隐私基线按路径跟踪）。
   改了会失配 ⇒ 登记而不是"改干净"。
+* **英文标识符与文件名未动**（属"改名即破坏契约"的一类，需要你拍板）：`--demo` / `DEMO_ENV` /
+  `demo-check`（CLI + 计划任务动作串 + `docs/OPS_GUIDE.md`）、`scripts/backtest_demo.py` /
+  `demo_tour.py` / `seed_demo_data.py`（文件名）、`模拟产业数据(Demo)`（**DB 里的 source_name 取值**）。
 
 #### 41.47.5 ★ 一条**不是我造成**的既存红灯（如实登记，不替别人调门槛）
 
