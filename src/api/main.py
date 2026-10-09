@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -1166,16 +1167,66 @@ app.add_middleware(
 register_handlers(app)
 
 
+# ============ 静态资源的缓存策略（2026-10-08）============
+#
+# 判据是**构建产物文件名里的内容指纹**（Vite 的 `mainlineApi-BGk44bI9.js`），
+# 不是"路径以 `/assets/` 开头" —— 后者会给一个没指纹的文件发 `immutable`，
+# 那会让客户**永远**看不到更新，比不缓存更糟。
+#
+# 指纹段取 8 位以上：Vite 默认 8 位 base64 字符，写 `{8}` 会在换了
+# 哈希长度（配置过 `build.rollupOptions.output.entryFileNames`）时**静默失效** ——
+# 失效的表现是"又回到每次回源"，不报错。所以用 `{8,}` 并允许 `-`/`_`。
+_HASHED_ASSET = re.compile(r"/assets/[^/]+-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$")
+
+#: 有指纹的资源：一年 + `immutable`（浏览器连校验请求都不发）。
+ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+#: 入口 HTML：每次回源校验（发布新构建后刷新即生效）。
+HTML_CACHE_CONTROL = "no-cache"
+
+
+def static_cache_control(path: str, content_type: str) -> str | None:
+    """`(路径, Content-Type)` → 该发哪个 `Cache-Control`（`None` = 本中间件不管）。
+
+    抽成**纯函数**是为了让判据能直接喂输入看输出（见
+    `tests/unit/test_static_asset_cache_headers.py`），而不是靠"源码里有这个字串"。
+
+    ⚠️ 判定顺序是有意的：**先判 HTML**。入口就是 `index.html`，
+    它若被误判成资源，客户将永远看不到新构建。
+    """
+    if content_type.startswith("text/html"):
+        return HTML_CACHE_CONTROL
+    if _HASHED_ASSET.search(path):
+        return ASSET_CACHE_CONTROL
+    return None
+
+
 @app.middleware("http")
 async def no_cache_html(request, call_next):
-    """入口HTML禁缓存（发布新构建后刷新即生效）；hash资源仍走浏览器缓存。"""
+    """入口 HTML 禁缓存；**带内容指纹的构建产物**走一年强缓存。
+
+    ## 这两句话为什么必须在一起（2026-10-08）
+
+    它们是一对：入口 HTML **必须**每次回源（否则客户看不到新构建），
+    而它引用的那些 `assets/index-<指纹>.js` **必须**一次都不回源。
+
+    实测依据：这条公网链路上**每次请求固定 ~1.0~1.2 s**（64 字节的
+    `/health/live` 也要 1.03~1.74 s）—— 而 Starlette 的 `StaticFiles`
+    **不发 `Cache-Control`**，浏览器只能用启发式新鲜度（≈ 构建时间的 10%）：
+    一份 8 小时前的构建，它的资源每小时就要回源校验一次，每次都是一趟公网往返。
+    加上 `immutable` 之后这一趟**必然为 0**（判据写"次数"，不写毫秒）。
+
+    只改一边就会出问题：只加 immutable 而不禁 HTML ⇒ 客户永远看不到新构建；
+    只禁 HTML 而不加 immutable ⇒ 每次加载白跑几趟。
+    """
     response = await call_next(request)
-    if response.headers.get("content-type", "").startswith("text/html"):
-        response.headers["Cache-Control"] = "no-cache"
+    policy = static_cache_control(request.url.path,
+                                  response.headers.get("content-type", ""))
+    if policy is not None:
+        response.headers["Cache-Control"] = policy
     return response
 
 
-# 前端构建产物（web/dist）存在时由同一服务托管，单服务演示
+# 前端构建产物（web/dist）存在时由同一服务托管，单服务
 #
 # ★ `MOSS_WEB_DIST` 可覆盖托管目录 —— 对外试点实例必须用**冻结的一份**。
 #

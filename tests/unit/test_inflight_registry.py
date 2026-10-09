@@ -200,3 +200,68 @@ async def test_loop_lag_spike_names_the_inflight_handler(monkeypatch) -> None:
     _kind, _ind, reason = recorded[0]
     assert "data-status" in reason, (
         f"卡顿理由里没有点名在飞的处理器 ⇒ 仪器等于没装：{reason!r}")
+
+
+# ======================================================================
+# `interactive()`：**给后台任务让路**用的判据（`CHG-0221`）
+#
+# 背景：2026-10-08 用户报「自选股的分时图加载很慢」。量出来是日K预热占掉
+# API 进程 70% 的墙钟，用户点票的 `/intraday/snapshot` p50 = 3.67 s。
+# 修法是让预热**看见用户在等就让路** —— 而"用户在等"这个判据一旦写错，
+# 后果是**静默**的：要么让路变成永不生效，要么变成把预热整个关掉。
+# ======================================================================
+
+@pytest.mark.asyncio
+async def test_interactive_counts_http_requests() -> None:
+    """HTTP 请求/响应周期算"用户在等"。"""
+    inflight.enter("GET /api/v1/intraday/snapshot")
+    rows = inflight.interactive()
+    assert [r["label"] for r in rows] == ["GET /api/v1/intraday/snapshot"], rows
+
+
+@pytest.mark.asyncio
+async def test_interactive_excludes_websockets_and_tasks() -> None:
+    """★★ **长连接与后台任务都不算"用户在等"** —— 这条是本判据的全部价值。
+
+    实测过的两个反例（都来自生产日志）：
+
+        websocket /api/v1/ws/alerts(2272813ms)   ← 一条挂过 **38 分钟**
+        task:catalog-rebuild(30313ms)            ← 后台任务自己
+
+    拿"登记簿非空"当判据，`websocket` 会让预热**永远**让路（等于把预热关掉，
+    而界面上看不出任何异常，只是每只票都变冷）；`task:` 则让后台给后台让路。
+    """
+    inflight.enter("websocket /api/v1/ws/alerts")
+    inflight.enter("task:catalog-rebuild")
+    inflight.enter("task:intel-feed-prewarm")
+    assert inflight.interactive() == [], (
+        "长连接/后台任务被算成了交互请求 ⇒ 预热会永远让路（静默退化）")
+
+    # 混进来一个真请求时，只有它被算进去
+    inflight.enter("POST /api/v1/research/analyze")
+    assert [r["label"] for r in inflight.interactive()] == [
+        "POST /api/v1/research/analyze"]
+
+
+@pytest.mark.asyncio
+async def test_interactive_is_ordered_like_snapshot() -> None:
+    """排序与 `snapshot()` 同口径（已持续最久的在前），便于日志直接读。"""
+    async def _hold(label: str, sleep_s: float) -> None:
+        inflight.enter(label)
+        try:
+            await asyncio.sleep(sleep_s)
+        finally:
+            inflight.leave()
+
+    t1 = asyncio.create_task(_hold("GET /api/v1/older", 0.30))
+    await asyncio.sleep(0.05)
+    t2 = asyncio.create_task(_hold("GET /api/v1/newer", 0.30))
+    await asyncio.sleep(0.05)
+    assert [r["label"] for r in inflight.interactive()] == [
+        "GET /api/v1/older", "GET /api/v1/newer"]
+    await asyncio.gather(t1, t2)
+
+
+def test_interactive_outside_loop_is_empty_not_error() -> None:
+    """没有事件循环时返回空表（不是异常）—— 后台线程里也要能安全问一句。"""
+    assert inflight.interactive() == []

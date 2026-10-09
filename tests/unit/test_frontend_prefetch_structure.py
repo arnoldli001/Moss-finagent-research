@@ -264,3 +264,122 @@ def test_logout_resets_prefetch_state():
     """登出必须重置预取记账，否则下一个人登录后保活会以为"刚取过"而跳过。"""
     src = _read("hooks/useAuth.ts")
     assert "resetPrefetchState" in src, "登出没有重置预取记账"
+
+
+# ------------------------------------------------- 主线挖掘快照缓存（2026-10-08 报障）
+#
+# > "为什么每次打开 主线挖掘，热加载 切界面也要等 2-3 秒？"
+#
+# 量出来的账：**服务端 p50 = 19 ms**（`data/pilot/access_audit`，今天 27 次），
+# 但这条公网链路上**每次请求固定 ~1.0~1.2 s**（64 字节的 `/health/live`
+# 也要 1.03~1.74 s），而 `MainlinePanel` 在三元链里、切走即卸载
+# ⇒ 没有客户端缓存就是"每切一次等一趟往返"。
+#
+# 修法与 alerts/intel 逐条对齐（**不自造一套**，见 AGENTS.md《性能硬约束》）：
+# `mainlineCache.ts` 提供 localStorage 缓存，面板首帧先画、请求照发，
+# 保活预取负责续期。下面守的就是"改错任何一处都会静默退回冷路径"的几处。
+
+def _exported_number(src: str, name: str) -> int:
+    """从 TS 源码里读一个形如 `export const X = 10 * 60 * 1000;` 的常量。"""
+    m = re.search(rf"\b{name}\s*=\s*([0-9_*\s]+?);", src)
+    assert m, f"{name} 找不到（常量名被改了？）"
+    return int(eval(m.group(1).replace("_", "")))  # noqa: S307 常量表达式
+
+
+def test_mainline_cache_ttl_outlives_keepalive():
+    """主线缓存的 TTL 必须**大于**保活续期间隔，否则续期之间是冷窗口。
+
+    这一条是 `test_keepalive_interval_is_shorter_than_shortest_cache_ttl`
+    的同类判据 —— 加一个缓存就要加一条，否则"最短的那个 TTL"会悄悄换人。
+    """
+    keepalive = _exported_number(_read("panelPrefetch.ts"), "KEEPALIVE_MS")
+    ttl = _exported_number(_read("mainlineCache.ts"), "MAINLINE_MAX_AGE_MS")
+    assert ttl > keepalive, (
+        f"主线缓存 TTL {ttl}ms 不大于保活续期 {keepalive}ms —— "
+        "续期之间会出现缓存已过期、面板又是冷的窗口（用户又要等一趟往返）")
+
+
+def test_prefetch_covers_mainline_snapshot():
+    """保活预取必须**覆盖主线快照** —— 只做缓存不做续期，TTL 一到又是冷的。
+
+    同时守两件事：目标进了 `allSettled` 列表（失败互不拖累）、
+    登出记账里也有它（否则下一个人登录时会被判"刚取过"而跳过）。
+    """
+    src = _read("panelPrefetch.ts")
+    assert "prefetchMainline" in src, "panelPrefetch 没有预取主线快照"
+    m = re.search(r"prefetchPanels[\s\S]*?allSettled\(\[([\s\S]*?)\]\)", src)
+    assert m, "找不到 prefetchPanels 的 allSettled 列表"
+    assert "prefetchMainline(force)" in m.group(1), (
+        "prefetchMainline 没有进 allSettled 列表 —— 不会被登录/刷新/续期触发")
+    reset = src[src.find("export function resetPrefetchState"):]
+    assert "lastDone.mainline" in reset[:400], (
+        "resetPrefetchState 没有重置 mainline 的记账 —— "
+        "换个人登录后第一次预取会被跳过")
+
+
+def test_mainline_prefetch_uses_the_shared_params():
+    """预取**不许自己写死** `top` / `alert_limit`。
+
+    后端 `routes/mainline.py::WARM_TOP/WARM_ALERT_LIMIT` 决定了落盘热快照
+    的缓存键指纹；前端一旦漂移，那份热快照就**永远命中不了**，
+    而这个失效不报错 —— 只表现为"第一个打开面板的人等一次全市场重算"。
+    本项目为同一形状的事故付过代价（见
+    `tests/unit/test_api_no_loop_blocking.py::test_warm_uses_the_same_cache_key_as_the_route`）。
+    """
+    src = _strip_comments(_read("panelPrefetch.ts"))
+    assert "mainlineSnapshotParams()" in src, (
+        "预取没有走 mainlineSnapshotParams() —— 参数会有第二份来源")
+    assert not re.search(r"snapshot\(\s*\{\s*top\s*:", src), (
+        "预取里写死了 top —— 必须走 mainlineSnapshotParams()")
+
+
+def test_mainline_panel_paints_from_cache_before_the_network():
+    """面板首帧必须**先画缓存**，且缓存命中时不许再显示加载态。
+
+    两处最容易写错的：
+      ① 用 `useEffect` 补一刀而不是 `useState` 初值 ⇒ 第一帧仍会闪
+         「正在读取评分…」，用户看到的等待没变；
+      ② 缓存命中却仍走非静默分支 ⇒ `loading` 置真，刚画出来的内容
+         被加载态盖掉，等于没做。
+    """
+    panel = _strip_comments(_read("components/MainlinePanel.tsx"))
+    assert "readMainlineSnapshot()" in panel, "面板没有读本地缓存"
+    # ① 初值里读（不是 effect 里补）
+    m = re.search(r"useState<MainlineSnapshot \| null>\(\s*\(\)\s*=>"
+                  r"\s*readMainlineSnapshot\(\)", panel)
+    assert m, (
+        "缓存必须在 `useState` 的惰性初值里读 —— 放 effect 里第一帧仍会闪加载态")
+    # ② 取到新的要写回缓存
+    assert "writeMainlineSnapshot(" in panel, "面板取到快照后没有写回缓存"
+    # ③ 缓存命中时第一次核对必须是静默的
+    assert re.search(r"loadSnapshot\(seededRef\.current\)", panel), (
+        "缓存命中后第一次核对没有走静默分支 —— 加载态会盖掉刚画出来的内容")
+
+
+def test_mainline_params_match_the_backend_warm_key():
+    """前端请求参数与后端热快照指纹必须**逐项一致**（跨语言契约）。
+
+    这是唯一一处"两边各写一份数字、且没法自动同步"的地方 ——
+    所以判据直接跨语言比对。后端那侧见
+    `routes/mainline.py` 的 `WARM_TOP` / `WARM_ALERT_LIMIT`。
+    """
+    ts = _read("mainlineCache.ts")
+    py = (Path(__file__).resolve().parents[2]
+          / "src" / "api" / "routes" / "mainline.py").read_text(encoding="utf-8")
+
+    def py_const(name: str) -> int:
+        m = re.search(rf"^{name}\s*=\s*([0-9]+)\s*$", py, re.M)
+        assert m, f"后端找不到 {name}"
+        return int(m.group(1))
+
+    assert _exported_number(ts, "MAINLINE_TOP") == py_const("WARM_TOP"), (
+        "前端 top 与后端 WARM_TOP 不一致 —— 落盘热快照会永远命中不了（不报错）")
+    assert _exported_number(ts, "MAINLINE_ALERT_LIMIT") \
+        == py_const("WARM_ALERT_LIMIT"), (
+        "前端 alert_limit 与后端 WARM_ALERT_LIMIT 不一致 —— 同上")
+
+
+def test_logout_clears_mainline_cache():
+    """登出必须清主线缓存：里面是**评分与告警**，换个人不该看到。"""
+    src = _read("hooks/useAuth.ts")
+    assert "clearMainlineCache" in src, "登出没有清主线挖掘缓存"

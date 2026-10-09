@@ -86,6 +86,39 @@ def inflight_count() -> int:
     return len(_INFLIGHT)
 
 
+#: HTTP 方法前缀 —— `_mark_inflight` 登记的标签形如 `"GET /api/v1/x"`。
+#:
+#: ⚠️ 它同时登记 `"websocket /api/v1/ws/alerts"` 与 `"task:catalog-rebuild"`，
+#: 而这两类**都不是"用户在等"** —— 见 `interactive()` 的说明。
+HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE",
+                          "HEAD", "OPTIONS", "TRACE"})
+
+
+def interactive(*, now: float | None = None) -> list[dict[str, Any]]:
+    """此刻在飞的**交互请求**（一次 HTTP 请求/响应周期）。
+
+    ## 它是给"后台任务让路"用的判据（`CHG-0221`）
+
+    为什么不能直接看 `snapshot()`（"有没有东西在飞"）：
+
+    | 标签形态 | 是什么 | 能不能当"用户在等" |
+    |---|---|---|
+    | `GET /api/v1/...` | 一次请求/响应 | ✅ 是 |
+    | `websocket /api/v1/ws/alerts` | **长连接**，实测一条挂过 **2,272,813 ms（38 分钟）** | ❌ 永远为真 ⇒ 让路变成"把预热关掉" |
+    | `task:catalog-rebuild` | 后台任务自己 | ❌ 后台给后台让路没有意义 |
+
+    所以判据是 `kind` 落在 HTTP 方法集合里，而不是"登记簿非空"。
+    """
+    t = time.monotonic() if now is None else now
+    rows = [
+        {"label": label, "elapsed_ms": round((t - started) * 1000.0, 1)}
+        for label, started in _INFLIGHT.values()
+        if label.split(" ", 1)[0] in HTTP_METHODS
+    ]
+    rows.sort(key=lambda r: -r["elapsed_ms"])
+    return rows
+
+
 def reset() -> None:
     """清空（测试用；生产不需要 —— 任务结束时自己注销）。"""
     _INFLIGHT.clear()

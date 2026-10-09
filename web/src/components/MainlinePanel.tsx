@@ -13,6 +13,11 @@ import {
   type MainlineRefreshStatus,
   type MainlineSnapshot,
 } from "../mainlineApi";
+import {
+  mainlineSnapshotParams,
+  readMainlineSnapshot,
+  writeMainlineSnapshot,
+} from "../mainlineCache";
 
 /**
  * 主线挖掘 · 主容器（**顶级页签**，位于「量化交易」右侧、「资金流监控」左侧）。
@@ -39,6 +44,13 @@ import {
  * 5. **整页宽度排版**（不再是 380px 侧栏）。热力图列数、告警表列宽都按整页
  *    自适应 —— 这也是把它从「资金流监控」里提级出来的直接原因（见
  *    `FundFlowPanel.tsx` 的注释）。
+ * 6. ★ **首帧先画本地缓存**（`mainlineCache.ts`，2026-10-08 加）。
+ *    后端早就热了（服务端 p50 = 19 ms），但这条公网链路上**每次请求固定
+ *    ~1.0~1.2 s**（64 字节的探针也一样），而这个面板是三元链渲染、
+ *    切走即卸载 —— 没有缓存就等于"每切一次等一趟往返"。
+ *    所以缓存命中时不再显示「正在读取评分…」，直接出内容，请求照发
+ *    （stale-while-revalidate）；显示的是缓存那份的 `generated_at`，
+ *    **不伪造新鲜度**。
  */
 
 /** 快照轮询周期：评分一天只算一次，300 秒足够；再密就是白打库。 */
@@ -69,7 +81,18 @@ const TABS: { key: Tab; label: string; title: string }[] = [
 
 export default function MainlinePanel() {
   const [tab, setTab] = useState<Tab>("heat");
-  const [snapshot, setSnapshot] = useState<MainlineSnapshot | null>(null);
+  /**
+   * ★ 首帧用**本地缓存**初始化（0 往返就画出内容）。
+   *
+   * 用 `useState` 的惰性初值而不是 `useEffect` 里补一刀：这样**第一帧**
+   * 就有数据，不会先闪一下「正在读取评分…」再被覆盖（那正是用户看到的
+   * "每次都要等 2-3 秒"）。
+   *
+   * 过期 / 损坏 / 隐私模式一律返回 `null` → 退回原来的冷路径行为，
+   * 不会更差（见 `mainlineCache.ts`）。
+   */
+  const [snapshot, setSnapshot] = useState<MainlineSnapshot | null>(
+    () => readMainlineSnapshot()?.snapshot ?? null);
   const [futures, setFutures] = useState<MainlineFuturesSnapshot | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -89,11 +112,23 @@ export default function MainlinePanel() {
    */
   const hasSnapshotRef = useRef(false);
   const hasFuturesRef = useRef(false);
+  /**
+   * 首帧是否来自本地缓存 —— 决定挂载后第一次核对是**静默**还是**转圈**。
+   *
+   * 缓存命中时不能再用 `loadSnapshot()` 的非静默分支：那会把 `loading`
+   * 置真，`MainlineHeatmap` 于是又显示「正在读取评分…」，
+   * 刚画出来的内容被加载态盖掉 —— 优化等于没做。
+   */
+  const seededRef = useRef(snapshot !== null);
 
   const loadSnapshot = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      setSnapshot(await mainlineApi.snapshot({ top: 60, alertLimit: 100 }));
+      const data = await mainlineApi.snapshot(mainlineSnapshotParams());
+      setSnapshot(data);
+      // 每次取到新的都刷缓存：用户停留在页面上时 300 秒一次的静默轮询
+      // 会让缓存一直新鲜，下次切回来仍是"0 往返"。
+      writeMainlineSnapshot(data);
       hasSnapshotRef.current = true;
       setError("");
     } catch (exc) {
@@ -122,7 +157,9 @@ export default function MainlinePanel() {
     if (tab === "futures") {
       if (!hasFuturesRef.current) void loadFutures();
     } else if (!hasSnapshotRef.current) {
-      void loadSnapshot();
+      // 缓存命中 → 静默核对（内容已经在屏幕上）；没命中 → 照旧显示加载态
+      void loadSnapshot(seededRef.current);
+      seededRef.current = false;
     }
     const timer = window.setInterval(() => {
       if (tab === "futures") void loadFutures(true);
@@ -152,8 +189,11 @@ export default function MainlinePanel() {
       if (state !== "running" && state !== "queued") {
         stopTaskPoll();
         if (state === "done") {
-          if (status.result) setSnapshot(status.result);
-          else await loadSnapshot(true);
+          if (status.result) {
+            setSnapshot(status.result);
+            // 手动刷新的结果同样进缓存：下一次切回来仍是 0 往返
+            writeMainlineSnapshot(status.result);
+          } else await loadSnapshot(true);
           if (tab === "futures") await loadFutures(true);
         } else if (state === "idle" || state === "") {
           /* 后端"查不到这个任务"= 进程重启过（任务表在进程内存里，`state=idle`

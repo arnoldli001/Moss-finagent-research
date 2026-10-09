@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "check:intel": "esbuild src/intelRenderCheck.tsx --bundle --platform=node --format=cjs --jsx=automatic --log-level=warning --outfile=node_modules/.cache/intelRenderCheck.cjs && node node_modules/.cache/intelRenderCheck.cjs",
-    "check:rateguard": "esbuild scripts/rateGuardViewCheck.ts --bundle --platform=node --format=cjs --log-level=warning --outfile=node_modules/.cache/rateGuardViewCheck.cjs && node node_modules/.cache/rateGuardViewCheck.cjs"
+    "check:rateguard": "esbuild scripts/rateGuardViewCheck.ts --bundle --platform=node --format=cjs --log-level=warning --outfile=node_modules/.cache/rateGuardViewCheck.cjs && node node_modules/.cache/rateGuardViewCheck.cjs",
+    "check:mainline": "esbuild scripts/mainlineCacheCheck.ts --bundle --platform=node --format=cjs --log-level=warning --outfile=node_modules/.cache/mainlineCacheCheck.cjs && node node_modules/.cache/mainlineCacheCheck.cjs"
   },
   "dependencies": {
     "marked": "^15.0.0",

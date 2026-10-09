@@ -205,6 +205,12 @@ export function useAuth() {
         const { clearCrowdingDetailCache } = await import("../crowdingDetailCache");
         clearCrowdingDetailCache();
       } catch { /* 清理失败不该阻断登出 */ }
+      // 主线挖掘快照缓存同理（2026-10-08）：里面是**评分与告警**，
+      // 换个人登录更不该看到上一个人的持仓线索。
+      try {
+        const { clearMainlineCache } = await import("../mainlineCache");
+        clearMainlineCache();
+      } catch { /* 清理失败不该阻断登出 */ }
       // 预取记账也要重置：否则下一个人登录后，保活续期会以为
       // "刚刚取过"而跳过第一次预取，缓存又是冷的。
       try {
