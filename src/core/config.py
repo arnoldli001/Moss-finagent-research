@@ -1,7 +1,7 @@
 """应用配置。
 
 敏感项（API Key、密码、Token）一律经环境变量注入，禁止硬编码；
-仅本地开发默认值（如postgres口令）允许作为兜底，生产必须覆盖。
+仅本地Demo默认值（如postgres口令）允许作为兜底，生产必须覆盖。
 """
 
 from __future__ import annotations
@@ -251,104 +251,6 @@ class Settings(BaseSettings):
         lambda: _store_rel_default("llm_cache"), "LLM_CACHE_DIR")
     llm_cache_ttl_hours: float = 24.0
     llm_semantic_threshold: float = 0.85  # n-gram余弦≥该值判语义命中
-    # ======================================================================
-    # ★ 缓存三级化：3-gram 粗筛（召回） → Embedding 精排（判定）（`CHG-0178`）
-    # ======================================================================
-    #
-    # ## 为什么不复用 `llm_semantic_threshold`
-    #
-    # 那一个阈值是**字符 3-gram** 的，量纲完全不同：它坐在每个桶分布的
-    # **上方**（实测同桶 ≥0.85 的 pair 占比 ≤0.4%），所以语义层只贡献了
-    # **1.89%** 的命中。embedding 的相似度分布是另一条曲线，两者不可互相换算。
-    #
-    # ## ★ 默认**开启**（`CHG-0180`）：三级缓存已上线
-    #
-    # 与 `CHG-0178` 首次落地时的口径相反，这里解释为什么改了：
-    #
-    # · **护栏先行**：L3 只在**调用点传了 `anchor`** 时才跑（见 `LLMCache.aget`
-    #   的结构性护栏）。不传 anchor 的调用点（大批处理作业）**一次网络都不会出**，
-    #   行为与两级时代逐字一致 ⇒ 默认开着的代价是 0。
-    # · **不传 anchor 而开 L3 会更糟**（实测反证）：整 prompt 的 embedding 余弦在
-    #   两条完全不同的资讯之间是 **0.9604 / 0.9768 / 0.9657**，全部远高于阈值 0.80
-    #   ⇒ 语义缓存会退化成"返回这个 agent+层级的第一条缓存答案"，且静默。
-    #   所以护栏是"能默认开"的前提，不是可选项。
-    # · **缺 key 时自动失效**：`_build_embed_client()` 配不齐就返回 `None`，
-    #   `rerank_enabled` 如实报 False，不会变成"接上了但每次都超时"。
-    # · **查询向量按 anchor 记忆化** ⇒ 一次分析（4~15 次调用）只出网一次。
-    #
-    # 要退回两级：`LLM_EMBED_RERANK_ENABLED=false`。
-    llm_embed_rerank_enabled: bool = True
-    #: 精排模型。**不进 `configs/models.yaml` 的 `models:` 段** ——
-    #: 那一段是降级链的候选池，写进去等于把 embedding 模型当 LLM 用。
-    #:
-    #: ⚠️ **不许带 `Pro/` 前缀**（`CHG-0202` 账单实测）：
-    #: `Pro/BAAI/bge-m3` 与 `BAAI/bge-m3` 的 p50 与 AUC **逐位相同**
-    #: （0.8604 / 0.8221 / 0.573）⇒ **同一个模型**；而账单显示
-    #: **不带前缀 ¥0.0000（免费）、带前缀 ¥0.0842/M tokens**。
-    #: ⇒ 带 `Pro/` 是**纯多花钱、零收益**。判据见
-    #: `tests/unit/test_embed_model_tier_guard.py`。
-    llm_embed_model: str = "BAAI/bge-m3"
-    #: 精排端点。留空则回落到 `siliconflow_base_url`（同一把 key，已实测 200）。
-    llm_embed_base_url: str = ""
-    #: 精排硬超时（秒）。必须有界（见 `embedding.DEFAULT_TIMEOUT_SEC`）。
-    llm_embed_timeout_seconds: float = 1.5
-    #: 精排命中阈值（余弦）。
-    #:
-    #: ⚠️ **这是初始值，不是标定值**。依据是 anchor（变量文本）上的实测两簇：
-    #:     不同事件（回购 / 碳化硅投产 / 工业增加值）  0.4359 / 0.4010 / 0.5002
-    #:     同一事件的**改写稿**                        0.9639
-    #: n=4 对，**方向明确但不是统计结论**。按本项目口径，任何相似度阈值
-    #: 都必须与"内容的指纹密度"一起**按桶标定**后才能改这个数
-    #: （`docs/INTERVIEW_FAQ_LOCAL_LLM_20260929.md` 记着 0.85 未标定的旧账）。
-    llm_embed_threshold: float = 0.80
-    #: L3 精排的召回条数 K（L2 只召回、不判定）。
-    #:
-    #: 为什么是 K 而不是阈值：实测**单一全局粗筛阈值在这份语料上两边都不成立** ——
-    #: `intel_extract` 桶 ≥0.60 的 pair 占 **100%**（等于没筛），
-    #: `mainline_member_pure` 桶占 **0%**（等于永久短路）。
-    #: 所以 L2 做 top-K 截断，判定权交给 L3。
-    llm_embed_recall_k: int = 12
-    #: ★ cross-encoder 判定（`CHG-0203`）：把"是不是同一件事"的判定权
-    #: 从 bi-encoder 余弦**换成** cross-encoder（两段文本拼一起过模型）。
-    #:
-    #: ## 为什么换（实测，`CHG-0199`）
-    #:
-    #: 同一批 40 对上，bi-encoder 与 cross-encoder 的 **AUC**：
-    #:     `BAAI/bge-m3`（现行判定）      0.573   ← 接近抛硬币
-    #:     `Qwen3-Embedding-4B`（bi 最好） 0.618
-    #:     `BAAI/bge-reranker-v2-m3`      **0.775** ← 唯一能分开的
-    #: 且 cross-encoder 的操作点**每一个都严格优于现行**：
-    #:     现行 bge-m3 @0.80 ⇒ 召回 50% / 假阳 65%
-    #:     reranker  @0.90 ⇒ 召回 65% / 假阳 30%
-    #:     reranker  @0.95 ⇒ 召回 60% / 假阳 **15%**
-    #:
-    #: ## 为什么可以默认开（三条）
-    #:
-    #: 1. **fail-open**：rerank 失败 ⇒ 退回 embedding 阈值 ⇒ 再退 3-gram 阈值，
-    #:    与"没开"逐字一致；**绝不抛**。
-    #: 2. **结构性护栏已在**：只在 anchor 模式跑（`CHG-0180`），prompt 模式一次网络都不出。
-    #: 3. **连存量条目也能受益**：reranker 吃**原始文本**、不需要向量
-    #:    ⇒ 今天那 5,007 条**没有 embedding** 的旧条目也能被它判定
-    #:    （`CHG-0202` 实测带向量的存量 = **0/5007**）。
-    #:
-    #: ⚠️ **延迟代价**：一次调用 ≈ 159 ms（K=12，`CHG-0199` 实测），
-    #: 与现行 embedding 的 172 ms **同量级**。
-    llm_rerank_enabled: bool = True
-    #: cross-encoder 模型名。**与 `llm_embed_model` 同一条纪律：不许带 `Pro/`**。
-    llm_rerank_model: str = "BAAI/bge-reranker-v2-m3"
-    #: cross-encoder 硬超时（秒）。K=12 实测 159 ms ⇒ 3 s 是宽裕的有界值。
-    llm_rerank_timeout_seconds: float = 3.0
-    #: cross-encoder 判定阈值（**与 embedding 的余弦不是同一把尺子**）。
-    #:
-    #: ⚠️ 依据 n=20+20 构造对集，**是初始值不是标定值**：
-    #:     0.90 ⇒ 召回 65% / 假阳 30%
-    #:     0.95 ⇒ 召回 60% / 假阳 **15%**   ← 取这个
-    #: 选 0.95 的理由：多 5pp 召回不值得多 15pp 假阳 ——
-    #: **假阳是静默错答**（用户看到的是"有据的错结论"），召回低只是少省一次 LLM。
-    llm_rerank_threshold: float = 0.95
-    #: 交给 cross-encoder 的候选条数（= 召回层输出）。
-    #: 实测延迟随 K 线性：K=12 ⇒ 157 ms / K=30 ⇒ 313 ms / K=59 ⇒ 576 ms。
-    llm_rerank_top_k: int = 12
     #: LLM 调用审计目录。默认值来自 registry 的 `llm_audit` ——
     #: 主实例解析为 `data/audit`（**与改动前逐字一致**），隔离档为 `data/<env>/audit`。
     llm_audit_dir: str = _env_field_factory(
@@ -370,42 +272,6 @@ class Settings(BaseSettings):
     #: 交互路径**防撞钟**秒数（`src/core/intel_limits.py` 的默认是 10.0）。
     #: 同上：登记进 Settings 才能被 `.env` 覆盖。
     query_deadline_sec: str = _env_field("MOSS_QUERY_DEADLINE_SEC", "")
-    #: 幻觉防护的三档开关（逗号分隔层号，`src/infrastructure/llm/hallucination_guard.py`）。
-    #:
-    #: 「1」数字溯源（硬）·「2」股票代码 grounding（硬）·「3」来源标注（advisory）。
-    #:
-    #: ## 为什么必须登记进 Settings（`CHG-0173`，2026-10-05）
-    #:
-    #: 与 `MOSS_NETWORK_FALLBACK_ALLOWLIST` 同一个坑：pydantic-settings 只把 `.env`
-    #: 读进 Settings 对象、**不写回 `os.environ`**。护栏若只读 `os.environ`，
-    #: 在 `.env` 里关掉某一层会**不生效**，而日志里看不出区别 ——
-    #: "开关压根没接上"与"护栏正常工作"长得一模一样。
-    #:
-    #: 默认 `1,2,3`（全开）。Tier3 之所以敢默认开，是因为它**在结构上**
-    #: 只能给已被 Tier1 点名的句子补充细节，不可能独立制造新警告 ——
-    #: 实测误报面与收窄依据见 `scripts/_probe_tier3_fp_corpus.py`。
-    hallucination_tiers: str = _env_field("MOSS_HALLUCINATION_TIERS", "1,2,3")
-    #: 分布式追踪（OpenTelemetry，`CHG-0174`）。**默认关闭**。
-    #:
-    #: 为什么默认关：本项目默认零依赖可跑（SQLite + 本地模型），追踪是可选的补强；
-    #: 打开需要 `uv sync --extra otel`。没装 SDK 时 `init_tracing()` 如实返回
-    #: `no_sdk` 并**完全不影响应用**（fail-open），不是静默降级。
-    #:
-    #: ⚠️ 这三个字段必须登记进 `Settings`：`tracing.py` 读的是这里，
-    #: 只写 `os.environ` 会被 pydantic-settings 的 `.env` 语义绕过（同
-    #: `MOSS_NETWORK_FALLBACK_ALLOWLIST` / `MOSS_HALLUCINATION_TIERS` 的坑）。
-    otel_enabled: str = _env_field("MOSS_OTEL_ENABLED", "")
-    #: OTLP/HTTP 端点（如 `http://127.0.0.1:4318`）。留空 = 即使开了也不追踪
-    #: —— 「开了但没配端点」是一种**配置错误**，`tracing.status().reason` 会明说。
-    otel_endpoint: str = _env_field("MOSS_OTEL_ENDPOINT", "")
-    otel_service_name: str = _env_field(
-        "MOSS_OTEL_SERVICE_NAME", "moss-finagent-research")
-    #: 采样率（0~1）。默认 **1.0**（全采）而不是 OTel 的默认采样器：
-    #: 本项目是**单进程低频**（本机 / 小团队），1.0 的 span 量有上界，
-    #: 而"某一次用户报障的请求恰好没被采样"会让追踪在排障时**刚好没用**。
-    #: ⚠️ 量的上界写在 `tracing.py` 的 `_MAX_QUEUE_SIZE` 等四个常量里；
-    #: 流量涨了要下调本值（或改尾采样），别让它变成"没写上限"。
-    otel_sample_ratio: str = _env_field("MOSS_OTEL_SAMPLE_RATIO", "1.0")
     # Token预算：单任务DeepSeek调用累计token上限，超过则拒绝后续调用（防超支）
     #
     # 200000 而不是原来的 30000。实测依据（data/audit/llm_audit.jsonl 里 85 个任务）：

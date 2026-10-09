@@ -1,7 +1,7 @@
 """仓储工厂：按Settings组装 后端(SQLite/PostgreSQL) + 可选Redis缓存装饰。
 
 装配规则：
-- DATA_BACKEND=sqlite（默认）→ SQLite文件库，零外部依赖；
+- DATA_BACKEND=sqlite（默认）→ SQLite文件库，Demo零外部依赖；
 - DATA_BACKEND=postgres → asyncpg连接池（懒连接，无服务不阻断启动，首次IO报错带排障提示）；
 - REDIS_CACHE_ENABLED=true → 任意后端外再包一层CachedRepository，Redis不可达自动fail-open。
 """
@@ -49,7 +49,7 @@ def build_repository(settings: Settings) -> DataPointRepository:
 
 
 def build_event_repository(settings: Settings) -> EventRepository:
-    """构建事件/告警仓储（当前仅SQLite；postgres实现未纳入本版范围）。"""
+    """构建事件/告警仓储（Demo仅SQLite；postgres实现未纳入本版范围）。"""
     backend = settings.data_backend.strip().lower()
     if backend == "postgres":
         raise ConfigError(
@@ -62,7 +62,7 @@ def build_event_repository(settings: Settings) -> EventRepository:
 def build_intraday_profile_repository(
     settings: Settings,
 ) -> IntradayProfileRepository:
-    """构建做T权重档案仓储（当前仅SQLite；postgres实现未纳入本版范围）。
+    """构建做T权重档案仓储（Demo仅SQLite；postgres实现未纳入本版范围）。
 
     与做T权重档案的姊妹能力「个股微调」的分工：
     `configs/intraday.yaml` 的 `overrides:` 段继续可用（手工编辑、可版本化），
@@ -83,7 +83,7 @@ def build_intraday_profile_repository(
 
 
 def build_news_cache_repository(settings: Settings) -> NewsCacheRepository:
-    """构建新闻/快讯缓存仓储（当前仅SQLite；新闻为增强链路）。"""
+    """构建新闻/快讯缓存仓储（Demo仅SQLite；新闻为增强链路）。"""
     backend = settings.data_backend.strip().lower()
     if backend not in _BACKENDS:
         raise ConfigError(

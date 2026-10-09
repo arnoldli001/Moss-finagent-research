@@ -13481,69 +13481,6 @@ A05/A06/A07 **零调用**；与此同时 `_fetch_news_per_code()` 单独实测**
   见 §41.45.7 的说明（`argon2-cffi` 是**刻意不装**的陷阱）。
 
 
-
-### 41.47 非 `docs/` 目录的措辞清理与脱敏（`CHG-0242`）
-
-> **触发**：用户「非doc文件夹下，去掉『面试』『简历』『演示』的相关词汇，提交本会话修改的代码到
-> github，注意脱敏」。
-
-#### 41.47.1 做了什么
-
-| 类别 | 处理 | 规模 |
-|---|---|---|
-| 代码里的**框架词**（注释/docstring） | `（Demo版）` → 去掉；`Demo 阶段` → `当前阶段`；`单进程Demo` → `单进程部署`；`Demo规模/数据量` → `当前规模/数据量` | `src/**` **11 个文件**、`pyproject.toml`、`manage.py` |
-| 非 docs 的 **markdown** | 同口径改写（`Demo 阶段` → `当前阶段`、`（demo 版）` → 去掉、`文档/简历` → `文档/对外材料`） | `README.md`、`AGENTS.md`、`.trae/skills/**` **4 个文件** |
-| ★ **脱敏：个人简历工具** | `scripts/gen_resume_v2.py` / `gen_resume_v3.py` **移出版本库**（`git rm --cached`，**本地文件保留**，`/scripts/*` 默认 ignore） | 2 个文件（含**真实姓名**、个人照片路径、桌面路径） |
-| ★ **脱敏：本机绝对路径 / 其它项目名** | `.trae/skills/ai-dev-playbook/SKILL.md` 里 8 处 `D:\code\清单\…`（含**另一个项目**的名字）换成 `<另一项目>/…`、`<知识库>/…` 占位 | 1 个文件 8 处 |
-
-合计 **20 个文件 30 处**改写；`git grep` 复核：**已跟踪的非 docs 文件里再无**真实姓名、
-`Desktop`、`C:\Users` 路径。
-
-#### 41.47.2 ★ 功能词**一律不动**（附理由，免得下一轮"顺手改干净"把系统改坏）
-
-| 词 | 为什么不能动 |
-|---|---|
-| `--resume` / `resume=` / `no_resume` | 是**断点续跑**，与"简历"同形不同义（`rescore_mainline`/`collect_auction_data`/`backfill_pool_history`）。全局替换会把"断点续跑"改成"断点简历" |
-| `--demo` / `demo-check` / `demo=True` | **CLI 契约**（试运行档）：改它要同时改 `manage.py`、测试、`docs/OPS_GUIDE.md`、计划任务的动作串 |
-| `模拟产业数据(Demo)` | **数据库里的 `source_name` 取值**（`purge_simulated_points.py` 与 `test_storage_backends.py` 按它匹配）。改名 ⇒ 匹配失配 |
-| `resume`（复牌时间） | 行情字段名（`calendar_events.py`） |
-| `<html>demo</html>` / `src.demo` | 测试夹具与 logger 名（改了没有收益，只有风险） |
-| `echarts.min.js` | **第三方压缩产物**，不手改 |
-
-#### 41.47.3 判据
-
-* `git grep -e '李浩' -e Desktop -e 'C:\Users' -- ':!docs'` ⇒ **空**；
-* 措辞敏感面 `pytest -k "demo or profile or readme or doc or contract or meta or naming or help"`
-  ⇒ **354 passed**（唯一红是 `test_ps1_encoding` 对 **untracked** PS1 的 BOM 要求，已修）；
-* `ruff` 干净；`pyproject.toml` 仍可解析（`description` 已去掉"（Demo版）"）。
-
-#### 41.47.4 诚实边界（三条**没做**的，都需要你拍板）
-
-* ★★ **提交历史里的 PII 抹不掉**：真实姓名与桌面路径**早已在历史提交里**
-  （`scripts/gen_resume_v2.py` 由 `8dbe816` 引入）。本次只是"**移出跟踪集合**"。
-  真要清除必须**改写历史**（`git filter-repo` / BFG）+ 强推，会影响所有协作者与已克隆仓库 ⇒ **没做**。
-* **`docs/` 按指示保留这些词**（含 `docs/interview/**`；另有 `docs/_calendar_source_probe.txt`
-  里一条形似 token 的占位值，属脱敏门禁的豁免路径）。
-* **两处功能性路径保留**：`.gitignore` 的 `/docs/面试准备_*`（ignore 规则要匹配真实文件名）、
-  `configs/privacy_tracking_baseline.yaml` 里指向 `docs/interview/…` 的条目（隐私基线按路径跟踪）。
-  改了会失配 ⇒ 登记而不是"改干净"。
-
-#### 41.47.5 ★ 一条**不是我造成**的既存红灯（如实登记，不替别人调门槛）
-
-`tests/unit/test_no_secrets_in_tracked_tree.py::test_path_exemptions_stay_bounded`
-（脱敏门禁的**计数棘轮**）当前红：豁免放行 **49 > 基线 46**。定性证据：
-
-* 多出的 **3 条**分别来自 `tests/unit/test_intraday_user_watch.py` /
-  `test_quant_sector_ownership.py` / `test_quant_sector_quota.py`，**各 1 条夹具口令**
-  （`PASSWORD = "WatchUser#2026x"` 一类，与基线文档描述的"测试自建账号口令"同类，**不是真凭据**）；
-* 这 3 个文件都由提交 **`66e2fdc`（2026-10-09）** 引入，而基线 46 是 **2026-10-05** 实测的；
-* 12 个"单命中"文件**全部已在 HEAD**（排除"新入库文件"这条路径）。
-
-⇒ 修法只有一条（该文件 docstring 自己写明的先例，40→46 就是这么处理的）：
-把 `EXEMPTED_BASELINE` 46 → 49 并在说明里写清这 3 条的来历。
-**我特意没有替他们改安全棘轮** —— 那属于该门禁所有者的判断（改数字必须被 code review 看见）。
-
-
 ## 四十二、投研分析的多 Agent 协作模式：**5 类在用、2 类半用、5 类刻意不用**（现行口径 · 2026-10-07 定型，`CHG-0189`）
 
 > **触发**（用户原话）：「在投研分析功能模块，用了如下哪些多agent模式，选型是否合理？」

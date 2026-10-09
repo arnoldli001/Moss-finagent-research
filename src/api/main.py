@@ -688,7 +688,7 @@ async def lifespan(app: FastAPI):
         app.state.alert_hub = stack.hub
     except ConfigError as exc:
         logger.warning("事件告警子系统不可用（降级）: %s", brief(exc, BRIEF_DEFAULT))
-    # 零依赖演示模式：进程内Cron调度（生产用Celery Beat，见celery_app.py）
+    # 零依赖模式：进程内Cron调度（生产用Celery Beat，见celery_app.py）
     #
     # ★ 2026-09-28 第十二轮：先装 catalog 驱动的采集作业，再启动调度器。
     # 顺序不能反 —— `CronScheduler.__init__` / `_loop` 会遍历 JOB_REGISTRY，

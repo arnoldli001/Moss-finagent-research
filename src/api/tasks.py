@@ -1,4 +1,4 @@
-"""异步任务存储（进程内TaskStore，单实例部署）。
+"""异步任务存储（进程内TaskStore，Demo版单实例）。
 
 支持：
 - 任务创建/查询/更新
@@ -75,14 +75,6 @@ class TaskRecord(BaseModel):
     finished_at: float = 0.0
     #: 同问合流：本次请求是复用他人计算的（见 routes/research.py 的 in-flight 合流）
     deduplicated: bool = False
-    #: ★ 2026-10-07（`CHG-0190` ①）：A18 审计结论的机器可读三态
-    #: （`verdict` ∈ 通过/不通过/未量到 + 链状态 + 完整性问题）。
-    #: 加这个字段的原因：原先"审计不通过"**没有任何自动化消费方** ——
-    #: 它只活在报告正文的一句话里，接口与前端都拿不到，于是没人能对它做事。
-    audit: dict[str, Any] = Field(default_factory=dict)
-    #: ★ 2026-10-07（`CHG-0190` ② / `CHG-0192` ①）：本轮**真缺口**里待自修复的指标。
-    #: 与 `self_heal_pending` state channel 同源 —— 它以前只是一个**注释里的名字**。
-    self_heal_pending: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class TaskStore:

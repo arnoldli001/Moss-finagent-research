@@ -11,7 +11,7 @@
          HALF_OPEN 任意 1 次失败 → 立即回 OPEN。
 
 参考：moss-finance-assistant governance/guardrails/circuit_breaker.py
-简化：去掉Actor模型桥接（单进程部署不需要），保留核心三态状态机。
+简化：去掉Actor模型桥接（单进程Demo不需要），保留核心三态状态机。
 
 ## ★ 隔离维度是 `provider × 租户`，不是 `provider`
 
@@ -88,7 +88,7 @@ GLOBAL_SCOPE: Final[str] = "global"
 JUDGE_FAILURES_TO_OPEN: Final[int] = 3
 
 #: 熔断后的冷却时长（秒）。一次投研分析里缓存查找的间隔是秒级，
-#: 60 s 足够覆盖"这一波抖动"，又不会让一个已恢复的端点被冷落一整轮分析。
+#: 60 s 足够覆盖"这一波抖动"，又不会让一个已恢复的端点被冷落一整轮演示。
 JUDGE_COOLDOWN_SEC: Final[float] = 60.0
 
 #: 失败计数窗口（秒）。取值**远大于**连续失败的实际间隔即可 ——

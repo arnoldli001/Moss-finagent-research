@@ -21,7 +21,7 @@
 
 ## 任务表为什么是进程内的 dict
 
-与 `sector_crowding.refresh` 同口径：当前阶段单进程，任务状态放内存最简单，
+与 `sector_crowding.refresh` 同口径：Demo 阶段单进程，任务状态放内存最简单，
 重启后丢失可接受（任务本身就是"再点一次"的事）。
 代价写清楚：**多进程部署时轮询会打到没有该任务的 worker 上**，
 那时需要换成 Redis —— 这在 `docs/MAINLINE_MINING.md` 里写明了。
@@ -639,32 +639,6 @@ async def alert_returns_panel(
         refresh=refresh)
 
 
-def _win_rate_request(*, min_win_rate: float = alert_returns.DEFAULT_MIN_WIN_RATE,
-                      refresh: bool = False) -> dict[str, Any]:
-    """`/board-win-rates` 的**参数组单一来源**（路由与启动预热共用）。
-
-    ## 为什么必须抽出来（不是顺手重构）
-
-    启动预热要生效，前提是它请求的**缓存键与路由逐项一致**。
-    本项目在 `_warm_quant_data_status` 上踩过同一个坑：预热把 `root` 写成
-    `"data/quant"`，而路由默认是 `DEFAULT_ROOT="data/quant/tushare"` ——
-    预热跑完了，第一个用户照样等 11 秒，**日志里毫无异常**。
-    这里把参数组收成一处，两边都不再各自写一份字面量，键就不可能漂移。
-    """
-    return {
-        "start": "", "end": "",
-        "level_list": list(alert_returns.DEFAULT_LEVELS),
-        "split": alert_returns.DEFAULT_SPLIT,
-        "dedup_days": alert_returns.DEFAULT_DEDUP_DAYS,
-        "horizon_list": list(alert_returns.DEFAULT_HORIZONS),
-        "leaders": False,
-        "stock_window": alert_returns.DEFAULT_STOCK_WINDOW,
-        "top_leaders": alert_returns.DEFAULT_LEADERS,
-        "min_win_rate": min_win_rate, "history_only": False, "limit": 0,
-        "refresh": refresh,
-    }
-
-
 @router.get("/board-win-rates")
 async def board_win_rates(
         min_win_rate: float = Query(default=alert_returns.DEFAULT_MIN_WIN_RATE,
@@ -678,7 +652,15 @@ async def board_win_rates(
     参数与 `/alert-returns` 的默认值逐项一致，所以两个页签共用一份缓存结果。
     """
     payload = await _alert_returns_payload(
-        **_win_rate_request(min_win_rate=min_win_rate, refresh=refresh))
+        start="", end="",
+        level_list=list(alert_returns.DEFAULT_LEVELS),
+        split=alert_returns.DEFAULT_SPLIT,
+        dedup_days=alert_returns.DEFAULT_DEDUP_DAYS,
+        horizon_list=list(alert_returns.DEFAULT_HORIZONS),
+        leaders=False,
+        stock_window=alert_returns.DEFAULT_STOCK_WINDOW,
+        top_leaders=alert_returns.DEFAULT_LEADERS,
+        min_win_rate=min_win_rate, history_only=False, limit=0, refresh=refresh)
 
     boards = [{
         "board_code": item.get("board_code", ""),
@@ -702,31 +684,6 @@ async def board_win_rates(
         "gaps": [gap for gap in (payload.get("gaps") or [])
                  if "leaders=true" not in gap],
     }
-
-
-async def warm_board_win_rates() -> dict[str, Any]:
-    """启动预热「板块 20 日胜率」缓存（lifespan 后台调，best-effort）。
-
-    ## 为什么需要（2026-10-02 真机实测）
-
-        主线·板胜率 #1（进程内缓存冷）    781 ms
-        主线·板胜率 #2（缓存命中）          32 ms
-
-    780 毫秒本身不算灾难，但它是**每进程一次**、而且落在"用户点开「告警流水」
-    页签"那一刻 —— 切个页签先等 0.8 秒，体感上就是"这个页签有点卡"。
-    预热把它挪到没人等的时刻。
-
-    ## 与 `/alert-returns` 的关系
-
-    两者共用 `_alert_returns_payload` 的同一把缓存键，所以预热一次
-    「回测报告 → 回测收益展示」页签也一并受益（它默认参数与这里逐项一致）。
-
-    失败一律吞掉：预热是增益，不是启动的前置条件。
-    """
-    payload = await _alert_returns_payload(**_win_rate_request())
-    return {"rows": len(payload.get("rows") or []),
-            "boards": len(payload.get("boards") or []),
-            "cached": bool(payload.get("cached", False))}
 
 
 @router.get("/data/status")
