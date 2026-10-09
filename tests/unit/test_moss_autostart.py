@@ -260,7 +260,7 @@ def test_placeholder_mail_recipient_is_not_configured() -> None:
                                 from_name="n")
     assert placeholder.configured is False
     real = ma.MailConfig(host="smtp.qq.com", port=465, user="a@qq.com",
-                         auth_code="x", to="2693888583@qq.com", from_name="n")
+                         auth_code="x", to="someone@example.com", from_name="n")
     assert real.configured is True
 
 
