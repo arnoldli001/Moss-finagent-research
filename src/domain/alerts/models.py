@@ -1,7 +1,7 @@
 """事件告警领域模型（统一JSON契约，字段全部 snake_case）。
 
 所有告警输出与前端视图必须附 DISCLAIMER 免责声明；
-事件/告警均带 tenant_id（演示环境固定 tenant_001，接口预留多租户）。
+事件/告警均带 tenant_id（环境固定 tenant_001，接口预留多租户）。
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
-"""进程内Cron调度器（零依赖演示模式）。
+"""进程内Cron调度器（零依赖模式）。
 
 生产/分布式环境使用 Celery Beat（见 celery_app.py，broker=Redis）；
-本地SQLite演示时由FastAPI lifespan启动本服务，按JOB_REGISTRY的cron表达式
+本地SQLite时由FastAPI lifespan启动本服务，按JOB_REGISTRY的cron表达式
 在API进程内直接执行 jobs.execute_job，同样落运行记录与重试/暂停判定。
 
 特性：

@@ -77,7 +77,7 @@ class JobSpec:
     updates: tuple[str, ...] = ()
 
 
-# 演示环境作业集（付费产业接口接入后，fetch_industry的模拟源自动替换为真实源）
+# 环境作业集（付费产业接口接入后，fetch_industry的模拟源自动替换为真实源）
 JOB_REGISTRY: dict[str, JobSpec] = {
     "snapshot_macro": JobSpec(
         name="snapshot_macro",

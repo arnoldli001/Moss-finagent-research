@@ -3,7 +3,7 @@
 beat_schedule由registry.JOB_REGISTRY单一事实源生成，禁止在此硬编码cron。
 无Redis环境下无需导入本模块：API手动触发直接进程内执行jobs.execute_job。
 
-运行（本机Windows演示需solo池）：
+运行（本机Windows需solo池）：
   uv run celery -A src.scheduler.celery_app.celery_app worker -B --pool=solo -l info
 生产：redis作为broker，worker与beat可分进程部署。
 """

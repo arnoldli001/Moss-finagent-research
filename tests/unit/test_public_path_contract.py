@@ -7,7 +7,7 @@
 1. `src/api/tenancy_middleware.py::_PUBLIC_PATHS`（免鉴权）
 2. `src/api/login_gate.py::PUBLIC_EXACT`（免登录）
 3. `Dockerfile` 的 `HEALTHCHECK`
-4. `docs/*.md` 里运维/演示照着敲的命令
+4. `docs/*.md` 里运维/照着敲的命令
 
 **此前没有任何东西把它们与真实路由表对过一遍。** 而在字符串层面，
 "写在一个 `frozenset` 里"与"有一条路由在服务它"**长得一模一样** ——
@@ -19,7 +19,7 @@
   `/api/v1/metrics/ready`、`/healthz`。后两条的注释还写着"既有公开探针，
   保持兼容"——**"既有"不成立**，它们只存在于
   `docs/PLATFORM_MULTI_TENANCY_DESIGN.md` 的**计划**里，是从计划抄进代码的；
-* `docs/DEMO_GUIDE.md` 让演示者用 `curl .../api/v1/metrics/health` 自检
+* `docs/DEMO_GUIDE.md` 让者用 `curl .../api/v1/metrics/health` 自检
   "服务活着"，**期望 200、实际 404** ⇒ 照文档走会得出"服务挂了"的结论；
 * `Dockerfile` 的 `HEALTHCHECK` 打 `/health`（真实路径是 `/api/v1/health`），
   而那个聚合探针最坏 **142.8 秒**、开鉴权后返回 **401** ⇒ `urlopen` 遇 4xx
@@ -50,7 +50,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 #: 由这个静态挂载（或前端构建产物）服务。
 _STATIC_SERVED: frozenset[str] = frozenset({"/", "/index.html", "/favicon.ico"})
 
-#: **可执行**的文档：运维/演示会照着敲命令的那几份。
+#: **可执行**的文档：运维/会照着敲命令的那几份。
 #:
 #: 历史复盘（`INCIDENT_*` / `SESSION_*` / `INTERVIEW_*` / `SECTOR_CROWDING` 等）
 #: **故意不在内**：那些文档引用当年的坏 URL（`/none`、`/...`、带 `?$m` 的 shell
@@ -145,7 +145,7 @@ def test_two_whitelists_agree_on_api_paths() -> None:
 
 
 def test_runbook_and_dockerfile_paths_exist() -> None:
-    """运维/演示文档与 `Dockerfile` 里出现的**每一个** `host:port/path` 都必须存在。
+    """运维/文档与 `Dockerfile` 里出现的**每一个** `host:port/path` 都必须存在。
 
     这条盯的是根因层：路径字符串写在文档里时，**没有任何东西会去核对它**。
     """

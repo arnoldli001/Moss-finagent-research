@@ -1,4 +1,4 @@
-"""手工事件采集器：API导入的兜底/演示数据源（FR-10）。"""
+"""手工事件采集器：API导入的兜底/数据源（FR-10）。"""
 
 from __future__ import annotations
 

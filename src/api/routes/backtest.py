@@ -29,7 +29,7 @@ _DISCLAIMER = (
     "投资有风险，入市需谨慎，盈亏自负。"
 )
 
-# 全历史行情拉取约10-30秒；月末月度数据短期不变，进程内TTL缓存避免演示重复等待。
+# 全历史行情拉取约10-30秒；月末月度数据短期不变，进程内TTL缓存避免重复等待。
 _CACHE_TTL_SECONDS = 600.0
 _fetch_cache: dict[str, tuple[float, list[DataPoint]]] = {}
 

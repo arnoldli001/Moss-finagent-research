@@ -1,4 +1,4 @@
-"""回测演示：PPI同比动量规则 vs 周期股月度收益（真实AkShare优先，合成数据回退）。
+"""回测：PPI同比动量规则 vs 周期股月度收益（真实AkShare优先，合成数据回退）。
 
 运行（项目根目录）：
     uv run python -u scripts/backtest_demo.py
@@ -42,7 +42,7 @@ async def _fetch_with_retry(conn, indicator: str, retries: int = 1):
     for attempt in range(retries + 1):
         try:
             return await conn.fetch(indicator)
-        except Exception as exc:  # noqa: BLE001 演示脚本重试后才回退
+        except Exception as exc:  # noqa: BLE001 脚本重试后才回退
             last_exc = exc
             if attempt < retries:
                 await asyncio.sleep(3)
@@ -102,7 +102,7 @@ async def main(force_synthetic: bool, code: str) -> int:
     else:
         try:
             bars = await _load_real_bars(code)
-        except Exception as exc:  # noqa: BLE001 演示脚本：任何真实数据问题都回退
+        except Exception as exc:  # noqa: BLE001 脚本：任何真实数据问题都回退
             print(f"[warn] 真实数据加载失败，回退合成数据：{exc}")
             bars = _synthetic_bars()
             simulated = True

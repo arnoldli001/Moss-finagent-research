@@ -1,4 +1,4 @@
-"""演示数据预热：提前拉取CPI/PPI并幂等入库，避免演示现场等待网络采集。
+"""数据预热：提前拉取CPI/PPI并幂等入库，避免现场等待网络采集。
 
 运行：$env:PYTHONPATH="."; uv run python scripts/seed_demo_data.py
 说明：行业层指标已全部切到真实互联网数据源（中证指数官网/中电联CECI/CDE药审中心等），
@@ -32,7 +32,7 @@ async def main() -> int:
             stats = await runtime.repo.save_points(points, task_id="seed_demo")
             print(f"[seed] {ind}: 拉取{len(points)}点，入库统计 {stats}")
         except Exception as exc:  # noqa: BLE001 预热失败不应中断其他指标
-            print(f"[seed] {ind} 拉取失败（演示任务运行时仍会重试）: {exc}")
+            print(f"[seed] {ind} 拉取失败（任务运行时仍会重试）: {exc}")
             failed.append(ind)
         await asyncio.sleep(1)
 

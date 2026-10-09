@@ -1,4 +1,4 @@
-"""面试演示导览：按固定脚本依次演示系统全部核心能力（面向运行中的API服务）。
+"""导览：按固定脚本依次走查系统全部核心能力（面向运行中的API服务）。
 
 运行：
   1. 启动服务：.venv\\Scripts\\python.exe manage.py start --daemon
@@ -33,7 +33,7 @@ import urllib.request
 from pathlib import Path
 
 DISCLAIMER = (
-    "⚠️ 演示内容来自公开数据与本地模型推理，仅供参考，不构成投资建议。"
+    "⚠️ 导览内容来自公开数据与本地模型推理，仅供参考，不构成投资建议。"
     "投资有风险，入市需谨慎，盈亏自负。"
 )
 
@@ -43,7 +43,7 @@ def _request(base: str, path: str, body: dict | None = None,
     """返回 `(载荷, HTTP状态码)`。**HTTP错误不当异常抛** —— 状态码本身是判据。
 
     为什么必须这么写：`urlopen` 对 4xx/5xx 抛 `HTTPError`，而旧版全脚本只捕获
-    `URLError/TimeoutError` ⇒ 一个 401（第 5 步）就让整场演示崩在半路，
+    `URLError/TimeoutError` ⇒ 一个 401（第 5 步）就让整场导览崩在半路，
     后面几步连机会都没有。鉴权门是**预期结果**，不是崩溃。
     """
     data = json.dumps(body).encode() if body is not None else None
@@ -70,7 +70,7 @@ def _request(base: str, path: str, body: dict | None = None,
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         # 连接层失败（服务没起 / 端口打错 / 打到 8110 但被拒 / 超时）：
         # 返回 code=0 让调用方**判 FAIL 并给人话**，而不是抛栈崩在半路 ——
-        # 这正是本脚本最初的报障形态（ConnectionRefused 直接把演示打断）。
+        # 这正是本脚本最初的报障形态（ConnectionRefused 直接把导览打断）。
         return {"_error": f"{type(exc).__name__}: {exc}"}, 0
 
 
@@ -115,7 +115,7 @@ def _banner(step: str, title: str) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Moss-FinAgent-Research 演示导览")
+    parser = argparse.ArgumentParser(description="Moss-FinAgent-Research 导览")
     parser.add_argument("--base", default="http://127.0.0.1:8100")
     parser.add_argument("--poll-timeout", type=int, default=300)
     parser.add_argument("--backtest-timeout", type=int, default=300,
@@ -147,7 +147,7 @@ def main() -> int:
     if health_code == 0:
         _service_down_hint(args.base)
         check("健康检查", False, "服务不可达")
-        print(f"\n演示导览结果：0/{len(checks)} PASS"
+        print(f"\n导览结果：0/{len(checks)} PASS"
               "（健康检查未过，其余步骤未执行）")
         return 1
     if health_code != 200:
@@ -156,7 +156,7 @@ def main() -> int:
         print("     不是 200 ⇒ 后面的步骤全部无意义，直接退出。")
         print("     若这是 8110：那是对外试点，全站强制登录；匿名导览请用 dev 的 8100。")
         check("健康检查", False, f"HTTP {health_code}")
-        print(f"\n演示导览结果：0/{len(checks)} PASS"
+        print(f"\n导览结果：0/{len(checks)} PASS"
               "（健康检查未过，其余步骤未执行）")
         return 1
     print(json.dumps(health, ensure_ascii=False, indent=2)[:800])
@@ -342,7 +342,7 @@ def main() -> int:
                       f"持仓月数={s.get('invested_months')}/{s.get('total_months')}")
                 exc = s.get("excess_cumulative_return")
                 if isinstance(exc, (int, float)) and exc < 0:
-                    # 跑输就直说：演示里最不该做的就是只留好看的数。
+                    # 跑输就直说：导览里最不该做的就是只留好看的数。
                     print(f"  ⚠️ 该规则区间内**跑输**买入持有 {_pp(exc)} "
                           "（趋势+PE闸门是规则验证，不是可交易策略）")
                 check("回测端点", int(bt.get("periods") or 0) >= 8,
@@ -353,11 +353,11 @@ def main() -> int:
                 check("回测端点", False,
                       f"{done.get('status')}（{done.get('error') or '超时'}）")
     else:
-        print("\n[7/7] 回测演示已跳过（加 --with-backtest 启用）")
+        print("\n[7/7] 回测已跳过（加 --with-backtest 启用）")
 
     print("\n" + "=" * 64)
     passed = sum(1 for _, ok in checks if ok)
-    print(f"演示导览结果：{passed}/{len(checks)} PASS")
+    print(f"导览结果：{passed}/{len(checks)} PASS")
     for name, ok in checks:
         print(f"  [{'x' if ok else ' '}] {name}")
     print(DISCLAIMER)
