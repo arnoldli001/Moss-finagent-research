@@ -15,7 +15,7 @@ import MarketContextStrip from "./MarketContextStrip";
 import PrivateFeatureNotice from "./PrivateFeatureNotice";
 import { QuantSelectPanel } from "../privatePanels";
 import { StockPicker } from "./StockPicker";
-import { useQuantSectors, type DrawerSource } from "./useQuantSectors";
+import { SECTOR_SCOPE_HINT, useQuantSectors, type DrawerSource } from "./useQuantSectors";
 import WeightProfileEditor from "./WeightProfileEditor";
 
 /**
@@ -1262,7 +1262,7 @@ export default function IntradayTPanel({ view = "t", onEditProfile }: {
             {sectorsApi.available && (
               <button className="btn-ghost tiny"
                       onClick={() => setCreating((value) => !value)}
-                      title="新建自定义板块（就地建，不用切到量化选股页签）">＋</button>
+                      title={`新建自定义板块（就地建，不用切到量化选股页签）。${SECTOR_SCOPE_HINT}`}>＋</button>
             )}
             {activeSector === null && (
               <select className="watch-sort mono" value={watchSort}
@@ -1401,6 +1401,11 @@ export default function IntradayTPanel({ view = "t", onEditProfile }: {
                   取消
                 </button>
               </div>
+              {/* 归属说明（2026-10-08 起板块按账号隔离）：新账号看到的是空列表，
+                  不写这句会被读成"我的板块丢了/功能坏了"。 */}
+              <div className="muted-text" style={{ fontSize: 11, lineHeight: 1.5 }}>
+                {SECTOR_SCOPE_HINT}
+              </div>
             </div>
           )}
 
@@ -1438,6 +1443,10 @@ export default function IntradayTPanel({ view = "t", onEditProfile }: {
             {watch.length === 0 && (
               <li className="muted-text watch-empty">
                 暂无自选 —— 在上方输入 6 位代码后点「＋ 加自选」即可
+                {/* 2026-10-08 起自选**按账号隔离**（PRD §50.5）：新账号从空开始，
+                    不写这句会被读成"我原来的自选丢了 / 功能坏了"。 */}
+                <br />
+                自选属于你自己的账号，只有你能看到（别人的自选不会出现在这里）
               </li>
             )}
             {sortedWatch.map((item) => (

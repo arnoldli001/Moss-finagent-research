@@ -44,7 +44,7 @@ from src.core.trading_session import (
 from src.core.trading_session import (
     session_state as _session_state,
 )
-from src.intraday import hot_cache
+from src.intraday import hot_cache, user_watch
 from src.intraday import indicators as ind
 from src.intraday.backtest import DISCLAIMER as BACKTEST_DISCLAIMER
 from src.intraday.backtest import run_threshold_backtest
@@ -383,6 +383,23 @@ class IntradayService:
         # 缓存的意义：全表重算要为每只票各跑一次轻量快照（实测整表 ~1.1s 且每只票
         # 都要打一次数据源），前端每分钟取一次若都重算，就会和刷新循环重复取数。
         self._watch_cache: tuple[float, list[WatchItem]] | None = None
+        # ---- 按账号的自选视图（2026-10-08，`CHG-0224` 接线）----
+        #
+        # 键 = `user_id`；SYSTEM（作业用的并集）仍然用上面那份 `_watch_cache`。
+        # 为什么分开放而不是改造成一个 dict：SYSTEM 那条路被 49 个既有用例与
+        # 三个后台作业（扫描 / 日K预热 / 报价快车道）依赖，**原样不动**；
+        # 按账号这条是新路，出问题只影响登录用户的一次读取，不会连带作业。
+        self._owner_cache: dict[str, tuple[float, list[WatchItem]]] = {}
+        #: 正在后台重算的 owner（去重，避免同一账号被并发算多次）
+        self._owner_inflight: set[str] = set()
+        #: owner → (单调钟, 该账号的自选行)。TTL 很短：它只用来避免"一次请求里
+        #: 逐只票都去查一次库"（`config.watch(code)` 在快照里被调多次）。
+        self._owner_rows: dict[str, tuple[float, list[Any]]] = {}
+        self._owner_rows_ttl = 5.0
+        #: 启动时那条兼容路径（SYSTEM 并集为空 ⇒ 回落 YAML）的说明，供状态接口透出
+        self._watch_source = "owners"
+        #: 启动时那条迁移的**证据**（行数/归属/原因），供 `/config` 与排障读取
+        self._watch_migration: dict[str, Any] = {}
         self._watch_lock = asyncio.Lock()
         # 单只增删自选期间置 True：让 `invalidate_watchlist_cache()` 早退，
         # 改由 `_invalidate_watch_entry()` 按"一只"的粒度动缓存。
@@ -621,7 +638,7 @@ class IntradayService:
                 "config": config.snapshot(),
                 "boards": list(config.board_names(code)),
                 "overseas": list(config.overseas_for(code)),
-                "peers": list(getattr(config.watch(code), "peers", []) or []),
+                "peers": list(getattr(self.watch_config(code), "peers", []) or []),
             }
             blob = json.dumps(material, ensure_ascii=False, sort_keys=True,
                               default=str)
@@ -809,8 +826,8 @@ class IntradayService:
     def add_watch(
         self, code: str, *, name: str = "", boards: list[str] | None = None,
         peers: list[str] | None = None, industry: str = "",
-        overseas: list[str] | None = None,
-    ) -> IntradayConfig:
+        overseas: list[str] | None = None, quota: Any = None,
+    ) -> Any:
         """新增/更新自选标的并写回 configs/intraday.yaml（注释保留）。
 
         **名称缺失时用本地股票字典补齐**（不再退回代码本身）。
@@ -823,6 +840,12 @@ class IntradayService:
         from src.intraday.config import WatchConfig, upsert_watch
 
         code = str(code).strip().split(".")[0].zfill(6)
+        # ---- 按账号隔离（CHG-0224）：有身份就写**这个账号自己的**那一行 ----
+        owner_id, owner_tenant = user_watch.current_owner()
+        if owner_id:
+            return self._add_watch_for_owner(
+                owner_id, owner_tenant, code, name=name, boards=boards,
+                peers=peers, industry=industry, overseas=overseas, quota=quota)
         resolved = (name or "").strip()
         if not resolved or resolved == code:
             resolved = self._lookup_name(code)
@@ -949,7 +972,8 @@ class IntradayService:
         except Exception as exc:  # noqa: BLE001 见上：不阻断加自选
             logger.warning("个股绑定落库失败(%s)：%s", key, brief(exc, BRIEF_TIGHT))
 
-    def add_watch_many(self, items: list[dict[str, str]]) -> dict[str, Any]:
+    def add_watch_many(self, items: list[dict[str, str]], *,
+                       quota: Any = None) -> dict[str, Any]:
         """批量加入自选池：**一次落盘、一次重建子组件**。
 
         ## 为什么不循环调 `add_watch`
@@ -970,6 +994,10 @@ class IntradayService:
         返回按结果分类，**不谎报成功**：写不进去的（代码格式错）进 `failed`，
         名称解析不出来的进 `missing_name`。
         """
+        owner_id, owner_tenant = user_watch.current_owner()
+        if owner_id:
+            return self._add_watch_many_for_owner(owner_id, owner_tenant,
+                                                  list(items or []), quota=quota)
         from src.intraday.config import WatchConfig, load_intraday_config, save_watchlist
 
         config = load_intraday_config(self._config_path)
@@ -1028,7 +1056,7 @@ class IntradayService:
                 "failed": failed, "missing_name": missing_name,
                 "total": len(saved.watchlist)}
 
-    def remove_watch(self, code: str) -> IntradayConfig:
+    def remove_watch(self, code: str) -> Any:
         """从自选池移除标的并写回 configs/intraday.yaml（幂等）。
 
         ## 为什么删除后要"精确更新缓存"而不是整个作废
@@ -1046,6 +1074,10 @@ class IntradayService:
         分支永远走不到，"精确剔除"是一段死代码。2026-09-23 用
         `_watch_cache_single_change_guard()` 抑制那次整张作废后才真正生效。
         """
+        owner_id, _owner_tenant = user_watch.current_owner()
+        if owner_id:
+            self._remove_watch_for_owner(owner_id, code)
+            return self.owner_watch_payload(owner_id)
         from src.intraday.config import remove_watch as remove_from_yaml
 
         # ⚠️ 2026-09-23 修：这段"精确剔除"**过去一直是死代码** ——
@@ -1068,7 +1100,7 @@ class IntradayService:
             logger.info("自选概览缓存已精确剔除 %s（无需重算整表）", target)
         return saved
 
-    def set_watch_pinned(self, code: str, pinned: bool) -> IntradayConfig:
+    def set_watch_pinned(self, code: str, pinned: bool) -> Any:
         """置顶/取消置顶一只自选（写回配置文件；幂等）。
 
         置顶状态**存在配置里**而不是前端 localStorage：换浏览器、换机器应该一致，
@@ -1079,6 +1111,10 @@ class IntradayService:
 
         target = str(code).strip().split(".")[0].zfill(6)
         config = self._reload_config()
+        owner_id, _owner_tenant = user_watch.current_owner()
+        if owner_id:
+            self._set_pinned_for_owner(owner_id, code, pinned)
+            return self.owner_watch_payload(owner_id)
         current = config.watch(target)
         if current is None:
             raise ConfigError(f"自选池里没有 {target}，无法置顶")
@@ -1202,7 +1238,7 @@ class IntradayService:
             if persisted is not None:
                 self._schedule_snapshot_refresh(code)
                 return persisted
-        watch = config.watch(code)
+        watch = self.watch_config(code)
         attempts: list[SourceAttempt] = []
         gaps: list[str] = []
         if config_patch is not None:
@@ -2424,6 +2460,13 @@ class IntradayService:
         这样强制刷新的响应时间从"随自选数量增长"变成"基本恒定（≈1 只票）"。
         不传 `active` 时保持旧语义（整表重算），供刷新循环/后台任务复用。
         """
+        # ---- 按账号隔离（2026-10-08，CHG-0224）：有身份就走这条 ----
+        # SYSTEM（后台作业）继续走下面的老路径（并集），一行不改。
+        owner_id, owner_tenant = user_watch.current_owner()
+        if owner_id:
+            return await self._owner_watchlist(
+                owner_id, owner_tenant, limit=limit, force=force,
+                active=active or None)
         ttl = self._watch_cache_ttl()
         cached = self._watch_cache
 
@@ -2542,6 +2585,273 @@ class IntradayService:
 
             task.add_done_callback(_done)
         return task
+
+    # ================================================================
+    # 按账号的自选视图（2026-10-08，`CHG-0222` / `CHG-0224`）
+    # ================================================================
+
+    async def _migrate_legacy_watchlist_once(self) -> None:
+        """启动时把共享 YAML 清单落到管理员名下（幂等；见 `user_watch`）。"""
+        try:
+            report = await asyncio.to_thread(
+                user_watch.migrate_legacy_watchlist, self._reload_config())
+        except Exception as exc:  # noqa: BLE001 迁移失败不该挡住模块装配
+            logger.warning("自选归属迁移失败（按账号自选从空开始）：%s",
+                           brief(exc, BRIEF_DEFAULT))
+            return
+        if report.get("migrated"):
+            logger.warning("自选归属迁移完成：%s 只 → %s",
+                           report.get("rows"), report.get("owner"))
+        self._watch_migration = report
+
+    def owner_watch_payload(self, user_id: str) -> list[dict[str, Any]]:
+        """给接口回显用的**当前账号**自选清单（与 `WatchItem` 同字段名足够）。"""
+        return [
+            {"code": row.code, "name": row.name, "boards": list(row.boards),
+             "peers": list(row.peers), "overseas": list(row.overseas),
+             "industry": row.industry, "pinned": bool(row.pinned)}
+            for row in self.owner_records(user_id, force=True)
+        ]
+
+    def _add_watch_for_owner(self, user_id: str, tenant_id: str, code: str, *,
+                             name: str, boards: list[str] | None,
+                             peers: list[str] | None, industry: str,
+                             overseas: list[str] | None,
+                             quota: Any) -> Any:
+        """按账号加自选（写 `dim_user_watchlist_v2`，**不碰** YAML）。
+
+        名称与绑定回落的规则与老路径**完全一致**（名称缺失用本地字典补、
+        关联板块/海外映射"调用方给了就用给的，没给才回落已存绑定"），
+        区别只在"存到哪一行"。
+        """
+        target = str(code).strip().split(".")[0].zfill(6)
+        resolved = (name or "").strip()
+        if not resolved or resolved == target:
+            resolved = self._lookup_name(target)
+        saved_boards, saved_overseas = self.binding_for(target)
+        final_boards = list(boards or []) or saved_boards
+        final_overseas = list(overseas or []) or saved_overseas
+        record = user_watch.add_item(
+            user_id, tenant_id, code=target, name=resolved,
+            boards=final_boards, peers=list(peers or []), industry=industry,
+            overseas=final_overseas, quota=quota)
+        self._remember_binding(target, list(record.boards),
+                               list(record.overseas))
+        self.invalidate_owner(user_id)
+        # 与老路径一致：只更新**这一只**在缓存里的那行（不做整表重算）
+        self._invalidate_watch_entry(target, fresh=WatchItem(
+            code=target, name=record.name or self._lookup_name(target),
+            boards=list(record.boards), pinned=bool(record.pinned)))
+        return record
+
+    def _add_watch_many_for_owner(self, user_id: str, tenant_id: str,
+                                  items: list[dict[str, str]], *,
+                                  quota: Any) -> dict[str, Any]:
+        """按账号批量加自选（返回与老路径**同一套键**，不谎报成功）。"""
+        from src.intraday.config import WatchConfig
+
+        current = {row.code: row for row in self.owner_records(user_id, force=True)}
+        added: list[str] = []
+        repaired: list[str] = []
+        existing: list[str] = []
+        failed: list[dict[str, str]] = []
+        missing_name: list[str] = []
+        seen: set[str] = set()
+        for raw in items or []:
+            code = str((raw or {}).get("code") or "").strip().split(".")[0]
+            if not code.isdigit() or len(code) != 6:
+                failed.append({"code": str((raw or {}).get("code") or ""),
+                               "reason": "代码格式不对（要 6 位数字）"})
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            name = str((raw or {}).get("name") or "").strip()
+            if not name or name == code:
+                name = self._lookup_name(code)
+            row = current.get(code)
+            if row is not None:
+                # 已在自选里：**不动**用户配过的板块/映射，只补空名字
+                if not row.name and name:
+                    self._add_watch_for_owner(
+                        user_id, tenant_id, code, name=name, boards=None,
+                        peers=None, industry="", overseas=None, quota=None)
+                    repaired.append(code)
+                else:
+                    existing.append(code)
+                continue
+            if not name:
+                missing_name.append(code)
+            self._add_watch_for_owner(
+                user_id, tenant_id, code, name=name,
+                boards=None, peers=None, industry="", overseas=None,
+                quota=quota)
+            current[code] = WatchConfig(code=code, name=name)
+            added.append(code)
+        logger.info("按账号批量加自选：user=%s 新增 %d、补名 %d、已在池中 %d、失败 %d",
+                    user_id, len(added), len(repaired), len(existing), len(failed))
+        return {"saved": bool(added or repaired), "requested": len(items or []),
+                "added": added, "repaired": repaired, "existing": existing,
+                "failed": failed, "missing_name": missing_name,
+                "total": len(self.owner_records(user_id, force=True))}
+
+    def _remove_watch_for_owner(self, user_id: str, code: str) -> bool:
+        target = str(code).strip().split(".")[0].zfill(6)
+        removed = user_watch.remove_item(user_id, target)
+        self.invalidate_owner(user_id)
+        if removed:
+            self._invalidate_watch_entry(target)
+        return removed
+
+    def _set_pinned_for_owner(self, user_id: str, code: str, pinned: bool) -> bool:
+        target = str(code).strip().split(".")[0].zfill(6)
+        rows = {row.code: row for row in self.owner_records(user_id, force=True)}
+        row = rows.get(target)
+        if row is None:
+            raise ConfigError(f"自选池里没有 {target}，无法置顶")
+        if bool(row.pinned) == bool(pinned):
+            return False                      # 幂等：状态没变就不写库
+        user_watch.pin_item(user_id, target, pinned)
+        self.invalidate_owner(user_id)
+        return True
+
+
+    def owner_records(self, user_id: str, *, force: bool = False) -> list[Any]:
+        """该账号的自选行（`dim_user_watchlist_v2`）——**短 TTL 缓存**。
+
+        为什么需要缓存：`snapshot()` 里每只票都要问一次"这只票的板块/同业是什么"
+        （`watch_config`），一次请求可能问十几遍；每次都查库是纯浪费。
+        写入路径（加/删/置顶）会**主动作废**它，所以 TTL 只兜"外部改动"。
+        """
+        key = str(user_id or "")
+        now = time.monotonic()
+        slot = None if force else self._owner_rows.get(key)
+        if slot is not None and now - slot[0] < self._owner_rows_ttl:
+            return list(slot[1])
+        rows = user_watch.list_items(key)
+        self._owner_rows[key] = (now, list(rows))
+        return list(rows)
+
+    def invalidate_owner(self, user_id: str) -> None:
+        """账号的自选变了：行缓存与概览缓存一起作废（下一次读取重算）。
+
+        同时**递增全局版号**：WS 是按 `(generation, quote_generation)` 指纹决定
+        推不推的 —— 不递增的话，某个账号加/删自选后他自己那条连接要等下一轮
+        轮询（最长 60 秒）才看到变化。代价是"任一账号变动会让所有连接各重读一次
+        自己的清单"，这比"列表看起来没反应"便宜得多。
+        """
+        key = str(user_id or "")
+        self._owner_rows.pop(key, None)
+        self._owner_cache.pop(key, None)
+        self._watch_generation += 1
+
+    def watch_config(self, code: str) -> Any:
+        """一只票的板块/同业口径：**当前账号那行优先**，没有才回落系统配置。
+
+        这是"隔离"落到最细的一处：同一只票，A 账号配的关联板块与 B 账号配的
+        可以不同；作业（无 owner）拿到的仍然是 `configs/intraday.yaml` 的口径。
+        """
+        target = str(code or "").strip()
+        owner_id = user_watch.current_owner()[0]
+        if owner_id:
+            for row in self.owner_records(owner_id):
+                if row.code == target:
+                    from src.intraday.config import WatchConfig
+
+                    return WatchConfig(
+                        code=row.code, name=row.name, boards=list(row.boards),
+                        industry=row.industry, peers=list(row.peers),
+                        overseas=list(row.overseas), pinned=bool(row.pinned))
+        return self._reload_config().watch(target)
+
+    def all_watch_codes(self) -> list[str]:
+        """**全体账号**自选代码的并集（作业用）；为空才回落老 YAML 清单。"""
+        codes, source = user_watch.all_codes_for_system(self._reload_config())
+        self._watch_source = source
+        return codes
+
+    def _placeholder_from_rows(self, rows: list[Any], limit: int) -> list[WatchItem]:
+        """按账号的占位列表：只有身份字段（分数/价格要真算才有，不编）。"""
+        items = [
+            WatchItem(code=row.code,
+                      name=row.name or self._lookup_name(row.code),
+                      boards=list(row.boards),
+                      pinned=bool(row.pinned))
+            for row in rows[:max(0, limit)]
+        ]
+        return sort_watch_items(items)
+
+    def _owner_cache_ttl(self) -> float:
+        return float(self._watch_cache_ttl())
+
+    async def _recompute_owner(self, user_id: str) -> list[WatchItem]:
+        """重算**某个账号**的概览（写回它的缓存槽）。"""
+        if user_id in self._owner_inflight:
+            slot = self._owner_cache.get(user_id)
+            return list(slot[1]) if slot else []
+        self._owner_inflight.add(user_id)
+        try:
+            rows = self.owner_records(user_id, force=True)
+            codes = [row.code for row in rows]
+            meta = {row.code: {"boards": list(row.boards), "name": row.name,
+                               "pinned": bool(row.pinned)}
+                    for row in rows}
+            items = await self._compute_watchlist_for_codes(codes, meta=meta)
+            self._owner_cache[user_id] = (time.monotonic(), items)
+            return items
+        finally:
+            self._owner_inflight.discard(user_id)
+
+    def _schedule_owner_recompute(self, user_id: str) -> None:
+        """把"某个账号的整表重算"丢到后台（去重 + 强引用，与既有套路一致）。"""
+        if user_id in self._owner_inflight:
+            return
+        task = asyncio.get_running_loop().create_task(
+            self._recompute_owner(user_id), name=f"intraday-owner-watch-{user_id}")
+        self._watch_refresh_tasks.add(task)
+        task.add_done_callback(self._watch_refresh_tasks.discard)
+
+    async def _owner_watchlist(self, user_id: str, tenant_id: str, *,
+                               limit: int, force: bool,
+                               active: str | None) -> list[WatchItem]:
+        """**某个账号**的自选概览（与 SYSTEM 那条同语义：先给缓存/占位，再后台补算）。
+
+        为什么不用"整表重算"当默认：`/intraday/watchlist` 是前端每分钟轮询的接口，
+        让它在请求里等 50 只票的重算 = 每次打开面板都要几十秒。所以：
+          - 有缓存 → 直接给（价格另有报价快车道贴）；
+          - 没缓存 → 先给**这个账号自己的**占位表（身份字段），后台重算补分。
+        分数从哪来：后台的 SYSTEM 循环（每分钟）已经把**并集**里每只票的轻量快照
+        算进 `_light_cache`（按代码分键），所以按账号重算大多是缓存命中。
+        """
+        rows = await asyncio.to_thread(self.owner_records, user_id, force=force)
+        codes = [row.code for row in rows]
+        if not codes:
+            # 空清单也是**正确的答案**（新账号/刚清空）：不要回落任何人的清单。
+            self._owner_cache[user_id] = (time.monotonic(), [])
+            return []
+        if force and active and active in codes:
+            fresh = await self._refresh_one_watch(active)
+            if fresh is not None:
+                slot = self._owner_cache.get(user_id)
+                base = (list(slot[1]) if slot
+                        else self._placeholder_from_rows(rows, len(rows)))
+                merged = [fresh if item.code == active else item for item in base]
+                if not any(item.code == active for item in merged):
+                    merged.insert(0, fresh)
+                self._owner_cache[user_id] = (time.monotonic(), merged)
+                return self._apply_quote_overlay(merged[:limit])
+        slot = self._owner_cache.get(user_id)
+        if not force and slot is not None and (
+                time.monotonic() - slot[0]) < self._owner_cache_ttl():
+            return self._apply_quote_overlay(list(slot[1])[:limit])
+        if slot is not None:
+            # 过期但可用：先给旧值，后台补新值（stale-while-revalidate）
+            self._schedule_owner_recompute(user_id)
+            return self._apply_quote_overlay(list(slot[1])[:limit])
+        # 完全没有缓存：给占位 + 后台补算（首屏不阻塞）
+        self._schedule_owner_recompute(user_id)
+        placeholder = self._placeholder_from_rows(rows, max(limit, len(rows)))
+        return self._apply_quote_overlay(placeholder[:limit])
 
     async def _recompute_into_cache(self) -> list[WatchItem]:
         """真正算一次整表并写回缓存（`_watch_lock` 单飞）。调用方决定"等不等"。"""
@@ -2837,7 +3147,9 @@ class IntradayService:
         这一步做完，再交给同一个计算核，避免两份取数逻辑漂移。
         """
         config = self._reload_config()
-        codes = [item.code for item in config.watchlist][:limit]
+        # 2026-10-08（CHG-0224）：SYSTEM 的代码来源改成**全体账号并集**；
+        # 并集为空才回落 `configs/intraday.yaml`（老机器兼容路径，见 user_watch）。
+        codes = self.all_watch_codes()[:limit]
         if only:
             # 优先刷新：只算指定的这几只（顺序按配置里的顺序，保证列表稳定）
             wanted = {str(code) for code in only}
@@ -2980,7 +3292,13 @@ class IntradayService:
     # ==================== 自选池盘中自动刷新 ====================
 
     async def start_watchlist_refresh(self) -> None:
-        """启动「自选池盘中每分钟自动刷新」循环（幂等，重复调用不会起两个）。"""
+        """启动「自选池盘中每分钟自动刷新」循环（幂等，重复调用不会起两个）。
+
+        同时**跑一次存量自选迁移**（`CHG-0224`）：把 `configs/intraday.yaml` 里那份
+        共享清单落到该环境最早的管理员名下（幂等；没有管理员就一行都不迁，
+        只打 WARNING）。放在这里是因为它是启动钩子，而迁移必须"在有人读之前"完成。
+        """
+        await self._migrate_legacy_watchlist_once()
         interval = self._config.data.watchlist_refresh_seconds
         if interval <= 0:
             logger.info("自选池自动刷新未启用（watchlist_refresh_seconds=0）")
@@ -3175,7 +3493,21 @@ class IntradayService:
         try:
             result = await selector.run(window=window)
             if apply and result.selected:
-                existing = {item.code for item in await self.watchlist()}
+                # 2026-10-08（CHG-0224）：自选现在**按账号**存 —— 后台自动选股
+                # 没有身份，**不能**替任何人往他的清单里写（旧行为是往那份
+                # 共享 YAML 里加，等于把所有人的池子当自己的）。所以无 owner 时
+                # 只留信号与通知，不写清单；要收进自选由用户自己在面板上点。
+                if not user_watch.has_owner():
+                    logger.info("自动选股选出 %d 只，但自选已按账号隔离 ⇒ "
+                                "不替用户写入清单（去面板上点「加自选」）",
+                                len(result.selected))
+                    for item in result.selected:
+                        result.skipped.append(item.code)
+                    result.notes.append(
+                        "自选按账号隔离：后台不代写，请手动「＋加自选」")
+                    existing = set()
+                else:
+                    existing = {item.code for item in await self.watchlist()}
                 for item in result.selected:
                     if item.code in existing:
                         result.skipped.append(item.code)
@@ -3374,7 +3706,7 @@ class IntradayService:
                 and ttl > 0 and now - hit[0] < ttl):
             return hit[1]
         config = config_patch if config_patch is not None else self._reload_config()
-        watch = config.watch(code)
+        watch = self.watch_config(code)
         # 情绪周期（自选池共用一份缓存）是日线加权总分的一个输入。
         # 股性画像**不在这里取** —— 它必须用与日K面板同一份日线，
         # 否则两条取数路径在数据源落后时会拿到不同的末日（见 daily._daily_character）。
@@ -3403,7 +3735,7 @@ class IntradayService:
                        days: int = 20) -> BacktestResult:
         """阈值回测（先做回测，再谈实盘做T）。"""
         config = self._reload_config()
-        watch = config.watch(code)
+        watch = self.watch_config(code)
         name = watch.name if watch else ""
         try:
             bars, source, _ = await self._data.fetch_bars(code, days=days)

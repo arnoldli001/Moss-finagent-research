@@ -26,6 +26,16 @@ import { api, type QuantSector } from "../api";
 /** 左侧列表当前展示的来源：自选池，或某个自定义板块。 */
 export type DrawerSource = { kind: "watch" } | { kind: "sector"; id: number };
 
+/**
+ * 空态提示（用户口径 2026-10-08：板块**按账号隔离**）。
+ *
+ * 为什么要写出来：隔离之前所有人共用一份，新账号一进来就能看到别人的板块，
+ * 于是"板块是谁的"从来不需要解释；隔离之后新账号看到的是**空列表** ——
+ * 不写这句话，用户会以为"功能坏了 / 我的板块丢了"。
+ */
+export const SECTOR_SCOPE_HINT =
+  "板块属于你自己的账号，只有你能看到（别人的板块不会出现在这里）";
+
 /** 新建/更新板块的请求体（与 `api.quantSaveSector` 对齐）。 */
 export type SectorDraft = Parameters<typeof api.quantSaveSector>[0];
 

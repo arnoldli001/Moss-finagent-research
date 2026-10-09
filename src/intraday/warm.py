@@ -135,7 +135,32 @@ DAILY_WARM_MAX_CODES = 80
 #: ★ `CHG-0137`：**这个常量现在是硬约束**（见 `warm_watchlist_daily` 的
 #: `asyncio.wait_for`）。撞预算会：① 取消在飞任务 ② 记一条 `job_budget` 采集异常
 #: ③ 在 `WarmReport` 里如实计数 —— 不再靠人读日志发现"这一轮少预热了几只"。
-DAILY_WARM_BUDGET_SEC = 90.0
+#:
+#: ★★ `CHG-0221`（2026-10-08）：**90 → 45**。起因是用户报"自选股的分时图加载很慢"，
+#: 量出来的账是：**预热占掉了 API 进程 70% 的墙钟**（09:31–10:28 实测 29 轮、合计
+#: 2,396 s / 3,414 s；`[循环延迟]` 超阈值 378 次），而用户点开一只票的
+#: `/intraday/snapshot` 在同一窗口是 **p50 = 3,670 ms、max = 25,965 ms**。
+#:
+#: 关键在于**旧的 90 s 并没有换来覆盖**：`CHG-0149` 把并发钉成 **1**
+#: （并发 3 时 V8 崩溃 3/3，见 `DAILY_WARM_CONCURRENCY`），于是 57~64 只的池子
+#: 串行取一轮要 ~95 s+ ⇒ 实测 **25/29 轮全部撞满 90 s**，每轮只热到 14~43 只，
+#: 尾巴**永远**是冷的。也就是说：那 90 s 买到的不是覆盖，而是"每一轮都跑满"。
+#:
+#: 45 s = tick 的 37.5%（`test_warm_budget_leaves_headroom_in_the_tick` 会验），
+#: 与 `PER_CODE_SEC(12)` 的搭配依然成立。**这一半不是根治**：真正让"用户进程"
+#: 与"后台批处理"分开的是把预热搬到 `manage.py start-worker`（已登记待办），
+#: 在那之前，保护交互路径靠的是 `yield_to_interactive()`（见下）。
+DAILY_WARM_BUDGET_SEC = 45.0
+
+#: 让路的轮询间隔（秒）。交互请求通常 0.1~4 s 就走完，0.2 s 足够跟手又不会空转。
+DAILY_WARM_YIELD_POLL_SEC = 0.2
+
+#: 单只票**最多**为交互请求让路多久（秒）。
+#:
+#: 为什么必须有上限：用户连续点击时，"一直有请求在飞"是常态 —— 没有上限
+#: 就等于把预热停掉（那又回到"点开一只冷票要 4~7 s"的原点）。
+#: 3 s ≈ 一次冷取（4.2 s）的 0.7 倍：让过这一波，下一只继续。
+DAILY_WARM_YIELD_MAX_SEC = 3.0
 
 #: 单只票的墙钟上限（秒）。日线链自己也有超时，这一层是"它自己没兜住"时的保险。
 #:
@@ -145,6 +170,54 @@ DAILY_WARM_BUDGET_SEC = 90.0
 #: 仍只切"病态慢"的那只；而"一只病态"对整轮的伤害从 30 s 降到 12 s。
 #: 真正的护栏是硬预算：即使 12 s 也不够，一轮也**不会**超过 90 s。
 DAILY_WARM_PER_CODE_SEC = 12.0
+
+
+async def yield_to_interactive(
+    *,
+    poll_sec: float = DAILY_WARM_YIELD_POLL_SEC,
+    max_sec: float = DAILY_WARM_YIELD_MAX_SEC,
+) -> float:
+    """有**交互请求**在飞时让路；返回实际等了多少秒（0 = 没人在等）。
+
+    ## 为什么需要它（`CHG-0221`，用户原话"自选股的分时图加载很慢"）
+
+    预热的本意是"让用户点开快"，而它与用户**共享同一条事件循环、同一批数据源
+    槽位、同一个线程池**。实测代价（2026-10-08，pilot）：
+
+        · 预热占掉 API 进程 **70%** 的墙钟（29 轮 / 2,396 s / 3,414 s）
+        · 同一窗口用户点票的 `/intraday/snapshot`：**p50 3,670 ms、max 25,965 ms**
+        · 同一份代码在**空闲**进程上只要 **144 ms**（light）/ 487 ms（完整）
+
+    也就是说：**批量任务在跟它服务的那个请求抢资源** —— 这是"预热养缓存"
+    这个设计自带的矛盾。修法不是把预热关掉（那会让每只票都冷），而是让它
+    **知道自己是可以等的那一个**。
+
+    ## 判据用的是 `inflight.interactive()`，不是"登记簿非空"
+
+    见 `src/core/inflight.py::interactive()`：WebSocket 是长连接（实测挂过 38 分钟），
+    拿它当判据会让预热**永远**让路；`task:...` 是别的后台任务，后台给后台让路没有意义。
+
+    ## 三条边界
+
+    * **空闲时零开销**：没有交互请求就只读一次登记簿（O(1) 字典）直接返回；
+    * **有上限**：用户连续点击时"一直有请求在飞"是常态，没有上限就等于停掉预热
+      （见 `DAILY_WARM_YIELD_MAX_SEC`）；
+    * **绝不抛**：登记簿是观测器，它出问题不许把预热带崩。
+    """
+    waited = 0.0
+    while waited < max_sec:
+        try:
+            from src.core import inflight
+
+            busy = inflight.interactive()
+        except Exception:  # noqa: BLE001 观测器故障不许影响预热
+            return waited
+        if not busy:
+            return waited
+        step = min(poll_sec, max_sec - waited)
+        await asyncio.sleep(step)
+        waited += step
+    return waited
 
 
 def _record_warm_budget_anomaly(report: "WarmReport", budget_sec: float) -> None:
@@ -237,6 +310,9 @@ class WarmReport:
     budget_hit: bool = False
     skipped_reason: str = ""
     deferred: int = 0          #: 因**上一轮超时**而被降到队尾的只数
+    #: 这一轮为**交互请求**让路让掉的时间（秒，`CHG-0221`）。
+    #: 必须可见：不然"让路生效了吗"只能靠猜，而它恰恰是这一轮改动的判据。
+    yielded_sec: float = 0.0
     errors: list[str] = field(default_factory=list)
 
     def render(self) -> str:
@@ -246,6 +322,8 @@ class WarmReport:
         head = (f"目标 {self.codes} 只（自选 {self.warm_targets} + 最近点开 "
                 f"{self.recent_targets}）：预热 {self.warmed} 只"
                 f"，失败 {self.failed} 只，用时 {self.seconds:.1f}s")
+        if self.yielded_sec >= 0.5:
+            head += f"（其中让路给交互请求 {self.yielded_sec:.1f}s）"
         if self.deferred:
             head += f"；{self.deferred} 只因上轮超时被降到队尾"
         if self.budget_hit:
@@ -259,26 +337,27 @@ class WarmReport:
 def watchlist_codes(service: Any) -> list[str]:
     """自选池的 6 位代码（去重保序）。
 
-    从 `service.config.watchlist` 读 —— 与前端「自选池」、`intraday_t_scan`
-    用的是**同一份配置**，所以"预热的"与"用户会点的"是同一批票。
+    **2026-10-08（`CHG-0224`）起改成"全体账号的并集"**：自选已按账号隔离，
+    后台预热没有"谁"这回事，要热的是**所有人在看的票**；并集为空才回落
+    `configs/intraday.yaml`（老机器兼容路径，见 `src/intraday/user_watch.py`）。
     """
     try:
-        items = list(getattr(service.config, "watchlist", []) or [])
+        codes = [str(code) for code in service.all_watch_codes()]
     except Exception as exc:  # noqa: BLE001 配置读不到不该让作业炸
         logger.warning("日K预热读自选池失败：%s", type(exc).__name__)
         return []
-    codes: list[str] = []
+    out: list[str] = []
     seen: set[str] = set()
-    for item in items:
-        raw = str(getattr(item, "code", "") or "").strip()
-        if not raw:
+    for raw in codes:
+        code = raw.strip()
+        if not code:
             continue
-        code = raw.zfill(6) if raw.isdigit() else raw
+        code = code.zfill(6) if code.isdigit() else code
         if code in seen:
             continue
         seen.add(code)
-        codes.append(code)
-    return codes
+        out.append(code)
+    return out
 
 
 def warm_targets(service: Any, *,
@@ -325,9 +404,21 @@ def warm_targets(service: Any, *,
 
 
 async def _warm_one(service: Any, code: str, sem: asyncio.Semaphore,
-                    errors: list[str]) -> bool:
-    """预热一只票；成功 True。异常只记录（预热失败不该让整轮判失败）。"""
+                    errors: list[str],
+                    gate: Any = None) -> bool:
+    """预热一只票；成功 True。异常只记录（预热失败不该让整轮判失败）。
+
+    `gate`：可选的 `async () -> float`，**在取数之前**调用 —— 有交互请求在飞时
+    它会等（见 `yield_to_interactive`）。⚠️ 它在 `wait_for` **之外**：
+    让路的时间不该算进"这一只票取数超时"（那是两件事，混在一起会让
+    "让路让多了"伪装成"数据源超时"）。
+    """
     async with sem:
+        if gate is not None:
+            try:
+                await gate()
+            except Exception:  # noqa: BLE001 让路失败照常预热，绝不因此少热一只
+                logger.debug("预热让路失败（照常继续）", exc_info=True)
         try:
             snapshot = await asyncio.wait_for(
                 service.daily(code), timeout=DAILY_WARM_PER_CODE_SEC)
@@ -376,6 +467,15 @@ async def warm_watchlist_daily(
                         deferred=len([c for c in targets if c in deferred_codes()]))
     sem = asyncio.Semaphore(max(1, int(concurrency)))
 
+    # ★ `CHG-0221`：让路记账。用 dict 而不是 nonlocal ——
+    #   `_warm_one` 是模块级函数（测试直接调它），闭包变量传不进去。
+    yielded = {"sec": 0.0}
+
+    async def gate() -> None:
+        waited = await yield_to_interactive()
+        if waited:
+            yielded["sec"] += waited
+
     pending: list[asyncio.Task[bool]] = []
     for code in targets:
         # ★ 预算判据放在**每次启动新的一只之前**：已经在飞的让它跑完
@@ -383,7 +483,8 @@ async def warm_watchlist_daily(
         if time.monotonic() - started >= budget_sec:
             report.budget_hit = True
             break
-        pending.append(asyncio.create_task(_warm_one(service, code, sem, report.errors)))
+        pending.append(asyncio.create_task(
+            _warm_one(service, code, sem, report.errors, gate)))
 
     if pending:
         # ★★ 2026-09-30（`CHG-0137`）：**预算必须是硬约束，而不是提交前的礼貌检查**。
@@ -427,6 +528,7 @@ async def warm_watchlist_daily(
     if report.budget_hit:
         report.skipped = max(0, len(targets) - report.warmed - report.failed)
     report.seconds = time.monotonic() - started
+    report.yielded_sec = yielded["sec"]
     logger.info("日K预热：%s", report.render())
     if report.budget_hit:
         #: "预算截断"必须**留痕**：否则"这一轮少预热了 N 只"只能靠人读日志发现

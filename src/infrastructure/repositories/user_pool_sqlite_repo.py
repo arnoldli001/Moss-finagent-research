@@ -672,6 +672,166 @@ class UserPoolSqliteRepository:
             pinned=bool(r["pinned"]),
             sort_order=int(r["sort_order"])) for r in rows]
 
+    # ---------------- 自选条目：**按 user_id 定位**（2026-10-08，CHG-0227） ----------------
+    #
+    # 上面那组 `list_stocks/remove_stock/set_pinned` 是 `(tenant_id, user_id)` 双条件，
+    # 而这个平台的 `tenant_id` 装的是**套餐等级**（`applied_tier`，见
+    # `src/api/session_ctx.py:104`）—— 于是用户升/降一次套餐，他那份自选就"查不到"了
+    # （既有隐患，PRD §50.7 缺口 4 已登记）。做T自选是**最显眼的那份用户数据**，
+    # 所以它从第一天就走"只按 user_id 定位"：
+    #   · 读/删/置顶：WHERE user_id = ?（+ pool_id/code），**不带 tenant**；
+    #   · 写：先按 (user_id, pool_id, code) 找已有行 → 有则 UPDATE（**保留原有 tenant_id**），
+    #     没有才 INSERT。这样同一个 (user, pool, code) 永远只有一行，
+    #     套餐怎么变都不会分叉出第二行。
+    # `tenant_id` 仍然写下来（它是"这行是什么时候、在哪个档位建的"的来源登记），
+    # 只是不参与过滤。
+
+    @staticmethod
+    def _watch_row_to_record(r: Any) -> WatchRecord:
+        return WatchRecord(
+            tenant_id=str(r["tenant_id"]), user_id=str(r["user_id"]),
+            pool_id=str(r["pool_id"]), code=str(r["code"]),
+            name=str(r["name"] or ""), industry=str(r["industry"] or ""),
+            boards=tuple(_loads(r["boards_json"], [])),
+            overseas=tuple(_loads(r["overseas_json"], [])),
+            peers=tuple(_loads(r["peers_json"], [])),
+            note=str(r["note"] or ""), pinned=bool(r["pinned"]),
+            sort_order=int(r["sort_order"]))
+
+    def list_watch_by_owner(self, user_id: str, *,
+                            pool_id: str = "") -> list[WatchRecord]:
+        """某账号的自选条目（**只按 user_id**；顺序=置顶在前 + 新加的在前）。"""
+        self._ready()
+        sql = f"SELECT * FROM {TABLE_WATCH} WHERE user_id = ?"
+        params: list[Any] = [str(user_id or "")]
+        if pool_id:
+            sql += " AND pool_id = ?"
+            params.append(pool_id)
+        with self._connect() as conn:
+            rows = conn.execute(
+                sql + " ORDER BY pinned DESC, sort_order ASC, code ASC",
+                params).fetchall()
+        return [self._watch_row_to_record(r) for r in rows]
+
+    def upsert_watch_by_owner(self, *, user_id: str, tenant_id: str,
+                              pool_id: str, code: str, name: str = "",
+                              industry: str = "", boards: object = (),
+                              overseas: object = (), peers: object = (),
+                              note: str = "",
+                              pinned: bool = False) -> WatchRecord:
+        """加/更新一只自选（唯一键语义 = `(user_id, pool_id, code)`）。
+
+        **新条目的 `sort_order` 取当前最小值 − 1** ⇒ 列表里"新加的在最上面"
+        （用户口径 2026-09-23；YAML 时代的 `prepend=True` 就是这个语义）。
+        """
+        self._ready()
+        clean_code = normalize_code(code)
+        clean_user = str(user_id or "")
+        if not clean_user:
+            raise ValueError("自选必须绑定账号：user_id 不能为空")
+        boards_json = _dumps([str(x).strip() for x in (boards or ()) if str(x).strip()])
+        overseas_json = _dumps([str(x).strip() for x in (overseas or ()) if str(x).strip()])
+        peers_json = _dumps([str(x).strip() for x in (peers or ()) if str(x).strip()])
+        now = _now()
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT tenant_id, sort_order FROM {TABLE_WATCH}"
+                " WHERE user_id = ? AND pool_id = ? AND code = ?"
+                " ORDER BY updated_at DESC", (clean_user, pool_id, clean_code)
+            ).fetchall()
+            if rows:
+                # 保留最早那一行的 tenant_id；历史分叉（同键多行）顺手收敛掉
+                keep_tenant = str(rows[0]["tenant_id"])
+                sort_order = int(rows[0]["sort_order"])
+                if len(rows) > 1:
+                    conn.execute(
+                        f"DELETE FROM {TABLE_WATCH} WHERE user_id = ? AND pool_id = ?"
+                        " AND code = ? AND tenant_id <> ?",
+                        (clean_user, pool_id, clean_code, keep_tenant))
+                conn.execute(
+                    f"UPDATE {TABLE_WATCH} SET name = ?, industry = ?,"
+                    " boards_json = ?, overseas_json = ?, peers_json = ?,"
+                    " note = ?, pinned = ?, updated_at = ?"
+                    " WHERE user_id = ? AND pool_id = ? AND code = ?",
+                    (name, industry, boards_json, overseas_json, peers_json,
+                     note, int(bool(pinned)), now, clean_user, pool_id, clean_code))
+                return WatchRecord(
+                    tenant_id=keep_tenant, user_id=clean_user, pool_id=pool_id,
+                    code=clean_code, name=name, industry=industry,
+                    boards=tuple(_loads(boards_json, [])),
+                    overseas=tuple(_loads(overseas_json, [])),
+                    peers=tuple(_loads(peers_json, [])), note=note,
+                    pinned=bool(pinned), sort_order=sort_order)
+            head = conn.execute(
+                f"SELECT MIN(sort_order) AS m FROM {TABLE_WATCH}"
+                " WHERE user_id = ? AND pool_id = ?", (clean_user, pool_id)
+            ).fetchone()
+            sort_order = (int(head["m"]) - 1) if head and head["m"] is not None else 0
+            conn.execute(
+                f"INSERT INTO {TABLE_WATCH}"
+                "(tenant_id, user_id, pool_id, code, name, industry, boards_json,"
+                " overseas_json, peers_json, note, pinned, sort_order,"
+                " created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(tenant_id or ""), clean_user, pool_id, clean_code, name,
+                 industry, boards_json, overseas_json, peers_json, note,
+                 int(bool(pinned)), sort_order, now, now))
+        return WatchRecord(
+            tenant_id=str(tenant_id or ""), user_id=clean_user, pool_id=pool_id,
+            code=clean_code, name=name, industry=industry,
+            boards=tuple(_loads(boards_json, [])),
+            overseas=tuple(_loads(overseas_json, [])),
+            peers=tuple(_loads(peers_json, [])), note=note,
+            pinned=bool(pinned), sort_order=sort_order)
+
+    def remove_watch_by_owner(self, *, user_id: str, pool_id: str,
+                              code: str) -> bool:
+        self._ready()
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"DELETE FROM {TABLE_WATCH}"
+                " WHERE user_id = ? AND pool_id = ? AND code = ?",
+                (str(user_id or ""), pool_id, normalize_code(code)))
+            return bool(cur.rowcount)
+
+    def pin_watch_by_owner(self, *, user_id: str, pool_id: str, code: str,
+                           pinned: bool) -> int:
+        self._ready()
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE {TABLE_WATCH} SET pinned = ?, updated_at = ?"
+                " WHERE user_id = ? AND pool_id = ? AND code = ?",
+                (int(bool(pinned)), _now(), str(user_id or ""), pool_id,
+                 normalize_code(code)))
+            return int(cur.rowcount)
+
+    def owner_watch_counts(self, pool_id: str = "") -> dict[str, int]:
+        """每个账号几只自选（**全体并集用的口径**：按 user_id 分组计数）。"""
+        self._ready()
+        sql = f"SELECT user_id, COUNT(DISTINCT code) AS n FROM {TABLE_WATCH}"
+        params: list[Any] = []
+        if pool_id:
+            sql += " WHERE pool_id = ?"
+            params.append(pool_id)
+        with self._connect() as conn:
+            return {str(r["user_id"]): int(r["n"]) for r in
+                    conn.execute(sql + " GROUP BY user_id", params).fetchall()}
+
+    def owner_watch_codes(self, pool_id: str = "") -> list[str]:
+        """**全体账号**自选代码的并集（去重排序）。
+
+        后台作业（扫描/预热/报价）要的是"所有人在看的票"—— 它们没有身份，
+        也不该只看某一个人的清单。
+        """
+        self._ready()
+        sql = f"SELECT DISTINCT code FROM {TABLE_WATCH}"
+        params: list[Any] = []
+        if pool_id:
+            sql += " WHERE pool_id = ?"
+            params.append(pool_id)
+        with self._connect() as conn:
+            return [str(r["code"]) for r in
+                    conn.execute(sql + " ORDER BY code", params).fetchall()]
+
     def rename_pool(self, tenant_id: str, user_id: str, pool_id: str,
                     name: str) -> bool:
         """重命名池。

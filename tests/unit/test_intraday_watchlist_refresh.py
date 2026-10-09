@@ -643,6 +643,26 @@ def _stub_request(service: IntradayService):
         state=SimpleNamespace(runtime=SimpleNamespace(intraday=service))))
 
 
+@pytest.fixture(autouse=True)
+def _stub_identity(monkeypatch):
+    """给本文件的 API 用例注入**SYSTEM（无 owner）**身份。
+
+    为什么是空身份而不是某个用户：本文件的 `_FakeService` 是 `IntradayService`
+    的**子类**，只覆写了 `_compute_watchlist`（SYSTEM 那条路）。若这里给一个真
+    user_id，路由就会走"按账号"新路径（`_owner_watchlist` → 读真库），
+    于是这个替身根本不会被调用 —— 实测表现为 `computes == 0`、`count == 0`。
+
+    本文件要验的是 **payload 形状与刷新语义**；"按账号隔离"的语义由
+    `tests/unit/test_intraday_user_watch.py` 用真实 TestClient + 真登录覆盖。
+    这里替掉身份解析只是为了让端点不再要求会话（`_stub_request` 没有 Cookie）。
+    """
+
+    async def _ident(request, *, write: bool = True):  # noqa: ANN001, ARG001
+        return ("", "")
+
+    monkeypatch.setattr("src.api.routes.intraday._identity", _ident)
+
+
 def test_api_watchlist_returns_items_and_auto_refresh() -> None:
     """`GET /intraday/watchlist` 必须带上 auto_refresh —— 前端靠它显示刷新状态。"""
     from src.api.routes.intraday import watchlist as watchlist_route

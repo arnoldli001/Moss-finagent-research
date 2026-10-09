@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -99,6 +99,12 @@ node_modules/
 !/scripts/preflight_check.py
 !/scripts/affected_tests.py
 !/scripts/check_external_sources.py
+# 运维自启/告警三件套（CHG-0168）：被 AGENTS.md / docs/OPS_GUIDE.md 当命令引用 ⇒ 必须发布。
+# 三个一起发布：`moss_autostart` 与 `moss_vps_monitor` 都 import `moss_ops_alert`，
+# 少发一个，克隆里就是 ImportError（而开发机上永远不报错）。
+!/scripts/moss_ops_alert.py
+!/scripts/moss_autostart.py
+!/scripts/moss_vps_monitor.py
 !/scripts/crowding_refresh.ps1
 !/scripts/setup_crowding_refresh_task.py
 !/scripts/quant_cases.py

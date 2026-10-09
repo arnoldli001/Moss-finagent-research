@@ -71,6 +71,14 @@ class _FakeService:
     而不是靠"我看了一遍代码觉得没问题"。
     """
 
+    def all_watch_codes(self) -> list[str]:
+        """真服务的新接口（2026-10-08，`CHG-0224`）：自选按账号后作业读**全体并集**。
+
+        替身必须与真服务同形 —— 少了这个方法，`warm.watchlist_codes` 会
+        AttributeError 被兜住成空清单，作业静默不干活（本轮实测就是这样红了 17 条）。
+        """
+        return [item.code for item in self.config.watchlist]
+
     def __init__(self, codes: list[str], *, ttl: float = 180.0,
                  hang: set[str] | None = None,
                  unavailable: set[str] | None = None,
@@ -514,3 +522,137 @@ def test_execute_warm_without_service_marks_failed(tmp_path,
     record = _run_job(tmp_path, None, monkeypatch)
     assert record["status"] == "failed"
     assert "未装配" in (record["error_message"] or "")
+
+
+# ------------------------------------------------- 6. 让路给交互请求（CHG-0221）
+#
+# 用户原话（2026-10-08）：「为什么 自选股 的 分时图 加载很慢？之前优化过一轮的。」
+# 量出来的账：预热占掉 API 进程 **70%** 的墙钟（09:31–10:28 实测 29 轮 / 2,396 s），
+# 同一窗口用户点票的 `/intraday/snapshot` **p50 = 3,670 ms、max = 25,965 ms**；
+# 而同一份代码在**空闲**进程上只要 144 ms（light）。⇒ 批量任务在跟它服务的
+# 那个请求抢资源。下面守的就是"让路真的发生、且不会退化成把预热关掉"。
+
+def test_warm_budget_leaves_headroom_in_the_tick() -> None:
+    """★ 一轮预算**最多占 tick 的一半** —— 这一条是新加的，理由就是这次的报障。
+
+    旧口径只要求"预算 < tick"（`test_warm_round_fits_before_the_next_tick`），
+    于是 90/120 = **75%** 也合法 —— 而实测的后果正是"每一轮都跑满，
+    用户在用的那条循环长期没有余量"。**预算管的是「别跑爆」，不是「别跟用户抢」**，
+    所以这里把"抢"的那一半也定成判据。
+    """
+    from src.intraday.warm import DAILY_WARM_BUDGET_SEC
+    from src.scheduler.registry import JOB_REGISTRY
+
+    gap = _max_gap_seconds_within_session(JOB_REGISTRY[JOB_NAME].cron)
+    assert DAILY_WARM_BUDGET_SEC <= gap / 2, (
+        f"预热预算 {DAILY_WARM_BUDGET_SEC:.0f}s 超过 tick 间隔 {gap:.0f}s 的一半 —— "
+        "预热与用户请求共享同一条事件循环，占满 tick 就等于让每次点票都排队")
+
+
+def test_yield_to_interactive_is_instant_when_idle() -> None:
+    """**空闲时零开销**：没有交互请求就不许睡（否则等于给每只票白加延迟）。"""
+    from src.core import inflight
+    from src.intraday.warm import yield_to_interactive
+
+    inflight.reset()
+    started = time.monotonic()
+    waited = asyncio.run(yield_to_interactive())
+    elapsed = time.monotonic() - started
+
+    assert waited == 0.0
+    assert elapsed < 0.05, f"空闲时让路睡了 {elapsed:.3f}s —— 应当只读一次登记簿"
+
+
+def test_yield_to_interactive_waits_for_a_real_request() -> None:
+    """有交互请求在飞时**真的等**，且等满上限就走（不许无限等）。"""
+    from src.core import inflight
+    from src.intraday.warm import yield_to_interactive
+
+    async def scenario() -> float:
+        inflight.reset()
+        inflight.enter("GET /api/v1/intraday/snapshot")
+        try:
+            return await yield_to_interactive(poll_sec=0.02, max_sec=0.1)
+        finally:
+            inflight.reset()
+
+    waited = asyncio.run(scenario())
+    assert waited >= 0.1, (
+        f"有请求在飞却只等了 {waited:.3f}s —— 让路没生效，用户照样排在预热后面")
+
+
+def test_yield_to_interactive_ignores_websocket_and_tasks() -> None:
+    """★ 反向判据：**长连接与后台任务不许触发让路**。
+
+    写错这一格是**静默**的：`websocket /api/v1/ws/alerts` 实测挂过 38 分钟，
+    拿它当"用户在等"，预热会永远让路 —— 界面上没有任何异常，只是每只票都变冷。
+    """
+    from src.core import inflight
+    from src.intraday.warm import yield_to_interactive
+
+    async def scenario() -> float:
+        inflight.reset()
+        inflight.enter("websocket /api/v1/ws/alerts")
+        inflight.enter("task:catalog-rebuild")
+        try:
+            return await yield_to_interactive(poll_sec=0.02, max_sec=0.1)
+        finally:
+            inflight.reset()
+
+    assert asyncio.run(scenario()) == 0.0
+
+
+def test_warm_round_reports_yielded_time() -> None:
+    """让路的时间必须**进 report 与日志** —— 否则"让路生效了吗"只能靠猜。"""
+    service = _FakeService(["600036", "000001"])
+    report = asyncio.run(warm_watchlist_daily(
+        service, now=datetime(2026, 9, 28, 10, 0)))
+
+    assert report.yielded_sec == 0.0, "空闲时不该有让路时间"
+    assert "让路" not in report.render(), "没让路就不要在台账里写让路"
+
+
+def test_warm_round_yields_before_fetching(monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ **行为**判据：gate 必须真的被调，而且**在取数之前**。
+
+    只断言"函数存在"是形状判据 —— 把 `gate` 传丢、或在 `daily()` 之后才调，
+    源码里那些字串照样在，而让路**一次都没发生**。
+    """
+    from src.intraday import warm as warm_module
+
+    order: list[str] = []
+
+    async def _fake_yield(**kwargs) -> float:
+        order.append("yield")
+        return 0.0
+
+    monkeypatch.setattr(warm_module, "yield_to_interactive", _fake_yield)
+
+    class _Recording(_FakeService):
+        async def daily(self, code: str, **kwargs):  # type: ignore[override]
+            order.append(f"daily:{code}")
+            return await super().daily(code, **kwargs)
+
+    service = _Recording(["600036", "000001"])
+    asyncio.run(warm_watchlist_daily(service, now=datetime(2026, 9, 28, 10, 0)))
+
+    assert order.count("yield") == 2, f"每只票取数前都该问一次让路：{order}"
+    assert order[0] == "yield" and order[2] == "yield", (
+        f"让路没有发生在取数**之前**（顺序={order}）")
+
+
+def test_warm_round_counts_yielded_time_into_report(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """让路时间要累计进 `report.yielded_sec` 并出现在台账那一行里。"""
+    from src.intraday import warm as warm_module
+
+    async def _slow_yield(**kwargs) -> float:
+        return 1.25
+
+    monkeypatch.setattr(warm_module, "yield_to_interactive", _slow_yield)
+    service = _FakeService(["600036", "000001"])
+    report = asyncio.run(warm_watchlist_daily(
+        service, now=datetime(2026, 9, 28, 10, 0)))
+
+    assert report.yielded_sec == pytest.approx(2.5), "两只票各 1.25s，必须累计"
+    assert "让路给交互请求 2.5s" in report.render(), report.render()

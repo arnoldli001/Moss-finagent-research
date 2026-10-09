@@ -27,6 +27,8 @@ from src.core.errors import (
     BRIEF_TIGHT,
     brief,
 )
+from src.infrastructure.repositories.user_pool_sqlite_repo import PoolValidationError
+from src.intraday import user_watch
 from src.intraday.config import FACTOR_LABELS
 from src.intraday.service import IntradayService
 
@@ -39,6 +41,17 @@ router = APIRouter(prefix="/api/v1", tags=["intraday"])
 # 若把循环整体设成 15 秒，快车道做出 5 秒的数据也会被卡在 15 秒才到屏幕上。
 _WS_INTERVAL_SECONDS = 15.0
 _WS_TICK_SECONDS = 1.0
+
+
+async def _identity(request: Request, *, write: bool = True) -> tuple[str, str]:
+    """当前会话的 `(user_id, tenant_id/tier)`；未登录 401、到期账号写操作 403。
+
+    与 `/me/profiles`、`/quant/sectors` 同一处口径（`session_ctx.current_user`）：
+    **读路径必须显式 `write=False`**，否则"账号到期"会把只读也变成 403。
+    """
+    from src.api.session_ctx import current_user
+
+    return await current_user(request, write=write)
 
 
 def _service(request: Request) -> IntradayService:
@@ -181,16 +194,23 @@ async def auto_select(
     result = await selector.run(window="manual")
     added: list[str] = []
     if apply and result.selected:
-        added = await _add_selected_to_watchlist(service, result)
+        # 写入的是**调用者自己的**自选（2026-10-08 起按账号隔离），并受套餐额度约束
+        from src.domain.quota.service import get_quota_service
+
+        user_id, tenant_id = await _identity(request, write=True)
+        quota = await get_quota_service().quota_for(user_id)
+        with user_watch.owner_scope(user_id, tenant_id):
+            added = await _add_selected_to_watchlist(service, result, quota=quota)
     return {"ok": True, "applied": bool(apply), "added": added,
             **result.as_dict()}
 
 
-async def _add_selected_to_watchlist(service: Any, result: Any) -> list[str]:
-    """把入选标的写入自选池（幂等：已在自选里的跳过）。
+async def _add_selected_to_watchlist(service: Any, result: Any, *,
+                                     quota: Any = None) -> list[str]:
+    """把入选标的写入**当前账号的**自选（幂等：已在自选里的跳过）。
 
-    复用 `service.add_watch`（同步方法，内部走 Moss 既有写盘逻辑：
-    原子替换 + 校验 + 保留注释），**不自己拼 YAML**。
+    复用 `service.add_watch`（同步方法，内部按 owner 写库或（无 owner 时）
+    走原 YAML 路径），**不自己拼 YAML**。
     """
     import asyncio
 
@@ -201,7 +221,8 @@ async def _add_selected_to_watchlist(service: Any, result: Any) -> list[str]:
             result.skipped.append(item.code)
             continue
         try:
-            await asyncio.to_thread(service.add_watch, item.code, name=item.name)
+            await asyncio.to_thread(service.add_watch, item.code,
+                                    name=item.name, quota=quota)
             item.added = True
             added.append(item.code)
         except Exception as exc:  # noqa: BLE001 单只失败不影响其余
@@ -232,8 +253,10 @@ async def watchlist(
     `active` 是「强制刷新不卡」的关键：见 `IntradayService.watchlist` 的说明。
     """
     service = _service(request)
-    items = await service.watchlist(limit=limit, force=force,
-                                    active=active or None)
+    user_id, tenant_id = await _identity(request, write=False)
+    with user_watch.owner_scope(user_id, tenant_id):
+        items = await service.watchlist(limit=limit, force=force,
+                                        active=active or None)
     return _watchlist_payload(items, service.watchlist_refresh_status())
 
 
@@ -275,7 +298,12 @@ async def stock_bindings(request: Request) -> dict:
         rows = {}
     names = {}
     try:
-        names = {item.code: item.name for item in service.config.watchlist}
+        # 2026-10-08（CHG-0224）：名字从**当前账号自己**的自选里取。
+        # 旧写法读 `service.config.watchlist`（那份共享 YAML）—— 隔离之后
+        # 它既不是用户的数据，也会把别人的清单名字带出来。
+        user_id, _tenant = await _identity(request, write=False)
+        names = {row["code"]: row["name"]
+                 for row in service.owner_watch_payload(user_id)}
     except Exception:  # noqa: BLE001 名字只是展示，取不到不影响主信息
         names = {}
     items = [
@@ -307,8 +335,12 @@ async def stock_binding(code: str, request: Request) -> dict:
 
 @router.post("/intraday/watchlist")
 async def add_watch(body: WatchRequest, request: Request) -> dict:
-    """新增自选标的（写回 configs/intraday.yaml，保留文件注释，进程内即时生效）。"""
+    """新增自选标的（写**当前账号自己的**清单；进程内即时生效）。"""
+    from src.domain.quota.service import get_quota_service
+
     service = _service(request)
+    user_id, tenant_id = await _identity(request, write=True)
+    quota = await get_quota_service().quota_for(user_id)
     code = _validate_code(body.code)
     name = body.name.strip()
     if not name and body.fetch_name:
@@ -319,35 +351,43 @@ async def add_watch(body: WatchRequest, request: Request) -> dict:
             logger.info("加自选时取证券简称失败(%s): %s", code, brief(exc, BRIEF_TIGHT))
     peers = [_validate_code(peer) for peer in body.peers]
     try:
-        config = service.add_watch(
-            code, name=name, boards=body.boards, peers=peers,
-            industry=body.industry.strip(), overseas=body.overseas)
+        with user_watch.owner_scope(user_id, tenant_id):
+            service.add_watch(code, name=name, boards=body.boards,
+                              peers=peers, industry=body.industry.strip(),
+                              overseas=body.overseas, quota=quota)
+    except PoolValidationError as exc:
+        raise HTTPException(status_code=422, detail={
+            "code": exc.code, "message": exc.message}) from exc
     except Exception as exc:  # noqa: BLE001 磁盘写入/配置校验失败转400
         raise HTTPException(
             status_code=400, detail=f"写入自选失败：{brief(exc, BRIEF_DEFAULT)}") from exc
+    rows = service.owner_watch_payload(user_id)
+    mine = next((row for row in rows if row["code"] == code), {})
     return {
         "ok": True, "code": code, "name": name,
         # 回显绑定结果：板块绑定决定「板块情绪/板块排行」两个维度能否计入总分
-        "boards": config.board_names(code),
-        "boards_bound": config.boards_bound(code),
-        "overseas": config.overseas_for(code),
-        "watchlist": [item.model_dump() for item in config.watchlist],
+        "boards": list(mine.get("boards") or []),
+        "boards_bound": bool(mine.get("boards")),
+        "overseas": list(mine.get("overseas") or []),
+        "watchlist": rows,
     }
 
 
 @router.delete("/intraday/watchlist/{code}")
 async def remove_watch(code: str, request: Request) -> dict:
-    """移除自选标的（写回配置文件；不存在时幂等成功）。"""
+    """移除自选标的（写**当前账号自己的**清单；不存在时幂等成功）。"""
     service = _service(request)
+    user_id, tenant_id = await _identity(request, write=True)
     target = _validate_code(code)
     try:
-        config = service.remove_watch(target)
+        with user_watch.owner_scope(user_id, tenant_id):
+            service.remove_watch(target)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=400, detail=f"移除自选失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return {
         "ok": True, "code": target,
-        "watchlist": [item.model_dump() for item in config.watchlist],
+        "watchlist": service.owner_watch_payload(user_id),
     }
 
 
@@ -367,9 +407,11 @@ async def pin_watch(
     from src.core.exceptions import ConfigError
 
     service = _service(request)
+    user_id, tenant_id = await _identity(request, write=True)
     target = _validate_code(code)
     try:
-        config = service.set_watch_pinned(target, pinned)
+        with user_watch.owner_scope(user_id, tenant_id):
+            service.set_watch_pinned(target, pinned)
     except ConfigError as exc:
         raise HTTPException(status_code=404, detail=brief(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -377,7 +419,7 @@ async def pin_watch(
             status_code=400, detail=f"置顶失败：{brief(exc, BRIEF_DEFAULT)}") from exc
     return {
         "ok": True, "code": target, "pinned": bool(pinned),
-        "watchlist": [item.model_dump() for item in config.watchlist],
+        "watchlist": service.owner_watch_payload(user_id),
     }
 
 
@@ -402,7 +444,12 @@ async def daily(
 
 @router.get("/intraday/config")
 async def module_config(request: Request) -> dict:
-    """当前打分口径（前端展示权重表与阈值，保证与后端计算完全一致）。"""
+    """当前打分口径（前端展示权重表与阈值，保证与后端计算完全一致）。
+
+    `watchlist` 字段回显的是**当前账号自己的**清单（2026-10-08 起按账号隔离）——
+    旧实现回显 `config.watchlist`（那份共享 YAML），等于把别人的清单发给这个账号。
+    """
+    user_id, _tenant = await _identity(request, write=False)
     service = _service(request)
     config = service.config
     weights = config.weights.as_dict()
@@ -430,7 +477,7 @@ async def module_config(request: Request) -> dict:
                    "levels": item.levels, "describe": item.describe()}
             for code, item in config.overrides.items()
         },
-        "watchlist": [item.model_dump() for item in config.watchlist],
+        "watchlist": service.owner_watch_payload(user_id),
         "notifier": service.notifier.channel_status(),
         "snapshot": config.snapshot(),
         "disclaimer": config.disclaimer,
@@ -465,7 +512,9 @@ async def scan(request: Request) -> dict:
     返回自动刷新循环写入的缓存（最长 60 秒前）会与动作语义不符。
     """
     service = _service(request)
-    items = await service.watchlist(force=True)
+    user_id, tenant_id = await _identity(request, write=True)
+    with user_watch.owner_scope(user_id, tenant_id):
+        items = await service.watchlist(force=True)
     triggered = [
         item.model_dump() for item in items
         if item.signal_strength in ("solid", "forced_exit")
@@ -497,10 +546,16 @@ async def intraday_ws(websocket: WebSocket,
     # ★ 登录门槛：WebSocket **不经过** `LoginGateMiddleware`
     #   （那是 BaseHTTPMiddleware，只管 http scope）。实测公网匿名连上
     #   `/ws/intraday` 就能收到整套快照，所以这里单独校验会话。
-    from src.api.session_ctx import ws_allow
+    from src.api.session_ctx import ws_allow, ws_identity
 
     if not await ws_allow(websocket):
         return
+    # ★ 自选按账号隔离（2026-10-08，CHG-0224）：WS **不经过** HTTP 中间件，
+    #   所以身份要按**连接**解析一次，并作用到这条连接后续所有推送 ——
+    #   否则每个连接都会收到"全体并集"那份清单（= 又看见别人的票）。
+    #   解析不到（dev 匿名联调）就退化成 SYSTEM，与 HTTP 侧一致。
+    _ident = await ws_identity(websocket)
+    ws_user_id, ws_tenant_id = _ident or ("", "")
     service = getattr(websocket.app.state.runtime, "intraday", None)
     if service is None:
         await websocket.close(code=1013)  # 模块不可用
@@ -546,7 +601,8 @@ async def intraday_ws(websocket: WebSocket,
                 fingerprint = (status.get("generation"),
                                status.get("quote_generation"))
                 if fingerprint != pushed:
-                    items = await service.watchlist()
+                    with user_watch.owner_scope(ws_user_id, ws_tenant_id):
+                        items = await service.watchlist()
                     await websocket.send_json({
                         "type": "watchlist",
                         "data": _watchlist_payload(items, status)})

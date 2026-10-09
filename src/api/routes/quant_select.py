@@ -40,6 +40,8 @@ from src.core.errors import (
     BRIEF_TIGHT,
     brief,
 )
+from src.domain.quota.service import get_quota_service
+from src.infrastructure.repositories.user_pool_sqlite_repo import PoolValidationError
 from src.quant.quant_select_service import QuantSelectService
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,51 @@ def _service(request: Request) -> QuantSelectService:
             status_code=503,
             detail="量化选股模块未装配（quant_select service unavailable）")
     return service
+
+
+async def _sector_identity(request: Request, *,
+                           write: bool) -> tuple[str, str, Any]:
+    """板块端点的身份 + 额度（**唯一一处**取法，六个端点共用）。
+
+    返回 `(user_id, tenant_id/tier, quota)`。
+
+    ## 三条口径（与 `/me/profiles`、`alerts` 保持一致）
+
+    · **`write=False` 必须显式传**：读路径不该因为"账号到期"就被 403
+      （`session_ctx.current_user` 的 `write` 语义）；
+    · **归属只由会话决定**：请求体里没有、也不接受 `user_id`；
+    · **额度在服务端取**（`QuotaService` 每次读库拿最新等级）—— 不传额度
+      等于"这个入口无限额度"（`quota/service.py` 开头那段就是为这件事写的）。
+    """
+    from src.api.session_ctx import current_user
+
+    user_id, tenant_id = await current_user(request, write=write)
+    quota = None if not write else await get_quota_service().quota_for(user_id)
+    return user_id, tenant_id, quota
+
+
+def _quota_error(exc: PoolValidationError) -> HTTPException:
+    """额度/校验失败 → 422 + 结构化 detail（与 `/me/profiles` 同一形状：
+    前端文案层认 `code`，`message` 里带**上限数字**，不是"操作失败"四个字）。"""
+    return HTTPException(status_code=422,
+                         detail={"code": exc.code, "message": exc.message})
+
+
+def _sector_missing(sector_id: int) -> HTTPException:
+    """**别人的板块与不存在的板块返回同一个 404**。
+
+    为什么不区分：区分就等于承认"这个 id 存在，只是不属于你" ——
+    那是一条可用来枚举别人板块 id 的通道（与 `login_gate` 对 `/docs`
+    返回 404 而不是 401 是同一条理由）。
+
+    `detail` 用结构化 `{code, message}`（与 422 同形状）：前端文案层认 `code`，
+    人看到的是"板块不存在或不属于当前账号" —— 而不是让用户去猜
+    "是被删了，还是我点错了账号"。
+    """
+    return HTTPException(status_code=404, detail={
+        "code": "sector_not_found",
+        "message": f"板块不存在或不属于当前账号（id={sector_id}）",
+    })
 
 
 # ================================================================
@@ -128,7 +175,9 @@ def _with_freshness(payload: dict) -> dict:
 
 @router.get("/quant/select/status")
 async def select_status(request: Request) -> dict:
-    return (await _service(request).status()).to_dict()
+    # `status.sectors` 是"**我**有几个板块" —— 必须带身份（读路径：到期账号照常看）
+    user_id, _tenant, _quota = await _sector_identity(request, write=False)
+    return (await _service(request).status(user_id=user_id)).to_dict()
 
 
 @router.post("/quant/select/train")
@@ -155,11 +204,14 @@ async def select_run(request: Request, body: RunRequest) -> dict:
     重复点击只会排队，不会真的并跑两轮。
     """
     service = _service(request)
+    # 手工跑批带会话身份：`sector_filter` 里的板块名只在**他自己的**板块里解析
+    user_id, _tenant, _quota = await _sector_identity(request, write=True)
     try:
         run = await service.run(
             window="manual", sector_filter=body.sector_filter,
             top_n=body.top_n, trade_date=body.trade_date,
-            triggered_by="manual", max_stocks=body.max_stocks)
+            triggered_by="manual", max_stocks=body.max_stocks,
+            user_id=user_id)
     except Exception as exc:  # noqa: BLE001 选股失败要给出可读原因
         logger.warning("手动量化选股失败：%s", brief(exc, BRIEF_DEFAULT))
         raise HTTPException(status_code=500,
@@ -233,8 +285,20 @@ async def add_to_watchlist(request: Request, body: AddToWatchlistRequest) -> dic
     code = str(body.code or "").strip()
     if not code:
         raise HTTPException(status_code=422, detail="code 不能为空")
+    # 自选按账号隔离（2026-10-08，CHG-0224）：写**调用者自己的**清单 + 套餐额度
+    from src.api.session_ctx import current_user
+    from src.domain.quota.service import get_quota_service
+    from src.intraday import user_watch
+
+    user_id, tenant_id = await current_user(request, write=True)
+    quota = await get_quota_service().quota_for(user_id)
     try:
-        await asyncio.to_thread(intraday.add_watch, code, name=body.name or "")
+        with user_watch.owner_scope(user_id, tenant_id):
+            await asyncio.to_thread(intraday.add_watch, code,
+                                    name=body.name or "", quota=quota)
+    except PoolValidationError as exc:
+        raise HTTPException(status_code=422, detail={
+            "code": exc.code, "message": exc.message}) from exc
     except Exception as exc:  # noqa: BLE001 交给前端显示原因
         raise HTTPException(status_code=400,
                             detail=f"加入自选失败：{brief(exc, BRIEF_DEFAULT)}") from exc
@@ -264,8 +328,19 @@ async def add_to_watchlist_batch(request: Request,
     items = [{"code": member.code, "name": member.name} for member in body.items]
     if not items:
         raise HTTPException(status_code=422, detail="items 不能为空")
+    from src.api.session_ctx import current_user
+    from src.domain.quota.service import get_quota_service
+    from src.intraday import user_watch
+
+    user_id, tenant_id = await current_user(request, write=True)
+    quota = await get_quota_service().quota_for(user_id)
     try:
-        result = await asyncio.to_thread(intraday.add_watch_many, items)
+        with user_watch.owner_scope(user_id, tenant_id):
+            result = await asyncio.to_thread(intraday.add_watch_many, items,
+                                             quota=quota)
+    except PoolValidationError as exc:
+        raise HTTPException(status_code=422, detail={
+            "code": exc.code, "message": exc.message}) from exc
     except Exception as exc:  # noqa: BLE001 交给前端显示原因
         raise HTTPException(status_code=400,
                             detail=f"批量加入自选失败：{brief(exc, BRIEF_DEFAULT)}") from exc
@@ -283,7 +358,14 @@ async def add_to_watchlist_batch(request: Request,
 async def list_sectors(
     request: Request, with_members: bool = Query(default=True),
 ) -> dict:
-    sectors = await _service(request).list_sectors(with_members=with_members)
+    """**我自己**的自定义板块（含成分）。
+
+    隔离前这里返回全表（所有人共用一份）；现在只返回 `user_id` 匹配的行 ——
+    新账号看到的是**空列表**（不是 404：路由存在、只是还没有数据）。
+    """
+    user_id, _tenant, _quota = await _sector_identity(request, write=False)
+    sectors = await _service(request).list_sectors(user_id=user_id,
+                                                   with_members=with_members)
     return {"sectors": [sector.to_dict() for sector in sectors],
             "count": len(sectors)}
 
@@ -291,11 +373,15 @@ async def list_sectors(
 @router.post("/quant/sectors")
 async def save_sector(request: Request, body: SectorRequest) -> dict:
     service = _service(request)
+    user_id, tenant_id, quota = await _sector_identity(request, write=True)
     try:
         sector = await service.create_sector(
+            user_id=user_id, tenant_id=tenant_id, quota=quota,
             name=body.name, kind=body.kind, note=body.note, rule=body.rule,
             color=body.color, sort_order=body.sort_order,
             members=[member.model_dump() for member in body.members])
+    except PoolValidationError as exc:
+        raise _quota_error(exc) from exc
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=brief(exc, BRIEF_DEFAULT)) from exc
     return sector.to_dict()
@@ -303,9 +389,11 @@ async def save_sector(request: Request, body: SectorRequest) -> dict:
 
 @router.delete("/quant/sectors/{sector_id}")
 async def delete_sector(request: Request, sector_id: int) -> dict:
-    ok = await _service(request).delete_sector(sector_id)
+    user_id, _tenant, _quota = await _sector_identity(request, write=True)
+    ok = await _service(request).delete_sector(sector_id, user_id=user_id)
     if not ok:
-        raise HTTPException(status_code=404, detail=f"板块不存在：id={sector_id}")
+        # 别人的板块与不存在**同一个 404**（见 `_sector_missing`）
+        raise _sector_missing(sector_id)
     return {"deleted": True, "sector_id": sector_id}
 
 
@@ -313,11 +401,15 @@ async def delete_sector(request: Request, sector_id: int) -> dict:
 async def replace_members(request: Request, sector_id: int,
                           body: MembersRequest) -> dict:
     service = _service(request)
+    user_id, _tenant, quota = await _sector_identity(request, write=True)
     try:
         members = await service.set_sector_members(
-            sector_id, [member.model_dump() for member in body.members])
+            sector_id, user_id=user_id, quota=quota,
+            members=[member.model_dump() for member in body.members])
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=brief(exc, BRIEF_DEFAULT)) from exc
+        raise _sector_missing(sector_id) from exc
+    except PoolValidationError as exc:
+        raise _quota_error(exc) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=brief(exc, BRIEF_DEFAULT)) from exc
     return {"sector_id": sector_id, "members": members, "count": len(members)}
@@ -328,11 +420,15 @@ async def add_members(request: Request, sector_id: int,
                       body: MembersRequest) -> dict:
     """增量加成分（幂等：已在板块里的不算新增）。返回**实际新增**条数。"""
     service = _service(request)
+    user_id, _tenant, quota = await _sector_identity(request, write=True)
     try:
         added = await service.add_sector_members(
-            sector_id, [member.model_dump() for member in body.members])
+            sector_id, user_id=user_id, quota=quota,
+            members=[member.model_dump() for member in body.members])
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail=brief(exc, BRIEF_DEFAULT)) from exc
+        raise _sector_missing(sector_id) from exc
+    except PoolValidationError as exc:
+        raise _quota_error(exc) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=brief(exc, BRIEF_DEFAULT)) from exc
     return {"sector_id": sector_id, "added": added}
@@ -340,8 +436,12 @@ async def add_members(request: Request, sector_id: int,
 
 @router.delete("/quant/sectors/{sector_id}/members/{code}")
 async def remove_member(request: Request, sector_id: int, code: str) -> dict:
-    ok = await _service(request).remove_sector_member(sector_id, code)
+    user_id, _tenant, _quota = await _sector_identity(request, write=True)
+    ok = await _service(request).remove_sector_member(sector_id, code,
+                                                      user_id=user_id)
     if not ok:
-        raise HTTPException(
-            status_code=404, detail=f"板块 {sector_id} 里没有 {code}")
+        raise HTTPException(status_code=404, detail={
+            "code": "sector_not_found",
+            "message": f"板块 {sector_id} 里没有 {code}（或该板块不属于当前账号）",
+        })
     return {"removed": True, "sector_id": sector_id, "code": code}

@@ -46,6 +46,14 @@ class _FakeService:
     def __init__(self, codes: list[str]) -> None:
         self.config = _FakeConfig(codes)
 
+    def all_watch_codes(self) -> list[str]:
+        """真服务的新接口（2026-10-08，`CHG-0224`）：自选按账号后作业读**全体并集**。
+
+        替身必须与真服务同形 —— 缺了它 `warm.watchlist_codes` 会 AttributeError
+        被兜成空清单，作业静默不干活（全量跑里这一条红了 4 例）。
+        """
+        return [item.code for item in self.config.watchlist]
+
     def recent_daily_codes(self, limit: int | None = None) -> list[str]:
         return []
 
