@@ -606,7 +606,7 @@ PILOT_BACKEND_PORT = 8110
 _ENV_BACKEND_PORT: dict[str, int] = {"dev": DEFAULT_BACKEND_PORT, "pilot": PILOT_BACKEND_PORT}
 _ENV_BACKEND_PID_NAME: dict[str, str] = {"dev": "backend-dev", "pilot": "backend"}
 
-#: ★ `--demo`：只做两件事 —— 给一个**宽松的**端到端期限、
+#: ★ `--demo`（试运行档）：只做两件事 —— 给一个**宽松的**端到端期限、
 #: 把缓存窗口放宽。**不用"跳过流程 / 少采数据"换时间**（见下方墓碑表）。
 #:
 #: ## 依据（实测，不是偏好）
@@ -629,11 +629,11 @@ DEMO_ENV: dict[str, str] = {
     #   **如果很多流程都跳过，数据也没采集到，这也是不合格的**。」
     #   ⇒ 期限只管 LLM 那几跳的等待上限，不许压缩采集或砍流程。
     "MOSS_ANALYSIS_DEADLINE_SEC": "40",
-    # 结果缓存窗口 10 分钟 → 2 小时：彩排一次，整个演示窗口都命中。
+    # 结果缓存窗口 10 分钟 → 2 小时：预热一次，整个试运行窗口都命中。
     "MOSS_RESULT_CACHE_TTL": "7200",
 }
 
-#: ⛔ **已废除的三个演示开关**（2026-10-05 同一轮口径修正，留墓碑不复活）：
+#: ⛔ **已废除的三个试运行开关**（2026-10-05 同一轮口径修正，留墓碑不复活）：
 #:
 #: | 开关 | 曾经的"好处" | 为什么废除 |
 #: |---|---|---|
@@ -1446,10 +1446,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         return rc
 
     if getattr(args, "demo", False):
-        # 演示档：把"宁可降级也不等"的口径一次打开（见 DEMO_ENV 的实测依据）。
+        # 试运行档：把"宁可降级也不等"的口径一次打开（见 DEMO_ENV 的实测依据）。
         # **必须逐条打印** —— 否则"设了没生效"与"没设"长得一模一样。
         extra_env.update(DEMO_ENV)
-        print("★ 演示档（--demo）已并入启动环境：", file=sys.stderr)
+        print("★ 试运行档（--demo）已并入启动环境：", file=sys.stderr)
         for key, value in DEMO_ENV.items():
             print(f"   {key}={value}", file=sys.stderr)
 
@@ -1707,7 +1707,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
     wpid = read_pid_file(RUN_DIR / "worker.pid") if RUN_DIR.exists() else None
     rows.append((
         "Celery调度", "—",
-        f"运行中(PID={wpid})" if wpid else "未运行(演示用内置调度)",
+        f"运行中(PID={wpid})" if wpid else "未运行(试运行用内置调度)",
         "python manage.py worker（需Redis）" if not wpid else "data/run/worker.log",
     ))
     # 调度 worker（无端口 ⇒ 只能看进程 + 心跳；★ `CHG-0141`）
@@ -1877,7 +1877,7 @@ def cmd_ship_frontend(_args: argparse.Namespace) -> int:
 def cmd_worker(args: argparse.Namespace) -> int:
     """Celery worker + beat（生产/分布式调度，需 Redis）。
 
-    本地演示默认由 FastAPI lifespan 进程内 CronScheduler 调度，无需启动本命令；
+    本地试运行默认由 FastAPI lifespan 进程内 CronScheduler 调度，无需启动本命令；
     仅当 REDIS_CACHE_ENABLED/分布式部署时使用。Windows 用 solo 池。
     """
     wpid = read_pid_file(RUN_DIR / "worker.pid") if RUN_DIR.exists() else None
@@ -2908,7 +2908,7 @@ def _log_line_ts(raw: str) -> float | None:
 
 def _result_cache_status(log_lines: list[str], qhash: str,
                          now: float) -> dict:
-    """从后端日志尾部推断"演示问句的结果缓存**现在**还有效吗"。
+    """从后端日志尾部推断"预热问句的结果缓存**现在**还有效吗"。
 
     ★ 为什么不能只看"结果缓存写入"那一行（本函数存在的理由，2026-10-05 实测）：
     结果缓存是**进程内存**里的 dict，重启即清空；而日志里那条写入记录**还在**
@@ -2917,7 +2917,7 @@ def _result_cache_status(log_lines: list[str], qhash: str,
     "写入之后有没有出现过启动标记"。
 
     返回 `{state, left, written_at, last_start}`，`state ∈`：
-      * `hit`     —— 写入在最后一次启动之后且未过期 ⇒ 演示会秒回；
+      * `hit`     —— 写入在最后一次启动之后且未过期 ⇒ 试运行会秒回；
       * `stale`   —— 写入在启动之后但已过期；
       * `wiped`   —— **写入之后进程重启过** ⇒ 缓存已清空（必须重新彩排）；
       * `missing` —— 日志里根本没有这次写入。
@@ -2972,15 +2972,15 @@ def _tail_text(path: Path, max_bytes: int = 8_000_000) -> list[str]:
 
 
 def cmd_demo_check(args: argparse.Namespace) -> int:
-    """演示前 checklist（只读、可复跑）：每条打 ✅/❌，退出码 = 有没有 ❌。
+    """上线前 checklist（只读、可复跑）：每条打 ✅/❌，退出码 = 有没有 ❌。
 
     ## 为什么要有它（而不是"我看一眼挺好"）
 
-    演示翻车的三个真实形态都**不看不知道**：
+    上线翻车的三个真实形态都**不看不知道**：
 
     1. 后端 / 公网入口不通（重启窗口没走完、隧道抖动、cloudflared 停了）；
-    2. 演示问句的**结果缓存已过期**（默认 TTL 600s）⇒ 演示时又变成 117s 全跑；
-    3. 质押整表索引过期 ⇒ 那 254 个请求会在演示中途被触发（本轮已改成
+    2. 预热问句的**结果缓存已过期**（默认 TTL 600s）⇒ 试运行时又变成 117s 全跑；
+    3. 质押整表索引过期 ⇒ 那 254 个请求会在试运行中途被触发（本轮已改成
        请求期 fail-closed，但过期就是"该指标拿不到值"）。
 
     判据全部来自**本地可读的事实**（进程/端口、落盘索引、后端日志的缓存写入行、
@@ -3000,7 +3000,7 @@ def cmd_demo_check(args: argparse.Namespace) -> int:
             failures.append(label)
 
     print("=" * 68)
-    print("演示前 checklist")
+    print("上线前 checklist")
     print("=" * 68)
 
     # ① 后端在跑 + 存活探针
@@ -3048,7 +3048,7 @@ def cmd_demo_check(args: argparse.Namespace) -> int:
              f"as_of={index['as_of'] or '-'} / 已存 {age_h:.1f}h（TTL "
              f"{_PLEDGE_DETAIL_TTL // 3600}h）")
 
-    # ④ 演示问句还会秒回吗（结果缓存 = 唯一 100% 确定的路径）
+    # ④ 预热问句还会秒回吗（结果缓存 = 唯一 100% 确定的路径）
     log_lines = _tail_text(RUN_DIR / "backend.log")
     if args.query:
         try:
@@ -3060,32 +3060,32 @@ def cmd_demo_check(args: argparse.Namespace) -> int:
             qhash = _query_hash(args.query, args.analysis_type,
                                 args.target or args.query)
         if qhash:
-            print(f"   （演示问句 qhash={qhash}）")
+            print(f"   （预热问句 qhash={qhash}）")
             st = _result_cache_status(log_lines, qhash, _time.time())
             if st["state"] == "missing":
-                line(False, "演示问句的结果缓存",
+                line(False, "预热问句的结果缓存",
                      "日志里没有它的「结果缓存写入」—— 先在界面上把**同一问句**"
                      "跑一遍（这就是彩排）")
             elif st["state"] == "wiped":
-                line(False, "演示问句的结果缓存",
+                line(False, "预热问句的结果缓存",
                      f"写入于 {st['written_at']}，但进程在 {st['last_start']} "
                      "**重启过** ⇒ 内存缓存已清空（日志里那行写入还在，是假绿）"
                      "—— 请重新彩排一次")
                 warnings.append("重启会清空结果缓存：最后一次重启之后必须再彩排一次")
             elif st["state"] == "stale":
-                line(False, "演示问句的结果缓存",
+                line(False, "预热问句的结果缓存",
                      f"写入于 {st['written_at']}（TTL {st['ttl']:.0f}s）⇒ "
                      f"已过期 {abs(st['left']):.0f}s，请重新彩排")
-                warnings.append("缓存已过期：演示前再彩排一次，或用 --demo 重启把 "
+                warnings.append("缓存已过期：试运行前再预热一次，或用 --demo 重启把 "
                                 "MOSS_RESULT_CACHE_TTL 放宽")
             else:
-                line(True, "演示问句的结果缓存",
+                line(True, "预热问句的结果缓存",
                      f"写入于 {st['written_at']}（TTL {st['ttl']:.0f}s）⇒ "
                      f"还可秒回 **{st['left']:.0f}s**"
                      + (f"；上次进程启动 {st['last_start']}"
                         if st["last_start"] else ""))
     else:
-        warnings.append("未传 --query ⇒ 无法核对『演示问句是否秒回』（强烈建议传）")
+        warnings.append("未传 --query ⇒ 无法核对『预热问句是否秒回』（强烈建议传）")
 
     # ⑤ 最近一次投研分析的实测（用了多少调用 / 命中几次 / 墙钟多长）
     audit = PILOT_ROOT / "audit" / "llm_audit.jsonl"
@@ -3118,7 +3118,7 @@ def cmd_demo_check(args: argparse.Namespace) -> int:
               f"缓存命中 {hits} 次 · LLM 段墙钟 {span_txt}（首条 {stamps[0][11:19]}）")
         if hits == 0:
             warnings.append("最近一次分析 **0 次 LLM 缓存命中**（冷跑）—— "
-                            "演示当天要的是热跑：先彩排一次同问句")
+                            "试运行当天要的是热跑：先预热一次同问句")
     else:
         warnings.append("审计里没有 task_ 记录（还没跑过投研分析？）")
 
@@ -3129,7 +3129,7 @@ def cmd_demo_check(args: argparse.Namespace) -> int:
         print("✅ 全部硬判据通过")
     for note in warnings:
         print(f"⚠️  {note}")
-    print("提示：用 `--demo` 重启（`manage.py restart-pilot --demo`）会打印 4 行演示档"
+    print("提示：用 `--demo` 重启（`manage.py restart-pilot --demo`）会打印 4 行试运行档"
           "环境；**看到那 4 行才算生效**（看不到就是没生效）。")
     return 1 if failures else 0
 
@@ -3323,7 +3323,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--auto-port", action="store_true",
                          help="端口冲突时自动 +1 寻找空闲端口")
     p_start.add_argument("--demo", action="store_true",
-                         help="并入【演示档】环境（见 DEMO_ENV）：宁可降级也不等")
+                         help="并入【试运行档】环境（见 DEMO_ENV）：宁可降级也不等")
     p_start.set_defaults(func=cmd_start)
 
     # 调度 worker（`CHG-0139`）：只跑 4 个重作业，与 API 进程分开。
@@ -3351,13 +3351,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_restart.add_argument("--verify-timeout", type=float, default=90.0,
                            help="重启后等就绪的秒数（实测启动段 25 秒以上）")
     p_restart.add_argument("--demo", action="store_true",
-                           help="并入【演示档】环境（见 DEMO_ENV）：宁可降级也不等")
+                           help="并入【试运行档】环境（见 DEMO_ENV）：宁可降级也不等")
     p_restart.set_defaults(func=cmd_restart_pilot)
 
     p_demo = sub.add_parser(
         "demo-check",
-        help="演示前 checklist：每条都是可复跑的 ✅/❌（含「演示问句还会秒回吗」）")
-    p_demo.add_argument("--query", default="", help="演示问句（原样，用于算 qhash）")
+        help="上线前 checklist：每条都是可复跑的 ✅/❌（含「预热问句还会秒回吗」）")
+    p_demo.add_argument("--query", default="", help="预热问句（原样，用于算 qhash）")
     p_demo.add_argument("--target", default="", help="标的（默认取 query）")
     p_demo.add_argument("--analysis-type", default="full", help="分析类型（默认 full）")
     p_demo.add_argument("--port", type=int, default=PILOT_BACKEND_PORT,
@@ -3437,7 +3437,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ship.set_defaults(func=cmd_ship_frontend)
 
     p_worker = sub.add_parser(
-        "worker", help="Celery worker+beat（生产调度，需Redis；演示模式无需启动）")
+        "worker", help="Celery worker+beat（生产调度，需Redis；试运行模式无需启动）")
     p_worker.add_argument("--daemon", action="store_true", help="后台运行")
     p_worker.add_argument("--replace", action="store_true", help="停止旧worker后重启")
     p_worker.add_argument("--pool", default="", help="执行池（Windows默认solo）")

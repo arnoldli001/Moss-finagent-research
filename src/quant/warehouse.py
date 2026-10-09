@@ -1493,7 +1493,7 @@ def strategy_case_store(root: str | Path = DEFAULT_ROOT, *,
 # 审计实证：load_dataset 每次新建实例 → 新建 engine → "SELECT 1" 探测 + 表存在性探测 = 1.4 ms/次
 # 同一进程 N 次调用就白花 1.4×N ms，且**数据库连接是 OS 级文件描述符**，反复开关有 fd 压力。
 # 单例化后只剩一次探测 + 一次连接。
-# 为什么不直接用 SQLAlchemy 连接池：现状后端是 SQLite（demo 阶段），连接池没收益；
+# 为什么不直接用 SQLAlchemy 连接池：现状后端是 SQLite（当前阶段），连接池没收益；
 # 换 PostgreSQL 后 `engine.pool` 自带连接池，单例化是切换前置条件。
 _WAREHOUSE_CACHE: dict[tuple[str, str], QuantWarehouse] = {}
 _WAREHOUSE_LOCK = threading.Lock()

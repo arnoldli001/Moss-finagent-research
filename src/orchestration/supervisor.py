@@ -2123,7 +2123,7 @@ def plan_run(
     query: str = "",
     focus_stock_codes: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """规则式Supervisor规划：决定采集指标与参与Agent（Demo用确定性路由）。
+    """规则式Supervisor规划：决定采集指标与参与Agent（确定性路由）。
 
     query：用户原始问题。行业Agent路由与主题新闻关键词同时参考target与query，
     因此target留空、问题写在query中（如"当前AI产业链…"）也能正确路由。
@@ -4223,7 +4223,7 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
                 await catalog.ensure_schema()
             else:
                 # 没有 repo 的场景（旧 build_research_graph 默认）：fallback 到全局单例
-                # —— 仅供集成测试 / 不带 DB 的 demo 模式
+                # —— 仅供集成测试 / 不带 DB 的轻量模式
                 catalog = get_catalog_repository()
                 await catalog.ensure_schema()
 
