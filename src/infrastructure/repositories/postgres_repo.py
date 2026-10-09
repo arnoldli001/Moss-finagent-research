@@ -58,7 +58,7 @@ def normalize_dsn(dsn: str) -> str:
 
 
 class PostgresRepository(DataPointRepository):
-    """PostgreSQL后端（单连接池，Demo规模足够；高并发可换create_pool分池）。"""
+    """PostgreSQL后端（单连接池，当前规模足够；高并发可换create_pool分池）。"""
 
     def __init__(self, dsn: str, *, min_size: int = 1, max_size: int = 5) -> None:
         self._dsn = normalize_dsn(dsn)
@@ -97,7 +97,7 @@ class PostgresRepository(DataPointRepository):
         async with pool.acquire() as conn:
             await conn.execute(_SCHEMA)  # 首写兜底建表（正常路径ensure_schema已建）
             inserted = 0
-            # executemany不回传逐行影响数，逐条写入换取幂等计数（Demo数据量可接受）
+            # executemany不回传逐行影响数，逐条写入换取幂等计数（当前数据量可接受）
             for row in rows:
                 tag = await conn.execute(_INSERT_SQL, *row)
                 if tag == "INSERT 0 1":
@@ -152,17 +152,28 @@ class PostgresRepository(DataPointRepository):
         async with pool.acquire() as conn:
             return int(await conn.fetchval(sql, source_name))
 
-    async def prune_before(self, cutoff_date: str) -> int:
-        """保留策略：删除所有早于 cutoff_date（YYYY-MM-DD）的数据点。"""
-        sql = (
-            "WITH deleted AS ("
-            "DELETE FROM fact_data_points "
-            "WHERE period_date IS NOT NULL AND period_date != '' "
-            "AND period_date < $1 RETURNING 1) "
-            "SELECT count(*) FROM deleted"
-        )
+    #: 保留期口径的 WHERE —— **删除与计数共用同一份**（理由见 `prune_before`）。
+    _PRUNE_WHERE = ("period_date IS NOT NULL AND period_date != '' "
+                    "AND period_date < $1")
+
+    async def prune_before(self, cutoff_date: str, *,
+                           dry_run: bool = False) -> int:
+        """保留策略：删除所有早于 cutoff_date（YYYY-MM-DD）的数据点。
+
+        `dry_run=True`：**只数不改**（同一 WHERE，见 `_PRUNE_WHERE`）。
+        """
         pool = await self._get_pool()
         async with pool.acquire() as conn:
+            if dry_run:
+                return int(await conn.fetchval(
+                    "SELECT count(*) FROM fact_data_points "
+                    f"WHERE {self._PRUNE_WHERE}", cutoff_date))
+            sql = (
+                "WITH deleted AS ("
+                "DELETE FROM fact_data_points "
+                f"WHERE {self._PRUNE_WHERE} RETURNING 1) "
+                "SELECT count(*) FROM deleted"
+            )
             return int(await conn.fetchval(sql, cutoff_date))
 
     async def count_by_indicator(self) -> dict[str, int]:

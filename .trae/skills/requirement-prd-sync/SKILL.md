@@ -146,7 +146,7 @@ uv run python scripts/prd_sync_check.py --list-sections
   （废止于 2026-09-28，CHG-0007：与「零依赖启动」冲突，见 AGENTS.md）
 
 > ⚠️ **已废止（CHG-0007，2026-09-28）**：原「Keycloak + OPA」改为进程内 RBAC。
->   原因：Demo 阶段零外部依赖；恢复路径见 `docs/MULTI_TENANCY_DESIGN.md`。
+>   原因：当前阶段零外部依赖；恢复路径见 `docs/MULTI_TENANCY_DESIGN.md`。
 ```
 
 **为什么必须留废止痕迹**：变更史本身就是需求，"为什么改"下一轮还会被问到。
