@@ -13555,6 +13555,102 @@ A05/A06/A07 **零调用**；与此同时 `_fetch_news_per_code()` 单独实测**
 **我特意没有替他们改安全棘轮** —— 那属于该门禁所有者的判断（改数字必须被 code review 看见）。
 
 
+
+### 41.48 重启后 `hk.wujiaitool.cn` 没自动起来：**任务被删在前、没人告警在后**（`CHG-0243`）
+
+> **触发**：用户两问 —— 「重启前后端的命令是什么？」「我电脑重启后为什么 8110 端口的
+> `hk.wujiaitool.cn` 没有自动启动？」两问都用**实测证据**回答，不靠回忆。
+
+#### 41.48.1 现象与两次取证
+
+    开机时间 2026-10-11 10:36:51（已运行 42 分钟时开始排查）
+    8100 / 8110 / 17000：**都不在监听**；uvicorn / worker / SSH 隧道 / frpc：**一个进程都没有**
+    公网 https://hk.wujiaitool.cn/ → **502**（客户入口当时确实是断的）
+
+**(a) 任务计划程序事件日志（`Microsoft-Windows-TaskScheduler/Operational`，事件 ID 141 = 删除任务）**
+
+    2026-10-11 10:22:10  用户"WIN-20240906ZEM\Administrator"已删除任务"\MossPilotAutostart"
+    2026-10-11 10:22:10  用户"WIN-20240906ZEM\Administrator"已删除任务"\MossPilotWatchdog"
+    2026-10-11 10:22:10  用户"WIN-20240906ZEM\Administrator"已删除任务"\MossAutostartGuard"
+    2026-10-11 10:21:12  （NT AUTHORITY\System 删了一个夸克更新任务）
+    2026-10-09 20:58:17~46  （Administrator 删了 WPS / kvpins 等 6 个任务）
+
+⇒ **重启前 14 分钟，三个任务被删掉了**。重启之后当然没有任何东西拉起 8110。
+★ 与 `CHG-0168`（2026-10-05 全站 502）**是同一事故的第二次发生**：
+「开机拉起 8110」这件事只挂在 `MossPilotAutostart` 一个持久对象上，它一没，就没有第二条路径。
+
+**(b) 仓库自己就躺着一把枪**：`日常运维命令删除开机自启.bat`
+
+* 它是**入库文件**，内容是**粘贴堆**（有 `PS D:\…>` 提示符、有"请用 --username 指定…"这种
+  对话残留、用 `#` 当注释 —— 而 `cmd.exe` 不认 `#`，会把它当命令执行）；
+* 里面正好有 `schtasks /delete /tn "MossPilotAutostart" /f` ⇒ **双击就会执行**。
+
+⇒ 已改成**只做安全动作**的版本：`chcp 65001` + `REM` 注释 + 只保留"触发一次/查状态/跑判据"，
+删除命令全部**注释掉并写明这是 2026-10-11 事故的直接原因**、临时停用请用
+`schtasks /change /disable`（可恢复）。
+
+#### 41.48.2 ★★ 为什么会没告警：监控在跑，**通知链路没配**
+
+VPS 侧（`43.128.5.94`）的 `~/moss-monitor/moss_vps_monitor.py` **每分钟都在跑**（crontab 在），
+它 **10:38 就判定了 down**，然后**如实写下"告警发不出去"**：
+
+    10:35:01 HTTP 200 ok=1 fail_consec=0
+    10:36:01 HTTP 502 ok=0 fail_consec=1        ← 重启
+    10:37:01 HTTP 502 ok=0 fail_consec=2
+    10:38:01 HTTP 502 ok=0 fail_consec=3  event=down
+    10:38:01 notify_unconfigured 邮件通道未配置（ALERT_SMTP_USER/AUTH_CODE/ALERT_EMAIL_TO）
+    10:38:01 ⚠️ 告警未能送达（unconfigured: 邮件通道未配置）
+             —— 这不是"没故障"，是"通知链路没配/坏了"
+    10:39:01 起 notify_suppressed（同一组故障 6 小时冷却）
+
+★ **`~/moss-monitor/notify.env` 不存在**（`ls` 查不到）⇒ 通道从未配置。
+⇒ 结论要分清两件事：**不是"监控没发现"，是"发现了但喊不出来"**。
+监控自己那句"这不是没故障，是通知链路没配"正是本仓库的纪律 —— 可惜**它只写在日志里，没有人看**。
+
+#### 41.48.3 处置（都做了，逐条可复核）
+
+1. `uv run python manage.py start --env pilot --port 8110 --daemon`
+   ⇒ 8110 起（并**连带**拉起 worker）；
+2. `schtasks /run /tn MossFrpEnsure` ⇒ 25 s 内 SSH 隧道就绪（`127.0.0.1:17000` 在监听）；
+3. 起 `bin\frpc.exe -c frpc.toml`（分离进程）⇒ `start proxy success`；
+4. **重建三个被删的任务**：`uv run python scripts/moss_autostart.py --install`
+   ⇒ 三个 ✅ 注册（`MossFrpEnsure` 按设计只核对不代装）；
+5. `uv run python scripts/moss_autostart.py --check` ⇒ **四个全 OK**；
+6. 公网复验：`/api/v1/health/live` **200（0.94 s）**、首页 **200（1.68 s）**。
+
+#### 41.48.4 ★ 过程中发现**我自己的 bug**：`--install` 一直是坏的（`CHG-0243` 的正题）
+
+`CHG-0239` 把 `install()` 的执行时限改成按间隔算时，我只换了字符串里的 `{limit_sec}`，
+**却没定义 `limit_sec`** ⇒ `--install` 每一次都 `NameError`。
+
+**它藏了两天**，因为：`execution_time_limit_sec()` 的纯函数判据是绿的、`--self-test` 是绿的
+（它不碰 `install()`）——**只有真要重建任务时才会走到那一行**。
+
+⇒ 已修（先算 `limit_sec`），并按"**判据必须能跑到那条路径**"补了
+`tests/unit/test_autostart_install_wiring.py`：用 `install(dry_run=True)`（无副作用但走完整条
+拼装路径）当判据，三点都钉住：
+ ① dry-run 必须返回 0 且每个可代装任务都出现在脚本里；
+ ② 脚本里的秒数必须**等于** `execution_time_limit_sec()`（接线判据，不是"看着像"）；
+ ③ dry-run **不许**真的执行 PowerShell（monkeypatch `_ps` 成"一调用就失败"）。
+**反事实**：把 `limit_sec = …` 那行删掉 ⇒ 三条**全红**；恢复后逐字节一致。
+
+#### 41.48.5 诚实边界与待办
+
+* ★ **`notify.env` 我没配**（需要 webhook 或邮箱授权码这类凭据，**造不出来也不该经对话传**）。
+  配法（任选一，写进 `~/moss-monitor/notify.env`，`chmod 600`）：
+  `MOSS_ALERT_WEBHOOK=…` 或 `ALERT_SMTP_USER=… / ALERT_SMTP_AUTH_CODE=… / ALERT_EMAIL_TO=…`。
+  **不配这一条，同类事故下次依然只会写进日志。**
+* **谁删的任务只查到"账户 + 时间 + 哪三个"**（Administrator / 10:22:10 / 三个），
+  **查不到"哪个进程/哪个人按的"** —— 事件 141 不记命令行。仓库里那把"枪"已拆，
+  但**不能据此断定这次就是它**（它只删一个任务，而这次三个同秒被删）。
+* **`MossFrpEnsure` 的"交接洞"仍在**：它探到本机后端没起来就**按设计放手**（归
+  `MossPilotWatchdog`），而后者不存在时**日志里只有一句看起来很正常的话**。
+  这是第三次撞到同一个洞 ⇒ 待办：放手时**必须留痕/告警**，不能只写"归某某"。
+* 「告警通道未配置」这件事本身**没有进本机判据**（只有 VPS 日志里能看到）⇒ 待办：
+  把它纳入 `moss_autostart.py --check` 或本机 guard。
+* 上一轮（`CHG-0242`）的遗留项仍未做：`docs/` 里仍有真实姓名、历史里的 PII 未清。
+
+
 ## 四十二、投研分析的多 Agent 协作模式：**5 类在用、2 类半用、5 类刻意不用**（现行口径 · 2026-10-07 定型，`CHG-0189`）
 
 > **触发**（用户原话）：「在投研分析功能模块，用了如下哪些多agent模式，选型是否合理？」

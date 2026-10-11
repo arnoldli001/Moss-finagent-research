@@ -652,6 +652,12 @@ def install(*, dry_run: bool = False) -> int:
             print(f"⏭  {spec.name}：本表只核对、不代装（承重细节多）—— {spec.restore}")
             continue
         execute, arguments = _action_for(spec)
+        # ★ `CHG-0243`：`limit_sec` 必须先算出来 —— `CHG-0239` 改这里时我只换了
+        #   字符串里的 `{limit_sec}` 却没定义它，于是 `--install` **每一次都会
+        #   `NameError`**（2026-10-11 重启后要重建任务时才暴露）。
+        #   ⇒ 教训：`--install` 的判据必须是**能跑的**（dry-run 也算），
+        #     只测 `execution_time_limit_sec()` 这个纯函数是测不到"接线断了"的。
+        limit_sec = execution_time_limit_sec(spec)
         trig = ["$triggers += New-ScheduledTaskTrigger -AtStartup"]
         if spec.needs_boot_trigger:
             # 开机 + 登录两处都补：开机触发若因故没跑成（磁盘就绪、依赖没起来），
