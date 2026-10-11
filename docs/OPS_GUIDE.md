@@ -756,6 +756,67 @@ CF 这条路径会有 **15~30 秒的瞬时超时**（同一时段实测到 8.3 �
 
 ---
 
+### 3.3 ⚠️ frpc 被 360 报毒：**是类别误报，不是中毒**（2026-10-11 实测核验）
+
+**先给结论（可复查）**：本机 `bin\frpc.exe` 与**官方 frp `v0.61.0` windows_amd64** 发布包里的
+`frpc.exe` **逐字节一致**：
+
+    SHA256   C28FA95A5D151D9E1D7642915EC5A727A2438477CAE0F26F0557B468800111F9
+    大小     15,296,512 B      版本 0.61.0（`bin\frpc.exe -v`）      数字签名 **NotSigned**
+
+比对方法（**每次升级 frpc 后必须重做**，命令可直接抄）：
+
+```powershell
+$tmp = Join-Path $env:TEMP 'frp'; New-Item -ItemType Directory -Force $tmp | Out-Null
+curl.exe -sL -o "$tmp\frp.zip" https://github.com/fatedier/frp/releases/download/v0.61.0/frp_0.61.0_windows_amd64.zip
+Expand-Archive "$tmp\frp.zip" $tmp -Force
+Get-FileHash (Get-ChildItem $tmp -Recurse -Filter frpc.exe)[0].FullName -Algorithm SHA256
+Get-FileHash bin\frpc.exe -Algorithm SHA256            # 两者必须相同
+```
+
+**为什么 360 会报**（四条，按权重）：
+
+1. **它是什么工具**：frp 是**内网穿透 / 反向代理**，攻击者大量用它建隧道绕边界 ⇒
+   杀软按**软件类别**归进 `RiskWare` / `HackTool` / `PUA`（"有风险 / 可能不需要"），
+   **不是"病毒"**。SakuraFrp 官方文档把这条列为常态，并列出典型症状：
+   `隧道启动失败: 拒绝访问`、`frpc.exe: file does not exist`、`Access is denied`、
+   `文件包含病毒或潜在的垃圾软件`。
+2. **没有数字签名、没有版本资源**（本机实测 `NotSigned`、版本信息全空）⇒ 云端信誉拿不到分。
+3. **行为模板恰好等于后门**：长连接外联 VPS + 本地 8110 监听 + 端口转发 +
+   **被 `wscript`/`powershell` 以 SYSTEM 身份、隐藏窗口、每 5 分钟自愈的计划任务拉起** +
+   开机自启。这串动作我们**全中**（`MossFrpEnsure` + `MossPilotAutostart`）。
+4. **360 的主动防御（`ZhuDongFangYu` / `deepscan`）是行为引擎**，比文件特征更敏感
+   （本机实测该服务 `Running` + 开机自启）。
+
+**怎么处理（正当做法，按优先级）**
+
+1. **加信任区 —— 不要删杀软**。对象给全：`bin\frpc.exe`、`bin\`（整个目录）、
+   `scripts\frp_ssh_tunnel.py`、`.venv\Scripts\python.exe`，
+   以及计划任务 `MossFrpEnsure` 的动作（`wscript.exe`）与 `MossPilotAutostart`（`powershell.exe`）。
+   不加的后果不是"多一条弹窗"，而是**隧道起不来 + 全站 502，日志里可能只有一句 `拒绝访问`**。
+2. **升级后重做哈希比对**（上面那段）—— 这是"报毒"这件事里**唯一真正该担心**的部分：
+   被替换/被投毒的 frpc 才是风险，而"被报毒"本身不是。
+3. **可选替代（要彻底绕开 frp 家族判定）**：
+   * **Cloudflare Tunnel（`cloudflared`）**：Cloudflare 签名 ⇒ 误报少；本仓库已有
+     `MossCloudflaredTunnel` 与 `moss.wujiaitool.cn` 命名隧道的整套记录（现为备用入口，
+     见 §3.1/§3.2 的"固有挂死"警告）。
+   * **纯 SSH 反向隧道**（`ssh -R`）：用 Windows 自带 OpenSSH（微软签名），
+     **不引入任何第三方 EXE**。密钥与 22 端口已通；只需把 VPS 侧 nginx 的上游
+     从现在实测在听的 `127.0.0.1:18110` 换成 `ssh -R` 绑定的端口。
+4. **兜底**：`MossFrpEnsure` 每 5 分钟自愈（frpc 被杀会重拉）；
+   但**告警通道必须先配**（`~/moss-monitor/notify.env`，见 §2.9b），
+   否则"frpc 被删/被隔离"只表现为站点 502，没有人会知道。
+
+⛔ **不要做的事**：为了"不被报毒"去**改文件名 / 加壳 / 混淆 / 打乱特征** ——
+那既无效（行为判定照旧），又让这个正当用途**看起来真的像恶意软件**。
+正当路径只有两条：**白名单** + **哈希校验**。
+
+> 顺带一条运维事实（`CHG-0243`）：360 这类安全软件的"开机加速 / 木马查杀"会**清理计划任务**，
+> 而我们的值守任务恰好长成它眼里的"可疑持久化"。所以**别把"重启后能自动起来"只挂在一个任务上**，
+> 并且要能发现"任务没了"（`uv run python scripts/moss_autostart.py --check`，退出码 1 = 有缺失）。
+
+---
+
 ## 4. 账号与密码
 
 ### 4.1 看账号
