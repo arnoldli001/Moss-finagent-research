@@ -129,45 +129,139 @@ def test_input_is_two_way_bound_to_the_filter_state() -> None:
     assert "value={boardFilter}" in code, "筛选输入框没有绑定 boardFilter"
     assert re.search(r"setBoardFilter\(\s*event\.target\.value\s*\)", code), (
         "输入框 onChange 没有回写 boardFilter（打字不会有任何变化）")
-    assert 'const [boardFilter, setBoardFilter] = useState("")' in code, (
+    assert "const [boardFilter, setBoardFilter] = useState(" in code, (
         "找不到 boardFilter 的 state 声明")
 
 
-def test_escape_clears_the_filter() -> None:
-    """Esc 清空 —— 用户敲错词时的第一反应。"""
+def test_escape_handles_both_dropdown_and_clear() -> None:
+    """Esc 先收联想、再清筛选 —— 分两步（只想关下拉时别把词清了）。"""
     code = _panel_code()
     esc = code.find('event.key === "Escape"')
     assert esc != -1, "筛选框没有 Esc 处理"
-    assert "setBoardFilter(\"\")" in code[esc:esc + 200], (
-        "Esc 分支没有清空 boardFilter")
+    branch = code[esc:esc + 320]
+    assert "setFilterFocused(false)" in branch, "Esc 没有先收联想下拉"
+    assert 'setBoardFilter("")' in branch, "Esc 分支没有清空 boardFilter"
     assert 'onClick={() => setBoardFilter("")}' in code, "没有「清空筛选」按钮"
 
 
-# ------------------------------------------------- ③ 联想（datalist）接得上
+# ------------------------------------------------- ③ 输入框必须在「板块」列头里
+#
+# 用户 2026-10-14 报障原话：「当前前端的 板块那一列 我看还没支持搜索过滤板块功能」
+# —— 功能其实已经在工具栏里跑着（`找板块`），用户就是**没找到**。
+# 所以下面这条守的是**位置**，不是功能：输入框一旦被挪回工具栏/别处，立刻变红。
 
-def test_datalist_id_matches_the_input_list_attribute() -> None:
-    """`list="..."` 与 `<datalist id="...">` 必须字面一致。
+def test_filter_input_lives_inside_the_board_column_header() -> None:
+    """筛选框必须在「板块」列表头里（用户第一眼就是往这一列找）。"""
+    code = _panel_code()
+    header_start = code.find("crowding-alert-header")
+    assert header_start != -1, "找不到表头容器"
+    header = code[header_start:]
+    assert "crowding-hfilter" in header, (
+        "「板块」列表头里没有筛选格（`crowding-hfilter`）—— "
+        "输入框又被挪回工具栏了，用户找不到（这就是这次的报障）")
+    cell_start = header.find("crowding-hfilter")
+    cell = header[cell_start:cell_start + 1200]
+    assert "crowding-col-filter" in cell, "列头里的筛选输入框不见了"
+    assert "value={boardFilter}" in cell, "列头那个输入框没绑 boardFilter"
+    # 列头那格原来是 `<button>`（点它排序）—— 按钮里套输入框是非法 HTML
+    assert re.search(r"<span className=\"crowding-hcell center crowding-hfilter\">",
+                     code), "列头筛选格必须用 <span> 容器，不能是 <button>"
 
-    写错一个字：输入框照常工作、**联想永远不出现**，控制台一声不响。
+
+def _dropdown_block(code: str) -> str:
+    """联想下拉那一段 JSX（从 `suggestOpen && popRect` 到 `document.body)}`）。
+
+    ⚠️ 必须**只取这一段**再断言：同一个文件里告警阈值编辑面板也用 `createPortal`
+    —— 拿整个文件去 `"createPortal(" in code` 会被那一处**顶绿**，
+    把这里的 portal 拆掉时守卫照样绿（第一版就是这么写的，突变自证抓出来了）。
+    """
+    start = code.find("suggestOpen && popRect")
+    assert start != -1, "找不到联想下拉的渲染条件（`suggestOpen && popRect`）"
+    end = code.find("document.body)}", start)
+    assert end != -1, "找不到联想下拉的 portal 收尾（`document.body)}`）"
+    return code[start:end + len("document.body)}")]
+
+
+def test_suggestion_dropdown_escapes_the_scroll_container() -> None:
+    """联想下拉必须 portal 到 body + `position: fixed`。
+
+    `.crowding-alert-scroll` 是 `overflow: auto` —— 就地渲染的下拉会被**裁掉**，
+    表现就是"联想弹不出来"（同一个文件里告警阈值编辑面板踩过同一脚）。
     """
     code = _panel_code()
-    used = re.search(r'list="([^"]+)"', code)
-    defined = re.search(r'<datalist id="([^"]+)"', code)
-    assert used is not None, "筛选输入框没有 list= 属性（没有联想）"
-    assert defined is not None, "面板里没有 <datalist>（联想没有数据源）"
-    assert used.group(1) == defined.group(1), (
-        f"list={used.group(1)!r} 与 datalist id={defined.group(1)!r} 不一致 "
-        "→ 联想永远不会弹出来")
+    assert "crowding-filter-pop" in code, "找不到联想下拉的类名"
+    block = _dropdown_block(code)
+    assert "createPortal(" in block, (
+        "联想下拉没有 portal 到 body —— 会被滚动容器裁掉（弹不出来）")
+    assert "document.body)}" in block, "portal 的挂载点不是 document.body"
+    assert "crowding-filter-pop" in block, "portal 里不是联想下拉"
+    # 点候选不能被 onBlur 抢跑：mousedown 必须 preventDefault
+    assert "onMouseDown={(event) => event.preventDefault()}" in block, (
+        "候选列表没有阻止 mousedown 默认行为 —— 点候选会先失焦、click 还没派发"
+        "下拉就关了，用户点了没反应")
+    css = (REPO / "web" / "src" / "styles.css").read_text(encoding="utf-8")
+    pop_css = css[css.find(".crowding-filter-pop"):]
+    assert "position: fixed" in pop_css[:200], (
+        "`.crowding-filter-pop` 没有 position: fixed（portal 坐标是视口坐标）")
 
 
-def test_datalist_only_offers_boards_inside_the_list() -> None:
-    """联想项只来自**当前清单**，且跳过空名字。"""
+def test_columns_header_input_is_not_a_datalist() -> None:
+    """不许再用原生 `<datalist>` 当联想源。
+
+    原生 datalist 只按 `<option value>`（板块名）匹配：敲全拼 `huagong`
+    时**一个候选都不弹**，而"拼音池"正是用户要的东西。留着它还会和
+    我们自己的下拉叠成两层浮层。
+    """
     code = _panel_code()
-    block = code[code.find("<datalist"):]
-    block = block[:block.find("</datalist>")]
-    assert "view.map(" in block, "联想项不是从清单（view）生成的"
-    assert ".filter(" in block, (
-        "联想项没有过滤掉空名字 —— `<option value=\"\">` 会在下拉里出现空条目")
+    assert "<datalist" not in code, (
+        "面板里还留着 <datalist> —— 它只按板块名匹配，敲拼音不弹候选，"
+        "而且会和我们自己的下拉叠在一起")
+
+
+# ------------------------------------------------- ③b 筛选记录要记得住
+
+def test_filter_state_is_seeded_from_cache_and_written_back() -> None:
+    """筛选记录：启动时读缓存、变化时写缓存（用户要求"保留在前端缓存里"）。"""
+    code = _panel_code()
+    assert "readBoardFilter()" in code, "面板没有读筛选记录（每次都从默认视图开始）"
+    assert re.search(r"useState\(\(\) => readBoardFilter\(\)\)", code), (
+        "缓存的读法必须是 `useState(() => ...)` 惰性初值 —— "
+        "直接写成 `useState(readBoardFilter())` 会每帧 parse 一遍 JSON")
+    assert "writeBoardFilter({" in code, "面板没有回写筛选记录"
+    # 三个字段都要进 effect 依赖，漏一个就会出现"改了没记住"
+    effect = code[code.find("writeBoardFilter({"):]
+    effect = effect[:effect.find("]);")]
+    for field in ("boardFilter", "onlyAlerts", "onlyTriggered"):
+        assert field in effect, f"`{field}` 没有进写缓存的依赖数组"
+
+
+def test_cache_module_is_wired_into_logout() -> None:
+    """登出要**调用**清筛选记录（与其它本地缓存一致，"清了哪些"要能读全）。
+
+    ⚠️ 只断言文件名/标识符不够：`await import("../boardFilterCache")` 那行与
+    `const { clearBoardFilterCache } = ...` 解构都在，**把调用删掉照样绿**
+    （第一版就是这样，突变自证抓出来了）。所以要断言"在 `logout` 里真的调了"。
+    """
+    auth = (REPO / "web" / "src" / "hooks" / "useAuth.ts").read_text(encoding="utf-8")
+    logout_at = auth.find("const logout = useCallback")
+    assert logout_at != -1, "找不到 logout 回调"
+    body = auth[logout_at:]
+    assert re.search(r"clearBoardFilterCache\(\);", body), (
+        "`useAuth.logout` 里没有**调用** `clearBoardFilterCache()` —— "
+        "换个账号登录还留着上一个人的筛选")
+    assert "../boardFilterCache" in body, "清筛选记录时 import 的不是 boardFilterCache 模块"
+
+
+def test_cache_module_never_throws_and_is_versioned() -> None:
+    """缓存模块的三条硬要求：绝不抛 / 有版本 / 结构不对就当没有。"""
+    src = (REPO / "web" / "src" / "boardFilterCache.ts").read_text(encoding="utf-8")
+    body = _strip_comments(src)
+    assert body.count("catch {") >= 3, (
+        "读/写/清三处都要自己吞异常（隐私模式、配额满、内容损坏）")
+    assert re.search(r"const VERSION = \d+", body), "缓存结构没有版本号"
+    assert "parsed?.version !== VERSION" in body, (
+        "读到旧结构时没有当'没有记录'处理 —— 升级后会读到形状不对的对象")
+    assert "window.localStorage" in body, "没有用 localStorage（活不过一次刷新就不算记住）"
 
 
 # ------------------------------------------------- ④ 三种"空"不能混为一谈
@@ -185,25 +279,30 @@ def test_empty_state_distinguishes_filter_miss_from_no_alert() -> None:
 
 # ------------------------------------------------- ⑤ 跨语言字段名契约
 
-def _backend_pinyin_key() -> str:
+def _backend_pinyin_keys() -> set[str]:
     src = _read(BACKEND)
     keys = set(re.findall(r'row\["([a-z_]*pinyin[a-z_]*)"\]', src))
-    assert len(keys) == 1, f"后端写拼音字段的地方不止一处（{keys}）—— 会漂移"
-    return keys.pop()
+    assert keys, "后端 `_with_pinyin` 一个拼音字段都没写"
+    return keys
 
 
-def test_pinyin_field_name_agrees_across_backend_and_frontend() -> None:
-    """后端写的 key、TS 类型声明的 key、匹配函数读的 key —— 必须同一个字。"""
-    key = _backend_pinyin_key()
+def test_pinyin_field_names_agree_across_backend_and_frontend() -> None:
+    """后端写的 key、TS 类型声明的 key、匹配函数读的 key —— 必须同一批字。
+
+    用户 2026-10-14 追加要求后这里守着**两个**字段（首字母 + 全拼）：
+    少守一个，就会出现"后端下了全拼、前端没人读"或反过来的静默失效。
+    """
+    keys = _backend_pinyin_keys()
+    assert keys == {"pinyin_initials", "pinyin_full"}, (
+        f"后端写的拼音字段变成 {sorted(keys)}：首字母与全拼两个都要有，"
+        "改名/漏写时要同步前端三处（TS 类型 / 匹配 / 拼音提示）")
     api_ts = _read(API_TS)
     search_ts = _read(SEARCH)
-    assert re.search(rf"^\s*{key}\?:", api_ts, re.M), (
-        f"`CrowdingListItem` 里没有声明 `{key}?`（后端下发了、TS 类型不认）")
-    assert f"{key}" in search_ts, (
-        f"`boardSearch.ts` 没读 `{key}` —— 后端算了拼音也没人用")
-    assert key == "pinyin_initials", (
-        f"字段名变成 {key!r}：前端/后端/文档三处引用都要同步改，"
-        "别只改一边（两边都还能跑，只是拼音搜索悄悄失效）")
+    for key in keys:
+        assert re.search(rf"^\s*{key}\?:", api_ts, re.M), (
+            f"`CrowdingListItem` 里没有声明 `{key}?`（后端下发了、TS 类型不认）")
+        assert key in search_ts, (
+            f"`boardSearch.ts` 没读 `{key}` —— 后端算了拼音也没人用")
 
 
 def test_frontend_does_not_reimplement_pinyin() -> None:
@@ -214,7 +313,7 @@ def test_frontend_does_not_reimplement_pinyin() -> None:
     hits = [word for word in banned if word in code]
     assert not hits, (
         f"`boardSearch.ts` 里出现了疑似自建拼音表的东西：{hits}；"
-        "首字母一律由后端 `to_initials()` 下发")
+        "首字母与全拼一律由后端 `to_initials()` / `to_full_pinyin()` 下发")
 
 
 # ------------------------------------------------- ⑥ 行为自证那条链是接上的
@@ -232,16 +331,21 @@ def test_node_check_is_wired_in_package_json() -> None:
     check_src = _read(CHECK_TS)
     assert re.search(r'from\s+"\.\./src/boardSearch"', check_src), (
         "自证脚本没有 import `../src/boardSearch`（判据必须来自真实实现）")
-    assert "filterBoards" in check_src and "matchBoard" in check_src, (
-        "自证脚本没有同时覆盖 filterBoards 与 matchBoard")
+    for symbol in ("filterBoards", "matchBoard", "suggestBoards", "pinyinHint"):
+        assert symbol in check_src, f"自证脚本没有覆盖 `{symbol}`"
+    # ★ 联想候选 ⊆ 筛选结果 这条不变式只能在行为层验（结构判据看不出来），
+    #   所以这里守"自证脚本里确实有这条对拍"，防止它被删掉后没人发现。
+    assert "不变式" in check_src and "violations" in check_src, (
+        "自证脚本里没有「候选集 ⊆ 筛选结果集」的对拍 —— "
+        "少了它，联想可能给出点不到的行（比没有联想更糟）")
 
 
-# ------------------------------------------------- ⑦ 后端补充拼音这一列
+# ------------------------------------------------- ⑦ 后端补充拼音这两列
 
 def test_with_pinyin_matches_the_shared_implementation() -> None:
-    """`_with_pinyin` 的值必须等于 `to_initials()`（唯一实现），空名字给空串。"""
+    """`_with_pinyin` 两列都必须等于仓库唯一的那个实现，空名字给空串。"""
     from src.api.routes.sector_crowding import _with_pinyin
-    from src.quant.stock_directory import to_initials
+    from src.quant.stock_directory import to_full_pinyin, to_initials
 
     rows = [
         {"sector_code": "885959.TI", "sector_name": "化工原料"},
@@ -249,8 +353,41 @@ def test_with_pinyin_matches_the_shared_implementation() -> None:
     ]
     out = _with_pinyin(rows)
     assert out[0]["pinyin_initials"] == to_initials("化工原料")
-    assert out[0]["pinyin_initials"], "中文板块名没算出拼音首字母（pypinyin 缺了？）"
-    assert out[1]["pinyin_initials"] == "", (
+    assert out[0]["pinyin_full"] == to_full_pinyin("化工原料")
+    assert out[0]["pinyin_full"] == "huagongyuanliao", (
+        f"全拼不是预期形态：{out[0]['pinyin_full']!r}（应为小写连写、无音节分隔）")
+    assert out[0]["pinyin_full"].islower(), (
+        "全拼必须小写 —— 前端按小写做包含匹配，大写会让 `huagong` 搜不到")
+    assert out[0]["pinyin_full"].isascii(), (
+        "全拼里混进了非 ASCII —— 前端敲键盘打不出来")
+    for row in out:
+        # 前端 `matchBoard` 依赖"空拼音不参与匹配"，所以这里必须是空串而不是缺 key。
+        assert "pinyin_initials" in row and "pinyin_full" in row, (
+            "有行缺了拼音 key —— 前端读到 `undefined` 会走 `String(...)` 兜底，"
+            "虽然不崩，但'缺字段'与'算不出来'就分不开了")
+    assert out[1]["pinyin_initials"] == "" and out[1]["pinyin_full"] == "", (
         "空板块名给了非空拼音 —— 前端会因此把不相干的行也筛出来")
-    # 前端 `matchBoard` 依赖"空拼音不参与匹配"，所以这里必须是空串而不是缺 key。
-    assert "pinyin_initials" in out[1], "空名字那行缺了 pinyin_initials 这个 key"
+
+
+def test_full_pinyin_is_what_the_frontend_filter_needs() -> None:
+    """把真实板块名走一遍"后端算 → 前端该命中"，堵住"两列都算了但形态对不上"。"""
+    from src.api.routes.sector_crowding import _with_pinyin
+
+    out = _with_pinyin([
+        {"sector_code": "885800.TI", "sector_name": "半导体材料"},
+        {"sector_code": "885633.TI", "sector_name": "染料"},
+    ])
+    ban = out[0]
+    # 前端 `matchBoard` 的判据是"查询串（小写化）是字段（小写化）的子串"
+    # （`field.includes(token)`，两边都先过 `strip()`）。所以这里也**必须**小写化
+    # —— 第一版忘了，于是 `bdtcl` 对着大写 "BDTCL" 判成不命中，是**判据自己错**
+    # （首字母在库里就是大写的），不是实现错。
+    lowered = {k: str(v).lower() for k, v in ban.items()}
+    for typed in ("bandao", "bdtcl", "ban", "cailiao", "半导体"):
+        probe = typed.lower()
+        field_hit = (probe in lowered["pinyin_full"]
+                     or probe in lowered["pinyin_initials"]
+                     or probe in lowered["sector_name"])
+        assert field_hit, f"敲 {typed!r} 按四路匹配一个字段都命不中：{ban}"
+    assert lowered["pinyin_full"].startswith("bandao"), (
+        "全拼必须以名称首个字的拼音开头 —— 否则'敲一半'的联想顺序会乱")

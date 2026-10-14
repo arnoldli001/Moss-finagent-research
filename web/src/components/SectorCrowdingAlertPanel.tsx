@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { filterBoards } from "../boardSearch";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { filterBoards, pinyinHint, suggestBoards } from "../boardSearch";
+import { readBoardFilter, writeBoardFilter } from "../boardFilterCache";
 import { createPortal } from "react-dom";
 import {
   sectorCrowdingApi,
@@ -246,19 +247,40 @@ export default function SectorCrowdingAlertPanel({
   const [options, setOptions] = useState<Record<string, unknown>[]>([]);
   const [searching, setSearching] = useState(false);
   const [busy, setBusy] = useState("");
-  const [onlyAlerts, setOnlyAlerts] = useState(false);
-  /** 只看自定义告警已触发的板块 */
-  const [onlyTriggered, setOnlyTriggered] = useState(false);
   /**
-   * 「板块」列的**筛选词**（2026-10-14 用户要求）。
+   * 筛选记录（**本地缓存**，2026-10-14 用户要求）。
+   *
+   * > 「筛选记录可以保留在前端缓存里，或者持久化到本地数据库，不就有了联想了吗」
+   *
+   * 走 localStorage（`boardFilterCache.ts`，内含"为什么不是库表"的三条理由）。
+   * ⚠️ **只读一次**：`useState(() => ...)` 的惰性初值，否则每帧都去 parse 一遍
+   * JSON；读失败/没记录一律回默认（读函数绝不抛）。
+   */
+  const [cachedFilter] = useState(() => readBoardFilter());
+  const [onlyAlerts, setOnlyAlerts] = useState(cachedFilter?.onlyAlerts ?? false);
+  /** 只看自定义告警已触发的板块 */
+  const [onlyTriggered, setOnlyTriggered] = useState(
+    cachedFilter?.onlyTriggered ?? false);
+  /**
+   * 「板块」列的**筛选词**（2026-10-14 用户要求，同一天追加全拼与"记住筛选"）。
    *
    * > 「给高度拥挤告警的数据面板中，"板块"这列加一个检索过滤功能，当前板块太多了，
    * >   想找其中一个板块要翻好久，支持联想或模糊搜索」
+   * > 「1.没有全拼，你就把当前拥挤度数据清单里，所有板块字段的板块名称，都映射出
+   * >   中文拼音全称字段，然后不就有了搜索联想拼音池了吗」
    *
    * 清单 262 个板块，靠滚动找要翻很久。匹配判据在 `boardSearch.ts`
-   * （名称 / 代码 / 拼音首字母三路，多词 AND，纯函数 + 单独自证）。
+   * （名称 / 代码 / 拼音首字母 / 拼音全拼四路，多词 AND，纯函数 + 单独自证）。
    */
-  const [boardFilter, setBoardFilter] = useState("");
+  const [boardFilter, setBoardFilter] = useState(cachedFilter?.q ?? "");
+  /** 输入框是否聚焦（决定联想下拉开不开） */
+  const [filterFocused, setFilterFocused] = useState(false);
+  /** 联想下拉里键盘选中的第几项（-1 = 没选） */
+  const [activeSuggest, setActiveSuggest] = useState(-1);
+  /** 联想下拉的固定定位（portal 挂到 body，所以要自己算坐标） */
+  const [popRect, setPopRect] = useState<
+    { left: number; top: number; width: number } | null>(null);
+  const filterInputRef = useRef<HTMLInputElement | null>(null);
   /** 正在编辑告警的板块（null = 未打开编辑面板） */
   const [alertEdit, setAlertEdit] = useState<string | null>(null);
 
@@ -368,6 +390,70 @@ export default function SectorCrowdingAlertPanel({
     </span>;
   }, [sortKey, sortDir]);
 
+  /**
+   * 联想候选（**本地、零请求**）：`suggestBoards` 是纯函数，见 `boardSearch.ts`。
+   *
+   * ★ 不变式：候选集**必须**是筛选结果的子集（先 `matchBoard` 再排序），
+   * 否则会出现"下拉里点了它、列表里却没有它"。那条不变式在
+   * `npm run check:boardsearch` 里有专门的断言（含多词场景）。
+   *
+   * 上限 8 条：下拉是"帮我少打几个字"，不是"再给我一张表"。
+   */
+  const suggestions = useMemo(
+    () => suggestBoards(view, boardFilter, 8), [view, boardFilter]);
+
+  /** 下拉当前该不该显示（有词、聚焦、有候选 —— 三个条件缺一不可）。 */
+  const suggestOpen = filterFocused && boardFilter.trim() !== ""
+    && suggestions.length > 0;
+
+  /** 点/回车选中一个候选 → 用**它的板块名**填满筛选框（列表随即只剩它）。 */
+  const applySuggestion = useCallback((row: CrowdingListItem) => {
+    setBoardFilter(row.sector_name || row.sector_code);
+    setActiveSuggest(-1);
+    // 选中即收下拉：不然它盖在刚筛出来的那一行上
+    setFilterFocused(false);
+  }, []);
+
+  /**
+   * 把筛选记录写进本地缓存（用户要求"筛选记录保留在前端缓存"）。
+   *
+   * 放在 `useEffect` 里而不是每个 `onChange` 里：三个字段（词 + 两个开关）
+   * 都会变，写在一处才不会漏。**写失败绝不抛**（缓存模块自己吞掉）。
+   */
+  useEffect(() => {
+    writeBoardFilter({ q: boardFilter, onlyAlerts, onlyTriggered });
+  }, [boardFilter, onlyAlerts, onlyTriggered]);
+
+  /**
+   * 联想下拉的坐标（`position: fixed` + portal 到 body）。
+   *
+   * ## 为什么必须 portal（不是审美问题）
+   *
+   * 表头在 `.crowding-alert-scroll`（`overflow: auto`）里 —— 就地渲染的下拉
+   * 会被**裁掉**，看起来就是"联想弹不出来"。同一个文件里告警阈值编辑面板
+   * 也踩过这一脚（见下面 `alertEdit` 的注释），解法一样：挂到 body。
+   * 代价是要自己算坐标，所以：
+   *   - 打开时算一次（`useLayoutEffect`，画之前就位，不会闪一下）；
+   *   - 滚动/改窗口大小时重算，且**用捕获阶段**监听 —— 横向滚动发生在
+   *     内层滚动容器上，不冒泡到 window，普通监听收不到。
+   */
+  useLayoutEffect(() => {
+    if (!suggestOpen) { setPopRect(null); return; }
+    const place = () => {
+      const box = filterInputRef.current?.getBoundingClientRect();
+      if (!box) return;
+      setPopRect({ left: box.left, top: box.bottom + 4,
+                   width: Math.max(box.width, 260) });
+    };
+    place();
+    window.addEventListener("scroll", place, true);
+    window.addEventListener("resize", place);
+    return () => {
+      window.removeEventListener("scroll", place, true);
+      window.removeEventListener("resize", place);
+    };
+  }, [suggestOpen, boardFilter, suggestions.length]);
+
   const alertCount = view.filter((row) => row.is_alert).length;
   const pinnedCount = view.filter((row) => row.pinned).length;
   /** 设了自定义告警的板块数 / 其中已触发的 */
@@ -467,25 +553,9 @@ export default function SectorCrowdingAlertPanel({
           只看已触发（{triggeredCount}）
         </label>
         {/* ★ 「板块」列筛选（2026-10-14 用户要求）：262 个板块靠翻页找太慢。
-            三路匹配（名称 / 代码 / 拼音首字母）、多词 AND、**本地即时**、不发请求。
-            联想用原生 `<datalist>`（浏览器自己按输入过滤）—— 不再造第二个下拉组件。 */}
-        <label className="muted-text"
-               title={"按板块筛选（本地即时，不发请求）：\n"
-                 + "· 名称：化工 / 体材料（中间片段也行）\n"
-                 + "· 代码：885959 / 885959.TI\n"
-                 + "· 拼音首字母：hg = 化工（后端用 pypinyin 现算）\n"
-                 + "· 空格分隔多个词 = 全部命中（如「半导 材料」）\n"
-                 + "Esc 或「清空」取消筛选"}>
-          找板块
-          <input className="qsel-input mono" list="crowding-board-filter-names"
-                 value={boardFilter} spellCheck={false}
-                 placeholder="名称/代码/拼音"
-                 style={{ width: 160, marginLeft: 4 }}
-                 onChange={(event) => setBoardFilter(event.target.value)}
-                 onKeyDown={(event) => {
-                   if (event.key === "Escape") setBoardFilter("");
-                 }} />
-        </label>
+            输入框**就在「板块」列表头里**（见下面表头那一格）—— 放工具栏里
+            用户找不到（用户原话：「板块那一列 我看还没支持搜索过滤」）。
+            这里只留"当前筛了什么、筛出几条"的状态条，避免筛选生效了却看不出来。 */}
         {boardFilter.trim() && (
           <>
             <span className="muted-text">
@@ -547,16 +617,10 @@ export default function SectorCrowdingAlertPanel({
             📌 置顶恢复（{pinnedCount}）
           </button>
         )}
-        {/* 联想数据源：原生 `<datalist>`（浏览器按当前输入自己过滤，零 JS）。
-            只放**清单内**的板块名 —— 清单外的板块本来就筛不出来，列进去会
-            让人以为能筛到。名字为空的行（缺 sector_name）跳过，否则 `<option>`
-            会出现空条目。`value` 去重交给 `datalist` 无所谓，但重复项在某些
-            浏览器里会让下拉里出现多条一样的，所以这里先 Set 去重。 */}
-        <datalist id="crowding-board-filter-names">
-          {Array.from(new Set(
-            view.map((row) => row.sector_name).filter((name) => !!name),
-          )).map((name) => <option key={name} value={name} />)}
-        </datalist>
+        {/* 联想数据源已改成**我们自己的下拉**（`filterPop`），不再用原生
+            `<datalist>` —— 原生 datalist 只按 `<option value>`（板块名）匹配，
+            敲拼音 `huagong` 时一个候选都不弹，而"拼音池"正是用户要的
+            （用户原话：「都映射出中文拼音全称字段，然后不就有了搜索联想拼音池了吗」）。 */}
       </div>
 
       {/* 搜索新增 */}
@@ -652,10 +716,59 @@ export default function SectorCrowdingAlertPanel({
           <span className="crowding-hcell num">置顶</span>
           <span className="crowding-hcell num">操作</span>
           <span className="crowding-hcell center">代码</span>
-          <button className="crowding-hsort center" title="按板块名称排序"
-                  onClick={() => toggleSort("name")}>
-            板块{sortArrow("name")}
-          </button>
+          {/*
+            ★ 「板块」列的表头 = 排序按钮 + **筛选输入框**（2026-10-14 用户要求）。
+            为什么不放在工具栏里：用户第一眼就是往这一列找（原话：「板块那一列
+            我看还没支持搜索过滤」）。放列头上还有两个好处：
+              · 表头是 `position: sticky` 的，**纵向滚动时筛选框一直在**，不用滚回顶部；
+              · 输入框与它筛的那一列在同一个视觉位置，不存在"这个框筛的是哪一列"的歧义。
+            ⚠️ 不能把 input 塞进原来那个 `<button>` 里（按钮套输入框是非法 HTML，
+            点击与键盘行为都会打架），所以表头这一格改成 `<span>` + 里面两个控件。
+          */}
+          <span className="crowding-hcell center crowding-hfilter">
+            <button className="crowding-hsort" title="按板块名称排序"
+                    onClick={() => toggleSort("name")}>
+              板块{sortArrow("name")}
+            </button>
+            <input ref={filterInputRef} className="qsel-input crowding-col-filter"
+                   value={boardFilter} spellCheck={false}
+                   placeholder="筛这列…"
+                   title={"按板块筛选本列（**本地即时**，不发请求、不改数据）：\n"
+                     + "· 名称：化工 / 体材料（中间片段也行）\n"
+                     + "· 代码：885959 或 885959.ti\n"
+                     + "· 拼音首字母：hg → 化工\n"
+                     + "· 拼音全拼：huagong → 化工原料（后端算好下发）\n"
+                     + "· 空格分隔多个词 = 全部命中（如「半导 材料」「bandao chanpin」）\n"
+                     + "· ↓↑ 选候选 / Enter 选中 / Esc 或「清空筛选」取消\n"
+                     + "筛选记录会记住（下次打开面板还在）"}
+                   onChange={(event) => {
+                     setBoardFilter(event.target.value);
+                     setActiveSuggest(-1);
+                   }}
+                   onFocus={() => setFilterFocused(true)}
+                   onBlur={() => setFilterFocused(false)}
+                   onKeyDown={(event) => {
+                     if (event.key === "Escape") {
+                       // Esc：先收候选、再清筛选（分两步，避免"只想关下拉却把词清了"）
+                       if (suggestOpen) { setFilterFocused(false); return; }
+                       setBoardFilter("");
+                       return;
+                     }
+                     if (!suggestOpen) return;
+                     if (event.key === "ArrowDown") {
+                       event.preventDefault();
+                       setActiveSuggest((i) => (i + 1) % suggestions.length);
+                     } else if (event.key === "ArrowUp") {
+                       event.preventDefault();
+                       setActiveSuggest((i) =>
+                         (i - 1 + suggestions.length) % suggestions.length);
+                     } else if (event.key === "Enter") {
+                       event.preventDefault();
+                       const picked = suggestions[activeSuggest >= 0 ? activeSuggest : 0];
+                       if (picked) applySuggestion(picked);
+                     }
+                   }} />
+          </span>
           <button className="crowding-hsort num"
                   title={"自定义告警阈值：点每行的格子设置水位线\n"
                     + "「高于设定值告警」看拥挤风险；「低于设定值告警」看退潮机会\n"
@@ -892,6 +1005,32 @@ export default function SectorCrowdingAlertPanel({
           )}
         </div>
       )}
+      {/*
+        联想下拉：portal 到 body + `position: fixed`（坐标由上面那个
+        `useLayoutEffect` 算）。**必须**这样挂 —— 就地渲染会被
+        `.crowding-alert-scroll` 的 `overflow: auto` 裁掉。
+        `onMouseDown` 里 `preventDefault()`：不这么做，点候选会先让输入框失焦
+        （`onBlur` 关掉下拉），click 还没派发下拉就没了 —— 点了没反应。
+      */}
+      {suggestOpen && popRect && createPortal(
+        <ul className="crowding-suggest crowding-filter-pop"
+            style={{ left: popRect.left, top: popRect.top, width: popRect.width }}
+            onMouseDown={(event) => event.preventDefault()}>
+          {suggestions.map((row, index) => {
+            const hint = pinyinHint(row);
+            return (
+              <li key={row.sector_code}>
+                <button className={index === activeSuggest ? "active" : ""}
+                        onClick={() => applySuggestion(row)}>
+                  <span>{row.sector_name || row.sector_code}</span>
+                  <span className="mono muted-text"> {row.sector_code}</span>
+                  {hint && <span className="muted-text crowding-py">{hint}</span>}
+                </button>
+              </li>
+            );
+          })}
+        </ul>,
+        document.body)}
     </section>
   );
 }

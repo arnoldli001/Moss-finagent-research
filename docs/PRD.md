@@ -15298,18 +15298,39 @@ python scripts/setup_crowding_refresh_task.py --delete
 > **自动归属/自动下单**，就必须先解决撞车（那时该走 `synonym_dict` 的约束）。
 > 结论：**同一个字符串匹配，代价取决于谁消费**。
 
-**拼音这一列由后端补**：`sector_crowding._with_pinyin()` 给 `/config_list`
-的每一行加 `pinyin_initials`，内部**只调用** `src/quant/stock_directory.py:110
-to_initials()` —— 它是仓库里唯一的"中文名 → 拼音首字母"实现，不另写第二份。
-成本：262 行纯本地计算（毫秒级），且 `/config_list` 本来就有 60 秒轮询与
-进程内缓存。**缺 `pypinyin` 时该列为空串**，前端自动退回"名称/代码"两路 ——
+**拼音这两列由后端补**：`sector_crowding._with_pinyin()` 给 `/config_list`
+的每一行加 `pinyin_initials`（首字母）与 `pinyin_full`（全拼，`CHG-0247` 追加），
+内部**只调用** `src/quant/stock_directory.py:110 to_initials()` / `:130
+to_full_pinyin()` —— 它们是仓库里唯一的"中文名 → 拼音"两个实现，不另写第二份。
+
+**成本（`CHG-0247` 实测，不是估的）** —— 在真实清单 267 行上量的稳态值：
+
+| 环节 | 稳态 | 备注 |
+|---|---|---|
+| `query_list_view` | 4.7 ms | 这条接口的大头 |
+| `_list_view_row` 映射 | 0.5 ms | |
+| `to_initials`（267 行） | 5.8 ms | 22 µs/行 |
+| `to_full_pinyin`（267 行） | ~6 ms | 也 22 µs/行 |
+| **首次调用** | **+112 ms** | `pypinyin` 惰性 import 的**一次性**开销 |
+
+> ⚠️ **就地更正 §52 早期版本的两处口径**（`CHG-0247`）：
+> ① 原来写"成本毫秒级"，那是**估的**；实测是上面这张表（且**首次**多 112 ms）。
+> ② 原来写"`/config_list` 有**进程内缓存**" —— **不成立**：查了 `config_list()`
+> （`src/api/routes/sector_crowding.py:550`），它是 `_run_db(_config_list_sync)`
+> 直查，只有 `load_config()` 有缓存，**接口本身没有响应缓存**。
+> 所以"60 秒轮询 × 每次 17 ms 拼音"是真实成本，只是这个量级可以接受。
+> 教训：**成本与缓存这类可测量的事实，不许用"毫秒级""应该有缓存"蒙过去** ——
+> 它们会被后来的人当成既有结论引用。
+
+**缺 `pypinyin` 时两列都是空串**，前端自动退回"名称/代码"两路 ——
 降级是静默的，但功能不塌。
 
 > ⚠️ **一个必须避开的假绿**：`initials.includes("")` 恒真。若拼音为空时
 > 让它参与匹配，则"没算拼音"会被伪装成"全部命中"，敲 `hg` 反而**一个都不筛掉**
 > —— 用户会以为筛选坏了，实际是判据把"无数据"当成"匹配成功"。
-> 所以 `matchBoard()` 里写的是 `initials !== "" && initials.includes(token)`，
-> 并且 `check:boardsearch` 有专门一条断言盯着（第 ④ 组）。
+> 所以 `matchBoard()` 里写的是 `initials !== "" && initials.includes(token)`
+> （全拼同理，两个字段各判一次），并且 `check:boardsearch` 有专门一组断言
+> 盯着它，含"**只缺全拼**"这种半降级形态（第 ⑤ 组）。
 
 ### 52.4 为什么判据单独一个文件 + 单独自证
 
@@ -15319,25 +15340,96 @@ to_initials()` —— 它是仓库里唯一的"中文名 → 拼音首字母"实
 |---|---|---|
 | `boardFilter` 忘了进 `useMemo` 依赖数组 | 打字没反应 | 筛选**从没生效** |
 | 空拼音走 `includes("")` | 敲什么都不缩小范围 | **假绿**（见上） |
-| `<datalist id>` 与 `list=` 差一个字 | 联想永远不弹 | 用户以为"没这功能" |
+| 联想下拉就地渲染（没 portal） | 联想永远不弹 | 被滚动容器裁掉了 |
 | 筛没了却复用「当前没有触发告警」文案 | 以为今天没告警 | 其实是筛错了词 |
+| 排序判据写成"查询串等于它自己" | 联想顺序看着像没排 | 所有候选并列同档（`CHG-0247` 真踩过） |
 
 所以判据抽成**纯函数**放 `web/src/boardSearch.ts`（无 React、可直接喂输入看输出），
-行为由 `npm run check:boardsearch` 自证（**23 条断言**，覆盖三路匹配 / 拼音为空 /
-多词 AND / 空查询原样返回 / 返回新数组不改入参）；结构不变式由
-`tests/unit/test_board_filter_structure.py`（**12 条**）守住 —— 它断言的是
-"筛选真的接在清单上、真的在依赖数组里、datalist id 真的对得上、空态文案真的分三态"，
+行为由 `npm run check:boardsearch` 自证（`CHG-0247` 扩到 **45 条断言**，覆盖四路匹配 /
+拼音为空（含半降级）/ 多词 AND / 空查询原样返回 / 返回新数组不改入参 /
+联想排序 / **候选集 ⊆ 筛选结果集**这条不变式）；结构不变式由
+`tests/unit/test_board_filter_structure.py`（`CHG-0247` 扩到 **17 条**）守住 ——
+它断言的是"筛选真的接在清单上、真的在依赖数组里、**输入框真的在「板块」列头里**、
+联想下拉真的 portal 出去了、筛选记录真的读/写/登出清、空态文案真的分三态"，
 以及**跨语言字段名契约**（后端 Python 写的 key、TS 类型声明的 key、匹配函数读的 key
-必须是同一个字面）。
+必须是同一批字面）。
 
-### 52.5 联想：用原生 `<datalist>`，不造第二个下拉组件
+### 52.5 联想：自己的下拉（**不是**原生 `<datalist>`）
 
-`<input list="crowding-board-filter-names">` + `<datalist>`：浏览器自己按当前输入
-过滤选项，**零 JS、零状态**（不引入"高亮第几项/键盘上下选/点外部关闭"那一整套）。
-选项**只列当前清单内的板块名**（清单外的本来就筛不出来，列进去是误导），
-并用 `Set` 去重 + 过滤空名（`<option value="">` 会在下拉里留空条目）。
+`CHG-0246` 第一版用的是原生 `<input list=...>` + `<datalist>`（零 JS），
+`CHG-0247` **换掉了**，理由是硬的：**原生 datalist 只按 `<option value>`
+（也就是板块名）匹配**，敲全拼 `huagong` 时**一个候选都不弹** ——
+而"拼音池"正是用户要的东西；留着它还会和自定义下拉叠成两层浮层。
 
-### 52.6 三种"空"必须分开说
+现在的做法：
+
+- 候选来自纯函数 `suggestBoards()`（**本地、零请求**，最多 8 条），
+  排序见 `rankOf()`：名称完全相等 > 名称前缀 > 名称子串 > 首字母相等 >
+  首字母前缀 > 全拼前缀 > 代码前缀 > 全拼子串 > 首字母子串 > 代码子串；
+  同档内**保持清单顺序**（`Array.prototype.sort` 稳定）⇒ 默认按拥挤度水位，
+  也就是"拼音撞车时先看到更拥挤的那个"，正合这个面板的语境。
+- 候选行右侧显示**拼音池**（`首字母 · 全拼`，如 `HGYL · huagongyuanliao`）
+  —— 不然没人知道能敲拼音。缺拼音时返回空串（不显示空括号）。
+- 交互：`↓↑` 选、`Enter` 选中、`Esc` **先收下拉再清筛选**（分两步，
+  免得"只想关掉候选却把词清了"）；点候选 = 用它的板块名填满筛选框。
+- ⚠️ 下拉必须 **portal 到 `document.body` + `position: fixed`**：
+  表头在 `.crowding-alert-scroll`（`overflow: auto`）里，就地渲染会被**裁掉**，
+  表现就是"联想弹不出来"。同一个文件里告警阈值编辑面板踩过同一脚，
+  解法一样。代价是自己算坐标（`useLayoutEffect` + 捕获阶段的 scroll 监听 ——
+  横向滚动发生在内层容器上，不冒泡到 window）。
+- ⚠️ 候选列表要 `onMouseDown` 里 `preventDefault()`：否则点候选会**先让输入框
+  失焦**（`onBlur` 关掉下拉），`click` 还没派发下拉就没了 —— 点了没反应。
+
+### 52.6 ★ 输入框放在**「板块」列的表头里**（`CHG-0247` 的报障）
+
+`CHG-0246` 把筛选框放在面板顶部的工具栏里（标签 `找板块`），功能是通的 ——
+但用户当天报障：
+
+> 「当前前端的 板块那一列 我看还没支持搜索过滤板块功能」
+
+**功能在跑，用户没找到**。所以 `CHG-0247` 把输入框挪进「板块」列表头那一格：
+
+- 用户第一眼就是往这一列找（他的原话就是"板块那一列"）；
+- 表头是 `position: sticky` 的 ⇒ **纵向滚动时筛选框一直在**，不用滚回顶部；
+- 输入框与它筛的那一列在同一个视觉位置 ⇒ 不存在"这个框筛的是哪一列"的歧义。
+
+⚠️ 实现细节：那一格原来是 `<button>`（点它排序），而**按钮里不能套输入框**
+（非法 HTML，点击与键盘行为都会打架），所以拆成 `<span>` 容器 + 排序按钮 + 输入框。
+这条写成了结构守卫（`test_filter_input_lives_inside_the_board_column_header`）
+——守的是**位置**，不是功能：挪回工具栏就当场变红。
+
+> **这一条的教训值得单独记**：`CHG-0246` 的判据全绿（23 + 12 条断言、4/4 突变），
+> 功能也确实上线了，但**用户仍然认为"没做"** —— 因为"做完了"的判据里
+> 缺了"用户能不能找到它"。凡是**交互入口**，验收面必须包含**位置**，
+> 而不只是"存在且正确"。
+
+### 52.7 筛选记录要记得住（`CHG-0247`）
+
+用户要求：
+
+> 「筛选记录可以保留在前端缓存里，或者持久化到本地数据库」
+
+选了**前端 localStorage**（`web/src/boardFilterCache.ts`），三条理由按权重：
+
+1. **它是"视图状态"，不是业务数据**。清单里"有哪 262 个板块"是账号级配置
+   （已按 `user_id` 落库，`CHG-0222`）；"我现在只想看名字带『半导』的那几行"是
+   我此刻的视角，换台机器就不成立，也不该被别的会话读到。
+2. **写频率**：筛选是**逐字符**变化的，落库 = 每敲一个字一条 `UPDATE`，
+   在 SQLite 单写者上就是拿写锁做输入法的事。
+3. **刷新页面必须还在**：这正是要救的场景，所以不能只放内存（活不过 F5）。
+
+存的是 `{q, onlyAlerts, onlyTriggered}`（一个筛选词 + 两个开关），
+**不含任何用户数据**（没有清单、持仓、告警阈值）⇒ 键里不带 `user_id`；
+登出时仍然清掉（`useAuth.logout`），与其它本地缓存保持一致 —— "清了哪些"
+要能一眼读全。结构带版本号，读到旧结构/形状不对一律当"没有记录"；
+读、写、清三处**各自吞异常**（隐私模式 / 配额满 / 内容损坏都不该影响渲染）。
+全默认值时**删键**而不是写一条空记录（避免 localStorage 里长期留着一条
+"什么都没有"的条目，看键名的人会以为用户设过筛选）。
+
+**需要跨设备同步时再说**（那时应当进"用户配置"接口，与清单同一张表）——
+现在是**明确不做**，不是忘了。
+
+### 52.8 三种"空"必须分开说
 
 `rows.length === 0` 有三种完全不同的原因，合成一句话会制造**静默的假信号**：
 
@@ -15349,38 +15441,67 @@ to_initials()` —— 它是仓库里唯一的"中文名 → 拼音首字母"实
 按钮文案不变、行数会少几百行，所以两处的 `title`/提示里**如实写明**
 `命中 N/M`，否则用户会以为导出了全量。
 
-### 52.7 实测与判据（本轮全部实跑）
+### 52.9 实测与判据（本轮全部实跑）
 
 ```bash
 cd web
-npm run check:boardsearch      # 23 条行为断言全通过（真实输入 → 真实输出）
+npm run check:boardsearch      # 45 条行为断言全通过（真实输入 → 真实输出；CHG-0247 扩容后）
 npx tsc -b                     # exit 0
 
 cd ..
-uv run python -m pytest tests/unit/test_board_filter_structure.py -q   # 12 passed
+uv run python -m pytest tests/unit/test_board_filter_structure.py -q   # 17 passed
 ```
 
-**突变自证**（改坏源码 → 守卫当场红 → 还原即绿，4/4 抓住）：
+**突变自证**（改坏源码 → 守卫当场红 → 还原即绿，两轮共 **12/12 抓住**）：
+
+第一轮（`CHG-0246`）：
 
 | 突变 | 变红的守卫 |
 |---|---|
 | ① 删掉 `list = filterBoards(list, boardFilter);` | `test_filter_is_applied_to_the_board_list` |
 | ② 依赖数组里删掉 `boardFilter` | `test_board_filter_is_a_memo_dependency` |
-| ③ 后端字段改名 `pinyin_initials` → `pinyin_initial` | `test_pinyin_field_name_agrees_across_backend_and_frontend` |
+| ③ 后端字段改名 `pinyin_initials` → `pinyin_initial` | `test_pinyin_field_names_agree_across_backend_and_frontend` |
 | ④ `<datalist id>` 改名 | `test_datalist_id_matches_the_input_list_attribute` |
 
-### 52.8 已知缺口（诚实登记，不省略）
+第二轮（`CHG-0247`）：
+
+| 突变 | 变红的守卫 |
+|---|---|
+| ⑤ 把筛选框挪出「板块」列头 | `test_filter_input_lives_inside_the_board_column_header` |
+| ⑥ 联想下拉不再 portal | `test_suggestion_dropdown_escapes_the_scroll_container` |
+| ⑦ 面板不读筛选记录 | `test_filter_state_is_seeded_from_cache_and_written_back` |
+| ⑧ 登出不清筛选记录 | `test_cache_module_is_wired_into_logout` |
+| ⑨ 后端删掉全拼那一行 | `test_pinyin_field_names_agree_across_backend_and_frontend` |
+| ⑩ 全拼字段还在但值恒为空串 | `test_with_pinyin_matches_the_shared_implementation` |
+| ⑪ 联想排序写成"查询串等于它自己" | `check:boardsearch`（"完全等于查询的排最前"） |
+| ⑫ 把原生 `<datalist>` 加回来 | `test_columns_header_input_is_not_a_datalist` |
+
+> ⚠️ 第二轮**第一次跑漏了 3 条**（⑥⑦⑨），三个原因都是判据太松，值得记下来：
+> ① ⑤ 的断言在整个文件里找 `createPortal(` —— 而同一个文件里告警编辑面板
+> 也有一个 portal，**那一处把它顶绿了**；改成"只取下拉那一段再断言"。
+> ② ⑦ 断言的是标识符 `clearBoardFilterCache` 出现过 —— 而 `await import(...)`
+> 与解构赋值两行里都有，**把调用删掉照样绿**；改成断言"在 `logout` 里真的调了"。
+> ③ ⑨ 断言的是**字段名**，突变改成"字段还在、值恒为空"就绕过了；这属于
+> **值**的范畴，交给行为守卫（⑩），于是补了第 ⑩ 条突变把那条守卫也验一遍。
+> **教训：突变自证的价值不在"全绿"，在于它能把"看起来在守"和"真的守得住"分开。**
+
+### 52.10 已知缺口（诚实登记，不省略）
 
 | # | 缺口 | 状态 |
 |---|---|---|
-| ① | **只有拼音首字母，没有全拼**（敲 `huagong` 搜不到「化工」）—— 需后端多下发 `pinyin_full` | 待办（本轮的明确取舍） |
-| ② | 筛选**不持久化**：切走视图或刷新页面后清空（`localStorage` 没存） | 待办（未要求） |
-| ③ | 联想只列**清单内**板块名，不联想代码/拼音 | 设计如此 |
+| ① | ~~只有拼音首字母，没有全拼~~ | **已闭环**（`CHG-0247`：后端补 `pinyin_full`，实测 267/267 行都有） |
+| ② | ~~筛选不持久化~~ | **已闭环**（`CHG-0247`：`boardFilterCache.ts` + 登出清理） |
+| ③ | ~~联想只列清单内板块名，不联想代码/拼音~~ | **已闭环**（`CHG-0247`：候选行显示拼音池，四路都能出候选） |
 | ④ | 筛选是**显示层**过滤：`置顶全部告警`/`重置清单` 仍按整份清单动作（已在按钮语义上区分） | 设计如此 |
-| ⑤ | 本轮前端**已发布**（见 52.9）；但这是**显示层**功能，后端 `pinyin_initials` 一旦缺失会静默退回两路匹配 | 已发布 |
+| ⑤ | 筛选记录**不跨设备**（localStorage 是本机本浏览器）；要跨设备得进"用户配置"接口 | 待办（明确不做，见 52.7） |
+| ⑥ | 拼音**撞车**：`hg` 会同时命中「化工原料」「化工机械」等 —— 筛选器可接受（多几个可读候选），但**不可**拿去当自动归属判据 | 设计如此（见 52.3 的引用块） |
+| ⑦ | 后端两列一旦缺失（缺 `pypinyin`）会**静默**退回"名称/代码"两路匹配，界面不提示 | 设计如此（降级不塌），但没做可见提示 |
 
-### 52.9 发布记录（2026-10-14）
+### 52.11 发布记录（2026-10-14）
 
-`manage.py build` → `manage.py ship-frontend` → `restart-pilot`，并在构建产物里
-grep 新字面量确认生效；`/` 响应头 `no-cache`、`/assets/*-<hash>.js` 为
-`public, max-age=31536000, immutable`（`CHG-0245` 那轮起的 `static_cache_control`）。
+`CHG-0246`：`manage.py build` → `manage.py ship-frontend` → `restart-pilot`
+（dev 一并重启），实测 `/` 响应头 `no-cache`、`/assets/index-*.js` 为
+`public, max-age=31536000, immutable`，构建产物里 grep 到新字面量。
+
+`CHG-0247`：同样流程再发一次（**后端也改了** ⇒ 两个实例都要重启才生效）。
+

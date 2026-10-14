@@ -2298,6 +2298,34 @@ code { color: var(--accent); font-family: ui-monospace, Consolas, monospace; }
   padding: 5px 8px; font-size: 12px; cursor: pointer; text-align: left;
 }
 .crowding-suggest button:hover { background: rgba(74,158,255,0.12); }
+.crowding-suggest button.active { background: rgba(74,158,255,0.18); }
+
+/* ---- 「板块」列表头里的筛选框（2026-10-14） ----
+   用户第一眼是往**这一列**找筛选（原话：「板块那一列 我看还没支持搜索过滤」），
+   所以输入框就放在列头里，而不是混在工具栏那一排控件里。
+   两个附带好处：表头是 sticky 的 ⇒ 纵向滚动时筛选框一直在；输入框与它筛的
+   那一列在同一个视觉位置 ⇒ 不存在"这个框筛的是哪一列"的歧义。
+   ⚠️ 表头那一格原来是 `<button>`（点它排序），按钮里不能套输入框（非法 HTML），
+   所以拆成 `<span>` 容器 + 按钮 + 输入框，见组件里的注释。 */
+.crowding-hfilter {
+  display: flex; flex-direction: column; align-items: stretch; gap: 3px;
+}
+.crowding-hfilter .crowding-hsort { text-align: center; }
+.crowding-col-filter {
+  width: 100%; min-width: 0; padding: 1px 6px; font-size: 11px; height: 20px;
+}
+.crowding-col-filter::placeholder { color: var(--muted); }
+
+/* 联想下拉（portal 到 body，坐标由组件算 → 必须 fixed，且不能被裁） */
+.crowding-filter-pop {
+  left: auto; right: auto; top: auto;   /* 覆盖 .crowding-suggest 的 left/right/top:100% */
+  position: fixed;
+  max-height: 300px;
+}
+/* 候选右侧的拼音池提示（首字母 · 全拼）。不吃掉整行宽度，靠右淡显。 */
+.crowding-suggest .crowding-py {
+  margin-left: auto; font-size: 10px; opacity: 0.75; white-space: nowrap;
+}
 
 /* ==================================================================
    集合竞价选股（量化交易 → 竞价选股页签）

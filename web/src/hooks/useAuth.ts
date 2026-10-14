@@ -211,6 +211,13 @@ export function useAuth() {
         const { clearMainlineCache } = await import("../mainlineCache");
         clearMainlineCache();
       } catch { /* 清理失败不该阻断登出 */ }
+      // 拥挤度告警面板的**筛选记录**（2026-10-14）。它本身不含隐私
+      // （一个筛选词 + 两个开关），但"清了哪些"要能一眼读全 ——
+      // 与上面几个缓存保持一致，避免下次有人问"到底清了哪几个"得读代码。
+      try {
+        const { clearBoardFilterCache } = await import("../boardFilterCache");
+        clearBoardFilterCache();
+      } catch { /* 清理失败不该阻断登出 */ }
       // 预取记账也要重置：否则下一个人登录后，保活续期会以为
       // "刚刚取过"而跳过第一次预取，缓存又是冷的。
       try {

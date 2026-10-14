@@ -479,7 +479,7 @@ def _read_list(conn, *, concepts_only: bool = False,
 
 
 def _with_pinyin(rows: list[dict]) -> list[dict]:
-    """给每一行补 `pinyin_initials`（前端"板块"列筛选用，2026-10-14）。
+    """给每一行补 `pinyin_initials` + `pinyin_full`（前端"板块"列检索用，2026-10-14）。
 
     ## 为什么在**后端**算
 
@@ -487,23 +487,45 @@ def _with_pinyin(rows: list[dict]) -> list[dict]:
     **股票**字典，板块没有对应物）。要支持"敲 `hg` 找 化工"就只能在有
     `pypinyin` 的这一侧算。
 
-    ## 为什么复用 `to_initials()` 而不是自己写一遍
+    ## 为什么复用 `to_initials()` / `to_full_pinyin()` 而不是自己写一遍
 
-    它是仓库里**唯一**的"中文名 → 拼音首字母"实现
-    （`src/quant/stock_directory.py:110`，股票那条链在用）。同一判断写两份
-    必然漂移（本项目已多次记录），所以这里只调用它。
+    它们是仓库里**唯一**的"中文名 → 拼音"两个实现
+    （`src/quant/stock_directory.py:110` / `:130`，股票那条链在用）。
+    同一判断写两份必然漂移（本项目已多次记录），所以这里只调用它们。
 
-    ⚠️ 成本：清单约 262 行，`to_initials` 是纯本地计算（毫秒级），
-    且 `/config_list` 本身有 60 秒轮询 + 进程内缓存 ⇒ 不构成负担。
-    算不出来时（缺 `pypinyin`）该字段为空串，前端会退回"名称/代码"两路匹配
-    —— **降级是静默的，但功能不塌**。
+    ## ★ 实测成本（2026-10-14，不是估计）
+
+    在**真实清单**（267 行，`data/moss_finagent.db`）上量的稳态值：
+
+    | 环节 | 稳态 | 备注 |
+    |---|---|---|
+    | `query_list_view` | 4.7 ms | 这条接口的大头 |
+    | `_list_view_row` 映射 | 0.5 ms | |
+    | `to_initials`（267 行） | 5.8 ms | 22 µs/行 |
+    | `to_full_pinyin`（267 行） | ~6 ms | 也 22 µs/行 |
+    | **首次调用** | **+112 ms** | `pypinyin` 惰性 import 的**一次性**开销 |
+
+    ⇒ 稳态下两列合计约 17 ms；首次请求多付一次 112 ms 的导入钱。
+    `/config_list` 是前端 60 秒轮询的接口，**且服务端没有响应缓存**
+    （只有 `load_config()` 有缓存）—— 所以这里写的是实测值，不写"毫秒级"。
+
+    ⚠️ 因为**首调用**多 112 ms，任何"这条接口必须在 X ms 内"的断言
+    都得先热一次，否则第一次跑必然超时（本项目登记过这种假红灯）。
+
+    算不出来时（缺 `pypinyin`）两个字段都是空串，前端会退回"名称/代码"
+    两路匹配 —— **降级是静默的，但功能不塌**。
     """
     try:
-        from src.quant.stock_directory import to_initials
-    except Exception:  # noqa: BLE001 拼音只是增强，取不到就不加这一列
+        from src.quant.stock_directory import to_full_pinyin, to_initials
+    except Exception:  # noqa: BLE001 拼音只是增强，取不到就不加这两列
         return rows
     for row in rows:
-        row["pinyin_initials"] = to_initials(str(row.get("sector_name") or ""))
+        name = str(row.get("sector_name") or "")
+        row["pinyin_initials"] = to_initials(name)
+        # 全拼（小写、无分隔）：用户 2026-10-14 要求"映射出中文拼音全称字段，
+        # 于是就有了搜索联想拼音池"。因为**无分隔**，多音节输入
+        # "bandao chanpin" 也能靠"空格 = AND"命中（两个片段都是子串）。
+        row["pinyin_full"] = to_full_pinyin(name)
     return rows
 
 

@@ -62,6 +62,19 @@ export type CrowdingListItem = {
    * **缺 `pypinyin` 时是空串**，前端此时退回"名称 / 代码"两路匹配。
    */
   pinyin_initials?: string;
+  /**
+   * 板块名的**拼音全拼**（小写连写，如 `化工原料` → `huagongyuanliao`）——
+   * 用户 2026-10-14 追加要求：
+   *
+   * > 「没有全拼，你就把当前拥挤度数据清单里，所有板块字段的板块名称，
+   * >   都映射出中文拼音全称字段，然后不就有了搜索联想拼音池了吗」
+   *
+   * 后端用 `stock_directory.to_full_pinyin()` 现算（同一个 `_with_pinyin`）。
+   * ⚠️ **无音节分隔**，所以 `bandao chanpin` 这种带空格的输入靠"空格 = AND"
+   * 命中（两个片段各自都是子串），而不是靠分隔符切词。
+   * **缺 `pypinyin` 时是空串**（与 `pinyin_initials` 同时降级）。
+   */
+  pinyin_full?: string;
   is_concept: number;
   bars: number;
   /** false = 用户已从清单删除（软删，历史数据仍在库里） */
