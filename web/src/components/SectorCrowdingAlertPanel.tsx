@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { filterBoards } from "../boardSearch";
 import { createPortal } from "react-dom";
 import {
   sectorCrowdingApi,
@@ -248,6 +249,16 @@ export default function SectorCrowdingAlertPanel({
   const [onlyAlerts, setOnlyAlerts] = useState(false);
   /** 只看自定义告警已触发的板块 */
   const [onlyTriggered, setOnlyTriggered] = useState(false);
+  /**
+   * 「板块」列的**筛选词**（2026-10-14 用户要求）。
+   *
+   * > 「给高度拥挤告警的数据面板中，"板块"这列加一个检索过滤功能，当前板块太多了，
+   * >   想找其中一个板块要翻好久，支持联想或模糊搜索」
+   *
+   * 清单 262 个板块，靠滚动找要翻很久。匹配判据在 `boardSearch.ts`
+   * （名称 / 代码 / 拼音首字母三路，多词 AND，纯函数 + 单独自证）。
+   */
+  const [boardFilter, setBoardFilter] = useState("");
   /** 正在编辑告警的板块（null = 未打开编辑面板） */
   const [alertEdit, setAlertEdit] = useState<string | null>(null);
 
@@ -286,6 +297,10 @@ export default function SectorCrowdingAlertPanel({
   const rows = useMemo(() => {
     let list = onlyAlerts ? view.filter((row) => row.is_alert) : [...view];
     if (onlyTriggered) list = list.filter((row) => row.alert_on);
+    // ★ 「板块」列筛选（2026-10-14）：**本地过滤** —— 清单已经在内存里，
+    //   打字即时生效、不发请求（那个"输入板块名称查询"的框是**加入清单**用的，
+    //   两件事；判据见 `boardSearch.ts`）。
+    list = filterBoards(list, boardFilter);
     /** 数值型排序键的取值器（NULL 统一沉底，不参与大小比较）。 */
     const metricOf = (row: (typeof list)[number]): number | null => {
       switch (sortKey) {
@@ -323,7 +338,8 @@ export default function SectorCrowdingAlertPanel({
       return sortDir === "desc" ? -diff : diff;
     });
     return list;
-  }, [view, ranks, sortKey, sortDir, onlyAlerts, onlyTriggered, pinsActive]);
+  }, [view, ranks, sortKey, sortDir, onlyAlerts, onlyTriggered, pinsActive,
+      boardFilter]);
 
   /**
    * 点表头/列头排序。
@@ -383,13 +399,17 @@ export default function SectorCrowdingAlertPanel({
     const text = rows
       .map((row) => `${row.sector_name || row.sector_code}\t${pct(row.water_level)}`)
       .join("\n");
+    // 筛选生效时**如实说明只复制了筛出来的那部分** —— 否则用户拿到的列表
+    // 少了几百行却看不出来（"复制列表"看起来像"复制全部"）。
+    const scope = boardFilter.trim()
+      ? `（当前筛选「${boardFilter.trim()}」命中 ${rows.length}/${view.length}）` : "";
     try {
       await navigator.clipboard.writeText(text);
-      onNotice?.(`已复制 ${rows.length} 个板块`);
+      onNotice?.(`已复制 ${rows.length} 个板块${scope}`);
     } catch {
       onNotice?.("复制失败：浏览器未授权剪贴板（可手动选中列表复制）");
     }
-  }, [rows, onNotice]);
+  }, [rows, view.length, boardFilter, onNotice]);
 
   const addAllAlerts = useCallback(async () => {
     const missing = view.filter((row) => row.is_alert && !row.pinned);
@@ -446,6 +466,35 @@ export default function SectorCrowdingAlertPanel({
                  title="只显示你设的自定义告警已触发的板块" />
           只看已触发（{triggeredCount}）
         </label>
+        {/* ★ 「板块」列筛选（2026-10-14 用户要求）：262 个板块靠翻页找太慢。
+            三路匹配（名称 / 代码 / 拼音首字母）、多词 AND、**本地即时**、不发请求。
+            联想用原生 `<datalist>`（浏览器自己按输入过滤）—— 不再造第二个下拉组件。 */}
+        <label className="muted-text"
+               title={"按板块筛选（本地即时，不发请求）：\n"
+                 + "· 名称：化工 / 体材料（中间片段也行）\n"
+                 + "· 代码：885959 / 885959.TI\n"
+                 + "· 拼音首字母：hg = 化工（后端用 pypinyin 现算）\n"
+                 + "· 空格分隔多个词 = 全部命中（如「半导 材料」）\n"
+                 + "Esc 或「清空」取消筛选"}>
+          找板块
+          <input className="qsel-input mono" list="crowding-board-filter-names"
+                 value={boardFilter} spellCheck={false}
+                 placeholder="名称/代码/拼音"
+                 style={{ width: 160, marginLeft: 4 }}
+                 onChange={(event) => setBoardFilter(event.target.value)}
+                 onKeyDown={(event) => {
+                   if (event.key === "Escape") setBoardFilter("");
+                 }} />
+        </label>
+        {boardFilter.trim() && (
+          <>
+            <span className="muted-text">
+              筛出 <b>{rows.length}</b> / {view.length}
+            </span>
+            <button className="btn-ghost tiny" onClick={() => setBoardFilter("")}
+                    title="清空筛选（Esc 也可以）">清空筛选</button>
+          </>
+        )}
         <label className="muted-text">
           排序
           <select className="mono" value={sortKey}
@@ -498,6 +547,16 @@ export default function SectorCrowdingAlertPanel({
             📌 置顶恢复（{pinnedCount}）
           </button>
         )}
+        {/* 联想数据源：原生 `<datalist>`（浏览器按当前输入自己过滤，零 JS）。
+            只放**清单内**的板块名 —— 清单外的板块本来就筛不出来，列进去会
+            让人以为能筛到。名字为空的行（缺 sector_name）跳过，否则 `<option>`
+            会出现空条目。`value` 去重交给 `datalist` 无所谓，但重复项在某些
+            浏览器里会让下拉里出现多条一样的，所以这里先 Set 去重。 */}
+        <datalist id="crowding-board-filter-names">
+          {Array.from(new Set(
+            view.map((row) => row.sector_name).filter((name) => !!name),
+          )).map((name) => <option key={name} value={name} />)}
+        </datalist>
       </div>
 
       {/* 搜索新增 */}
@@ -543,7 +602,10 @@ export default function SectorCrowdingAlertPanel({
         <button className="btn-ghost" disabled={view.length === 0}
                 onClick={() => downloadCsv(csvRows, (row) =>
                   row.sector_name || row.sector_code)}
-                title="导出为 CSV（Excel 可直接打开，带 BOM 不乱码）">导出 CSV</button>
+                title={"导出为 CSV（Excel 可直接打开，带 BOM 不乱码）"
+                  + (boardFilter.trim()
+                    ? `\n⚠️ 当前筛选「${boardFilter.trim()}」生效中，只导出命中的 `
+                      + `${rows.length} 行（不是全部 ${view.length} 行）` : "")}>导出 CSV</button>
         <button className="btn-ghost" disabled={view.length === 0}
                 title="清空清单配置，回到默认显示全部概念板块"
                 onClick={() => {
@@ -559,12 +621,21 @@ export default function SectorCrowdingAlertPanel({
 
       {!loading && rows.length === 0 && (
         <div className="crowding-alert-empty">
+          {/* ⚠️ 三种"空"必须分开说：清单本来就空 / 筛没了 / 真没告警。
+              合成一句「当前没有触发告警的板块」时，用户把筛选词打错会以为
+              是"今天没告警"—— 静默的假信号比空列表更糟。 */}
           {view.length === 0
             ? "清单是空的。用上方搜索框添加板块，或点「重置清单」回到默认全量。"
-            : "当前没有触发告警的板块"}
-          <span className="muted-text">
-            （水位 = 该板块当前平滑拥挤度 / 近 6 年最高值；未刷新的板块"数据不足"）
-          </span>
+            : boardFilter.trim()
+              ? <>筛选词「{boardFilter.trim()}」在清单 {view.length} 个板块里没有命中。</>
+              : "当前没有触发告警的板块"}
+          {boardFilter.trim() && view.length > 0
+            ? <span className="muted-text">
+                （只筛「板块」列的名称/代码/拼音首字母，不影响数据本身；Esc 或「清空筛选」取消）
+              </span>
+            : <span className="muted-text">
+                （水位 = 该板块当前平滑拥挤度 / 近 6 年最高值；未刷新的板块"数据不足"）
+              </span>}
         </div>
       )}
 

@@ -114,13 +114,60 @@ class RefreshRequest(BaseModel):
         description="限制刷新板块数（0=全部；调试用）")
 
 
+#: 只读实例拒绝刷新时用的**机器可读**码（前端按它决定"别给重试按钮"）。
+#: 人话在 `message` 里，且必须带**出路**（谁是写者 + 去哪刷）——
+#: 见 2026-10-13 的报障：原来用户看到的是 `PermissionError` 的原始异常文本。
+CROWDING_READ_ONLY = "crowding_read_only"
+
+
+def _write_decision() -> Any:
+    """本实例能不能写**共享拥挤度参考库**（`CHG-0087` 那套闸门）。
+
+    抽成函数是为了让判据能替换它（`tests/unit/test_crowding_write_gate.py`），
+    而不是去搭一张真库。
+    """
+    from src.infrastructure.catalog.data_stores import writable_here
+
+    return writable_here("crowding_shared")
+
+
+def _read_only_detail(decision: Any) -> dict[str, str]:
+    """只读实例的结构化拒绝：`code` 给机器、`message` 给人 + **给出路**。"""
+    store = getattr(decision, "store", "crowding_shared")
+    reason = getattr(decision, "reason", "")
+    return {
+        "code": CROWDING_READ_ONLY,
+        "message": (
+            f"拥挤度参考数据是**共享**的，本实例只读：{reason}。"
+            f"要刷新请到登记的写者（dev）实例上点，或改 "
+            f"`configs/data_stores.yaml` 里 `{store}` 的 `writer` 字段 "
+            f"（那一条是该存储写者的**唯一声明处**）。"),
+    }
+
+
 @router.post("/refresh_all")
 async def refresh_all(request: Request, body: RefreshRequest | None = None) -> dict:
     """一键刷新拥挤度（立即返回 task_id，后台执行）。
 
     默认只刷**关注板块池**：`sector_crowding_list` 里可见的板块（当前约 554 个），
     与主线挖掘的板块池同源。需要行业/地区口径时显式传 `pool_only=false`。
+
+    ## ★ 写权限**在起后台线程之前**问（2026-10-13 用户报障）
+
+    原来闸门只在后台线程里（`db.get_db_connection(..., writable=True)`）——
+    于是只读实例上点一次会：拿到 **200 + task_id** → 前端开始轮询 →
+    几秒后拿到 `PermissionError` 的**原始异常文本**。用户的原话是
+    「前端提示连不上服务…过一会儿提示刷新失败：PermissionError: …」。
+
+    现在这一层先拒：**409 + `crowding_read_only` + 人话（含去哪刷）**，
+    而且**一个线程都不起**。后台那一层 `assert_writable` 保留 ——
+    两层是刻意的（路由拒的是"这个动作"，连接级拒的是"任何写路径"，
+    后者覆盖我还没枚举到的第 6 处写）。
     """
+    decision = _write_decision()
+    if not getattr(decision, "allowed", False):
+        raise HTTPException(status_code=409, detail=_read_only_detail(decision))
+
     _ensure_tables()
     _invalidate_max_cache()
     payload = body or RefreshRequest()
@@ -426,8 +473,38 @@ def _list_view_row(row: dict, metric: dict | None = None) -> dict:
 def _read_list(conn, *, concepts_only: bool = False,
                with_metrics: bool = True) -> list[dict]:
     metrics = db.query_metrics(conn) if with_metrics else {}
-    return [_list_view_row(row, metrics.get(str(row.get("sector_code"))))
+    rows = [_list_view_row(row, metrics.get(str(row.get("sector_code"))))
             for row in db.query_list_view(conn, concepts_only=concepts_only)]
+    return _with_pinyin(rows)
+
+
+def _with_pinyin(rows: list[dict]) -> list[dict]:
+    """给每一行补 `pinyin_initials`（前端"板块"列筛选用，2026-10-14）。
+
+    ## 为什么在**后端**算
+
+    前端没有拼音表（`StockPicker` 的拼音来自 `/quant/stocks/search` 那个
+    **股票**字典，板块没有对应物）。要支持"敲 `hg` 找 化工"就只能在有
+    `pypinyin` 的这一侧算。
+
+    ## 为什么复用 `to_initials()` 而不是自己写一遍
+
+    它是仓库里**唯一**的"中文名 → 拼音首字母"实现
+    （`src/quant/stock_directory.py:110`，股票那条链在用）。同一判断写两份
+    必然漂移（本项目已多次记录），所以这里只调用它。
+
+    ⚠️ 成本：清单约 262 行，`to_initials` 是纯本地计算（毫秒级），
+    且 `/config_list` 本身有 60 秒轮询 + 进程内缓存 ⇒ 不构成负担。
+    算不出来时（缺 `pypinyin`）该字段为空串，前端会退回"名称/代码"两路匹配
+    —— **降级是静默的，但功能不塌**。
+    """
+    try:
+        from src.quant.stock_directory import to_initials
+    except Exception:  # noqa: BLE001 拼音只是增强，取不到就不加这一列
+        return rows
+    for row in rows:
+        row["pinyin_initials"] = to_initials(str(row.get("sector_name") or ""))
+    return rows
 
 
 def _config_list_sync(*, concepts_only: bool, config) -> dict:

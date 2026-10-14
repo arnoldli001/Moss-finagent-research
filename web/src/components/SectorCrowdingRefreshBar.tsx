@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { ApiError } from "../errors";
 import { sectorCrowdingApi, type CrowdingRefreshStatus } from "../sectorCrowdingApi";
 
 /**
@@ -16,9 +17,21 @@ import { sectorCrowdingApi, type CrowdingRefreshStatus } from "../sectorCrowding
  *    让它更明显 —— 重复点击不会真的并发跑两轮。
  * 2. **完成后回调**：刷新结束必须让图表与告警面板重新取数，否则用户看到的是
  *    刷新前的旧数据，会以为"刷了没用"。
+ *
+ * ## ★ 只读实例：**不给重试按钮**（2026-10-13 用户报障）
+ *
+ * 拥挤度参考库是共享的、写者只有一处声明（`configs/data_stores.yaml` 的
+ * `writer`）。在非写者实例（如对外 pilot）上点刷新，后端现在回
+ * **409 + `crowding_read_only` + 人话**（含"谁是写者、去哪刷"）。
+ * 这一档**重试一万次也不会成功**（`errors.ts` 里 `item_not_retained` 那条
+ * 用的是同一条纪律）—— 所以这里按**机器可读的码**判，不给"重试"，
+ * 并把后端那句人话原样显示（写者名字在里面，前端不许自己编）。
  */
 
 const POLL_MS = 1500;
+
+/** 后端拒绝刷新的码（`src/api/routes/sector_crowding.py::CROWDING_READ_ONLY`）。 */
+const READ_ONLY_CODE = "crowding_read_only";
 
 export default function SectorCrowdingRefreshBar({
   onFinished, initialStatus,
@@ -31,6 +44,8 @@ export default function SectorCrowdingRefreshBar({
     initialStatus ?? null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  /** 终态失败（重试也没用）：只读实例、权限不足这一类。 */
+  const [fatal, setFatal] = useState(false);
   const timerRef = useRef<number | null>(null);
   const taskRef = useRef("");
 
@@ -62,6 +77,7 @@ export default function SectorCrowdingRefreshBar({
 
   const start = useCallback(async (poolOnly = true) => {
     setError("");
+    setFatal(false);
     setBusy(true);
     try {
       // poolOnly=true（默认）：只刷**关注板块池**（清单里可见的板块，与主线挖掘同源）。
@@ -76,7 +92,12 @@ export default function SectorCrowdingRefreshBar({
         () => void poll(taskRef.current), POLL_MS);
     } catch (exc) {
       setBusy(false);
-      setError(`触发刷新失败：${exc instanceof Error ? exc.message : String(exc)}`);
+      // ★ 只读实例是**终态**：后端给的是 `code=crowding_read_only` + 人话
+      //   （写者是谁、去哪刷）。按**码**判，不按文案判 —— 文案会被"优化得更友好"，
+      //   而每一次优化都会让某个隐藏分支静默失效（本项目已有先例）。
+      const code = exc instanceof ApiError ? exc.code : "";
+      setFatal(code === READ_ONLY_CODE);
+      setError(exc instanceof Error ? exc.message : String(exc));
     }
   }, [poll, stopPolling]);
 
@@ -135,8 +156,14 @@ export default function SectorCrowdingRefreshBar({
 
       {error && (
         <>
-          <span className="error-text">{error}</span>
-          <button className="btn-ghost" onClick={() => void start()}>重试</button>
+          <span className="error-text">
+            {fatal ? error : `触发刷新失败：${error}`}
+          </span>
+          {/* 只读实例不给"重试"：那个按钮永远不会成功 —— 与 `errors.ts` 里
+              `item_not_retained` 同一条纪律（终态错误不许装成可重试）。 */}
+          {!fatal && (
+            <button className="btn-ghost" onClick={() => void start()}>重试</button>
+          )}
         </>
       )}
     </div>

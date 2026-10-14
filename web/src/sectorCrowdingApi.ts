@@ -56,6 +56,12 @@ export type CrowdingAlertRow = CrowdingOverviewRow & {
 export type CrowdingListItem = {
   sector_code: string;
   sector_name: string;
+  /**
+   * 板块名的**拼音首字母**（大写，如 `化工` → `HG`）—— 供"板块"列筛选用
+   * （2026-10-14）。后端用 `stock_directory.to_initials()` 现算；
+   * **缺 `pypinyin` 时是空串**，前端此时退回"名称 / 代码"两路匹配。
+   */
+  pinyin_initials?: string;
   is_concept: number;
   bars: number;
   /** false = 用户已从清单删除（软删，历史数据仍在库里） */
