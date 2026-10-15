@@ -255,12 +255,18 @@ export default function SectorCrowdingAlertPanel({
    * 走 localStorage（`boardFilterCache.ts`，内含"为什么不是库表"的三条理由）。
    * ⚠️ **只读一次**：`useState(() => ...)` 的惰性初值，否则每帧都去 parse 一遍
    * JSON；读失败/没记录一律回默认（读函数绝不抛）。
+   *
+   * ⚠️⚠️ **只恢复筛选词，不恢复「只看告警 / 只看已触发」**（2026-10-15 事故）：
+   * 用户报障「高拥挤度告警 这个板块的数据怎么不展示了」—— 查实当天 `alert_on`
+   * 对每一行都是 `False`（"已触发"= **0** 行），而 v1 把那两个开关也记进了缓存 ⇒
+   * 前一天点过「只看已触发」，第二天打开就是**一张空表**，看着完全像"数据没了"。
+   * 那两个开关是**会话内的临时视图开关**（随时可点、且能把数据藏光），不该跨会话
+   * 复活；缓存结构版本 +1 顺带把 v1 的旧记录一次性丢弃（刷新即恢复）。
    */
   const [cachedFilter] = useState(() => readBoardFilter());
-  const [onlyAlerts, setOnlyAlerts] = useState(cachedFilter?.onlyAlerts ?? false);
+  const [onlyAlerts, setOnlyAlerts] = useState(false);
   /** 只看自定义告警已触发的板块 */
-  const [onlyTriggered, setOnlyTriggered] = useState(
-    cachedFilter?.onlyTriggered ?? false);
+  const [onlyTriggered, setOnlyTriggered] = useState(false);
   /**
    * 「板块」列的**筛选词**（2026-10-14 用户要求，同一天追加全拼与"记住筛选"）。
    *
@@ -417,12 +423,12 @@ export default function SectorCrowdingAlertPanel({
   /**
    * 把筛选记录写进本地缓存（用户要求"筛选记录保留在前端缓存"）。
    *
-   * 放在 `useEffect` 里而不是每个 `onChange` 里：三个字段（词 + 两个开关）
-   * 都会变，写在一处才不会漏。**写失败绝不抛**（缓存模块自己吞掉）。
+   * ⚠️ **只写筛选词**：两个"只看…"开关刻意不写（见 state 那里的 2026-10-15 事故）。
+   * 这条在 `test_board_filter_structure.py` 里是**回归守卫**：谁把开关加回来就变红。
    */
   useEffect(() => {
-    writeBoardFilter({ q: boardFilter, onlyAlerts, onlyTriggered });
-  }, [boardFilter, onlyAlerts, onlyTriggered]);
+    writeBoardFilter({ q: boardFilter });
+  }, [boardFilter]);
 
   /**
    * 联想下拉的坐标（`position: fixed` + portal 到 body）。
@@ -707,7 +713,12 @@ export default function SectorCrowdingAlertPanel({
           所以表头与每一行严格对齐；窄屏时整张表横向滚动而不是压扁。 */}
       <div className="crowding-alert-scroll"
            style={{ "--crowding-grid": GRID } as React.CSSProperties}>
-      {rows.length > 0 && (
+      {/* ⚠️ 条件用 `view.length > 0`（清单非空）**而不是** `rows.length > 0`（筛完非空）：
+          用后者时，只要筛选把行筛光（或"只看…"开关把行藏光），**表头连同筛选框
+          一起消失** —— 用户面前只剩一句"没有命中"，却找不到改筛选词的地方。
+          这正是 2026-10-15 那次"数据不展示了"的一部分。表头是列标题 + 筛选入口，
+          清单里有东西就该在。 */}
+      {view.length > 0 && (
         <div className="crowding-alert-header" role="row">
           <button className="crowding-hsort num" title="拥挤度排名（水位降序，第 1 名最拥挤）"
                   onClick={() => toggleSort("rank")}>

@@ -228,11 +228,72 @@ def test_filter_state_is_seeded_from_cache_and_written_back() -> None:
         "缓存的读法必须是 `useState(() => ...)` 惰性初值 —— "
         "直接写成 `useState(readBoardFilter())` 会每帧 parse 一遍 JSON")
     assert "writeBoardFilter({" in code, "面板没有回写筛选记录"
-    # 三个字段都要进 effect 依赖，漏一个就会出现"改了没记住"
     effect = code[code.find("writeBoardFilter({"):]
     effect = effect[:effect.find("]);")]
-    for field in ("boardFilter", "onlyAlerts", "onlyTriggered"):
-        assert field in effect, f"`{field}` 没有进写缓存的依赖数组"
+    assert "boardFilter" in effect, "写缓存的依赖数组里没有 `boardFilter`"
+    # ★ 写进去的**载荷**里也只能有筛选词：deps 只管"什么时候重算"，
+    #   把开关塞进载荷才是 2026-10-15 空表事故的真正入口
+    #   （突变自证第一次跑时漏的正是这一条）。
+    payload = effect[effect.find("writeBoardFilter("):]
+    payload = payload[:payload.find(")")]
+    assert "onlyAlerts" not in payload and "onlyTriggered" not in payload, (
+        f"写缓存的载荷里又出现了视图开关：{payload}")
+    # 依赖数组同样只该有那一个字段
+    deps = effect[effect.find("}, ["):]
+    assert "onlyAlerts" not in deps and "onlyTriggered" not in deps, (
+        f"写缓存的依赖数组里又出现了视图开关：{deps}")
+
+
+def test_cache_remembers_only_the_query_not_the_hiding_switches() -> None:
+    """★ 回归守卫（2026-10-15 事故）：缓存里**只能**有筛选词。
+
+    用户报障「高拥挤度告警 这个板块的数据怎么不展示了」。查实：当天
+    `alert_on` 对**每一行**都是 `False`（"已触发"= **0** 行），而 v1 把
+    「只看告警 / 只看已触发」也记进了缓存 ⇒ 前一天点过「只看已触发」，
+    第二天打开面板就是**一张空表**，看着完全像"数据没了"。
+
+    所以这里三条一起守（缺一条都可能让事故复发）：
+      ① 缓存**类型**里只有 `q`（写进去的第二类字段迟早会被读回来）；
+      ② 缓存模块的**读**函数忽略多余字段（手改 localStorage 也不该能藏数据）；
+      ③ 面板**不**拿缓存去初始化那两个开关。
+    """
+    cache = (REPO / "web" / "src" / "boardFilterCache.ts").read_text(encoding="utf-8")
+    body = _strip_comments(cache)
+    type_block = body[body.find("export type BoardFilterState"):]
+    type_block = type_block[:type_block.find("};")]
+    assert "q: string" in type_block, "缓存类型里没有筛选词"
+    assert "onlyAlert" not in type_block and "onlyTriggered" not in type_block, (
+        f"缓存类型里又出现了会把数据藏光的开关：{type_block}")
+    assert re.search(r"return \{ q \};", body), (
+        "缓存模块的 sanitize 没有把多余字段丢掉 —— 手改 localStorage / 旧版本残留的"
+        "`onlyTriggered: true` 会重新生效，把面板变成空表")
+    assert re.search(r"const VERSION = 2", body), (
+        "缓存结构版本没有升到 2 —— v1 的旧记录（带开关）会继续被读出来，"
+        "已经中招的用户刷新页面也不会恢复")
+
+    panel = _panel_code()
+    assert "cachedFilter?.q" in panel, "面板没有用缓存的筛选词初始化输入框"
+    assert "cachedFilter?.onlyAlerts" not in panel, (
+        "面板又用缓存初始化「只看告警」了 —— 这正是 2026-10-15 空表事故的成因")
+    assert "cachedFilter?.onlyTriggered" not in panel, (
+        "面板又用缓存初始化「只看已触发」了 —— 当天 alert_on 全为 False 时，"
+        "这一条会让面板一打开就是空的")
+
+
+def test_column_header_survives_an_empty_filter_result() -> None:
+    """表头（含筛选框）要在**清单非空**时渲染，而不是"筛完非空"时。
+
+    用 `rows.length > 0` 时，筛选一旦把行筛光（或开关把行藏光），
+    表头连同筛选框一起消失 —— 用户只剩一句"没有命中"，却找不到改词的地方。
+    """
+    code = _panel_code()
+    header_at = code.find("crowding-alert-header")
+    assert header_at != -1, "找不到表头"
+    before = code[max(0, header_at - 400):header_at]
+    assert "view.length > 0 && (" in before, (
+        "表头的渲染条件不是 `view.length > 0` —— 筛光之后筛选框会一起消失")
+    assert "rows.length > 0 && (" not in before, (
+        "表头又用 `rows.length > 0` 当条件了：筛光即消失（2026-10-15 的一部分）")
 
 
 def test_cache_module_is_wired_into_logout() -> None:
