@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
 from langgraph.graph import END, StateGraph
 
 from src.core.models import AgentOutput
@@ -132,8 +133,16 @@ def test_banner_on_failure_and_silence_on_pass() -> None:
     assert any("未量到" in ln for ln in unmeasured)
 
 
-def test_report_carries_the_banner() -> None:
-    """横幅必须真的进 `final_report`（`_audit_banner` 被写好但没人调 = 没接）。"""
+def test_report_carries_the_banner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """横幅必须真的进 `final_report`（`_audit_banner` 被写好但没人调 = 没接）。
+
+    ⚠️ **显式钉住静默呈现开关**（`CHG-0253`）：本用例测的是**非静默**呈现，
+    而那个开关是**环境变量**，静默期间仓库根 `.env` 里写着 `MOSS_PRESENT_QUIET=1`。
+    不钉住的话，同一份代码会因为一台机器上的静默配置而**红/绿翻转**。
+    静默态本身由 `tests/unit/test_report_presentation_quiet.py` 覆盖。
+    """
+    monkeypatch.setattr("src.orchestration.supervisor._presentation_quiet",
+                        lambda: False)
     output = _audit_output({"verdict": "不通过", "chain_valid": False,
                             "chain_broken_at": 7,
                             "completeness_issues": ["缺 conclusion"]})

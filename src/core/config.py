@@ -59,6 +59,15 @@ def parse_qmt_enabled(value: object) -> bool:
     return str(value or "").strip().lower() in _QMT_TRUTHY
 
 
+#: `parse_qmt_enabled` 的**通用名**。
+#:
+#: 它是同一个函数对象（不是第二份实现）—— 存在的理由只是：真值解析这套判断
+#: 现在被 `QMT_ENABLED` 之外的开关复用了（如 `MOSS_PRESENT_QUIET`），
+#: 在新调用点上写 `parse_qmt_enabled` 会让读者以为"这跟 QMT 有关"。
+#: 保留旧名是因为既有测试与调用点已经引用它，改名要动的地方比收益多。
+parse_env_flag = parse_qmt_enabled
+
+
 def _env_field(name: str, default: str) -> Any:
     """声明一个"从环境变量读、同时保留同名默认值"的字符串字段。
 
@@ -238,6 +247,45 @@ class Settings(BaseSettings):
     model_config_path: str = "configs/models.yaml"
     llm_timeout_seconds: float = 120.0
     llm_cache_enabled: bool = True
+
+    # ======================================================================
+    # ★ 2026-10-16（CHG-0253）：**静默模式**（默认关）
+    # ======================================================================
+    #
+    # ## 它改什么、不改什么（一句话：只改「报告怎么写给读者看」）
+    #
+    # 打开后，仅两处**呈现层**变化：
+    #   ① 报告标题下的「⚠️ 审计未通过」横幅不再出现（`_audit_banner`）；
+    #   ② 文末「## 审计」段不再复述失败结论与问题清单，改为给**封存事实**
+    #      （哈希链条数 / 链是否完整 / 封存位）。
+    #
+    # **一行证据都没有少**：A18 的原始 `conclusion`、`completeness_issues`
+    # 明细、哈希链、审计日志、管理员「运行指标 → 审计」全都照旧。
+    # 换句话说它**不是"把不通过改成通过"**，而是"报告页不替审计员喊话"。
+    #
+    # ## 为什么默认关
+    #
+    # 它是**临时规避**，不是缺陷修复（真实缺陷见 `CHG-0254`：
+    # 一次**外部**数据源缺席与一次**产出**缺陷在报告上成了同一句话；
+    # 改它要动 verdict 口径，属产品决策）。
+    # 静默期结束必须关掉 —— 关闭方式见 `docs/OPS_GUIDE.md` §2.11。
+    #
+    # ⚠️ 必须显式声明 env 别名 + `field_validator`（与 `qmt_enabled` 同一个坑，
+    # 见那里的注释）：直接用 `bool` 吃 `MOSS_PRESENT_QUIET` 的原值时，
+    # `.env` 里一行空的 `MOSS_PRESENT_QUIET=` 就会抛 ValidationError
+    # **把整个应用带崩**。用 before-validator 统一解释，最坏是"当成关闭"。
+    # 真值解析复用 `parse_qmt_enabled`（仓库里**唯一**一份真值解析实现，
+    # 别名 `parse_env_flag` 只是给它一个不误导的名字，不是第二份实现）。
+    present_quiet: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("MOSS_PRESENT_QUIET", "present_quiet"))
+
+    @field_validator("present_quiet", mode="before")
+    @classmethod
+    def _validate_present_quiet(cls, value: object) -> bool:
+        """统一走 `parse_env_flag`（含空串/异常写法 → 关闭，不抛错）。"""
+        return parse_env_flag(value)
+
     #: LLM 响应缓存目录。**必须按环境隔离**（规则文档 §1「缓存必须隔离」、
     #: §6「dev 和 prod 共用缓存」列为反模式）。
     #:

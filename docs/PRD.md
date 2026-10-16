@@ -13555,13 +13555,43 @@ A05/A06/A07 **零调用**；与此同时 `_fetch_news_per_code()` 单独实测**
 
 * 多出的 **3 条**分别来自 `tests/unit/test_intraday_user_watch.py` /
   `test_quant_sector_ownership.py` / `test_quant_sector_quota.py`，**各 1 条夹具口令**
-  （`PASSWORD = "WatchUser#2026x"` 一类，与基线文档描述的"测试自建账号口令"同类，**不是真凭据**）；
+  （`PASSWORD = "WatchUser#…"` 一类，与基线文档描述的"测试自建账号口令"同类，**不是真凭据**）；
 * 这 3 个文件都由提交 **`66e2fdc`（2026-10-09）** 引入，而基线 46 是 **2026-10-05** 实测的；
 * 12 个"单命中"文件**全部已在 HEAD**（排除"新入库文件"这条路径）。
 
 ⇒ 修法只有一条（该文件 docstring 自己写明的先例，40→46 就是这么处理的）：
 把 `EXEMPTED_BASELINE` 46 → 49 并在说明里写清这 3 条的来历。
 **我特意没有替他们改安全棘轮** —— 那属于该门禁所有者的判断（改数字必须被 code review 看见）。
+
+#### 41.47.6 第二轮补扫（`CHG-0255`，2026-10-16）
+
+★ **上一轮扫干净了，但之后新写的文件把它带回来了** —— 这正是"清理类任务"
+最容易的复发形态：它没有红灯，只有下一次有人去 `git grep` 才会发现。
+
+| 复发来源 | 文件 | 处置 |
+|---|---|---|
+| `CHG-0253`（本轮新增的后端与判据） | `src/core/config.py`、`src/orchestration/supervisor.py`、`tests/unit/test_*.py` ×2 | 改成中性措辞（`静默模式` / `静默期间`） |
+| 同一轮 | 未入库探针 `scripts/_probe_report_present_quiet.py`、`.env` 注释 | 同上 |
+
+替换 **16 处**（逐文件计数：config 2 / supervisor 3 / 测试 3+5 / 探针 1 / `.env` 2），
+**残留 0 处**（脚本自带残留扫描）。替换只命中**注释与文档字符串**：
+行为由 `ruff`（干净）与 `pytest tests/unit/test_report_presentation_quiet.py tests/unit/test_audit_verdict_consumed.py`
+（**30 passed**）两道复验。
+
+**顺带修掉一处我自己造成的脱敏红灯**：§41.47.5 里为了说明"那 3 条是夹具口令"，
+我把**口令原文**抄进了已跟踪文档 ⇒ `test_no_secrets_in_tracked_tree::test_tracked_tree_has_no_unredacted_secrets`
+报 `[B_kv] docs/PRD.md:13558: PASSWORD = "WatchUser#…"`。现在改成掩码写法，
+该用例**由红转绿**（`1 passed`）。★ 教训是"**说明**一个口令不需要把口令抄出来"。
+
+**登记（不改，理由在括号里）**：
+
+* `.gitignore` 4 行含这三个词（`CHG-0242` 已登记）：`/docs/面试准备_*` 等是**功能性** ignore 规则，
+  词一改就匹配不到真实文件名 ⇒ 保留；
+* 未入库的本地脚本仍有 45 处：`scripts/gen_resume_*.py`（用户自己的简历生成器）、
+  `_resume_*.py` / `_docx_*.py` / `_scrub_words.py` / `_inventory_*.py`。
+  `git ls-files scripts/` 对它们**一条都没有**（`scripts/*` 被 gitignore）⇒ **不会进仓库**；
+  且它们是**用户本机工具**、内部引用了 `C:\Users\…\简历\…` 这类真实路径，
+  改词会直接破坏逻辑 ⇒ **本轮不动，登记待你定**。
 
 
 
@@ -13687,6 +13717,160 @@ VPS 实测在听的上游是 `127.0.0.1:18110`）；兜底靠 `MossFrpEnsure` �
 **本轮没有把哈希校验接进 `frp_watchdog.ps1`/`frpc_start.ps1`**（现在是**没有**校验的）——
 那需要先定一个取舍：哈希不符时**拒绝启动**（安全，但忘了更新常量就会让站点起不来）
 还是**告警后照常启动**（可用，但护栏不硬）。
+
+
+
+### 41.49 报告侧的演示静默：**标题下那条「⚠️ 审计未通过」横幅不上屏**（`CHG-0253`；真实缺陷登记见 `CHG-0254`）
+
+> **触发**（用户把报告第一行贴了回来）：
+> 「投研分析报告：600036 ⚠️ 审计未通过：完整性问题 2 项。详见文末「审计」」
+> —— 上下文是同一句要求：「我要面试展示，不好的点不要显示出来」。
+
+#### 41.49.1 先看清那条横幅在说什么（否则"藏掉"就是掩盖）
+
+横幅**不在前端**（前端只负责把 Markdown 渲染出来）：它是后端
+`supervisor._render_report()` 拼进 Markdown 的**第一行** ⇒
+要它不上屏，只能改**报告装配**这一层。
+
+于是先把那次运行逐字段核了一遍（`task_20261016_d6de56a7`，
+证据文件 `data/run/_multi_subject_e2e.json`，取证脚本临时存放、未入库）：
+
+| 量 | 实测值 |
+|---|---|
+| `verdict` | `不通过` |
+| `chain_valid` / `chain_count` | `True` / **27**（`audit_chain.records=28`，含 head） |
+| `completeness_issues` | **2 项**：`A01_data_collector[主线告警:600036]: 无数据溯源引用`、`A01_data_collector[货币资金占总资产比:600036]: 无数据溯源引用` |
+| `exempt_count` | `3`（`not_covered` ×2、`not_applicable` ×1） |
+| `collection_gap_count` | **3**，其中**前两条与那 2 项 completeness_issues 是同一批指标**：`gap_kind=null`、`reason="所有数据源都没有返回数据点（没量到 ≠ 量到 0）"`、`path_stats.hit_path="path1_empty"`、`paths_queried/available=1/1` 与 `1/5` |
+| `errors` | **空** |
+| A01 的产出原文 | `未获取到 主线告警:600036 数据`（`data_refs=0`、`result` 里**没有** `gap_kind`） |
+
+⇒ 那 2 项**不是"分析写错了"**，而是**外部数据源这一次没返回数据点**。
+也就是说：**横幅自己没写错，它是把"取数缺口"按"产出缺陷"报了** ——
+真实缺陷登记在 §41.49.5（**本轮不修**，因为修它会改变 verdict 口径，属产品决策）。
+
+#### 41.49.2 改了什么、没改什么
+
+| 静默时**不上屏**（本层唯一改的东西） | **一字未动**（证据都在，只是不在报告正文里） |
+|---|---|
+| 标题下的 `> ⚠️ **审计未通过**：完整性问题 N 项。详见文末「审计」。` | `A18_audit` 的原始 `conclusion`（**逐字**仍在 `agent_outputs`） |
+| 标题下的 `> ⚠️ **审计未完成（未量到，不等于通过）**：…` | `completeness_issues` 全清单、`exemptions`、`collection_gaps`、`path_stats` |
+| 文末「## 审计」里的失败结论与问题清单 | 哈希链本身（`chain_valid` / `chain_count` / `sealed_seq` / `sealed_hash`） |
+| — | 审计日志、管理员「运行指标 → 审计」、`logger.warning("★ A18 审计未通过…")` |
+
+静默时文末那一段换成**封存事实**：
+
+```text
+## 审计
+审计结论已封存：哈希链 27 条、链完整、封存位 seq=28。明细见管理员「运行指标 → 审计」与运行日志。
+```
+
+★ **它绝不写"审计通过"**：`chain_valid=True` 说的是"哈希链没断"，
+与"审计通过"是两件事；拿不到事实时更只写「审计结论已归档」+
+"去哪看"，**不许**用一个"通过"把未知说成已知（本项目铁律：没量到 ≠ 量到 0）。
+
+#### 41.49.3 开关：后端一个环境变量（**默认关**）
+
+| 开关 | 关掉/恢复 |
+|---|---|
+| `MOSS_PRESENT_QUIET=1`（`Settings.present_quiet`，**默认 `False`**） | 删掉 `.env` 里那一行（或改 `0`）→ 重启 pilot |
+
+它只改"报告怎么写给读者看"（**不是"问题消失"**）。静默期结束必须关掉
+（`docs/OPS_GUIDE.md` §2.11）。
+
+接线方式：`_render_report()` 里 `quiet = _presentation_quiet()` **只取一次**，
+然后传给 `_audit_banner(..., quiet=quiet)` 与 `_audit_section_lines(..., quiet=quiet)`
+—— 两处共用**同一个**变量，否则会出现"横幅静默了、文末还在喊"。
+读配置失败时按**不静默**（Fail-visible）：一次配置故障不许把自己伪装成
+"报告本来就没问题"。
+
+#### 41.49.4 判据（`tests/unit/test_report_presentation_quiet.py`，19 条）
+
+1. **默认关**：`Settings(_env_file=None).present_quiet is False`
+   —— 临时开关变成产品默认行为是这类改动最危险的结局（「默认值即护栏」）；
+2. **不崩**：`MOSS_PRESENT_QUIET=`（空值）/`随便写的`/`0`/`1`/`yes`/`off`
+   逐个构造 `Settings` 断言不抛 —— 这是 `config.py` 里
+   `qmt_enabled` 记着的同一个坑（裸 `bool` 字段吃环境原值 ⇒ 一行空值把**整个应用**带崩）；
+3. **静默 ≠ 改判断**：同一份 `AgentOutput` 在静默前后
+   `conclusion` 与 `result` **逐字段不变**；
+4. **静默 ≠ 谎报通过**：静默文案里**不许**出现"通过"字样，
+   拿不到事实时不许出现"链完整"；
+5. **真的接上了**：AST 检查 `_render_report` 函数体里
+   `quiet = _presentation_quiet()` 与两处 `quiet=quiet`（`count == 2`）；
+6. **真实路径**：`MOSS_PRESENT_QUIET=1` → `Settings` → `_presentation_quiet()` → `_render_report`
+   全链路，并用 `=0` 做**对照**（同一次运行的失败结论原样回来 ⇒ 静默可逆、无损）。
+
+**反事实自证 3 次**（删实现必须变红，恢复后逐字节一致）：
+
+| 拿掉什么 | 变红 |
+|---|---|
+| `_audit_banner` 的 `if quiet or …` → `if not summary:` | **2 红**（横幅静默、全链路两条） |
+| `_audit_section_lines(..., quiet=False)`（即审计段不接线） | **2 红**（AST 接线、全链路两条） |
+| `present_quiet` 的 `field_validator` | 等价裸字段复现：`MOSS_PRESENT_QUIET=` 与 `随便写的` ⇒ `ValidationError`（**应用起不来**） |
+
+★ 顺带修掉一个**既有判据的脆弱点**：`tests/unit/test_audit_verdict_consumed.py`
+的 `test_report_carries_the_banner` 现在**显式钉住**静默开关（`monkeypatch` 成 `False`）——
+它测的是非静默呈现，而开关是**环境变量**，不钉住的话
+"同一份代码会因为一台机器上的静默配置而红/绿翻转"。
+
+#### 41.49.4b 端到端复验：**真跑的实例，不是单测**（2026-10-16）
+
+单测只能证明"这个函数在 `quiet=True` 下怎么写"，证明不了
+**真在跑的进程读到了 `.env`**（`get_settings()` 是 `lru_cache` ⇒ 改 `.env` 必须重启）、
+也证明不了"真实那一次运行的第一行就是标题"。所以真跑了一趟
+（dev 8100，`task_20261016_ec9fa2ab`，问句 = 用户那条 600036 原话）：
+
+| 面 | 实测 |
+|---|---|
+| 报告第一行 | `# 投研分析报告：600036` —— **横幅不在**（`审计未通过`/`审计未完成`/`无数据溯源引用` 三个串都不在报告里） |
+| 文末审计段 | `审计结论已封存：哈希链 28 条、链完整、封存位 seq=29。明细见管理员「运行指标 → 审计」与运行日志。` |
+| 证据面 | trace 里 `A18_audit` 的 `conclusion` **仍是**「审计不通过：…产出完整性问题2项…」；`completeness_issues` **仍是那 2 项** ⇒ 静默只换了呈现 |
+| 一致性 | 报告里「哈希链 **28** 条」== trace `chain_count=28`（**封存事实不是编的**，这条是防"看着好看就写"） |
+| `errors` | **0 项** —— `CHG-0251` 的 A06 修复在真跑里仍然成立 |
+
+判据脚本是本地探针 `scripts/_probe_report_present_quiet.py`（红/绿都是机器判的，
+退出码即结论；`scripts/*` 不在版本控制里，故只登记不引用为交付物）；
+落盘证据 `data/run/_report_present_quiet_e2e.json`。**红灯 0 项。**
+
+⇒ 演示口径：`8100/8110` 两个实例在**重启之后**都已生效；
+关掉的方式与核验三步见 `docs/OPS_GUIDE.md` §2.11。
+
+#### 41.49.5 真实缺陷（**登记待办，本轮不修** · `CHG-0254`）
+
+同一件事被**计了两次**：`无数据溯源引用`（`completeness_issues`，2 项）
+与 `collection_gaps`（3 条，含同一批指标）**同源**，而 **verdict 只由前者驱动** ⇒
+"外部数据源这次没返回数据点"直接升级成"报告不可信"。
+
+* **不是实现 bug**：这是**设计如此**且写在两处 docstring 里
+  （`collector/logic.py`：「真的取数失败 ⇒（无 `gap_kind`）⇒ 去修取数链」；
+  `audit/verifier/agent.py`：老产出/真失败 ⇒ **逐字**退回 `无数据溯源引用`），
+  刻意 fail-closed（字段缺失**永不**买来豁免，否则历史数据会被静默豁免）。
+* **代价**：一次**外部**缺席与一次**产出**缺陷在报告上是同一句话，
+  使用者无法区分"该去修取数链"还是"该去修 Agent"。
+* **可选修法（需产品决策）**：当一条 `无数据溯源引用` 能在同一 task 的
+  `collection_gaps` 里找到同一 indicator 的记录 ⇒ 它计 `collection_gap_count`，
+  **不进** `completeness_issues`；verdict 相应分成"产出缺陷"与"取数受阻"两档
+  （或 `不通过（产出 0 项 / 取数缺口 2 项）`）。
+  **反方必须一起写**：把取数缺口从 verdict 里拿掉，
+  会让"关键指标没取到"的报告看起来像通过 —— 所以修法必须**同时**保留一个显式计数，
+  不能只是把它从 issues 里删掉。
+
+#### 41.49.6 诚实边界
+
+* **这是临时规避，不是修复**：它让报告**少说一句**，没有让任何一次运行变得更好；
+  真正的修复方向见 §41.49.5 与 `CHG-0251`；
+* **只静默"报告正文"这一层**：审计链、审计日志、管理员「运行指标 → 审计」、
+  A18 原始输出与 `logger.warning` **一行都没少**（要的是"汇报页干净"，
+  不是"问题消失"）；
+* **静默文案是我写的，不是审计员写的**：演示时若被追问"审计通过了吗"，
+  正确回答是"哈希链 27 条完整、有 2 项取数缺口被计成完整性问题，明细在管理端"
+  —— **不能**答"通过了"；
+* **未做真机逐屏回归**：验证到"`_render_report` 的产出里没有横幅、仍有序封存事实"，
+  没有在浏览器里逐屏点过；
+* **同类风险**：`_audit_banner` 与 `_audit_section_lines` 是报告里**仅有的**两处
+  审计呈现点，但没有判据保证"以后不新增第三处"（若以后有人直接往
+  `_render_report` 里插审计结论，静默不会覆盖它）。
+
 
 
 ## 四十二、投研分析的多 Agent 协作模式：**5 类在用、2 类半用、5 类刻意不用**（现行口径 · 2026-10-07 定型，`CHG-0189`）
@@ -14073,13 +14257,33 @@ Mermaid 图块数 = 页脚声明数 · HTML 标签配平 + `subgraph`/`end` 配�
 ① 图谱仍是**手写 HTML**：判据保证"数字与锚点不漂"，
 **不保证结构叙述**（哪条边是并行、谁等谁）永远正确 —— 那部分只能靠人读；
 ② **A20 不在 A17 的可追问集合里**（`askable_prefixes = A08..A16`，
-`supervisor.py:4446`），图谱已如实标注为**已登记缺口**，
+`supervisor.py:4509`），图谱已如实标注为**已登记缺口**，
 但这是**产品缺口不是文档问题**，本轮**未修**；
 ③ 判据把"静默过期"变成"变红"，但**没有消除维护成本**：
 代码一动，锚点表就得有人重取并更新；
 ④ 本轮只覆盖 `AGENT_COLLABORATION_ATLAS.html` 一份文档 ——
 仓库里还有别的带数字/锚点的手写文档（如 `docs/DEMO_GUIDE.md`、各 `*_AUDIT_*.md`），
 **它们没有同类判据**。
+
+**（g）锚点重钉：12 条的实测处置（`CHG-0256`，2026-10-16）。**
+★ **第 5 层判据真的响了**：本轮 `CHG-0253`（`config.py` +9/+48、`supervisor.py` +63）
+与上一轮 `CHG-0251`（`analysis/base.py` +43、`llm/gateway.py` +14）把 **12 条锚点**顶掉，
+`test_pinned_anchors_still_point_at_their_symbol` **当场变红** ——
+这正是它存在的意义：**"文件在、行号不越界、却指着一行无关代码"是最坏的形态**，
+只有把"这一行是什么"也钉住才抓得住。
+
+* **位移量逐条可解释**（没有一条是"随手改到绿"）：`config.py`
+  `+9`（新增 `parse_env_flag` 别名）/`+48`（`present_quiet` 字段块）；
+  `supervisor.py` `+63`（`_audit_banner` / `_presentation_quiet` / `_audit_section_lines`）；
+  `analysis/base.py` `+43`（`output_hit_cap` / `_truncation_note` / `emit_per_item_rows`）；
+  `llm/gateway.py` `+14`（公开 `tier_output_budget()`）。
+  12 条新行号由 `needle`（该行必须含的片段）在文件里的**实际位置**现取，不是按位移量算出来的。
+* **必须两处一起改**（`_PINNED` 表 + 图谱 HTML 里的锚点文本）：只改一处仍会红 ——
+  **反事实实测**：把 HTML 里 `config.py:248` 退回 `config.py:239`（`_PINNED` 不动）
+  ⇒ **1 failed / 9 passed**（报"页面里已经没有这个锚点"）；还原后 **10 passed**，逐字节一致。
+* **顺带修掉正文里的同类陈引用**：本节 (f)② 的 `supervisor.py:4446` → `supervisor.py:4509`。
+  ⚠️ 这暴露了 (f)③ 的成本还有第二条路径：**`_PINNED` 只管图谱，`docs/**` 正文里的行号引用
+  没有任何判据守着**（改代码不会让它们变红，只会让它们悄悄变错）。
 
 **判据**：
 

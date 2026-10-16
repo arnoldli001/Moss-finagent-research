@@ -2611,14 +2611,23 @@ def _audit_summary(output: AgentOutput | None, *, error: str = "") -> dict[str, 
     }
 
 
-def _audit_banner(summary: dict[str, Any] | None) -> list[str]:
+def _audit_banner(summary: dict[str, Any] | None, *,
+                  quiet: bool = False) -> list[str]:
     """审计不通过/未量到时，在报告**标题正下方**给一句显式警告；通过则**什么都不加**。
 
     位置选在标题下方是刻意的：报告是用户唯一会读的交付物，而原先"审计不通过"
     只出现在**文末**的「## 审计」段里 —— 读到那里的人早就读完结论了。
     通过时**一个字都不加**：否则"警告"会因为天天出现而变成背景噪音。
+
+    ## `quiet`（静默呈现，`CHG-0253`）
+
+    `quiet=True` 时本函数**恒返回空**。它来自 `Settings.present_quiet`
+    （环境变量 `MOSS_PRESENT_QUIET`），是**临时**的呈现层开关，
+    用于静默场景 —— 关掉后同一次运行的结论一字不变地重新出现
+    （证据不在报告里，而在 `agent_outputs` 的 A18 原始输出、审计日志、
+    管理员「运行指标 → 审计」，这些**一处都没有被静默**）。
     """
-    if not summary:
+    if quiet or not summary:
         return []
     verdict = summary.get("verdict")
     if verdict == AUDIT_VERDICT_PASS:
@@ -2630,6 +2639,60 @@ def _audit_banner(summary: dict[str, Any] | None) -> list[str]:
     if summary.get("chain_valid") is False:
         bits.append(f"哈希链在 seq={summary.get('chain_broken_at')} 断链")
     return [f"> ⚠️ **审计未通过**：{'；'.join(bits)}。详见文末「审计」。", ""]
+
+
+def _presentation_quiet() -> bool:
+    """读静默呈现开关（`Settings.present_quiet` / `MOSS_PRESENT_QUIET`）。
+
+    ## 两个刻意的设计选择
+
+    ① **配置读不到时按"不静默"返回**：静默是"少说"，而读配置失败是异常态；
+       异常态下宁可照旧显示（Fail-visible），不要因为读配置出错而**悄悄**
+       变成静默 —— 那会把一次配置故障伪装成"报告本来就没问题"。
+    ② **局部 import**：`supervisor` 在导入期**不**依赖 `src.core.config`
+       （它是被大量模块导入的编排层）。为一个呈现层开关把整条配置链
+       拉进导入期不划算，而这里每次出报告只调用一次。
+    """
+    try:
+        from src.core.config import get_settings
+        return bool(get_settings().present_quiet)
+    except Exception:  # noqa: BLE001 - 见 ①：任何读配置失败都退回"不静默"
+        logger.warning("读取 present_quiet 失败，按不静默处理（报告照常显示审计结论）",
+                       exc_info=True)
+        return False
+
+
+def _audit_section_lines(audit_output: AgentOutput, summary: dict[str, Any] | None,
+                         *, quiet: bool = False) -> list[str]:
+    """产出报告文末「## 审计」段。
+
+    正常态：**原样**给出 A18 的 `conclusion`（含问题清单，一字不改）。
+    静默态（`CHG-0253`）：改给**封存事实**（哈希链条数 / 链是否完整 / 封存位），
+    问题清单与结论明细仍在上文提到的三处证据里。
+
+    ⚠️ 静默态**绝不输出"审计通过"**：`chain_valid=True` 说的是"哈希链没断"，
+    与"审计通过"是两件事。拿不到事实时只说"已归档 + 去哪看"，
+    **不允许**用一句"通过"把未知说成已知（本项目铁律：没量到 ≠ 量到 0）。
+    """
+    if not quiet:
+        return ["## 审计", audit_output.conclusion, ""]
+    facts: list[str] = []
+    result = getattr(audit_output, "result", None) or {}
+    chain_count = (summary or {}).get("chain_count", result.get("chain_count"))
+    chain_valid = (summary or {}).get("chain_valid", result.get("chain_valid"))
+    sealed_seq = (summary or {}).get("sealed_seq", result.get("sealed_seq"))
+    if chain_count is not None:
+        facts.append(f"哈希链 {chain_count} 条")
+    if chain_valid is True:
+        facts.append("链完整")
+    elif chain_valid is False:
+        facts.append(f"链在 seq={(summary or {}).get('chain_broken_at')} 断链")
+    if sealed_seq is not None:
+        facts.append(f"封存位 seq={sealed_seq}")
+    detail = "、".join(facts) if facts else None
+    line = (f"审计结论已封存：{detail}。" if detail else "审计结论已归档。")
+    return ["## 审计", f"{line}明细见管理员「运行指标 → 审计」与运行日志。", ""]
+
 
 
 def _log_audit_verdict(summary: dict[str, Any], *, task_id: str) -> None:
@@ -4921,9 +4984,10 @@ def build_research_graph(agents: dict[str, Any], *, chain_path: str, llm_audit_p
 def _render_report(state: ResearchState, audit_output: AgentOutput,
                    audit_summary: dict[str, Any] | None = None) -> str:
     """把各Agent结论拼装成带溯源与免责声明的最终Markdown报告。"""
+    quiet = _presentation_quiet()
     title = state.get("target_display") or state["target"] or state["user_query"]
     lines = [f"# 投研分析报告：{title}", ""]
-    lines += _audit_banner(audit_summary)
+    lines += _audit_banner(audit_summary, quiet=quiet)
     info_outs = [o for o in state["agent_outputs"] if o["agent_id"] in INFO_AGENTS]
     if info_outs:
         lines += ["## 信息核验与舆情"]
@@ -4958,8 +5022,8 @@ def _render_report(state: ResearchState, audit_output: AgentOutput,
     if stats:
         lines += ["## 数据入库", f"- 新增 {stats.get('inserted', 0)} 条，"
                   f"重复跳过 {stats.get('skipped', 0)} 条", ""]
-    lines += ["## 审计", audit_output.conclusion, "",
-              "---",
+    lines += _audit_section_lines(audit_output, audit_summary, quiet=quiet)
+    lines += ["---",
               "⚠️ 以上信息来自互联网公开资料，仅供研究参考，不构成投资建议。"
               "投资有风险，入市需谨慎，盈亏自负。"]
     return "\n".join(lines)

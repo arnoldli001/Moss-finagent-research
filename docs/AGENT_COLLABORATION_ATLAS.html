@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -102,22 +102,68 @@
   <h1>Moss-FinAgent-Research · 投研分析多Agent协作图谱
     <small>
       代码级还原：协作拓扑 / 冲突仲裁 / 记忆共享 / 熔断防死循环<br>
-      依据 <code>src/orchestration/supervisor.py</code>（940行）、<code>planner.py</code>、
+      依据 <code>src/orchestration/supervisor.py</code>、<code>planner.py</code>、
       <code>message_bus.py</code>、<code>core/state.py</code>、<code>llm/gateway.py</code>、
-      <code>llm/circuit_breaker.py</code> 等实际实现
+      <code>llm/circuit_breaker.py</code> 等实际实现<br>
+      <b>代码基线：2026-10-15</b>。<b>本页的数字不再手写</b> —— 顶部
+      <code>atlas-facts</code> 块是唯一来源，并由
+      <code>tests/unit/test_agent_atlas_drift.py</code>
+      <b>对着代码现算</b>校验（不是对着本页自己），数字漂了会变红而不是静默过期。
     </small>
   </h1>
 </header>
 
+<!-- ============================================================ -->
+<!-- ATLAS-FACTS：本页**唯一**的数字来源（机器可读）。
+     改任何一个数字，必须同时改这里，然后重跑：
+         uv run python -m pytest tests/unit/test_agent_atlas_drift.py -q
+     那条判据会把这些值**对着代码现算一遍**（不是对着本文件自己），
+     所以"代码改了、文档忘了改"会变红，而不是静默过期。
+     这里不放行数、提交号一类天天变的量（它们只会制造假红）。 -->
+<script type="application/json" id="atlas-facts">
+{
+  "generated_for": "2026-10-15",
+  "agents_registered": 20,
+  "graph_nodes": 21,
+  "graph_edges": 33,
+  "analyze_nodes": 10,
+  "all_insight_agents": 10,
+  "analysis_agents": 5,
+  "industry_agents": 5,
+  "keyworded_industry_agents": 4,
+  "info_agents": 3,
+  "data_pipeline_agents": 3,
+  "industry_keyword_groups": 4,
+  "industry_keywords": 44,
+  "root_to_leaf_paths": 12,
+  "path_nodes_incl_sentinels": 11,
+  "path_nodes_real": 9,
+  "path_edges_real": 8,
+  "recommend_in_degree": 11,
+  "max_superstep_width": 11,
+  "max_asks_per_agent": 1,
+  "planner_max_agents": 12,
+  "planner_max_indicators": 20,
+  "react_max_steps": 2,
+  "skills_agent_dirs": 14,
+  "mermaid_figures": 15
+}
+</script>
+
 <div class="grid">
   <div class="card"><b>编排范式</b><div class="v">Supervisor + 黑板</div>
     <div class="d">LangGraph StateGraph，单进程进程内模块注册</div></div>
-  <div class="card"><b>已注册Agent</b><div class="v">19 个</div>
-    <div class="d">A01–A18 + A19 编码工程师（图中15个主链路节点）</div></div>
-  <div class="card"><b>依赖图节点</b><div class="v">16 个</div>
-    <div class="d">1 supervisor + 1 collect + 9 管线 + 5 分析扇出 + recommend/audit</div></div>
-  <div class="card"><b>最大并行度</b><div class="v">13 路</div>
-    <div class="d">A01指标并发(≤20) + 分析层5路同时扇出</div></div>
+  <div class="card"><b>已注册Agent</b><div class="v">20 个</div>
+    <div class="d">A01–A20（<code>runtime.agents</code> 一次装配）；其中 A19 编码实现<b>不挂在投研主图上</b>，
+      A20 是无关键词的<b>兜底行业</b>Agent<br/>
+      图内承载 Agent 的节点 19 个 + supervisor + 1 个零 LLM 本地量化节点 = 21</div></div>
+  <div class="card"><b>依赖图节点</b><div class="v">21 个</div>
+    <div class="d">1 supervisor + 1 collect + 3 数据管线(A02-A04) + 3 信息层(A05-A07)
+      + 1 本地量化(liquidity_ctx) + <b>10 分析扇出</b>(A08-A12/A13-A16/A20) + recommend/audit</div></div>
+  <div class="card"><b>最大并行度</b><div class="v">11 路</div>
+    <div class="d">同一超步内 <code>sentiment</code> + <b>10 个 <code>analyze_*</code></b> 同时可跑。
+      A01 的指标级并发<b>没有硬上限</b>（<code>smart_fetch</code> 直接 <code>gather</code>），
+      请求级另有准入闸门 <code>MOSS_RESEARCH_MAX_INFLIGHT=4</code></div></div>
 </div>
 
 <div class="toc">
@@ -160,7 +206,7 @@ flowchart TB
   end
 
   subgraph L2["② 编排层 · src/orchestration + src/core"]
-    S["supervisor.py<br/>build_research_graph 16节点"]
+    S["supervisor.py<br/>build_research_graph 21节点"]
     P["planner.py<br/>LLMSupervisorPlanner"]
     M["message_bus.py<br/>A2A ask_agent"]
     ST["core/state.py<br/>ResearchState 黑板"]
@@ -172,7 +218,8 @@ flowchart TB
     D["数据层 A01-A04"]
     I["信息层 A05-A07"]
     AN["分析层 A08-A12"]
-    IN["行业层 A13-A16"]
+    IN["行业层 A13-A16<br/>+ A20 兜底行业"]
+    EN["工程层 A19（不在投研主图）"]
     DE["决策层 A17"]
     AU["审计层 A18"]
   end
@@ -180,7 +227,7 @@ flowchart TB
   subgraph L4["④ 能力层 · src/infrastructure"]
     GW["llm/gateway.py 三层路由+熔断"]
     CB["llm/circuit_breaker.py 三态"]
-    LC["llm/cache.py 两级语义缓存"]
+    LC["llm/cache.py 三级语义缓存"]
     HG["llm/hallucination_guard.py"]
     RT["connectors/router.py 主备链"]
     DP["repositories/ 统一数据层"]
@@ -204,6 +251,7 @@ flowchart TB
   S --> ST
   S --> P
   S --> D & I & AN & IN & DE & AU
+  EN -.->|"缺口队列（不在主图）"| D
   DE -.->|"ReAct 追问"| M
   M --> AN & IN
   D & I & AN & IN & DE & AU --> GW
@@ -228,49 +276,64 @@ flowchart TB
   </div>
 </div>
 
-<h3>模型路由：三层能力梯度</h3>
+<h3>模型路由：五层能力梯度</h3>
 <p class="lead">
-  不是所有Agent都用同一个模型 —— <code>LLMGateway</code> 按 <code>task_tier</code> 选模型链，
-  失败自动降级到链上的下一个模型。规划这种"从目录里挑子集"的简单任务用本地小模型，
-  决策层才付云端大模型的钱。
+  不是所有Agent都用同一个模型 —— <code>LLMGateway</code> 按 <code>task_tier</code>
+  选模型链，失败自动降级到链上的下一个模型。五层的<b>次序是配置数据</b>
+  （<code>configs/models.yaml</code> 的 <code>routing:</code>），不是代码常量；
+  下面这张图就是它的现读结果，<b>不要照抄旧版的三层图</b> ——
+  2026-09-28 起 <code>reasoning</code> 的主力已经是云端 <code>deepseek-flash</code>、
+  本地中模型退到链尾当<b>地板</b>，另外多了 <code>medium</code> 与 <code>planning</code> 两层。
 </p>
 
 <div class="fig">
-  <p class="cap">图 1-2 · 三层模型路由与降级链（<code>configs/models.yaml</code>）</p>
+  <p class="cap">图 1-2 · 五层模型路由与降级链（<code>configs/models.yaml</code> → <code>routing</code>，箭头=降级方向）</p>
   <div class="mermaid">
-flowchart LR
+flowchart TD
   classDef light fill:#1a7f37,stroke:#3fb950,color:#fff
   classDef reason fill:#9e6a03,stroke:#d29922,color:#fff
   classDef dec fill:#a1281f,stroke:#f85149,color:#fff
 
-  subgraph T1["light 层 · 本地 2-5s"]
-    L["qwen2.5:1.5b-instruct<br/>Ollama 常驻 keep_alive=24h"]
+  subgraph T0["planning 层 · 每次请求 1 次，延迟敏感"]
+    P1["qwen-dashscope-flash"] --> P2["deepseek-flash"] --> P3["local_light<br/>qwen2.5:1.5b"]
   end
-  subgraph T2["reasoning 层 · 云端/本地中模型"]
-    R1["qwen3:8b-q4_K_M<br/>Ollama"] --> R2["DeepSeek-V4-Flash"]
-  end
-  subgraph T3["decision 层 · 云端大模型"]
-    D1["DeepSeek-V4-Pro"] --> D2["备模型"]
-  end
+  U1["supervisor.plan"] --> P1
 
-  U1["Supervisor 规划<br/>planner.plan"] --> L
-  U2["A08-A12 分析层<br/>A13-A16 行业层<br/>数据缺口自修复代码生成"] --> R1
-  U3["A17 投研建议<br/>ReAct 综合分析"] --> D1
-  L -.->|"失败/熔断"| R1
-  R1 -.->|"失败/熔断"| D1
+  subgraph T1["light 层 · 最高频（约占调用量 82%）"]
+    L1["qwen-siliconflow-7b"] --> L2["qwen-dashscope-flash"] --> L3["local_light<br/>qwen2.5:1.5b"]
+  end
+  U2["A07 情绪分（light）<br/>数据清洗/格式化类基础任务"] --> L1
 
-  class L,U1 light
-  class R1,R2,U2 reason
-  class D1,D2,U3 dec
+  subgraph T2["medium 层 · 信息层"]
+    M1["qwen-dashscope-flash"] --> M2["qwen-siliconflow-7b"] --> M3["deepseek-flash"] --> M4["local_medium<br/>qwen3.5:4b"]
+  end
+  U3["A05 去伪 / A06 提取<br/>（task_tier=medium）"] --> M1
+
+  subgraph T3["reasoning 层 · 核心分析"]
+    R1["deepseek-flash"] --> R2["qwen-dashscope-flash"] --> R3["qwen-siliconflow-7b"] --> R4["local_medium<br/>qwen3.5:4b"]
+  end
+  U4["A08-A12 分析层<br/>A13-A16 行业层 + A20 兜底行业<br/>A19 编码实现"] --> R1
+
+  subgraph T4["decision 层 · A17 综合"]
+    D1["deepseek-flash"] --> D2["qwen-dashscope-flash"] --> D3["local_medium<br/>qwen3.5:4b"]
+  end
+  U5["A17 投研建议 ReAct<br/>（task_tier=decision）"] --> D1
+
+  class P1,P2,P3,U1 light
+  class L1,L2,L3,U2 light
+  class M1,M2,M3,M4,U3 reason
+  class R1,R2,R3,R4,U4 reason
+  class D1,D2,D3,U5 dec
   </div>
 </div>
 
 <!-- ============================================================ -->
 <h2 id="s2"><span class="n">2</span>协作流程图（端到端全景）</h2>
 <p class="lead">
-  这是把 <code>build_research_graph()</code> 里的 16 个 <code>add_node</code> +
-  <code>add_edge</code> 逐条还原成的一张图。核心特征：
-  <b>串行为主 + 两处并发扇出</b>，且每个节点入口都有"计划内/前置条件"双重跳过闸门。
+  这是把 <code>build_research_graph()</code> 里的 <b>21 个 <code>add_node</code></b> +
+  <b>33 条 <code>add_edge</code></b> 还原成的一张<b>逻辑</b>流程图（与 §3 的真实拓扑一一对应）。
+  核心特征：<b>数据层串行 → 3 路 fan-out → 最宽 11 路并发</b>，
+  且每个节点入口都有"计划内/前置条件"双重跳过闸门。
 </p>
 
 <div class="fig">
@@ -296,8 +359,8 @@ flowchart TD
     SUP["supervisor_node"] --> PLAN{"LLM 规划<br/>planner.plan"}
     PLAN -->|成功| LP["LLM 计划<br/>agents + indicators"]
     PLAN -->|"异常 / 空"| RP["规则回退 plan_run<br/>_PLANNING 五类模板"]
-    RP --> ROUTE["行业路由 route_industry<br/>关键词表 A13-A16"]
-    ROUTE --> LIQ["append_liquidity_indicators<br/>确定性补齐大盘/双创/FedWatch"]
+    RP --> ROUTE["行业路由 route_industry<br/>关键词表 A13-A16<br/>（无命中时 A20 兜底）"]
+    ROUTE --> LIQ["append_liquidity_indicators<br/>确定性补齐大盘/双创 + 命中美联储类关键词时 5 条 fed:*"]
     LP --> LIQ
     LIQ --> TOPIC["extract_topic_keywords<br/>主题新闻关键词"]
     TOPIC --> PWRITE["写 state.plan<br/>+ _planned_indicators"]
@@ -305,12 +368,15 @@ flowchart TD
 
   PWRITE --> COL
 
-  subgraph G2["阶段2 · 数据采集层 A01 并发"]
-    COL["collect_node"] --> GATHER["asyncio.gather<br/>每指标一个协程"]
+  subgraph G2["阶段2 · 数据采集层 A01 并发（含新闻抓取）"]
+    COL["collect_node"] --> NFETCH{"news_fetcher<br/>且尚无 info_items?"}
+    NFETCH -->|"个股（多标的逐只）"| NF1["fetch_news(code)"]
+    NFETCH -->|主题| NF2["fetch_topic_news(kw)"]
+    COL --> GATHER["asyncio.gather<br/>每指标一个协程"]
     GATHER --> C1["A01_data_collector<br/>ConnectorRouter 主备链"]
     C1 --> C2{"拿到数据?"}
     C2 -->|是| SINKA["写入 raw_points<br/>asyncio.Lock 保护"]
-    C2 -->|否| FB["_storage_fallback<br/>读入库快照 last-N<br/>标 storage_fallback"]
+    C2 -->|否| FB["_fallback_trigger + _render_fallback_points<br/>四跳判据 → 读入库快照 last-N<br/>结构化 DataFallbackOutcome<br/>extra 标 storage_fallback"]
     FB --> FB2{"有快照?"}
     FB2 -->|否| HEAL["_try_self_heal<br/>LLM生成连接器→沙箱→热加载"]
     FB2 -->|是| SINKA
@@ -319,49 +385,49 @@ flowchart TD
 
   SINKA --> CLN
 
-  subgraph G3["阶段3 · 数据管线 串行四跳"]
+  subgraph G3["阶段3 · 数据管线 串行三跳"]
     CLN["A02_data_cleaner"] --> VAL["A03_data_validator<br/>写 validation_report"]
     VAL --> STO["A04_data_storage<br/>写 storage_stats 血缘"]
-    STO --> NEWS{"news_fetcher<br/>且无 info_items?"}
-    NEWS -->|个股| NF1["fetch_news(code)"]
-    NEWS -->|主题| NF2["fetch_topic_news(kw)"]
   end
 
-  NF1 --> VER
-  NF2 --> VER
+  NF1 & NF2 --> VER
+  NF1 & NF2 --> EXT
 
-  subgraph G4["阶段4 · 信息层 串行三跳"]
-    VER["A05_verifier<br/>本地可信分+LLM复核"] --> EXT["A06_extractor<br/>事件表带 evidence_quote"]
-    EXT --> SEN["A07_sentiment<br/>情绪分与周期一致性防线"]
+  subgraph G4["阶段4 · 信息层（A05 / A06 并行 → A07 汇合）"]
+    VER["A05_verifier<br/>本地可信分+LLM复核"] --> SEN
+    EXT["A06_extractor<br/>事件表带 evidence_quote"] --> SEN
+    SEN["A07_sentiment<br/>情绪分与周期一致性防线"]
   end
 
-  SEN --> LQ
+  SEN --> RCD
 
-  subgraph G5["阶段5 · 本地量化研判（非LLM）"]
+  subgraph G5["阶段5 · 本地量化研判（非LLM，与信息层并行）"]
     LQ{"有 mkt:/idx_val:/fed:<br/>数据点?"}
     LQ -->|是| LQC["liquidity_cycle.assess_liquidity<br/>量能分层/三市分项/两融/估值分位"]
     LQ -->|否 空跳过| FAN
     LQC --> HINT["写 analysis_hint.market_liquidity<br/>分析层与A17共享"]
   end
 
+  STO -.->|"与信息层并行，不等 A07"| LQ
   HINT --> FAN
 
-  subgraph G6["阶段6 · 分析层扇出 5路并行"]
-    FAN["liquidity_ctx → 5条边同时出"] --> FA["A08_macro"]
+  subgraph G6["阶段6 · 分析层扇出 10 路并行"]
+    FAN["liquidity_ctx → 10条边同时出"] --> FA["A08_macro"]
     FAN --> FB3["A09_meso"]
     FAN --> FC["A10_micro"]
     FAN --> FD["A11_fin_risk"]
     FAN --> FE["A12_compliance"]
-    FAN -.->|"industry类型追加"| FF["A13-A16 命中行业"]
-    FA & FB3 & FC & FD & FE & FF --> SHARE["共享同一份 payload<br/>validated_points / hint / events"]
+    FAN --> FF["A13-A16 命中行业<br/>（4 个关键词路由，常 0~1 个命中）"]
+    FAN --> FG["A20_generic_industry<br/>没有专属 Agent 覆盖时兜底"]
+    FA & FB3 & FC & FD & FE & FF & FG --> SHARE["共享同一份 payload<br/>validated_points / hint / events"]
   end
 
   SHARE --> RCD
 
   subgraph G7["阶段7 · 决策与审计"]
-    RCD["recommend_node A17"] --> REACT["ReActExecutor max_steps=3"]
+    RCD["recommend_node A17"] --> REACT["ReActExecutor max_steps=2"]
     REACT --> TOOL{"LLM 输出类型"}
-    TOOL -->|action| ASK["ask_agent 追问 A08-A16<br/>或 query_data / load_skill"]
+    TOOL -->|action| ASK["ask_agent 追问 A08-A16<br/>（A20 不在可追问集合，见 §4）<br/>或 query_data / load_skill"]
     ASK --> REACT
     TOOL -->|final_answer| A17O["A17 AgentOutput<br/>conclusion/stance/conflicts_resolved"]
     REACT -.->|"异常/空结论"| FBACK["回退单次直答"]
@@ -387,7 +453,7 @@ flowchart TD
   class SUP,PLAN,LP,RP,ROUTE,LIQ,TOPIC,PWRITE,RCD,REACT,TOOL,ASK,A17O orch
   class COL,GATHER,C1,C2,SINKA,FB,FB2,HEAL,CLN,VAL,STO,NEWS,NF1,NF2 data
   class VER,EXT,SEN,FAN,SHARE info
-  class FA,FB3,FC,FD,FE,FF ana
+  class FA,FB3,FC,FD,FE,FF,FG ana
   class AUD,CHK,CMP,SEAL,REP dec
   class CB1,CT1 cbt
   class LQ,LQC,HINT skip
@@ -411,10 +477,25 @@ flowchart TD
 <!-- ============================================================ -->
 <h2 id="s3"><span class="n">3</span>LangGraph 依赖图（真实边）</h2>
 <p class="lead">
-  与 <code>supervisor.py:878-893</code> 的边定义逐条对应。注意分析层是
-  <b>5 条独立扇出边 + 5 条独立扇入边</b>，不是循环也不是条件边 ——
-  "跳不跳过"由节点内部 <code>return {}</code> 决定，图的拓扑始终固定。
+  与 <code>build_research_graph()</code> 里 <code>supervisor.py:4885-4916</code> 的
+  <b>33 条 <code>add_edge</code></b> 逐条对应（<b>21 个节点</b>）。三处形状值得注意：
 </p>
+<ul class="lead" style="margin-top:-4px">
+  <li><b>数据层之后是 3 路 fan-out</b>：<code>store</code> 同时接出
+    <code>verify_info</code>(A05) / <code>extract_events</code>(A06) /
+    <code>liquidity_ctx</code>(本地量化) —— A06 <b>不等</b> A05，
+    本地量化也<b>不等</b>信息层（2026-09-28 第九轮并行化，见源码注释）。</li>
+  <li><b>分析层是 10 条独立扇出边 + 10 条独立扇入边</b>，不是循环也不是条件边 ——
+    "跳不跳过"由节点内部 <code>return {}</code> 决定，图的拓扑始终固定。</li>
+  <li><b>零 LLM 节点也在图里</b>：<code>liquidity_ctx</code> 是纯本地计算，
+    但它与 <code>sentiment</code> 在<b>同一个超步</b>收尾，
+    于是最宽超步 = 10 个 <code>analyze_*</code> + <code>sentiment</code> = <b>11 路</b>。</li>
+  <li><b>路径长度只有两种数法，别混用</b>：12 条 root→leaf 路径<b>全部等长</b> ——
+    只数真实节点是 <b>9 个节点 / 8 跳</b>（PRD §43.2 用这个口径）；
+    把 <code>START</code>/<code>END</code> 两个哨兵也算进去则是
+    <b>11 个节点 / 10 条边</b>（本页与 <code>atlas-facts</code> 用这个口径）。
+    <b>两个数都对，混着比才会得出"数量不一致"。</b></li>
+</ul>
 
 <div class="fig">
   <p class="cap">图 3-1 · StateGraph 拓扑（实线=固定边，虚线=节点内空跳过）</p>
@@ -425,14 +506,14 @@ flowchart LR
 
   START(["START"]) --> sup
   sup["supervisor<br/>规划"] --> col
-  col["collect<br/>A01并发采集"] --> cl
+  col["collect<br/>A01 并发采集"] --> cl
   cl["clean<br/>A02"] --> va
   va["validate<br/>A03"] --> st
-  st["store<br/>A04"] --> vi
-  vi["verify_info<br/>A05"] --> ex
+  st["store<br/>A04"] --> vi & ex & lq
+  vi["verify_info<br/>A05"] --> se
   ex["extract_events<br/>A06"] --> se
-  se["sentiment<br/>A07"] --> lq
-  lq["liquidity_ctx<br/>本地量化"] --> a8 & a9 & a10 & a11 & a12 & a13 & a14 & a15 & a16
+  se["sentiment<br/>A07"] --> rec
+  lq["liquidity_ctx<br/>本地量化 · 零 LLM"] --> a8 & a9 & a10 & a11 & a12 & a13 & a14 & a15 & a16 & a20
   a8["analyze_A08"] --> rec
   a9["analyze_A09"] --> rec
   a10["analyze_A10"] --> rec
@@ -442,7 +523,8 @@ flowchart LR
   a14["analyze_A14"] --> rec
   a15["analyze_A15"] --> rec
   a16["analyze_A16"] --> rec
-  rec["recommend<br/>A17 ReAct"] --> aud
+  a20["analyze_A20<br/>兜底行业"] --> rec
+  rec["recommend<br/>A17 ReAct<br/>入度 11"] --> aud
   aud["audit<br/>A18 封存"] --> END(["END"])
 
   cl -.->|"raw_points空"| SK1["return {}"]
@@ -450,7 +532,7 @@ flowchart LR
   a8 -.->|"不在plan"| SK3["return {}"]
 
   class START,sup,col,cl,va,st,vi,ex,se,lq,rec,aud,END fixed
-  class a8,a9,a10,a11,a12,a13,a14,a15,a16,SK1,SK2,SK3 node
+  class a8,a9,a10,a11,a12,a13,a14,a15,a16,a20,SK1,SK2,SK3 node
   </div>
 </div>
 
@@ -471,7 +553,7 @@ flowchart TD
 
   Q["user_query + target"] --> L{"planner 存在?"}
   L -->|否| RULE
-  L -->|是| CALL["gateway.complete light 层<br/>qwen2.5:1.5b · json_mode"]
+  L -->|是| CALL["gateway.complete planning 层<br/>qwen-dashscope-flash · json_mode"]
   CALL --> OK{"解析出合法 JSON<br/>且 agents 非空?"}
   OK -->|是| FIX["强制追加 A17_recommend + A18_audit<br/>去重保序 · 截断 max_agents=12<br/>indicators 截断 20 个"]
   OK -->|"否（异常/空）"| RULE["规则 plan_run<br/>_PLANNING 五类模板"]
@@ -492,7 +574,7 @@ flowchart TD
   ADD & NOADD --> DET["append_liquidity_indicators<br/>确定性补齐（LLM 常漏）"]
   FIX --> DET
   DET --> D1["stock/industry/full<br/>必加 7 个大盘流动性 + 3 个双创指标"]
-  DET --> D2["命中 美联储/降息/FOMC<br/>追加 fed:rate_prob:next"]
+  DET --> D2["命中 美联储/降息/FOMC<br/>追加 5 条 fed:*（effr / target_upper / target_lower / policy_range / rate_prob:next）"]
   D1 & D2 --> FIN["最终 plan<br/>保序去重"]
 
   class CALL,OK,FIX llm
@@ -519,7 +601,7 @@ sequenceDiagram
   participant A01 as A01 采集
   participant PIPE as A02-A04 管线
   participant INFO as A05-A07 信息层
-  participant ANA as A08-A16 分析层
+  participant ANA as A08-A16 + A20 分析层
   participant A17 as A17 决策 ReAct
   participant A18 as A18 审计
 
@@ -544,14 +626,19 @@ sequenceDiagram
   PIPE-->>SUP: validated_points + storage_stats
 
   alt info_items 非空
-    SUP->>INFO: A05 去伪 → A06 提取 → A07 舆情
-    INFO-->>SUP: verified_items / events / 情绪
+    par A05 ∥ A06（信息层两路并行）
+      SUP->>INFO: A05 去伪
+    and
+      SUP->>INFO: A06 提取事件
+    end
+    INFO-->>SUP: A07 舆情（等 A05 与 A06 都完成）
   else 无信息文本
     SUP->>INFO: 节点 return {} 空跳过
   end
 
-  SUP->>SUP: liquidity_ctx 本地量化研判
-  par 5-9 路并行扇出
+  Note over SUP: liquidity_ctx（本地量化）由 A04 之后直接接出，<br/>与信息层并行，不等 A07；<br/>A07 与 liquidity_ctx 在同一个超步收尾
+
+  par 最多 10 路并行扇出（A08-A12 + 命中的 A13-A16 + 兜底 A20）
     SUP->>ANA: A08 宏观
   and
     SUP->>ANA: A09 中观
@@ -561,11 +648,13 @@ sequenceDiagram
     SUP->>ANA: A11 财务风险
   and
     SUP->>ANA: A12 合规爆雷
+  and
+    SUP->>ANA: A13-A16 命中行业 / A20 兜底行业
   end
   ANA-->>SUP: agent_outputs 经 add reducer 聚合
 
   SUP->>A17: 上游结论摘要 + 用户问题 + 量化参考
-  loop ReAct max_steps=3
+  loop ReAct max_steps=2
     A17->>A17: LLM 推理
     alt 输出 action
       A17->>ANA: ask_agent 追问「A10, 估值分位为何与行业背离」
@@ -575,7 +664,7 @@ sequenceDiagram
       A17-->>SUP: conclusion/stance/conflicts_resolved
     end
   end
-  Note over A17: 每 Agent 最多追问 1 次<br/>同问题幂等缓存<br/>第3轮强制禁止工具调用
+  Note over A17: 每 Agent 最多追问 1 次<br/>同问题幂等缓存<br/>第2轮（末轮）强制禁止工具调用
 
   SUP->>A18: agent_outputs + trace_id
   A18->>A18: ChainVerifier 哈希链校验
@@ -603,6 +692,13 @@ sequenceDiagram
 <tr><td><b>A08–A12 分析层</b><br/><b>A13–A16 行业层</b></td>
     <td><code>AnalysisPayload</code><br/>{focus, user_query, data_points, events}</td>
     <td><code>state.validated_points</code>（只读快照）</td></tr>
+<tr><td><b><code>A20_generic_industry</code></b></td>
+    <td colspan="2">★ <b>当前不在可追问集合里</b>：闸门是
+    <code>askable_prefixes = tuple(f"A{n:02d}" for n in range(8, 17))</code>
+    （<code>supervisor.py:4509</code>，即 A08–A16），
+    <code>message_bus.py</code> 的 <code>_ANALYSIS_PREFIXES</code> 同样止于 A16。
+    它<b>会参与分析扇出、结论会进报告</b>，但 A17 用 <code>ask_agent</code> 问它只会拿到
+    "不支持直接问答" —— 这是<b>已登记的缺口</b>，不是"设计成不用问"</td></tr>
 <tr><td><b>A05 verifier</b></td><td><code>{info_items}</code></td><td><code>state.info_items</code></td></tr>
 <tr><td><b>A06 extractor</b></td><td><code>{info_items: 仅 verified]}</code></td><td><code>state.verified_items</code></td></tr>
 <tr><td><b>A07 sentiment</b></td><td><code>{events}</code></td><td><code>state.extracted_events</code></td></tr>
@@ -621,7 +717,7 @@ flowchart TD
   classDef act fill:#8957e5,stroke:#a371f7,color:#fff
 
   S["工具集注册<br/>ask_agent / query_data<br/>load_skill / load_reference"] --> BUILD["注入工具说明进 system<br/>+ 技能 L0 索引"]
-  BUILD --> LOOP{"step < max_steps=3?"}
+  BUILD --> LOOP{"step < max_steps=2?"}
   LOOP -->|否| FALL["兜底返回最后一次输出"]
   LOOP -->|是| CANCEL{"取消令牌 check"}
   CANCEL -->|已取消| STOP["抛 TaskCancelledError"]
@@ -660,7 +756,7 @@ flowchart TD
   代码注释写得很直白：<code>MAX_ASKS_PER_AGENT = 1  # 收紧：每Agent最多追问1次</code>。
   system prompt 里虽然还留着"最多2次"的历史措辞，但<b>实际闸门是 1 次</b> ——
   这是被"LLM 绕着重问同一个 Agent"实测逼出来的收紧。
-  另外观察结果从 1500 字符截断到 <b>800 字符</b>，保证 3 步累积不超过 2400 字符，
+  另外观察结果从 1500 字符截断到 <b>800 字符</b>，保证 2 步累积不超过 1600 字符，
   防止多步观测把 prompt 撑爆输入硬上限。
 </div>
 
@@ -735,7 +831,7 @@ flowchart TB
     <td>PE/PB 与行业均值对比、自身历史分位<br/>（样本≥8 才算分位，否则返回"数据不足"）</td>
     <td>估值定性解读 + 护城河五维打分</td>
     <td class="file">analysis/micro/agent.py<br/>_calc_valuation / _percentile_rank</td></tr>
-<tr><td><b>A13–A16 行业</b></td>
+<tr><td><b>A13–A16 + A20 行业</b></td>
     <td>关注指标最近两期环比方向、多指标投票汇总、PE 警戒线旗标</td>
     <td>按行业框架定性研判</td>
     <td class="file">industry/base.py<br/>_trend_signal / _valuation_flag</td></tr>
@@ -782,6 +878,8 @@ flowchart TB
   "risks":                 [ ... ],
   "monitoring_points":     [ ... ],
   "conflicts_resolved":    [ ... ],                     # ★ 冲突仲裁说明（必填字段）
+  "data_gaps":             [ ... ],                     # ★★ 数据缺口声明（必填，无则 []）
+                                                        #    上游没给而结论需要的口径必须逐条列出
   "position_advice":       "仓位区间 + 节奏",            # 买卖/仓位问题必填
   "expected_return_3_6m":  {                            # 收益预期问题必填
     "bull": "...", "base": "...", "bear": "...",
@@ -791,10 +889,13 @@ flowchart TB
 }</code></pre>
 
 <p class="lead">
-  三个字段值得单独指出：
+  四个字段值得单独指出：
 </p>
 <ul>
   <li><code>conflicts_resolved</code> —— 把仲裁过程<b>变成可审计的产出物</b>，而非隐式推理</li>
+  <li><code>data_gaps</code> —— <b>缺口声明已从"措辞要求"提升为必填 JSON 字段</b>
+      （<code>recommend/agent.py:92</code>）："上游未提供而结论需要的口径"必须逐条列出、
+      不许省略；写散文式的"数据不足"不再是合格产出</li>
   <li><code>invalid_signals</code> —— 明示"什么信号出现说明我错了"，是可信度自评而非单向断言</li>
   <li><code>stance</code> 与 <code>confidence</code> 的<b>绑定约束</b> —— "立场与证据强度一致，高风险禁看多"，
       从 prompt 层面阻止"数据很差但结论很乐观"这类最常见的 LLM 失效模式</li>
@@ -844,7 +945,7 @@ flowchart TB
 
   subgraph P["持久记忆 · 跨任务/跨进程 · 按用途分层 TTL"]
     direction LR
-    P1["LLM 语义缓存<br/>L1内存 + L2文件<br/>精确SHA256 + 3-gram余弦≥0.85"]
+    P1["LLM 语义缓存<br/>L1内存 + L2文件 + L3向量精排<br/>精确SHA256 → 3-gram余弦0.85 → 向量召回0.80 → 重排0.95"]
     P2["数据仓库 fact_*<br/>统一数据层唯一写入口"]
     P3["审计哈希链<br/>SHA256 前后链接"]
     P4["动态连接器<br/>自修复沉淀为永久能力"]
@@ -878,11 +979,11 @@ flowchart TB
 <tbody>
 <tr><td><code>raw_points</code></td><td><span class="tag">add 累加</span></td><td>A01 并发协程（<code>asyncio.Lock</code> 保护）</td><td>A02</td></tr>
 <tr><td><code>cleaned_points</code></td><td><span class="tag">add 累加</span></td><td>A02</td><td>A03</td></tr>
-<tr><td><code>validated_points</code></td><td><span class="tag">add 累加</span></td><td>A03</td><td><b>A08–A16 全部分析Agent</b> + A17 <code>query_data</code></td></tr>
+<tr><td><code>validated_points</code></td><td><span class="tag">add 累加</span></td><td>A03</td><td><b>A08–A16 + A20 全部分析Agent</b> + A17 <code>query_data</code></td></tr>
 <tr><td><code>info_items</code></td><td><span class="tag warn">覆盖</span></td><td>任务创建时注入 / collect 节点抓新闻</td><td>A05</td></tr>
 <tr><td><code>verified_items</code></td><td><span class="tag warn">覆盖</span></td><td>A05</td><td>A06、A17 追问</td></tr>
 <tr><td><code>extracted_events</code></td><td><span class="tag warn">覆盖</span></td><td>A06</td><td>A07、全部分析Agent</td></tr>
-<tr><td><code>analysis_hint</code></td><td><span class="tag warn">覆盖</span></td><td>liquidity_ctx 节点 + 各 Agent <code>_prepare</code></td><td>A08–A16、A17</td></tr>
+<tr><td><code>analysis_hint</code></td><td><span class="tag warn">覆盖</span></td><td>liquidity_ctx 节点 + 各 Agent <code>_prepare</code></td><td>A08–A16 + A20、A17</td></tr>
 <tr><td><code>agent_outputs</code></td><td><span class="tag">add 累加</span></td><td><b>全部 Agent</b></td><td>A17 综合、A18 审计、报告渲染</td></tr>
 <tr><td><code>agent_messages</code></td><td><span class="tag">add 累加</span></td><td>A17 ReAct 追问</td><td>前端 <code>AgentChatView</code>、报告章节</td></tr>
 <tr><td><code>errors</code></td><td><span class="tag">add 累加</span></td><td>任意节点异常捕获</td><td>A18、前端错误展示</td></tr>
@@ -936,7 +1037,7 @@ flowchart LR
 
   W1["A08 宏观<br/>context_max_periods = 12<br/>月度指标12期够判趋势"]
   W2["A10 微观<br/>context_max_periods = 60<br/>日线序列只取最近60期<br/>但分位计算用全量"]
-  W3["A13-A16 行业<br/>_CONTEXT_PERIODS = 6<br/>仅关注指标 + PE点<br/>+ 申万截面 + 渗透率"]
+  W3["A13-A16 + A20 行业<br/>_CONTEXT_PERIODS = 6<br/>仅关注指标 + PE点<br/>+ 申万截面 + 渗透率"]
   W4["A17 决策<br/>不直接读数据点<br/>读其他Agent的结论摘要"]
 
   W1 & W2 & W3 --> P1["统一附加：<br/>新鲜度图标 + c置信度 + 来源 + w权重"]
@@ -952,7 +1053,9 @@ flowchart LR
 
 <h3>层 3：知识记忆 —— PTD 三级渐进式披露</h3>
 <p class="lead">
-  18 个 Agent 各自挂载专业技能（<code>skills/{agent_dir}/{skill_name}/SKILL.md</code>），
+  <b>14 个 Agent 各自挂载专业技能</b>（<code>skills/{agent_dir}/{skill_name}/SKILL.md</code>；
+  口径见 <code>DEFAULT_AGENT_DIRS</code>，是 <b>14 个键</b>而不是"每个 Agent 都有" ——
+  A02/A03/A04 与 A18 没有技能目录，A19/A20 也不在这张表里），
   但<b>不能一次性全塞进 prompt</b>。PTD 把技能访问拆成三级，
   每一级都有 token 预算和质量门，且每级都需要显式请求：
 </p>
@@ -1001,6 +1104,10 @@ flowchart TD
 <tr><td><b><code>A17_recommend</code></b></td>
     <td>summary-agent, opportunity-assessor, portfolio-manager</td>
     <td><b>ReAct 工具自主加载</b><br/>先看 L0 索引，LLM 自己决定 <code>load_skill</code></td></tr>
+<tr><td><code>A20_generic_industry</code></td>
+    <td><b>（无映射）</b></td>
+    <td>兜底行业 Agent <b>不在</b> <code>DEFAULT_AGENT_DIRS</code> 里 ——<br/>
+        行业名与关注指标由它自己按请求解析（银行/非银/公用事业这类没有专属 Agent 的行业）</td></tr>
 </tbody>
 </table>
 
@@ -1019,11 +1126,15 @@ flowchart TD
     <td><code>md5(query|type|target)</code> 归一化哈希</td>
     <td>600s（10 分钟）</td>
     <td>只缓存有 <code>final_report</code> 的成功任务；<code>force_refresh</code> 可绕过</td></tr>
-<tr><td rowspan="2"><b>LLM 响应缓存</b><br/><code>llm/cache.py</code></td>
-    <td>精确：规范化 prompt 的 SHA256</td>
+<tr><td rowspan="2"><b>LLM 响应缓存</b><br/><code>llm/cache.py</code><br/>（<b>三级</b>：精确 → 语义 → 向量精排）</td>
+    <td>L1 精确：规范化 prompt 的 SHA256<br/>L3 向量召回 ≥ 0.80 → 重排判定 ≥ 0.95</td>
     <td rowspan="2">默认 24h<br/>可<b>按调用覆盖</b></td>
-    <td><b>scope 分区</b>：<code>tier|json_mode|effort</code><br/>防止 light 层小模型的回答被 decision 层复用</td></tr>
-<tr><td>语义：字符 3-gram 余弦 ≥ 0.85</td>
+    <td><b>scope 分区</b>：<code>tier|json={0/1}|eff={effort}|sch={schema指纹}</code>
+        （带 <code>scope_extra</code> 时再加 <code>|d=…</code>）<br/>
+        防止 light 层小模型的回答被 decision 层复用；<b>换数据必须走精确匹配的 scope</b>，
+        不能交给模糊层分辨（<code>gateway.py:834,853</code>）</td></tr>
+<tr><td>L2 语义：字符 3-gram 余弦 ≥ 0.85<br/>
+        <b>★ 这条阈值坐在相似度分布上方 ⇒ 语义层几乎不干活</b>（<code>cache.py:26</code> 自述）</td>
     <td><b>仅限同一 <code>agent_id</code></b><br/>防止 A05/A06 输入重叠导致结论串台</td></tr>
 <tr><td><b>数据仓库</b><br/><code>fact_*</code> 表</td>
     <td>按 indicator 查询最近 N 条</td>
@@ -1032,7 +1143,7 @@ flowchart TD
 <tr><td><b>审计哈希链</b><br/><code>audit_chain.jsonl</code></td>
     <td>全链遍历校验</td>
     <td>永久（合规≥3年）</td>
-    <td><code>record_hash = SHA256(prev_hash + canonical(record))</code><br/>任何篡改/删除/插入都会导致断链并被定位到 seq</td></tr>
+    <td><code>record_hash = SHA256(canonical({seq, prev_hash, entry, ts}))</code><br/>任何篡改/删除/插入都会导致断链并被定位到 seq</td></tr>
 <tr><td><b>动态连接器</b><br/><code>dynamic_connectors/</code></td>
     <td>进程启动热加载 + 恢复定时作业</td>
     <td>永久（自修复沉淀）</td>
@@ -1073,7 +1184,7 @@ flowchart TB
   G3["③ 并发/输入/输出三重硬上限<br/>指标并发隔离 · 输入6000字符截断 · 输出32768 token 硬上限"] --> G4
   G4["④ provider 三态熔断器<br/>CLOSED→OPEN→HALF_OPEN<br/>3次/60s 失败即熔断，跳过API直接降级"] --> G5
   G5["⑤ 模型降级链<br/>不做重试，只做降级<br/>light→reasoning→decision 各链独立"] --> G6
-  G6["⑥ 循环步数上界<br/>ReAct max_steps=3 · 每Agent追问1次<br/>JSON修复1次 · 代码生成3轮 · 自修复2版"] --> G7
+  G6["⑥ 循环步数上界<br/>ReAct max_steps=2 · 每Agent追问1次<br/>JSON修复1次 · 代码生成3轮 · 自修复2版"] --> G7
   G7["⑦ 节点级异常隔离<br/>单节点失败吞入 state.errors<br/>不中断整图 · 存储降级 · 兜底返回"] --> OUT
 
   OUT["始终有产出：<br/>要么是完整报告，要么是带 errors 的部分报告<br/>绝不无限等待"]
@@ -1187,62 +1298,64 @@ flowchart TD
 <thead><tr><th>循环位置</th><th>上界</th><th>防的是什么问题</th><th>到界后的退出路径</th><th>代码锚点</th></tr></thead>
 <tbody>
 <tr><td><b>A17 ReAct 工具循环</b></td>
-    <td><code>max_steps=3</code></td>
+    <td><code>max_steps=2</code><br/>（<code>MOSS_REACT_MAX_STEPS</code> 可覆盖；<br/>限时模式剩余不足时降到 1）</td>
     <td>LLM 无限刷工具不收敛</td>
-    <td>第 3 轮<b>注入指令强制直出 <code>final_answer</code>、禁止再调工具</b>；
+    <td>末轮（第 2 轮）<b>注入指令强制直出 <code>final_answer</code>、禁止再调工具</b>；
         仍无则返回最后一次输出兜底</td>
-    <td class="file">analysis/react.py:88<br/>supervisor.py:756</td></tr>
+    <td class="file">analysis/react.py:125<br/>supervisor.py:4588-4597<br/>supervisor.py:45（限时降级）</td></tr>
 <tr><td><b>单 Agent 追问次数</b></td>
     <td><code>MAX_ASKS_PER_AGENT=1</code></td>
     <td>LLM 绕着重问同一个 Agent</td>
     <td>返回"已追问满额，请直接给 final_answer"，<b>不消耗 API 调用</b></td>
-    <td class="file">supervisor.py:677</td></tr>
+    <td class="file">supervisor.py:206<br/>supervisor.py:4463</td></tr>
 <tr><td><b>同问题重复追问</b></td>
     <td>幂等缓存（无限次去重）</td>
     <td>换措辞问同一件事</td>
     <td><code>normalize_question</code> 去标点/空白/大小写后判重，
         命中直接返回此前回答</td>
-    <td class="file">message_bus.py:23<br/>supervisor.py:686</td></tr>
+    <td class="file">message_bus.py:23<br/>supervisor.py:4451-4459</td></tr>
 <tr><td><b>JSON 解析失败修复</b></td>
     <td>1 次</td>
     <td>小模型输出非法 JSON</td>
     <td>带错误反馈重试一次（<code>use_cache=False</code> +
         <code>reasoning_effort="low"</code>），再失败则抛 <code>AgentExecutionError</code>
         被节点捕获</td>
-    <td class="file">analysis/base.py:276<br/>recommend/agent.py:146</td></tr>
+    <td class="file">analysis/base.py:808<br/>recommend/agent.py:364</td></tr>
 <tr><td><b>代码生成与验证</b></td>
     <td><code>for attempt in range(3)</code></td>
     <td>生成的连接器反复验证不过</td>
     <td><code>for...else</code> 分支抛 <code>AgentExecutionError</code>，
         附 3 轮累计的 <code>last_issues</code></td>
-    <td class="file">engineering/code_engineer/agent.py:227</td></tr>
+    <td class="file">engineering/code_engineer/agent.py:231</td></tr>
 <tr><td><b>数据缺口自修复</b></td>
     <td><code>_max_attempts=2</code></td>
     <td>LLM 反复写坏代码</td>
     <td>返回 <code>ResolutionResult(success=False)</code>，
         <b>缺口照样上报给 A17，不阻断主链路</b></td>
-    <td class="file">data_gap_resolver.py:160</td></tr>
+    <td class="file">data_gap_resolver.py:159</td></tr>
 <tr><td><b>沙箱执行</b></td>
     <td><code>SANDBOX_TIMEOUT_SEC=15</code></td>
     <td>生成代码里死循环 / 卡住</td>
     <td><code>asyncio.wait_for</code> 超时后 <code>proc.kill()</code>，返回
         <code>{"ok": False, "message": "沙箱执行超时(15s)"}</code></td>
-    <td class="file">code_validator.py:59,159</td></tr>
+    <td class="file">connectors/code_validator.py:59,160</td></tr>
 <tr><td><b>单次 HTTP 调用</b></td>
-    <td><code>llm_timeout_seconds=120</code></td>
+    <td><code>llm_timeout_seconds=120</code><br/><b>（只作用于云端跳）</b></td>
     <td>provider 无响应挂死</td>
-    <td>httpx 超时 → 包成 <code>LLMGatewayError</code>（计入熔断）→ 降级下一跳</td>
-    <td class="file">core/config.py:147</td></tr>
+    <td>httpx 超时 → 包成 <code>LLMGatewayError</code>（计入熔断）→ 降级下一跳。
+        <b>本地跳不用这个值</b>：它从 <code>LOCAL_HOP_CEILING_SEC</code> 派生
+        （见 <code>llm/providers.py:222-233</code>）</td>
+    <td class="file">core/config.py:248</td></tr>
 <tr><td><b>任务级 token 消耗</b></td>
     <td><code>llm_token_budget_per_task=200000</code></td>
     <td>循环异常导致费用失控</td>
     <td>超预算抛 <code>LLMGatewayError</code>，提示缩小分析范围</td>
-    <td class="file">gateway.py:211</td></tr>
+    <td class="file">gateway.py:884</td></tr>
 <tr><td><b>输出长度</b></td>
     <td><code>llm_max_tokens_hard_cap=32768</code></td>
     <td>思维链吃光预算后正文零输出</td>
     <td>按层级预算夹到硬上限；空响应<b>不写缓存</b>避免故障永久化</td>
-    <td class="file">config.py:182<br/>gateway.py:256</td></tr>
+    <td class="file">config.py:486<br/>gateway.py:946</td></tr>
 </tbody>
 </table>
 
@@ -1291,20 +1404,28 @@ flowchart LR
 <h2 id="s8"><span class="n">8</span>关键常量与代码锚点</h2>
 <p class="lead">
   所有上文中引用的数字都可以在这张表里对照到具体位置，便于代码走查与面试追问。
+  <b>行号是 2026-10-15 现查的</b>，并且由
+  <code>tests/unit/test_agent_atlas_drift.py</code> 逐条复核
+  （它会断言"这一行确实还是这个符号"）—— 代码一动，行号漂了就会变红，
+  而不是像本页旧版那样<b>静默指到无关的一行</b>。
 </p>
 
 <h3>协作与编排</h3>
 <table>
 <thead><tr><th>常量 / 参数</th><th>值</th><th>作用</th><th>文件</th></tr></thead>
 <tbody>
-<tr><td><code>_PLANNING</code></td><td>5 类模板</td><td>macro/industry/stock/news/full 的指标与 Agent 默认组合</td><td class="file">supervisor.py:147</td></tr>
-<tr><td><code>INDUSTRY_KEYWORDS</code></td><td>4 组共 46 个词</td><td>target 关键词 → A13–A16 路由</td><td class="file">supervisor.py:33</td></tr>
-<tr><td><code>TOPIC_KEYWORDS</code></td><td>5 组</td><td>主题新闻关键词提取（无命中不拉无关新闻）</td><td class="file">supervisor.py:50</td></tr>
-<tr><td><code>_MARKET_LIQUIDITY_INDICATORS</code></td><td>7 个</td><td>行业/个股任务确定性补齐的大盘流动性指标</td><td class="file">supervisor.py:91</td></tr>
-<tr><td><code>_BOARD_LIQUIDITY_INDICATORS</code></td><td>3 个</td><td>双创板块指标（中观三市分项轮动）</td><td class="file">supervisor.py:101</td></tr>
-<tr><td><code>max_agents</code>（planner）</td><td>12</td><td>LLM 规划的 Agent 数量上限</td><td class="file">planner.py:126</td></tr>
-<tr><td>indicators 截断</td><td>20</td><td>LLM 规划的指标数量上限</td><td class="file">planner.py:186</td></tr>
-<tr><td><code>ALL_INSIGHT_AGENTS</code></td><td>9 个</td><td>产出可被 A17 综合的全部分析类 Agent</td><td class="file">supervisor.py:46</td></tr>
+<tr><td><code>_PLANNING</code></td><td>5 类模板</td><td>macro/industry/stock/news/full 的指标与 Agent 默认组合</td><td class="file">supervisor.py:1326</td></tr>
+<tr><td><code>INDUSTRY_KEYWORDS</code></td><td>4 组共 <b>44</b> 个词</td><td>target 关键词 → A13–A16 路由（<b>A20 不在这里</b>：它没有关键词，靠 <code>needs_generic_industry()</code> 兜底）</td><td class="file">supervisor.py:217</td></tr>
+<tr><td><code>TOPIC_KEYWORDS</code></td><td>5 组（1 宏观 + 4 行业）</td><td>主题新闻关键词提取（无命中不拉无关新闻）</td><td class="file">supervisor.py:902</td></tr>
+<tr><td><code>_MARKET_LIQUIDITY_INDICATORS</code></td><td>7 个</td><td>行业/个股任务确定性补齐的大盘流动性指标</td><td class="file">supervisor.py:1257</td></tr>
+<tr><td><code>_BOARD_LIQUIDITY_INDICATORS</code></td><td>3 个</td><td>双创板块指标（中观三市分项轮动）</td><td class="file">supervisor.py:1267</td></tr>
+<tr><td><code>max_agents</code>（planner）</td><td>12</td><td>LLM 规划的 Agent 数量上限</td><td class="file">planner.py:402</td></tr>
+<tr><td>indicators 截断</td><td>20</td><td>LLM 规划的指标数量上限</td><td class="file">planner.py:541</td></tr>
+<tr><td><code>ANALYSIS_AGENTS</code> / <code>INDUSTRY_AGENTS</code></td><td><b>5 / 5</b></td><td>分析层（A08-A12）与行业层（A13-A16 + A20）</td><td class="file">supervisor.py:199<br/>supervisor.py:210</td></tr>
+<tr><td><code>INFO_AGENTS</code> / <code>DATA_PIPELINE_AGENTS</code></td><td>3 / 3</td><td>A05-A07 与 A02-A04（决定报告分节与进度归类）</td><td class="file">supervisor.py:227<br/>supervisor.py:228</td></tr>
+<tr><td><code>ALL_INSIGHT_AGENTS</code></td><td><b>10 个</b></td><td>产出可被 A17 综合的全部分析类 Agent（= 上两行相加 ⇒ <code>analyze_*</code> 节点 10 个）</td><td class="file">supervisor.py:230</td></tr>
+<tr><td><code>MAX_ASKS_PER_AGENT</code></td><td>1</td><td>A17 对同一个 Agent 的追问上限（工具描述与执行逻辑共用同一常量）</td><td class="file">supervisor.py:206</td></tr>
+<tr><td>图规模</td><td><b>21 节点 / 33 边</b></td><td><code>add_node</code> / <code>add_edge</code> 的实际条数；最宽超步 11</td><td class="file">supervisor.py:4849-4916</td></tr>
 </tbody>
 </table>
 
@@ -1312,17 +1433,18 @@ flowchart LR
 <table>
 <thead><tr><th>常量 / 参数</th><th>值</th><th>作用</th><th>文件</th></tr></thead>
 <tbody>
-<tr><td><code>context_max_periods</code>（A08）</td><td>12 期</td><td>月度宏观指标注入 prompt 的最近期数</td><td class="file">analysis/macro/agent.py:12</td></tr>
-<tr><td><code>context_max_periods</code>（A10）</td><td>60 期</td><td>个股日线/估值序列；<b>分位计算仍用全量</b></td><td class="file">analysis/micro/agent.py:52</td></tr>
-<tr><td><code>_CONTEXT_PERIODS</code>（行业）</td><td>6 期</td><td>行业关注指标注入期数</td><td class="file">industry/base.py:17</td></tr>
-<tr><td><code>_MIN_PERCENTILE_SAMPLE</code></td><td>8</td><td>少于 8 个样本不算历史分位（返回"数据不足"）</td><td class="file">analysis/micro/agent.py:33</td></tr>
-<tr><td>事件注入上限</td><td>15 条</td><td>分析层 prompt 的 <code>event_lines</code></td><td class="file">analysis/base.py:231</td></tr>
-<tr><td>已核验原文上限</td><td>5 条</td><td><code>verified_texts</code> 兜底事实素材</td><td class="file">analysis/base.py:233</td></tr>
+<tr><td><code>context_max_periods</code>（A08）</td><td>12 期</td><td>月度宏观指标注入 prompt 的最近期数</td><td class="file">analysis/macro/agent.py:131</td></tr>
+<tr><td><code>context_max_periods</code>（A10）</td><td>60 期</td><td>个股日线/估值序列；<b>分位计算仍用全量</b></td><td class="file">analysis/micro/agent.py:104</td></tr>
+<tr><td><code>_CONTEXT_PERIODS</code>（行业）</td><td>6 期</td><td>行业关注指标注入期数</td><td class="file">industry/base.py:23</td></tr>
+<tr><td><code>_MIN_PERCENTILE_SAMPLE</code></td><td>8</td><td>少于 8 个样本不算历史分位（返回"数据不足"）</td><td class="file">analysis/micro/agent.py:85</td></tr>
+<tr><td>事件注入上限</td><td>15 条</td><td>分析层 prompt 的 <code>event_lines</code></td><td class="file">analysis/base.py:747</td></tr>
+<tr><td>已核验原文上限</td><td>5 条</td><td><code>verified_texts</code> 兜底事实素材</td><td class="file">analysis/base.py:749</td></tr>
 <tr><td>L0 索引预算</td><td>&lt;100 token</td><td>技能索引注入成本的真实口径</td><td class="file">skills/library.py:32</td></tr>
 <tr><td>技能正文预算</td><td>&lt;5000 token</td><td>SKILL.md 全文质量门</td><td class="file">skills/library.py:34</td></tr>
-<tr><td><code>max_skills</code></td><td>2</td><td>确定性匹配一次最多命中技能数，防 prompt 超载</td><td class="file">skills/library.py:218</td></tr>
-<tr><td><code>_OBS_TRUNCATE</code></td><td>800 字符</td><td>ReAct 单步观察截断（原 1500，为控 prompt 总量下调）</td><td class="file">analysis/react.py:25</td></tr>
-<tr><td><code>_STORAGE_FALLBACK_LIMITS</code></td><td>1/8/10/30/60</td><td>存储降级读取行数（按指标给趋势所需长度）</td><td class="file">supervisor.py:328</td></tr>
+<tr><td><code>max_skills</code></td><td>2</td><td>确定性匹配一次最多命中技能数，防 prompt 超载</td><td class="file">skills/library.py:232</td></tr>
+<tr><td><code>DEFAULT_AGENT_DIRS</code></td><td>14 个键</td><td>"哪些 Agent 有技能"的唯一口径（A20 不在其中）</td><td class="file">skills/library.py:38</td></tr>
+<tr><td><code>_OBS_TRUNCATE</code></td><td>800 字符</td><td>ReAct 单步观察截断（原 1500，为控 prompt 总量下调）</td><td class="file">analysis/react.py:43</td></tr>
+<tr><td><s><code>_STORAGE_FALLBACK_LIMITS</code></s></td><td><b>dict 已删除</b><br/>现为单一默认 <b>60</b></td><td>旧的分指标降级行数表 <b>2026-10-07 随死代码 <code>_collect_one</code> / <code>_storage_fallback</code> 一起删除</b>；现行口径是一个默认值 + <code>DataFallbackOutcome</code> 结构化结论</td><td class="file">supervisor.py:4214<br/>supervisor.py:2735</td></tr>
 </tbody>
 </table>
 
@@ -1330,17 +1452,21 @@ flowchart LR
 <table>
 <thead><tr><th>常量 / 参数</th><th>值</th><th>作用</th><th>文件</th></tr></thead>
 <tbody>
-<tr><td><code>_RESULT_CACHE_TTL</code></td><td>600s</td><td>投研结果缓存（相同 query+type+target 不重跑图）</td><td class="file">routes/research.py:92</td></tr>
-<tr><td>LLM 缓存语义阈值</td><td>0.85</td><td>字符 3-gram 余弦相似度命中下限</td><td class="file">llm/cache.py:71</td></tr>
-<tr><td>LLM 缓存默认 TTL</td><td>24h</td><td>可被 <code>cache_ttl_hours</code> 按调用覆盖</td><td class="file">llm/gateway.py:94</td></tr>
-<tr><td><code>llm_timeout_seconds</code></td><td>120.0</td><td>httpx 单次调用超时</td><td class="file">config.py:147</td></tr>
-<tr><td><code>llm_token_budget_per_task</code></td><td>200000</td><td>单任务累计 token 上限（仅 DeepSeek 计费口径）</td><td class="file">config.py:169</td></tr>
-<tr><td><code>llm_max_tokens_hard_cap</code></td><td>32768</td><td>输出 token 全局成本护栏</td><td class="file">config.py:182</td></tr>
-<tr><td><code>llm_input_char_hard_cap</code></td><td>6000</td><td>输入 prompt 尾部截断阈值</td><td class="file">config.py:184</td></tr>
-<tr><td><code>SANDBOX_TIMEOUT_SEC</code></td><td>15</td><td>生成代码沙箱执行上限，超时 kill 子进程</td><td class="file">code_validator.py:59</td></tr>
-<tr><td><code>_CONFIG_STATUS</code></td><td>{401,402,403}</td><td><b>不计入熔断</b>的配置类错误码</td><td class="file">providers.py:26</td></tr>
-<tr><td>deepseek 熔断参数</td><td>3 / 60s / 30s / 2</td><td>阈值 / 窗口 / 冷却 / 半开需成功数</td><td class="file">circuit_breaker.py:136</td></tr>
-<tr><td>ollama 熔断参数</td><td>5 / 60s / 15s / 1</td><td>同上（本地模型容忍度更高）</td><td class="file">circuit_breaker.py:142</td></tr>
+<tr><td><code>_RESULT_CACHE_TTL</code></td><td>600s</td><td>投研结果缓存（相同 query+type+target 不重跑图）</td><td class="file">routes/research.py:112</td></tr>
+<tr><td>LLM 缓存三级阈值</td><td>0.85 / 0.80 / 0.95</td><td>语义判定（3-gram 余弦）/ 向量召回 / 重排判定 —— <b>三把尺子不是一把</b></td><td class="file">llm/cache.py:482</td></tr>
+<tr><td>LLM 缓存默认 TTL</td><td>24h</td><td>可被 <code>cache_ttl_hours</code> 按调用覆盖</td><td class="file">config.py:300</td></tr>
+<tr><td><code>llm_timeout_seconds</code></td><td>120.0</td><td>httpx 单次调用超时</td><td class="file">config.py:248</td></tr>
+<tr><td><code>llm_token_budget_per_task</code></td><td>200000</td><td>单任务累计 token 上限（仅 DeepSeek 计费口径）</td><td class="file">config.py:473</td></tr>
+<tr><td><code>llm_max_tokens_hard_cap</code></td><td>32768</td><td>输出 token 全局成本护栏</td><td class="file">config.py:486</td></tr>
+<tr><td><code>llm_input_char_hard_cap</code></td><td>6000</td><td>输入 prompt 尾部截断阈值</td><td class="file">config.py:488</td></tr>
+<tr><td><code>_TIER_OUTPUT_BUDGET</code></td><td>light 1024 / medium 2048<br/>reasoning · decision 8192</td><td>每层"允许输出多少 token"；<b>含思维链</b> ⇒ 推理模型会把正文挤成空串（PRD §五十三）</td><td class="file">llm/gateway.py:126</td></tr>
+<tr><td><code>_ATTEMPT_BUDGET</code></td><td>planning·light·medium 20s<br/>reasoning 25s / decision 30s</td><td>单跳墙钟预算，超了记 <code>late_result</code> 并降级</td><td class="file">llm/gateway.py:159</td></tr>
+<tr><td><code>_OUTPUT_TOKENS_PER_SEC</code></td><td>210.0（+ TTFT 2.0s）</td><td>把"允许输出"折算成墙钟的速率常数 —— <b>2026-10-15 实测链首免费云只有 ~97 tok/s</b>，所以它偏乐观</td><td class="file">llm/gateway.py:187</td></tr>
+<tr><td><code>_TIER_REASONING_EFFORT</code></td><td>light/medium <code>low</code><br/>reasoning/decision <code>high</code></td><td>思维链强度；可在调用点用 <code>reasoning_effort="none"</code> 逐次覆盖（A06 就是这么修的）</td><td class="file">llm/gateway.py:116</td></tr>
+<tr><td><code>SANDBOX_TIMEOUT_SEC</code></td><td>15</td><td>生成代码沙箱执行上限，超时 kill 子进程</td><td class="file">connectors/code_validator.py:59</td></tr>
+<tr><td><code>_CONFIG_STATUS</code></td><td>{401,402,403}</td><td><b>不计入熔断</b>的配置类错误码</td><td class="file">llm/providers.py:121</td></tr>
+<tr><td>deepseek 熔断参数</td><td>3 / 60s / 30s / 2</td><td>阈值 / 窗口 / 冷却 / 半开需成功数</td><td class="file">llm/circuit_breaker.py:328</td></tr>
+<tr><td>ollama 熔断参数</td><td>5 / 60s / 15s / 1</td><td>同上（本地模型容忍度更高）</td><td class="file">llm/circuit_breaker.py:334</td></tr>
 </tbody>
 </table>
 
@@ -1348,11 +1474,11 @@ flowchart LR
 <table>
 <thead><tr><th>机制</th><th>实现</th><th>作用</th><th>文件</th></tr></thead>
 <tbody>
-<tr><td><code>record_hash</code></td><td>SHA256(prev_hash + canonical(record) + ts)</td><td>任何篡改/删除/插入都会断链并被定位到 seq</td><td class="file">repositories/audit_chain.py:23</td></tr>
-<tr><td><code>_check_completeness</code></td><td>conclusion / confidence / data_refs 三项必查</td><td>信息层 A05-A07 豁免 data_refs（合法产出可为空）</td><td class="file">audit/verifier/agent.py:51</td></tr>
+<tr><td><code>record_hash</code></td><td>SHA256(canonical({seq, prev_hash, entry, ts}))</td><td>任何篡改/删除/插入都会断链并被定位到 seq</td><td class="file">repositories/audit_chain.py:101</td></tr>
+<tr><td><code>_check_completeness</code></td><td>conclusion / confidence / data_refs 三项必查</td><td>信息层 A05-A07 豁免 data_refs（合法产出可为空）</td><td class="file">audit/verifier/agent.py:187</td></tr>
 <tr><td>LLM 调用审计</td><td>每次调用写 <code>llm_audit.jsonl</code></td><td>含 prompt_hash / cache_kind / tokens / 错误</td><td class="file">llm/audit.py</td></tr>
 <tr><td>数据溯源</td><td>source_url / publish_time / fetch_time / raw_content_hash</td><td>降级数据额外标 <code>extra.storage_fallback</code></td><td class="file">core/schemas.py</td></tr>
-<tr><td>免责声明</td><td>A17 result 与最终报告双重附带</td><td>合规红线</td><td class="file">supervisor.py:938</td></tr>
+<tr><td>免责声明</td><td>A17 result 与最终报告双重附带</td><td>合规红线</td><td class="file">supervisor.py:4738<br/>supervisor.py:4963</td></tr>
 </tbody>
 </table>
 
@@ -1373,9 +1499,17 @@ flowchart LR
   <p>
     <b>Moss-FinAgent-Research</b> · 投研分析多Agent协作图谱<br/>
     图谱依据仓库实际代码绘制，节点/边/常量均可对照到源文件行号。
-    包含 11 张 Mermaid 图：分层架构、模型路由、端到端流程、StateGraph 拓扑、
-    规划决策树、协作时序、ReAct 护栏、冲突仲裁六闸门、记忆四层、
-    技能加载双路径、熔断状态机、网关准入流程、取消传播。
+    包含 <b>15 张 Mermaid 图</b>：分层架构、五层模型路由、端到端协作流程、StateGraph 拓扑、
+    规划决策树、协作时序、A17 ReAct 护栏、冲突仲裁六闸门、记忆四层、上下文窗口、
+    技能加载双路径、七道护栏、熔断状态机、网关准入与降级流程、取消传播。
+  </p>
+  <p>
+    <b>数字口径</b>：图内所有计数（Agent 数 / 节点数 / 边数 / 并行度 / 常量值）以顶部
+    <code>atlas-facts</code> 块为唯一来源，由
+    <code>tests/unit/test_agent_atlas_drift.py</code> 对着代码现算校验；
+    改代码而没改这里 ⇒ 判据变红。<br/>
+    <b>校验命令</b>：
+    <code>uv run python -m pytest tests/unit/test_agent_atlas_drift.py -q</code>
   </p>
   <p>
     ⚠️ 本项目为研究用途，所有分析输出仅供研究参考，不构成投资建议。

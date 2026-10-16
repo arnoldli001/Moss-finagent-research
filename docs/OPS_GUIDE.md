@@ -598,6 +598,53 @@ curl.exe -s -o NUL -w "%{http_code}`n" https://hk.wujiaitool.cn/     # 期望 20
 
 ---
 
+### 2.11 报告侧静默：标题下那条「⚠️ 审计未通过」横幅（`CHG-0253`，2026-10-16）
+
+> **触发**：用户把报告第一行贴了回来 ——
+> 「投研分析报告：600036 ⚠️ 审计未通过：完整性问题 2 项。详见文末「审计」」。
+>
+> ★ 它**不在前端**（前端只负责把 Markdown 渲染出来）：那是后端
+> `supervisor._render_report()` 拼进 Markdown 的**第一行**（`_audit_banner`）
+> ⇒ 要它不上屏，只能改**报告装配**这一层。
+
+**开关（后端一个环境变量，默认关）**
+
+```powershell
+# ① 打开：仓库根 .env 里加一行（当前演示期间就有这一行）
+#    MOSS_PRESENT_QUIET=1
+uv run python manage.py restart-pilot        # 后端改动必须重启才生效（8100/8110 各一次）
+
+# ② ★ 关掉（演示结束**必须**做）：把那行删掉或改成 0，然后重启
+#    删掉后报告立刻恢复「⚠️ 审计未通过」+ 文末问题清单 —— 同一次运行的结论一字不变
+
+# ③ 只想临时看一眼真实结论：不要动 .env，直接读管理端
+#    管理员「运行指标 → 审计」 / <run_dir>/audit 日志 / GET /api/v1/research/{task_id} 的 audit 字段
+```
+
+**它到底改了什么（两处，仅呈现层）**
+
+| 静默时**不上屏** | **一行未动**（证据仍可查） |
+|---|---|
+| 标题下的 `> ⚠️ 审计未通过：完整性问题 N 项…` | `agent_outputs` 里 `A18_audit` 的原始 `conclusion` |
+| 标题下的 `> ⚠️ 审计未完成（未量到，不等于通过）…` | `completeness_issues` / `exemptions` / `collection_gaps` / `path_stats` |
+| 文末「## 审计」的失败结论与清单（换成封存事实：`哈希链 N 条、链完整、封存位 seq=…`） | 哈希链本身、审计日志、管理员「运行指标 → 审计」、`logger.warning("★ A18 审计未通过…")` |
+
+★ 静默文案**绝不写"审计通过"**：`chain_valid=True` 是"哈希链没断"，不等于"审计通过"。
+被追问时正确回答是"哈希链 27 条完整、有 2 项**取数缺口**被计成了完整性问题，明细在管理端"
+—— **不能**答"通过了"（真实缺陷见 `docs/PRD.md` §41.49.5 / `CHG-0254`，**尚未修**）。
+
+**判据（可复跑）**
+
+```powershell
+uv run pytest tests/unit/test_report_presentation_quiet.py -q      # 期望 19 passed
+uv run pytest tests/unit/test_audit_verdict_consumed.py -q         # 期望 11 passed（含"钉住开关"那条）
+```
+
+**恢复核验（三步）**：① `.env` 里没有 `MOSS_PRESENT_QUIET`（或 =0）→ ② `manage.py restart-pilot`
+→ ③ 跑一次 600036，报告标题下应重新出现横幅、文末「## 审计」应是 A18 的原文结论。
+
+---
+
 ## 3. 隧道（cloudflared）
 
 ```powershell
