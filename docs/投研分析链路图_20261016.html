@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>图 1′ · 投研分析链路：20 Agent / 23 节点 + 唯一 LLM 出口 + 三级缓存判定（脱敏）</title>
+<style>
+  :root{
+    --ink:#16232e; --muted:#5b6b7a; --line:#c9d6e2; --bg:#eef3f8;
+    --blue:#2f6fb3; --blue-bg:#e8f0fa; --green:#2e8b57; --green-bg:#e7f5ec;
+    --amber:#b8801f; --amber-bg:#fdf3e2; --rose:#b6405a; --rose-bg:#fbe9ee;
+    --violet:#6b53b5; --violet-bg:#eeeafb; --slate:#546a7b; --slate-bg:#eaeff4;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:26px 30px 40px;background:var(--bg);color:var(--ink);
+       font:14px/1.55 "Segoe UI","Microsoft YaHei",system-ui,-apple-system,sans-serif}
+  h1{font-size:21px;margin:0 0 6px;text-align:center;letter-spacing:.2px}
+  .sub{text-align:center;color:var(--muted);font-size:12.5px;margin-bottom:20px}
+  .wrap{max-width:1220px;margin:0 auto}
+  .box{background:#fff;border:1.5px solid var(--line);border-radius:10px;padding:12px 14px}
+  .box h3{margin:0 0 6px;font-size:14.5px}
+  .box p{margin:0;color:var(--muted);font-size:12.5px}
+  .row{display:flex;gap:16px;align-items:stretch}
+  .col{flex:1;min-width:0}
+  .arrow{text-align:center;color:#8aa2b6;font-size:18px;line-height:1;margin:8px 0}
+  .layer{border-radius:10px;padding:12px 14px}
+  .l-info{background:var(--green-bg);border:1.5px solid #a9d6bb}
+  .l-ana{background:var(--amber-bg);border:1.5px solid #e6c489}
+  .l-risk{background:var(--rose-bg);border:1.5px solid #e9b3c1}
+  .l-dec{background:var(--blue-bg);border:1.5px solid #a9c6e6}
+  .l-audit{background:var(--violet-bg);border:1.5px solid #c3b6ea}
+  .l-gw{background:#f2f7fd;border:1.5px solid #a9c6e6}
+  .l-data{background:var(--slate-bg);border:1.5px solid #b9c7d3}
+  .chip{display:inline-block;background:#fff;border:1px solid var(--line);border-radius:999px;
+        padding:1px 8px;margin:2px 4px 2px 0;font-size:11.5px;color:var(--ink);white-space:nowrap}
+  .chip.new{border-color:var(--rose);color:var(--rose);font-weight:600}
+  .chip.hot{border-color:var(--green);color:var(--green);font-weight:600}
+  .tag{font-size:11px;color:var(--muted)}
+  .redline{margin:18px 0;border:2px dashed var(--rose);border-radius:10px;background:#fff5f7;
+           padding:10px 14px;text-align:center;color:var(--rose);font-weight:600;font-size:13.5px}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  .grid6{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+  .grid6 .box{padding:10px}
+  .grid6 h3{font-size:12.5px}
+  .grid6 p{font-size:11.5px}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;background:#fff;
+        border:1.5px solid var(--line);border-radius:10px;overflow:hidden}
+  th,td{border-bottom:1px solid #e4ecf3;padding:7px 9px;text-align:left;vertical-align:top}
+  th{background:#f6f9fc;font-weight:600;color:#33475b;white-space:nowrap}
+  tr:last-child td{border-bottom:none}
+  code{background:#f1f5f9;border:1px solid #e2e9f0;border-radius:4px;padding:0 4px;
+       font:11.5px/1.5 Consolas,"Cascadia Mono",monospace}
+  .sec{margin-top:22px}
+  .sec > h2{font-size:15px;margin:0 0 10px;padding-left:9px;border-left:4px solid var(--blue)}
+  .note{font-size:12px;color:var(--muted);margin-top:8px}
+  .flowline{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+  .flowline .box{flex:0 0 auto}
+  .pill{display:inline-block;border-radius:6px;padding:1px 7px;font-size:11.5px;font-weight:600}
+  .pill.ok{background:var(--green-bg);color:var(--green);border:1px solid #a9d6bb}
+  .pill.warn{background:var(--amber-bg);color:var(--amber);border:1px solid #e6c489}
+  .pill.new{background:var(--rose-bg);color:var(--rose);border:1px solid #e9b3c1}
+  .cache{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .cache .box{border-left-width:5px}
+  .c1{border-left-color:var(--green)} .c2{border-left-color:var(--blue)}
+  .c3{border-left-color:var(--violet)} .c4{border-left-color:var(--slate)}
+  footer{margin-top:26px;border-top:1px solid var(--line);padding-top:12px;
+         color:var(--muted);font-size:11.5px}
+  @media print{
+    body{background:#fff;padding:0}
+    .box,table{break-inside:avoid}
+    @page{size:A4 landscape;margin:10mm}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>图 1′ · 投研分析链路：<b>20 Agent / 23 节点 / 33 边</b> + 唯一 LLM 出口 + <b>三级缓存判定</b>（脱敏）</h1>
+  <div class="sub">
+    口径日期 <b>2026-10-16</b> · 与上一版（19 Agent、两级缓存）的差异用
+    <span class="pill new">新增</span> 标出 · 全部数字来自本机实测（复跑命令见页脚）
+  </div>
+
+  <!-- ============ 主链路 ============ -->
+  <div class="sec">
+    <h2>一、主链路：谁在跑、按什么顺序跑</h2>
+
+    <div class="flowline">
+      <div class="box"><h3>用户问句</h3><p>自然语言 + 标的（代码 / 拼音首字母 / 中文名）</p></div>
+      <span class="arrow">➜</span>
+      <div class="box"><h3>Supervisor / Planner</h3>
+        <p>按指标目录 + Agent 目录挑子集（<b>不是每次全唤醒</b>）<br>
+        实测：<code>full=10 agent/12 指标</code> · <code>stock=8/15</code> ·
+        <code>macro=3/13</code> · <code>industry=3/15</code> · <code>news=5/0</code></p></div>
+    </div>
+
+    <div class="arrow">▼</div>
+
+    <div class="layer l-data">
+      <h3>采集四连（串行，图上 4 个节点）</h3>
+      <p><code>collect → clean → validate → store</code>
+        &nbsp;<span class="tag">A01 采集 / A02 清洗 / A03 校验 / A04 入库；实测"快批 59~70 + 懒批 2"并发（SmartFetcher 智能路由），失败不阻断整图</span></p>
+    </div>
+
+    <div class="arrow">▼</div>
+
+    <div class="row">
+      <div class="col layer l-info">
+        <h3>信息层（串行）</h3>
+        <p><span class="chip">A05_verifier 去伪</span><span class="chip">A06_extractor 提取</span>
+           <span class="chip">A07_sentiment 情绪</span></p>
+        <p class="note">图上节点 <code>verify_info → extract_events → sentiment</code>；<br>
+          本地串行实测 <b>91 s → 换云后 −82%</b>；<br>
+          <b>多标的</b>时逐只取新闻、事件带 <code>stock_code</code>、情绪按标的出分</p>
+      </div>
+
+      <div class="col layer l-ana">
+        <h3>分析层（并行 fan-out，图上 10 个 analyze 节点）</h3>
+        <p>
+          <span class="chip">A08 宏观</span><span class="chip">A09 中观</span><span class="chip">A10 微观</span>
+          <span class="chip">A13 科技</span><span class="chip">A14 消费</span>
+          <span class="chip new">A15 周期</span><span class="chip new">A16 医药</span>
+          <span class="chip new">A20 兜底行业</span>
+        </p>
+        <p class="note">状态键用 <code>reducer(operator.add)</code> <b>聚合而不是覆盖</b>；<br>
+          节点级 <code>try/except</code> → <code>errors</code>，单个失败不中断整图；<br>
+          <b>行业 Agent 按标的行业裁剪</b>（判不出行业时原样返回，不猜不砍）</p>
+      </div>
+
+      <div class="col layer l-risk">
+        <h3>风控层</h3>
+        <p><span class="chip">A11 财务排雷</span><span class="chip">A12 合规</span></p>
+        <p class="note">时效红线：<b>拒绝引用过期数据</b>；<br>
+          A12 六族逐只判定（不拼跨公司合格证）；<br>
+          A11 排雷结论带数据缺口声明</p>
+      </div>
+    </div>
+
+    <div class="arrow">▼</div>
+
+    <div class="flowline">
+      <div class="box l-dec" style="min-width:340px"><h3>Analyze · A17 决策综合</h3>
+        <p>唯一产出最终建议的节点；冲突需<b>显式仲裁</b>；多标的时<b>逐只表态</b>
+           （缺一只会被运行时校验补位并降置信度）</p></div>
+      <span class="arrow">➜</span>
+      <div class="box l-audit" style="min-width:300px"><h3>A18 审计 / 封存校验</h3>
+        <p>完整性 + 哈希链；不通过会如实写在结论里</p></div>
+    </div>
+
+    <p class="note">
+      ★ <b>A19_code_engineer 不在本图</b>：它不在投研图里跑，而是盘后作业的「数据缺口 → 自动生成连接器」，
+      经沙箱验证后入库（图上是 20 个注册 Agent，其中 19 个在投研链路内）。
+    </p>
+  </div>
+
+  <div class="redline">
+    ★ 架构红线：以上任何节点都<b>不许直连模型 API</b> —— 全部必须经过下面的网关（唯一出口）
+  </div>
+
+  <!-- ============ 网关 ============ -->
+  <div class="sec">
+    <h2>二、LLM 网关（唯一出口）：六个机制</h2>
+    <div class="grid6">
+      <div class="box"><h3>① 取消检查</h3><p>调前拦断，避免浪费<br><span class="tag">取消令牌逐跳检查</span></p></div>
+      <div class="box"><h3>② 保头保尾截断</h3><p>7:3 保头尾（防切断 schema）<br><span class="tag">超长 prompt 不丢尾部契约</span></p></div>
+      <div class="box" style="border-color:#a9d6bb;background:#f4fbf7">
+        <h3>③ 三级缓存 + 判定 <span class="pill ok">本版重写</span></h3>
+        <p>精确哈希 → 语义召回 → 判定<br><span class="tag">详见下一节</span></p></div>
+      <div class="box"><h3>④ token 预算</h3><p>按 trace 累计，超额拒绝<br><span class="tag">超限是"拒绝"不是"截断"</span></p></div>
+      <div class="box"><h3>⑤ 降级链</h3><p>熔断按 provider × 租户分别记<br><span class="tag">同 provider 的"备"不算备</span></p></div>
+      <div class="box"><h3>⑥ 哈希审计</h3><p>prompt/response 哈希<br><span class="tag">每次调用可回放、可比对</span></p></div>
+    </div>
+  </div>
+
+  <!-- ============ 缓存 ============ -->
+  <div class="sec">
+    <h2>三、③ 的展开：三级缓存 —— <b>拦截发生在哪一层，决定它有多便宜</b></h2>
+
+    <div class="cache">
+      <div class="box c1">
+        <h3>L1 精确命中</h3>
+        <p><code>SHA256(system+prompt+scope)</code>，进程内索引（≤20000 条）</p>
+        <p class="note">命中 p50 <b>19.7 µs</b>、<b>0 次网络</b><br>
+          <span class="tag">贵的一跳（embedding/rerank）一次都不发</span></p>
+      </div>
+      <div class="box c2">
+        <h3>L2 语义召回</h3>
+        <p><code>BAAI/bge-m3</code> 余弦 top-K（<b>K=12</b>）<br>判定阈值 <b>0.85</b>（默认）/ 0.80（embedding 侧）</p>
+        <p class="note">桶内没有向量时<b>退化 3-gram</b>（同形不同义的安全网）<br>
+          <span class="tag">"换个说法该复用"由这一层负责</span></p>
+      </div>
+      <div class="box c3">
+        <h3>L3 判定（重排）</h3>
+        <p><code>BAAI/bge-reranker-v2-m3</code> 对 K 条<b>原文</b>打分<br>阈值 <b>0.95</b>，top-k 12</p>
+        <p class="note">★ <b>只在 anchor 模式</b>跑；<b>prompt 模式 0 网络</b><br>
+          <span class="tag">逐字引用类输出（引文/证据）禁语义复用</span></p>
+      </div>
+      <div class="box c4">
+        <h3>L4 回源（LLM）</h3>
+        <p>真调模型，然后按 <code>(agent_id, scope, anchor|prompt)</code> 入桶</p>
+        <p class="note"><code>scope</code> 带<b>数据指纹</b> <code>d=&lt;16hex&gt;</code>
+          ⇒ <b>数据一变，L1/L2/L3 整条路径一起失效</b></p>
+      </div>
+    </div>
+
+    <table style="margin-top:14px">
+      <tr><th>护栏 / 观测量</th><th>实测值（2026-10）</th><th>它防的是什么</th></tr>
+      <tr><td>判定侧熔断（embed / rerank 各自一份）</td>
+          <td>3 次失败 → OPEN，窗口 600 s，冷却 60 s</td>
+          <td>判定服务挂了却"每次都等满超时"：实测黑洞单次查找 <b>4.5 s</b>（embed 1.5 + rerank 3.0）→
+              熔断后第 4 次查找 <b>1 ms</b></td></tr>
+      <tr><td>L1 miss 的代价（K=12）</td><td>约 <b>376 ms</b>（含 embed + rerank）</td>
+          <td>"两级缓存"到"三级"不是白拿的：<b>贵是有价的，所以必须能被看见</b></td></tr>
+      <tr><td>复用率 / 命中年龄分桶</td>
+          <td>桶：<code>&lt;1min · 1-10min · 10min-1h · 1-6h · 6-24h · 1-3d · 3-7d · &gt;7d</code></td>
+          <td>只报"命中率"会把"召回多少"与"真拦下多少"混成一个数；
+              <b>独立拦复用的判定次数：2 → 3</b> 才是这一版的意义</td></tr>
+      <tr><td><code>no_traffic</code> 与"L1 全命中"分开报</td>
+          <td>prompt 模式只有语义层查找、无判定 ⇒ 如实报"无判定流量"</td>
+          <td>把"没量到"报成"命中率 100%"是本项目最反对的假绿</td></tr>
+    </table>
+  </div>
+
+  <!-- ============ 模型池 ============ -->
+  <div class="sec">
+    <h2>四、模型池：唯一出口的另一端（<code>configs/models.yaml</code> 为唯一事实源）</h2>
+    <div class="grid4">
+      <div class="box" style="border-color:#a9d6bb">
+        <h3>本地小模型（Ollama）</h3>
+        <p><code>qwen2.5:1.5b</code> · <code>qwen3.5:4b</code> · <code>deepseek-r1:7b</code></p>
+        <p class="note">零配额、<b>唯一可持续的底板</b>；8 GB 单槽<br>
+        <span class="tag">实测 44.1 tok/s · 只常驻 4B + 1.5B</span></p>
+      </div>
+      <div class="box" style="border-color:#a9c6e6">
+        <h3>免费云 A（总量额度）</h3>
+        <p><code>qwen-flash</code>（阿里云百炼）</p>
+        <p class="note">额度有限 ⇒ <b>必须监控跑道</b><br>
+        <span class="tag">实测跑道 6.4 天 → 23.9 天（限走高频层后）</span></p>
+      </div>
+      <div class="box" style="border-color:#c3b6ea">
+        <h3>免费云 B（速率限制）</h3>
+        <p><code>Qwen/Qwen2.5-7B-Instruct</code>（硅基流动） · <code>glm-4.7-flash</code></p>
+        <p class="note">可再生 ⇒ 会 429 ⇒ <b>需限流熔断</b><br>
+        <span class="tag">连续 3 次 429 → 锁该跳 10 分钟</span></p>
+      </div>
+      <div class="box" style="border-color:#e9b3c1">
+        <h3>付费云（兜底）</h3>
+        <p><code>deepseek-flash</code> · <code>deepseek-v4-*</code></p>
+        <p class="note">按 token 计 ⇒ <b>要能被钱验证</b><br>
+        <span class="tag">日成本上限 + 预扣结算</span></p>
+      </div>
+    </div>
+    <p class="note">降级方向：<b>本地 → 免费云 → 付费云</b>；"成功但极慢"也会前进到下一跳（单跳墙钟预算），
+      但<b>链上最后一跳不设墙钟</b>——给它设预算只会把"慢但正确"变成"必然失败"。</p>
+  </div>
+
+  <footer>
+    <b>判据（可复跑，退出码即结论）</b>：<br>
+    ① 图规模：<code>uv run python -c "from src.orchestration.supervisor import build_research_graph; ..."</code>
+       ⇒ <b>23 节点 / 33 边</b>（含 <code>__start__</code>/<code>__end__</code>）<br>
+    ② 注册 Agent：<code>src/api/runtime.py</code> 的 <code>agents</code> 表 ⇒ <b>20 个</b>（A01–A20）<br>
+    ③ 计划规模：<code>plan_run("full","600036",None,query=…)</code> ⇒ <b>10 agent / 12 指标</b><br>
+    ④ 缓存参数：<code>LLMCache.__init__</code> 签名 ⇒ <code>ttl 24h · semantic 0.85 · embed 0.80 · rerank 0.95 · recall_k 12</code><br>
+    ⑤ 熔断常量：<code>circuit_breaker.py</code> ⇒ <code>3 次 / 600 s 窗口 / 60 s 冷却</code><br>
+    <br>
+    <b>脱敏说明</b>：本图只出现组件名、参数与实测数字；不含主机名、路径、账号、密钥、
+    客户标识与业务数值。图内所有"实测"均可在本仓库以给定命令复跑。<br>
+    <b>本图相对上一版的差异</b>：① Agent 19 → <b>20</b>（新增 A15 周期 / A16 医药 / A20 兜底行业；
+    A19 属盘后缺口作业、不在投研图内）；② 分析层由"A13 行业"[单框] 展开为
+    <b>A13/A14/A15/A16 + A20</b>；③ 网关第 ③ 项由"两级缓存"升级为
+    <b>三级缓存 + 判定（含熔断与复用年龄分桶）</b>，并补上 L1→L4 的代价与护栏。
+  </footer>
+</div>
+</body>
+</html>
