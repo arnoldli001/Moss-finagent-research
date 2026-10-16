@@ -200,6 +200,11 @@ def _wrap_response(
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         reasoning_tokens=reasoning_tokens,
+        # ★ `CHG-0250`：把**本次实际生效的输出上限**带回响应。
+        #   此处 `spec.max_tokens` 已被网关四重夹过（硬上限 / 层预算 / 本地窗口 /
+        #   任务期限折算，见 `complete()` 里 960~997 行）⇒ 它就是"允许生成多少"。
+        #   判"是不是被截断"靠它：`tokens_out >= max_tokens` ⇒ JSON 写到一半没结尾。
+        max_tokens=spec.max_tokens,
         latency_ms=latency_ms,
         wait_ms=wait_ms,
         model_ms=model_ms,

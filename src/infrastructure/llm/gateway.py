@@ -130,6 +130,20 @@ _TIER_OUTPUT_BUDGET: dict[str, int] = {
     "decision": 8192,
 }
 
+
+def tier_output_budget(task_tier: str) -> int:
+    """该层的**默认输出预算**（token）—— `_TIER_OUTPUT_BUDGET` 的**唯一公开取法**（`CHG-0250`）。
+
+    用途：判断"这次输出是不是**顶到了上限**"（= 被截断）。没有它，调用点只能看到
+    `Expecting value: line 224 column 18 (char 5278)` 这种"JSON 坏在哪"的报错，
+    而真因是"要得太多装不下" —— 2026-10-16 A06 现场正是如此（`out=2048 == medium 预算`，
+    而前一天的 `char 0` 是**另一个**根因：思维链吃光预算，见 `CHG-0249`）。
+
+    ⚠️ 调用方若**显式**传了 `max_tokens=`，以那个为准；本函数只回答"默认"。
+    取不到的层返回 `0`（= 未知，调用方**不许**据此断言截断）。
+    """
+    return int(_TIER_OUTPUT_BUDGET.get(str(task_tier or "").strip(), 0))
+
 #: 单次尝试的墙钟预算（秒）。**只对有备用模型的链生效** ——
 #: 链上最后一跳没有退路，给它设预算只会把"慢但正确"变成"必然失败"。
 #: （例外：调用方**显式**传入 `attempt_budget_sec` 时，最后一跳也生效 ——

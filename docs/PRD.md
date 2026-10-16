@@ -14013,6 +14013,80 @@ print('nodes',len(N),'edges',len(E),'paths',len(P),'len set',set(L))"
 uv run python scripts/prd_sync_check.py --keyword "关键路径"
 ```
 
+### 43.8 结构口径的**单一事实源**：`docs/AGENT_COLLABORATION_ATLAS.html` 与它的漂移判据（`CHG-0250`）
+
+> **触发**（用户原话）：「**AGENT_COLLABORATION_ATLAS.html 这个架构图 需要重新更新一下，
+> 最近新增了投研分析的 agent，数量不一致了**」。
+>
+> **T1 对账**：`--keyword 协作图谱` = **`TODO`**（三面全 0：
+> 图谱这份文档**从来没在 PRD / 台账里出现过**）⇒ 本节补写。
+
+**（a）事故形态：做得最像"精确"的那张表，错得最彻底。**
+图谱于 2026-09-26 写成，此后**没有任何判据看着它**。到 2026-10-15 实测，
+它整篇停在旧口径上：`已注册Agent 19 个`（实为 **20**）、`依赖图节点 16 个`
+（实为 **21 节点 / 33 边**）、`分析层扇出 5 路`（实为 **10 路**）、
+`行业层 A13-A16`（实为 **A13–A16 + A20 兜底**）、`ReAct max_steps=3`（实为 **2**）、
+`模型路由三层`（实为 **五层**）、信息层画成串行三跳（2026-09-28 起是 **A05 ∥ A06 → A07**）、
+新闻抓取画在 A04 之后（实际在 **collect 节点内**）。
+但**危害最大的一处不是数字，是 §8「关键常量与代码锚点」那张表**：
+它的 `文件:行号` 写作时 `supervisor.py` 只有 **940 行**，现在是 **4965 行** ⇒
+**约 40 个锚点全部漂移**。锚点是全文里看起来最可信的东西，
+漂了之后它指着**无关的一行**，比不写行号更坏。
+（`_STORAGE_FALLBACK_LIMITS` 甚至已被删除，图谱仍在引用它 —— 见 `CHG-0192` ①。）
+
+**（b）"数量不一致"必须拆成两种，混着比才会得出错误结论。**
+① **真漂移**：文档没跟上代码（19 vs 20）；② **数法不同**：
+12 条 root→leaf 路径**全部等长**，只数真实节点是 **9 个节点 / 8 跳**（本节 §43.2 的口径），
+把 `START`/`END` 两个哨兵也算进去是 **11 个节点 / 10 条边**。
+**后者两个数都对** —— 图谱里已就地写明这两种数法，判据两个都钉。
+
+**（c）修法三件。**
+① **图谱补齐**：A20 进层图/扇出/技能表、信息层改成并行扇出+汇聚、
+`store` 三路 fan-out（A05 ∥ A06 ∥ 本地量化）、模型路由重画为五层、
+`max_steps=2`（连带"末轮"从第 3 轮改第 2 轮、观测累积 2400→1600 字符）、
+`INDUSTRY_KEYWORDS` 46→**44** 词、`ALL_INSIGHT_AGENTS` 9→**10**、
+`data_gaps` 进 A17 输出契约、缓存"两级→三级"（0.85 / 0.80 / 0.95 三把尺子）、
+`record_hash` 公式补 `seq`/`ts`、`llm_timeout_seconds` 注明**只作用于云端跳**，
+以及**全部 §8 锚点重取**。
+② **顶部加 `atlas-facts` 机器可读块**（`<script type="application/json">`）作为
+页面数字的**唯一来源** —— 正文里的数字必须与它一致。
+③ **新增 `tests/unit/test_agent_atlas_drift.py`（10 条）**，五层：
+facts 与**代码现算**逐条相等 · 正文卡片/关键串必须带着这些数 ·
+Mermaid 图块数 = 页脚声明数 · HTML 标签配平 + `subgraph`/`end` 配平 ·
+每个 `路径:行号` 存在且不越界 ·
+**47 个高风险锚点还要断言"那一行确实仍含这个符号"**。
+
+**（d）★ 第 5 层判据为什么必须存在（也是它为什么必须自证）。**
+只查"文件存在 + 行号不越界"**抓不住最常见的那种错**：行号漂到文件中间，
+文件在、不越界、看着最精确，而那一行是别的东西 —— §8 旧版整张表都是这个样子。
+所以锚点按 `(文件, 行号, 必须含有的片段)` 三元组钉住。
+并且**它自己也有一条自证**（`test_the_pinned_check_can_fail`）：
+把锚点指到同文件的无关行（229）、指到文件外（999999）、从页面里删掉，
+三种都必须报红，而**正确的锚点必须不报**（否则判据是恒红的，同样没用）。
+
+**（e）突变自证（真跑过，不是声称）。**
+`graph_nodes` 21→16 ⇒ **3 条红**；只改正文卡片（facts 保持正确）⇒ **恰好 1 条红**
+（证明分层有效，不是一条判据兜住所有事）；锚点 `230→46` ⇒ 红；
+删掉一个 `</table>` ⇒ 标签配平红；**逐项还原后 10 passed**。
+
+**（f）边界（未闭环，逐条登记）。**
+① 图谱仍是**手写 HTML**：判据保证"数字与锚点不漂"，
+**不保证结构叙述**（哪条边是并行、谁等谁）永远正确 —— 那部分只能靠人读；
+② **A20 不在 A17 的可追问集合里**（`askable_prefixes = A08..A16`，
+`supervisor.py:4446`），图谱已如实标注为**已登记缺口**，
+但这是**产品缺口不是文档问题**，本轮**未修**；
+③ 判据把"静默过期"变成"变红"，但**没有消除维护成本**：
+代码一动，锚点表就得有人重取并更新；
+④ 本轮只覆盖 `AGENT_COLLABORATION_ATLAS.html` 一份文档 ——
+仓库里还有别的带数字/锚点的手写文档（如 `docs/DEMO_GUIDE.md`、各 `*_AUDIT_*.md`），
+**它们没有同类判据**。
+
+**判据**：
+
+```bash
+uv run python -m pytest tests/unit/test_agent_atlas_drift.py -q   # ⇒ 10 passed
+```
+
 ---
 
 ## 四十四、集合竞价「黄金回归」：**564 处逐位一致是重构期的对拍规模，不是常驻断言**（现行口径 · 2026-10-07 定型，`CHG-0193`）
@@ -15555,4 +15629,175 @@ uv run python -m pytest tests/unit/test_board_filter_structure.py -q   # 17 pass
 已中招的浏览器要靠新代码里的 `VERSION = 2` 才能把那条"藏着开关"的旧记录丢掉
 （用户只需刷新一次页面）。
 
+---
 
+## 五十三、A06 报「LLM输出非合法JSON: … char 0」：**空正文 ≠ 非法 JSON**（现行口径 · 2026-10-15 定型，`CHG-0249`）
+
+> **触发**（用户原话，前端报障）：「投研分析输入了：当前宏观环境如何，预测下未来一年
+> 美国的加息、降息节奏，对A股的影响，以及AI应用加速失业率增加对消费的影响节奏时间
+> 节点分析，未来半年能否持有高股息的招商银行？综合　标的：600036」→
+> 「反馈一个部分节点异常：`A06_extractor: A06_extractor LLM输出非合法JSON:
+> Expecting value: line 1 column 1 (char 0)`」。
+>
+> **T1 对账**：`--keyword reasoning_effort` = **`MISS_PRD`**（实现面 **27** 处、
+> 台账 1 处、**PRD 0 处**）⇒ 本节补写；`A06` / `空正文` / `思维链吃` 三个关键词 = `OK`。
+
+### 53.1 现场（审计实证，不是推测）
+
+`data/pilot/audit/llm_audit.jsonl`，trace **`task_20261015_f03aa9c5`** 的 A06 四跳：
+
+| 时刻 | 模型 / provider | in | out | reasoning | error |
+|---|---|---:|---:|---:|---|
+| 21:16:47 | `qwen-flash` / dashscope | 2319 | **2048** | 0 | `late_result _cached(超预算 20s 但跑完，out=2048)` |
+| 21:17:06 | `Qwen2.5-7B` / siliconflow | 0 | 0 | 0 | `attempt_budget_exceeded(20s)` |
+| 21:17:08 | `Qwen2.5-7B` / siliconflow | 2317 | 903 | 0 | `late_result _cached(超预算 20s 但跑完，out=903)` |
+| **21:17:16** | **`deepseek-flash` / deepseek** | 2042 | **2048** | **2048** | `None` |
+
+**决定性的那一行是最后一行**：`tokens_out = reasoning_tokens = 2048`
+⇒ 模型的输出**全部**是思维链，**正文 0 字符** ⇒ `json.loads("")` 抛
+`Expecting value: line 1 column 1 (char 0)` —— 用户看到的就是这句。
+
+### 53.2 根因（两层，都有实测数字）
+
+1. **思维链把输出预算吃光。** `medium` 层的配置是 **输出预算 2048（含思维链）+
+   思维链强度 `low`**（`gateway.py::_TIER_OUTPUT_BUDGET` / `_TIER_REASONING_EFFORT`），
+   而 `deepseek-flash` 是**推理模型**，CoT 计入输出 ⇒ `low` 也足够把整份预算烧掉。
+   **同一条处方在 `planner.py` 上验证过**：那次（2026-09-28）加了
+   `reasoning_effort="none"` 之后，全量审计（3 个实例共 7 万+ 行）里
+   "输出 100% 是思维链"**再没出现过**（最后一条就是 09-28 那次）。
+2. **链首那跳撞单跳墙钟。** dashscope 这场 **2048 tok / 21.16 s ≈ 97 tok/s**，
+   而单跳预算 `_ATTEMPT_BUDGET["medium"] = 20 s` ⇒ 链首**跑完了却已经在预算之外**，
+   被 `late_result` 缓存（"下次可命中"），**本轮调用方拿到的是空**。
+   ⚠️ 关键点：`_OUTPUT_TOKENS_PER_SEC = 210` 是 **deepseek 的实测值**（195~223 tok/s），
+   用它去折算**免费云链首**（实测约一半）⇒ 算出来的"装得下"是**乐观的**。
+
+### 53.3 修法（三件；**不动 `max_tokens`**）
+
+| # | 落点 | 内容 |
+|---|---|---|
+| 1 | `info/extractor/agent.py` | A06 显式 **`reasoning_effort="none"`** —— 抽取的活是"从给定文本挑子集 + 按 schema 填字段"，`evidence_quote` 还必须逐字来自输入，**不需要多步推演** |
+| 2 | `analysis/base.py::parse_llm_json` | **空正文与非法 JSON 分开报**：空正文给出**成因 + 处置**（"本次输出全部是思维链 ⇒ 该调用点应显式 `reasoning_effort="none"`" / "一个 token 都没产出 ⇒ 核对降级链与单跳预算"），并附**用量事实**（model / tier / out / 思维链）；非空的坏 JSON **仍走老文案**（不扩大解释）。调用方通过新增的 `diagnostics=` 传入用量 |
+| 2b | A05 / A07 / A06 三处调用点 | 带上 `diagnostics`（同类里预算最紧的三处：`medium` 2048、`light` **1024**） |
+| 3 | `tests/unit/test_empty_body_and_cot_budget.py` | 7 条新护栏（含自证），并**补齐**既有不变量判据漏掉的层 |
+
+**为什么不动 `max_tokens`**（这是本轮最重要的一个"不顺手改"）：
+`medium` 的 2048 对**正文**是够的（A06 历史上成功的一次 `out=1745`），被吃光的只是思维链；
+而抬预算会**撞单跳墙钟** —— dashscope 实测 ~97 tok/s，2048 已经贴着 20 s，
+抬到 3072/4096 只会让链首更必然被砍。要动就得"预算 × 速率 × 墙钟"三者一起动。
+
+### 53.4 判据（`tests/unit/test_empty_body_and_cot_budget.py`，7 条）
+
+- **A06 关思维链**（kwargs 判据，不看源码）· **A06 不许自己定 `max_tokens`**（附理由）；
+- **空正文 ⇒ 文案必须点名成因与处置**，且**不许**再出现 `Expecting value` / `char 0`；
+- **反例**：非空坏 JSON 仍走老文案（判据只对"空"改口径）；
+- **容忍路径不回归**：围栏 / `<think>` 包裹 / 尾随文本照旧解析；
+- **不变量（补洞）**：每层"允许输出"都要装得进该层单跳墙钟 —— **含链首为免费云的
+  `light` / `medium`**。既有的 `test_attempt_budget_output_consistency.py::test_every_paid_primary_tier_is_self_consistent`
+  只查**"付费做链首"**的层（`if head.provider not in PAID_PROVIDERS: continue`），
+  而 `medium` 链首 dashscope / `light` 链首 siliconflow **都是免费云** ⇒ 它们
+  **从来没被查过**，本轮报障正好落在 `medium` 上。
+- **自证**：把 `medium` 输出预算抬到 4096（墙钟不动）必须被判红 —— 判据抓得住"偷偷抬预算"。
+
+### 53.5 已知缺口（诚实登记，不省略）
+
+1. **其余 8 处 `parse_llm_json` 调用点未传 `diagnostics`**（`planner` / `alerts/analyzer` ×2 /
+   `intraday/sentiment` / `analysis/base::_parse_llm_json`（A08-A16）/ `recommend` ×2 / `react`）：
+   它们照样受益于"空正文"文案，但**拿不到用量事实**。未逐处改的理由：那些层预算更大
+   （`reasoning`/`decision` 8192），实测 CoT 占比 25~60%，**没有出现过 100% 的现场**。
+2. **`_OUTPUT_TOKENS_PER_SEC = 210` 是按 deepseek 标定的**；免费云链首实测可能只有一半
+   （本轮 97 tok/s）⇒ 53.4 那条不变量只是**地板**，不等于"免费云也装得下"。
+3. **"恰好撞层上限"共 270 条**（pilot 187 / dev 35 / main 48，集中在 `alert_analyzer` 81、
+   `data_gap_resolver` 62、`intel_extract` 42、`mainline_member_pure` 28）：**未逐条归因**，
+   本轮只修了报障这一条链路。
+4. **"跑完了却拿不到"这个形状本身**（`late_result _cached` 两跳 21.16 s / 22.8 s）值得单独一轮：
+   现在的处置是"缓存给下次用、本轮记空"，而**用户等的那一轮是白等的**。
+5. 本轮**未跑全量**：只跑了相关测试面（见 53.6）；`supervisor.py` 等高扇出文件**本轮未改动**。
+
+### 53.6 复跑判据
+
+```bash
+uv run python -m pytest tests/unit/test_empty_body_and_cot_budget.py \
+    tests/unit/test_verbatim_output_forbids_semantic_cache.py \
+    tests/unit/test_info_agents.py \
+    tests/unit/test_attempt_budget_output_consistency.py -q     # 期望全绿
+# 现场复算（只读）：那一跳的 out / reasoning 是否相等
+uv run python -c "import json,pathlib; rows=[json.loads(l) for l in pathlib.Path('data/pilot/audit/llm_audit.jsonl').read_text(encoding='utf-8').splitlines() if l.strip()]; print([(r['ts'], r['model'], r['tokens_out'], r['reasoning_tokens']) for r in rows if r.get('trace_id')=='task_20261015_f03aa9c5' and r.get('agent_id')=='A06_extractor'])"
+```
+
+
+## 五十四、A06 又报「LLM输出非合法JSON」——**这次是"输出撞上限被截断"**（现行口径 · 2026-10-16 定型，`CHG-0251`）
+
+> **触发**（用户原话）：「投研分析……未来半年能否持有高股息的招商银行？综合 600036
+> 执行开始分析的结果里报错，**昨天让修改后怎么还有这个问题**」。报错原文：
+>
+>     A06_extractor: A06_extractor LLM输出非合法JSON:
+>     Expecting value: line 224 column 18 (char 5278)
+>     （用量：model=qwen-flash tier=medium out=2048）
+
+### 54.1 为什么"昨天改了还有"：**同一个文案，两个根因**
+
+| | §五十三（`CHG-0249`，2026-10-15） | 本章（`CHG-0251`，2026-10-16） |
+|---|---|---|
+| 报错位置 | `line 1 column 1 (**char 0**)` | `line 224 column 18 (**char 5278**)` |
+| 含义 | 正文是**空串** | 正文写到一半**被截断** |
+| 实测用量 | `out=2048 **== reasoning_tokens=2048**` | `out=2048 **== medium 层预算 2048**` |
+| 真因 | 思维链把预算**吃光** | 要的 JSON **装不下**（prompt 让"提取全部事件"） |
+| 修法 | `reasoning_effort="none"` | **事前限量** + 截断时**换更小的要求**重试 |
+
+★ 两句报错的前缀**逐字相同**（`LLM输出非合法JSON`），只有 `char N` 不同 ——
+所以"昨天修过了"与"今天又来了"**并不矛盾**：昨天修的是空正文那一支。
+这正是本项目反复记的：**同一个报错文案 ≠ 同一个根因**；
+判据必须落在"**能区分成因**"的量上（这里是 `char 0` / `char 5278` 与 `out` 和上限的关系）。
+
+### 54.2 根因（三层，都有实测）
+
+1. **上限**：`medium` 层输出预算 = **2048 token**（`_TIER_OUTPUT_BUDGET`，
+   `src/infrastructure/llm/gateway.py`）。审计实测 A06 共 7 次调用，**3 次 `out=2048`**
+   （贴着上限 = 截断特征）。
+2. **要得太多**：prompt 原文是「从上述条目中提取**全部**可确认的事件（每条信息可提取 0-3 个）」。
+   本次问句（宏观 + 美国加息 + A股 + AI 失业 + 消费 + 招行）拿到的资讯有 20 多条
+   ⇒ 最多可要求 **60 条**事件；而一条事件 JSON 有 7 个字段、`evidence_quote` 还要**逐字引用**
+   ⇒ 实测每条约 90~120 token ⇒ **2048 只装得下 ~16 条** ⇒ 必然写不完。
+   ★ 后果不是"少几条"，而是**一条都读不出来**（JSON 缺收尾 ⇒ 整个 parse 失败）。
+3. **没有任何重试**：A06 当时直接 `parse_llm_json(...)`，失败即抛（与分析层基类不同，
+   基类那条"JSON 修复重试"治的是转义/围栏这类**写法**问题，治不了**容量**问题）。
+
+### 54.3 修法（四件；仍然**不抬** `max_tokens`）
+
+1. **事前限量**（治本）：prompt 改成「**最多输出 `_PROMPT_MAX_EVENTS`=16 条事件**，
+   超过只保留最重要的」——16 条 ≫ 0 条（截断时的实际产出）；
+2. **截断自成一态**：`parse_llm_json` 新增 `_truncation_note()` —— 当
+   `tokens_out > 0 且 上限 > 0 且 out >= 上限` 时，错误里**明写**
+   「★ 这是**被输出上限截断**……**原样重发必然同样被截断**」；
+3. **换更小的要求重试一次**（`_smaller_ask()`：最多 6 条、`magnitude` 留空、
+   引文压到 20 字内、只要紧凑 JSON），**且只在截断时**触发（其它失败换小要求也没用，
+   无限重试会把"降级"放大成"整条链路超时"）；
+4. **把"本次上限"变成可读事实**：`LLMResponse.max_tokens`（网关四重夹后的值）
+   + 公开取法 `tier_output_budget(tier)`（取不到返回 0 = 未知，**不许据此断言截断**）。
+   ⚠️ **仍然不传 `max_tokens=`**：层级预算与单跳墙钟配套（`medium` 免费云链首实测
+   ~97 tok/s，2048 已贴着 20 s 预算；抬到 3072 只会让链首更必然被砍）。
+
+### 54.4 判据（`tests/unit/test_output_truncation_guard.py`，10 条）
+
+* 判据函数：`out>=上限` 才算截断；**上限未知不下判断**（`output_hit_cap` 三态）；
+* 文案：截断必须**说出成因**；`out` 没顶到上限时**不许**声称截断（反例护栏）；
+* A06 行为：截断 ⇒ 2 次调用、第二次 prompt **不同**且含「最多只输出 6 条」、
+  仍 `reasoning_effort="none"`/`semantic_cache=False`/`json_mode=True`、**不传 `max_tokens`**；
+  非截断 ⇒ **恰好 1 次**；prompt 里**事前**写着"最多 16 条"；
+* 诊断：上限优先取响应自带值 → 退层预算 → 再退 0（未知）。
+* **反事实**：拿掉截断文案 ⇒ **1 红**；拿掉"更小要求"重试 ⇒ **1 红**（各自逐字节还原）。
+* 回归面：`pytest tests/unit -k "llm or provider or info or truncat or cot or budget or contract"`
+  ⇒ **503 passed / 1 xfailed / 0 failed**。
+
+### 54.5 诚实边界
+
+* **`_PROMPT_MAX_EVENTS=16` 是按"2048 ÷ 每条约 90~120 token"估的**，不是量出来的
+  （没有"每事件 token 数"的直方图）⇒ 若某次事件普遍更长，仍可能截断 —— 那时会走
+  "更小要求"的重试，**但重试也可能再截断**（只重试一次，之后仍抛错，不许假装成功）；
+* **"每事件 token"应当补一条实测**（把成功响应的 `out ÷ 事件数` 记进审计），
+  这样才能把 16 这个数字变成**算出来的**（登记待办）；
+* 本轮的端到端**没有重跑**用户那条问句（那要真 LLM + 外部数据、且要占 pilot）；
+  判据是单元层的（真跑一次 A06 的替身）；**"用户那条问句现在还会不会报"没有被实测** ——
+  要说"已修好"必须补这一次真跑（登记待办）；
+* 同一类风险**不止 A06**：任何"输出上限小 + 要求条数多"的 Agent 都可能撞（A07/A09/A17…），
+  本轮只修了 A06（其余未逐个核）。

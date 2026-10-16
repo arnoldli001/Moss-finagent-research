@@ -42,16 +42,30 @@ class AnalysisPayload(BaseModel):
     """A05已核验可信但A06未结构化为事件的原文摘要（兜底事实素材，带溯源来源行）"""
 
 
-def parse_llm_json(agent_id: str, content: str) -> dict[str, Any]:
+def parse_llm_json(agent_id: str, content: str,
+                   diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
     """解析LLM输出JSON（容忍```json围栏、<think>块与尾随文本）。
 
     依次尝试：围栏提取 → 整体loads → raw_decode取首个JSON对象。
+
+    ## ★ 2026-10-15：**空正文必须与"非法 JSON"分开报**（`CHG-0249` / PRD §五十三）
+
+    报障原话：`A06_extractor: A06_extractor LLM输出非合法JSON: Expecting value:
+    line 1 column 1 (char 0)`。`char 0` 的含义是**正文是空串**，而不是"模型写坏了
+    JSON" —— 但这两件事原先共用同一句话，于是它把人往"模型不会输出结构化内容"
+    的方向带，而真因通常是**输出预算被思维链吃光**（实测：`tokens_out=2048 ==
+    reasoning_tokens=2048`，正文 0 字符；同一条处方见 `planner.py`）。
+
+    `diagnostics` 由调用方传**用量事实**（model / tokens_out / reasoning_tokens /
+    task_tier），只用来把错误文案写准 —— **不参与解析**。
     """
     text = content.strip()
     fenced = re.search(r"```(?:json)?\s*(.+?)```", text, re.DOTALL)
     if fenced:
         text = fenced.group(1).strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if not text:
+        raise AgentExecutionError(_empty_body_message(agent_id, diagnostics))
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -62,10 +76,87 @@ def parse_llm_json(agent_id: str, content: str) -> dict[str, Any]:
     try:
         data, _ = json.JSONDecoder().raw_decode(text)
     except json.JSONDecodeError as exc:
-        raise AgentExecutionError(f"{agent_id} LLM输出非合法JSON: {exc}") from exc
+        raise AgentExecutionError(
+            f"{agent_id} LLM输出非合法JSON: {exc}"
+            + _usage_suffix(diagnostics)
+            + _truncation_note(diagnostics)) from exc
     if not isinstance(data, dict):
         raise AgentExecutionError(f"{agent_id} LLM输出JSON非对象: {type(data)}")
     return data
+
+
+def _usage_suffix(diagnostics: dict[str, Any] | None) -> str:
+    """把用量事实拼成一句人话后缀（没有诊断信息时返回空串 ⇒ 老文案逐字不变）。"""
+    d = diagnostics or {}
+    if not d:
+        return ""
+    bits = [f"model={d.get('model') or '?'}"]
+    if d.get("task_tier"):
+        bits.append(f"tier={d['task_tier']}")
+    bits.append(f"out={int(d.get('tokens_out') or 0)}")
+    if int(d.get("max_tokens") or 0) > 0:
+        bits.append(f"上限={int(d['max_tokens'])}")
+    if int(d.get("reasoning_tokens") or 0) > 0:
+        bits.append(f"思维链={int(d['reasoning_tokens'])}")
+    return "（用量：" + " ".join(bits) + "）"
+
+
+def output_hit_cap(diagnostics: dict[str, Any] | None) -> bool:
+    """本次输出是否**顶到了上限**（= 被截断的判据）。`CHG-0250`。
+
+    ## 为什么"输出顶到上限"必须自成一态
+
+    2026-10-16 用户报障（**与 `CHG-0249` 的 `char 0` 是两个不同根因**）：
+
+        A06_extractor LLM输出非合法JSON: Expecting value: line 224 column 18 (char 5278)
+        （用量：model=qwen-flash tier=medium out=2048）
+
+    `char 5278`（正文深处）而不是 `char 0`（空正文）⇒ **JSON 写到一半被截断**，
+    而 `out=2048 == medium 层预算`。两件事共用一句"非合法JSON"的后果是：
+    修的人会去查"模型会不会写 JSON / prompt 的 schema 是不是不清楚"，
+    **而真因是"要得太多、装不下"** —— 这正是本项目反复记的
+    「同一个报错文案 ≠ 同一个根因」。
+
+    ★ 判据只在**两个数都拿得到**时才成立：`out > 0` 且 `上限 > 0` 且 `out >= 上限`；
+    拿不到上限**不下判断**（宁可不说，也不猜 —— 猜错会把人带去改错地方）。
+    """
+    d = diagnostics or {}
+    out = int(d.get("tokens_out") or 0)
+    cap = int(d.get("max_tokens") or 0)
+    return bool(out and cap and out >= cap)
+
+
+def _truncation_note(diagnostics: dict[str, Any] | None) -> str:
+    """命中输出上限时补一句**指向真因**的话；不命中返回空串（老文案逐字不变）。"""
+    if not output_hit_cap(diagnostics):
+        return ""
+    d = diagnostics or {}
+    out = int(d.get("tokens_out") or 0)
+    cap = int(d.get("max_tokens") or 0)
+    return (
+        f" —— ★ 这是**被输出上限截断**：out={out} **顶到**上限 {cap}，"
+        "JSON 写到一半没有收尾（报错位置在正文深处就是这个特征）。"
+        "要治的是**输出预算或输出要求**（少要一些 / 压缩字段 / 分批），"
+        "**不是**「模型不会写 JSON」；★ 原样重发**必然同样被截断**。"
+    )
+
+
+def _empty_body_message(agent_id: str,
+                        diagnostics: dict[str, Any] | None) -> str:
+    """空正文的**可定位**文案：说出两种已知成因，而不是 `char 0`。"""
+    d = diagnostics or {}
+    out = int(d.get("tokens_out") or 0)
+    think = int(d.get("reasoning_tokens") or 0)
+    cause = ""
+    if out and think and think >= out:
+        cause = ("—— 本次输出**全部是思维链**（out == reasoning_tokens），"
+                 "正文一个字符都没有；处置：该调用点应显式 `reasoning_effort=\"none\"`")
+    elif out:
+        cause = ("—— 模型有输出但正文为空（疑似被 `max_tokens` 截断或只回了思维链）；"
+                 "处置：核对本层输出预算与该跳实际速率")
+    else:
+        cause = "—— 模型**一个 token 都没产出**；处置：核对降级链与单跳预算是否把它砍在预算外"
+    return f"{agent_id} LLM输出为**空正文**{cause}{_usage_suffix(diagnostics)}"
 
 
 # ============================================================

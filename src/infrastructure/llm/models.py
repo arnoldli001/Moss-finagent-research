@@ -63,7 +63,56 @@ class LLMResponse(BaseModel):
     #: 默认 high，且关思考后 3168 token 正文仍需 ~32s）。
     #: 0 = 未提供（本地 Ollama / 非推理模型 / 老版本 API）。
     reasoning_tokens: int = 0
+    #: ★ 2026-10-16（`CHG-0250`）：本次调用**实际生效的输出上限**（token）。
+    #:
+    #: 为什么要它：`tokens_out` 单独看不出"是不是被截断"——
+    #: `out=900` 与 `out=2048（上限 2048）` 的含义完全相反，而两者原先在错误里
+    #: 长得一样（都只是"非合法JSON"）。有了这个字段，调用点才能区分
+    #: 「模型写坏了 JSON」与「**要得太多、装不下**」。
+    #: `0` = 未知（老路径/未设置）⇒ 调用方**不许**据此断言截断。
+    max_tokens: int = 0
     latency_ms: int = 0
+    #: ★ 2026-10-05：这一跳**排队**了多久（毫秒）—— 等 `local_gate` 槽位的时间。
+    #:
+    #: ## 为什么必须与 `latency_ms` 拆开（实测，`CHG-0177`）
+    #:
+    #: 实测 `provider=ollama` 共 12,651 次调用：p50 4,542ms 而
+    #: **max 210,136ms**。那 210 秒 = `local_gate` 的 **90s** 排队上限
+    #: + HTTP 的 **120s** 超时（两个常量由两个模块各自定义）。
+    #: 合成一个 `latency_ms` 时，"这 210 秒里排队占多少、生成占多少"
+    #: **无法回答** —— 而这两个方向的处置**完全相反**：
+    #:
+    #:   · 排队占大头 ⇒ 该治的是**准入/争抢**（谁在抢那个唯一槽位）
+    #:   · 生成占大头 ⇒ 该治的是**模型/输出预算**（换了 4B、或砍 max_tokens）
+    #:
+    #: 没有这个字段，任何"本地为什么慢"的结论都只能是猜。
+    #:
+    #: ## 口径
+    #:
+    #: 只在**走闸**的 provider（Ollama）上有值。云端 provider **不适用**
+    #: ⇒ `None`。⚠️ `None` = **未量到 / 不适用**，**不是 0**
+    #: （AGENTS.md：「没量到」与「量到 0」必须分开）。
+    wait_ms: int | None = None
+    #: **模型侧**耗时（毫秒）= `latency_ms - wait_ms`。
+    #:
+    #: ## ⚠️ 为什么叫 `model_ms` 而不是 `gen_ms`（实测后改名，`CHG-0177`）
+    #:
+    #: 它**不只**是生成，而是"从拿到槽位到响应返回"的全部模型侧时间：
+    #: **模型加载/换入 + prompt 预填充 + 生成**。
+    #:
+    #: 实测（6 路并发打真实 Ollama，`qwen2.5:1.5b`，短 prompt，`_probe_wait_gen_split`）：
+    #:
+    #:     #0  wait=0ms     model_ms=2383ms  out=3 tok  ← 2.38s 是**加载**，不是生成
+    #:     #1  wait=2359ms  model_ms=31ms    out=3 tok  ← 模型已驻留，真的只花 31ms
+    #:
+    #: 若叫 `gen_ms`，就会有人算"平均生成速度 = tokens / gen_ms" ——
+    #: 在冷调用上得到 1.3 tok/s 这种荒谬值。那正是本项目已登记过的
+    #: 「**同名不同义**」缺陷（两个 `cache_hit` 曾差出 65.5% 的金额）。
+    #: **名字必须和口径一样准。**
+    #:
+    #: ⚠️ 口径同 `wait_ms`：云端 provider 为 `None`（不是 0）——
+    #: 没有可减的基准时，填 `latency_ms` 会把"不适用"伪装成"零排队"。
+    model_ms: int | None = None
     cache_hit: bool = False
     cache_kind: Literal["exact", "semantic", "none"] = "none"
     fallback_used: bool = False
