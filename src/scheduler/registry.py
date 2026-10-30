@@ -47,6 +47,7 @@ JobKind = Literal[
     "data_freshness_audit",  # ★ 定期数据维护：扫陈旧/缺失序列 → 报日志 + 落报告 + 入补采队列
     "derived_metrics",       # ★ 派生指标落库（净息差等）：每次计算都记一行 ⇒ 攒趋势
     "source_leads_audit",    # ★ 换源线索上报：把 path C 搜到的候选源网址送到运维日志
+    "compliance_pledge_warm",  # ★ 质押股东明细整表预热（从请求期挪到定时，见 JobSpec 注释）
 ]
 
 
@@ -270,6 +271,21 @@ JOB_REGISTRY: dict[str, JobSpec] = {
         ),
         params={"task_prefix": "fin_ratio", "indicators": []},  # 标的由作业内解析
     ),
+    "compliance_pledge_warm": JobSpec(
+        name="compliance_pledge_warm",
+        # ★ 一周两次（周二/周六 03:00），**必须比 7 天 TTL 更频繁** ——
+        #   一周一次正好等于 TTL，一次失败/延迟就出现"冷窗口"，
+        #   而冷窗口里的交互请求现在会直接报缺口（fail-closed）。
+        #   本项目同族先例：`daily_warm` 的轮询间隔必须严格小于它自己的 TTL。
+        cron="0 3 * * 2,6",
+        kind="compliance_pledge_warm",
+        description=(
+            "预热「东财股权质押-股东粒度明细」整表索引（126872 行 / 约 254 次分页请求 / "
+            "实测 75~240s），落盘 data/compliance_pledge_index.json，"
+            "使 A12 的大股东质押比例走缓存命中而不是请求期同步拉取"
+        ),
+        params={},
+    ),
     "tech_industry_daily": JobSpec(
         name="tech_industry_daily",
         cron="30 16 * * 1-5",
@@ -441,6 +457,39 @@ JOB_REGISTRY: dict[str, JobSpec] = {
             "供资金流监控→板块拥挤度面板排序查看（同一周已算过则跳过）"
         ),
         params={"force": False},
+    ),
+    # ★ 数据新鲜度 + 作业暂停自检（2026-10-30 事故的"自动化"那一层）
+    #
+    # ## 为什么必须有作业，而不是"记得手动跑脚本"
+    #
+    # 2026-10-30 实测：三条链路分别停更 7 / 18 / 21 天，**系统一声没响** ——
+    # `mainline_daily` 连续三次 failed 被自动暂停（只写一行 INFO）、
+    # 拥挤度日线靠 Windows 计划任务刷新而那任务被删了（毫无痕迹）、
+    # 数据停更本身从来不算"错误"。用户是**看页面上的日期**才发现的。
+    #
+    # 所以：判据脚本 `scripts/data_freshness_check.py` + 这个作业，让
+    # "停更/被暂停"每个工作日自己浮出来一次（WARNING + 机器码 `DATA_STALE`）。
+    #
+    # ## 三个刻意的选择
+    #
+    # 1. **19:00**：晚于 `mainline_daily`(17:30)、`mainline_etf_flow`(17:50)、
+    #    `mainline_warm`(18:10) —— 白天该跑的都跑完了再判，
+    #    不会在盘中误报"今天还没数据"。
+    # 2. **永远 success，绝不 failed**：它自己 failed 三次就会被暂停 ——
+    #    那正是"监视器被它监视的机制停掉"的荒谬局面。判据结果放 `detail`，
+    #    告警走 WARNING 日志。
+    # 3. **只读**：不写任何库（`updates=()`），与写者归属 / 锁竞争都无关，
+    #    在 dev 还是 pilot 上跑都安全。
+    "data_freshness_check": JobSpec(
+        name="data_freshness_check",
+        cron="0 19 * * 1-5",
+        kind="data_freshness",
+        description=(
+            "数据新鲜度 + 作业暂停自检：比对每个数据集的最新交易日与交易日历，"
+            "并扫运行记录找出「连续三次 failed 已被自动暂停」的作业；"
+            "只读，结果写日志（WARNING + DATA_STALE）与 detail"
+        ),
+        params={"tolerance": 1},
     ),
     # ★ 限售解禁**逐股明细表**（用户 2026-09-29 口径）：
     #   「按投研分析要查的股票、解禁日期、**解禁数量**落入到数据库**单独的表中**，

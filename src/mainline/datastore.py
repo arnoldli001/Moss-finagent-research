@@ -1808,12 +1808,28 @@ class MainlineDataStore:
                 continue
             if not rows:
                 # 空是**正常**的（当天没有个股上榜），不该记成失败
+                #
+                # ⚠️ 这里的第二个参数**必须**是"一行记录的列表"`[(...)]`，
+                #    不能是裸元组 `(...)`：`_write()` 内部走的是
+                #    `connection.executemany(sql, rows)`，它把外层序列的**每个元素**
+                #    当成一条记录。给裸元组 `(day, day, now)` 时它会拿第一个元素
+                #    （日期字符串 `"20261030"`）当一条记录去绑定 —— 于是报
+                #    「The current statement uses 3, and there are 8 supplied」
+                #    （8 正好是日期串的长度），一句完全看不出根因的错。
+                #
+                # ★ 这个 bug 的杀伤力远大于它自己：它只在"当天没有龙虎榜"时触发，
+                #   而它会让 `sync_seats` 整个数据集记成 failed ⇒ `mainline_daily`
+                #    连续三次 failed ⇒ **被调度器自动暂停 18 天**（2026-10-12 →
+                #    2026-10-30 实测），主线评分/ETF 份额/告警全部停更，而暂停
+                #    当时**没有任何提示**。护栏见
+                #    `tests/unit/test_mainline_write_shape.py`（AST 扫描所有
+                #    `_write(` 调用，第二个参数不许是裸元组）。
                 self._write("INSERT INTO ml_sync(dataset, span_start, span_end,"
                             " rows, status, message, seconds, updated_at)"
                             " VALUES('seat_day', ?, ?, 0, 'ok', '', 0, ?)"
                             " ON CONFLICT(dataset, span_start, span_end)"
                             " DO UPDATE SET updated_at=excluded.updated_at",
-                            (day, day, _now()))
+                            [(day, day, _now())])
                 continue
             total += self._write(
                 "INSERT INTO ml_seat(trade_date, code, exalter, side, buy, sell,"

@@ -150,6 +150,39 @@ def test_sync_status_records_last_run(store: MainlineDataStore) -> None:
     assert any(row["dataset"] == "calendar" for row in status)
 
 
+def test_sync_seats_with_empty_day_does_not_raise(store: MainlineDataStore) -> None:
+    """龙虎榜"当天没人上榜"是**正常**的，不能把整条同步链炸掉。
+
+    ## 这条守的是一次真实事故（2026-10-30 查实）
+
+    `sync_seats` 的空分支原来写的是 `self._write(sql, (day, day, now))` ——
+    **裸元组**。而 `_write()` 内部是 `connection.executemany(sql, rows)`，它把
+    外层序列的每个元素当成一条记录 ⇒ 拿第一个元素（日期串 `"20261030"`，
+    正好 8 个字符）去绑 3 个占位符，报
+
+    > `Incorrect number of bindings supplied. The current statement uses 3,
+    >  and there are 8 supplied.`
+
+    杀伤力不在这一句：它让 `sync_seats` 整个数据集记成 failed ⇒
+    `mainline_daily` 连续三次 failed ⇒ **调度器自动暂停 18 天**（10-12 → 10-30），
+    主线评分 / ETF 份额 / 告警全部停更，**而暂停没有任何提示**。
+
+    ⚠️ 假 Tushare 的 `seat_rows()` 返回空列表，走的就是这条分支 ——
+    所以这个用例在修之前**必然红**。
+
+    ⚠️ 必须先 `sync_calendar()`：`_missing_dates()` **以交易日历为准**
+    （拿自然日算会把周末当成缺失），日历空着时它返回 `[]`，
+    空分支一条都不会走 —— 那这个用例会"绿得毫无意义"。
+    """
+    store.sync_calendar("20260915", "20260917")
+    result = store.sync_seats(start="20260915", end="20260917")
+    assert result.status == "ok", f"空龙虎榜被当成失败：{result.message}"
+    assert result.missing == [], f"不该有失败日：{result.missing}"
+    # 台账里要留下"这天查过了、是空的"的痕迹（否则每次都会重查）
+    assert any(row["dataset"] == "seat_day" for row in store.sync_status()), (
+        "空分支没有写台账 —— 下次同步还会把这几天当成缺的再拉一遍")
+
+
 # ==================================================================
 # 一之二、ETF 份额补拉（`sync_etf_shares` / `etf_share_coverage`）
 # ==================================================================

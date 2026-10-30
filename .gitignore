@@ -96,6 +96,7 @@ node_modules/
 !/scripts/intraday_failover_check.py
 !/scripts/intraday_latency_probe.py
 !/scripts/prd_sync_check.py
+!/scripts/data_freshness_check.py
 !/scripts/preflight_check.py
 !/scripts/affected_tests.py
 !/scripts/check_external_sources.py

@@ -375,67 +375,95 @@ async def execute_job(
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "quant_data_sync":
                 processed, detail = await _quant_data_sync(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "model_retrain":
                 processed, detail = await _model_retrain(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
+            if spec.kind == "data_freshness":
+                # ★ 2026-10-30 事故的自动化护栏：判"数据停更 / 作业被暂停"。
+                #
+                # ⚠️ **永远 success**（哪怕发现陈旧）：这个作业若 failed 三次，
+                #    调度器会把它自己暂停 —— "监视器被它监视的机制停掉"，
+                #    比没有监视器更糟。判据结论放 `detail`，告警走 WARNING，
+                #    机器可读码 `DATA_STALE` 供 grep / 后续接通知。
+                stale_count, detail = await _data_freshness(spec)
+                if stale_count:
+                    logger.warning(
+                        "数据新鲜度自检发现 %d 处异常（DATA_STALE）：%s",
+                        stale_count, detail[:600])
+                else:
+                    logger.info("数据新鲜度自检通过：%s", detail[:300])
+                return run_log.finish(
+                    record, status="success", records_processed=stale_count,
+                    error_message="", detail=detail[:900])
             if spec.kind == "crowding_metrics":
                 processed, detail = await _crowding_metrics(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "auction_tick_capture":
                 processed, detail = await _auction_tick_capture(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "intel_zsxq_collect":
                 processed, detail = await _intel_zsxq_collect(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "intel_token_alert":
                 processed, detail = await _intel_token_alert(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "intel_tone_extract":
                 processed, detail = await _intel_tone_extract(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "intel_hot_topics":
                 processed, detail = await _intel_hot_topics(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "intel_hot_rank":
                 processed, detail = await _intel_hot_rank(spec)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "intel_signal_alert":
                 processed, detail = await _intel_signal_alert(spec, runtime)
                 status = "success" if not detail.startswith("失败") else "failed"
                 return run_log.finish(
                     record, status=status, records_processed=processed,
-                    error_message="" if status == "success" else detail[:500])
+                    error_message="" if status == "success" else detail[:500],
+                    detail=detail[:500])
             if spec.kind == "dynamic_collection":
                 indicators = spec.params.get("indicators") or []
                 processed, errors = await _collect_through_pipeline(
@@ -457,6 +485,33 @@ async def execute_job(
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("catalog 索引回填失败（忽略）: %s", exc)
                 return _finish_collection(record, run_log, processed, errors)
+            if spec.kind == "compliance_pledge_warm":
+                # ★★ 2026-10-05（用户报障「采集等操作端到端要 2 分钟」）：
+                # 把「东财股权质押-股东粒度明细」**整表拉取**从**请求期**挪到**定时**。
+                #
+                # 病灶（实测，不是推断）：该接口没有个股参数，只能整表拉
+                # （126872 行 / 约 254 次分页请求 / 75~240s）。它由交互请求触发，
+                # 调用方 10 秒就被路由层的防撞钟放弃，但 `asyncio.to_thread` 里
+                # 那次拉取**继续跑满 233s**，正好横跨用户整条投研链路：
+                #
+                #     12:20:33 起拉 → 12:20:43 调用方放弃 → 12:24:26 拉完（233.3s）
+                #     （09-30 同一条路径 261.1s，非偶发）
+                #
+                # 收口三件：① 本作业按周预热（cron 比 7 天 TTL 更频繁）；
+                # ② 索引落盘 ⇒ 预热在哪个进程跑、API 何时重启都不影响命中；
+                # ③ `_pledge_points` 走 `allow_fetch=False`（fail-closed）⇒
+                #    冷索引时请求期立刻报缺口，**不再开那个没人要的线程**。
+                from src.infrastructure.connectors.compliance_fin_connector import (
+                    ComplianceFinConnector,
+                )
+
+                stats = await ComplianceFinConnector().warm_pledge_index()
+                logger.info(
+                    "合规财务比率：质押整表预热完成 —— %s 只 / %s 行 / as_of=%s / %s",
+                    stats.get("codes"), stats.get("rows"), stats.get("as_of"),
+                    stats.get("artifact"))
+                return _finish_collection(
+                    record, run_log, int(stats.get("codes") or 0), [])
             if spec.kind == "data_freshness_audit":
                 # ★ 2026-09-29 用户要求：「数据采集 agent 要记录任何未能获取到的
                 #   信息日志…**定期维护数据**」。
@@ -1434,6 +1489,52 @@ async def _model_retrain(spec: Any) -> tuple[int, str]:
     if report.notes:
         detail += "；" + "；".join(report.notes)[:200]
     return produced, detail
+
+
+async def _data_freshness(spec: Any) -> tuple[int, str]:
+    """数据新鲜度 + 作业暂停自检（2026-10-30 事故的自动化护栏）。
+
+    返回 `(异常条数, 说明)`。**调用方永远记 success** —— 理由见
+    `execute_job` 里 `kind == "data_freshness"` 那段注释：这个作业一旦
+    failed 三次就会被调度器自己暂停，那就等于"把报警器关了"。
+
+    ## 为什么在**线程**里跑而不是直接 await
+
+    判据要读 4 个 SQLite 文件（其中仓库 15 GB、日历 2 千多行），
+    都是同步 IO；直接放在事件循环里会制造一次可观测的循环延迟
+    （本仓库 `src/core/loop_lag.py` 会把 >500ms 的卡顿记下来）。
+    这个作业每天只跑一次，用 `to_thread` 的代价可以忽略。
+
+    ⚠️ 依赖方向：`scripts/` **不是**包（没有 `__init__.py`），这里按文件路径
+    加载，并且**每次调用都重新加载**：脚本改了口径不需要重启进程才能生效
+    —— 自检脚本最怕的就是"改了但跑的还是旧逻辑"。
+    """
+    import importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "data_freshness_check.py"
+    if not script.is_file():
+        return 0, f"自检脚本不存在：{script}（跳过，不判失败）"
+
+    def _run() -> tuple[int, str]:
+        name = "data_freshness_check_runtime"
+        spec_ = importlib.util.spec_from_file_location(name, script)
+        if spec_.loader is None:
+            return 0, "自检脚本无法加载"
+        module = importlib.util.module_from_spec(spec_)
+        sys.modules[name] = module          # dataclass 需要它（见测试里的同款注释）
+        spec_.loader.exec_module(module)
+        tolerance = int((spec.params or {}).get("tolerance", 1))
+        report = module.check(tolerance=tolerance)
+        if report.ok:
+            return 0, "全部新鲜：" + "、".join(report.checked)
+        codes = ",".join(finding.code for finding in report.findings)
+        return len(report.findings), f"DATA_STALE {codes}｜" + "；".join(
+            finding.render() for finding in report.findings)
+
+    import sys
+
+    return await asyncio.to_thread(_run)
 
 
 async def _crowding_metrics(spec: Any) -> tuple[int, str]:

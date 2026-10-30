@@ -220,7 +220,18 @@ class CronScheduler:
                 logger.warning("作业%s上一轮未结束，跳过本轮", name)
                 continue
             if self._run_log.is_paused(name):
-                logger.info("作业%s已被自动暂停（连续失败），跳过", name)
+                # ⚠️ **必须是 WARNING**（2026-10-30 由 INFO 提升）：
+                #    `mainline_daily` 就是这样被静默暂停了 18 天 ——
+                #    连续三次 failed 之后，调度器每天只在 INFO 里写一句
+                #    "已被自动暂停（连续失败），跳过"，混在几千行 INFO 里
+                #    没人会看见，数据于是静静地停更。
+                #    暂停是"需要人工介入"的状态，不是日常信息。
+                #    判据侧配套：`scripts/data_freshness_check.py`
+                #    （作业 `data_freshness_check` 每工作日 19:00 兜一遍）。
+                logger.warning(
+                    "作业%s已被自动暂停（连续失败），跳过本轮；需要人工介入 —— "
+                    "修好根因后手动跑一次即可恢复（manual 触发不受暂停限制）",
+                    name)
                 continue
             asyncio.create_task(self._run_one(name))
 

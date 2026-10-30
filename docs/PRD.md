@@ -16034,3 +16034,118 @@ uv run python -c "import json,pathlib; rows=[json.loads(l) for l in pathlib.Path
 **但边界仍然要留着**：这一次成功**不等于**"任何问句都不会再截断"（同一层的 A07/A09/A17
 未逐个核；`_PROMPT_MAX_EVENTS=16` 仍是估算值）—— 真出现时走"更小要求重试一次"，
 重试也失败就**照旧抛错**（不假装成功），而错误文案现在会**直说"被输出上限截断"**。
+
+
+## 五十五、定期自动刷新**静默停更**：三种停更、零个提示（现行口径 · 2026-10-30 定型，`CHG-0258`）
+
+### 55.1 需求原话（2026-10-30）
+
+> 「当前 资金流监控 ETF份额监控的前端数据还是10.23日的，没有自动刷新到最新最近的一次
+> 收盘数据（10.29日的数据），点击立即刷新也没执行。板块拥挤度也停留在10.23日没有自动
+> 刷新，重算异动指标；主线挖掘，也是停留在10.23日的；**只要开机，定期自动刷新的脚本
+> 是否按预期执行了？**」
+
+### 55.2 实测：**调度器在跑，而且跑得好好的** —— 但三条链路各自停更
+
+先正面回答用户那句话，证据来自 `data/pilot/scheduler/runs.jsonl`（累计 9417 条记录）：
+
+| 事实 | 证据 |
+|---|---|
+| 进程内 Cron 调度器**在跑** | 当天 08:00/08:10/08:20/08:30/08:40 都有作业完成：`intel_hot_rank`、`strategy_cases_daily`、`source_leads_audit`、`us_macro_daily`、`intel_signal_alert` |
+| `quant_data_sync` **正常**，已到 **20261029** | 10-24 之后成功 34 次 |
+| **`mainline_daily` 自 20261012 起再没跑过** | 最后三条记录 10-08 / 10-09 / 10-12 全是 `failed` ⇒ 被自动暂停 |
+| **`crowding_metrics_weekly`** 10-21 失败（`database is locked`），10-28 也没跑 | 台账最后一条停在 10-21 |
+| **拥挤度日线**靠 **Windows 计划任务** `MossCrowdingRefresh` 刷新 | 该任务**已不存在**（`Get-ScheduledTask` 查无）；最后一次成功是 10-24 11:00（`sector_crowding_max_ma5.updated_at = 2026-10-24T11:01`） |
+
+落库实况 —— **每个实例各有一份库**（这一点本轮才彻底看清，也是"为什么改对了却没生效"的常见陷阱）：
+
+| 数据 | pilot 库 | 共享库 |
+|---|---|---|
+| `sector_crowding_daily` | ——（只在共享库，218 万行） | **20261023** → 本轮修到 **20261029** |
+| `mainline_score` | **20261009** | 20260924 |
+| `mainline_alert` | **20261009** | 20260924 |
+| `mainline_etf_flow_signal` | **20261023** | 20260921 |
+| `ml_etf`（ETF 份额，共享行情缓存） | —— | **20261023** |
+| `sector_crowding_metric` | 2026-10-30 08:42（**用 10-23 的数据算的**） | 2026-09-30 |
+
+### 55.3 根因三条（各自独立，任一条都不至于停 7~21 天）
+
+**(一) 暂停是静默的。** `service.py` 里 `is_paused` 分支原来写 `logger.info`。
+`mainline_daily` 连续三次 `failed` 之后，调度器每天只在 INFO 里写一句
+「已被自动暂停（连续失败），跳过」，混在几千行 INFO 里没人看得见；
+而**数据停更本身从来不报错**，所以任何"看报错"的判据都抓不到它。
+
+**(二) 一对方括号。** `sync_seats` 的空分支（`src/mainline/datastore.py`）：
+
+```python
+self._write(sql, (day, day, _now()))      # ← 裸元组
+# _write 内部是 connection.executemany(sql, rows)
+# ⇒ 它把外层序列的每个元素当成一条记录：拿第一个元素（日期串 "20261030"，
+#   正好 8 个字符）去绑 3 个占位符
+# ⇒ 「The current statement uses 3, and there are 8 supplied」
+```
+
+这行只在**当天没有龙虎榜**时触发（`if not rows:`），报错完全看不出根因；
+它让 `sync_seats` 整个数据集记 `failed` ⇒ `mainline_daily` 连续三次 `failed`
+⇒ 触发 (一)。**ETF 份额同步也在同一条作业里**，于是 ETF 一起停更。
+
+**(三) Windows 计划任务会消失。** `CHG-0244` 记过"360 会清理计划任务"，
+`CHG-0243` 记过"别把重启后能自动起来只挂在一个任务上"。这次是**第二次**：
+`MossCrowdingRefresh` 不在了，而**没有任何东西发现它不在了**，拥挤度日线于是停 7 天。
+
+### 55.4 修法（四层：从根因到可见性）
+
+| # | 修法 | 位置 |
+|---|---|---|
+| ① | `sync_seats` 空分支改 `[(day, day, _now())]` | `src/mainline/datastore.py` |
+| ② | 暂停分支 `logger.info` → **`logger.warning`**，并写明"怎么恢复"（manual 触发不受暂停限制） | `src/scheduler/service.py` |
+| ③ | 新脚本 `scripts/data_freshness_check.py`：**日期比日期** + **状态数枚举**，退出码三态（0 正常 / 1 有异常 / 2 自检自己坏了） | `scripts/` |
+| ④ | 新作业 `data_freshness_check`（**每工作日 19:00**、只读、永远 success）把 ③ 的结果写进 WARNING + 机器码 `DATA_STALE` | `src/scheduler/registry.py`、`jobs.py` |
+
+**为什么作业必须"永远 success"**：它若也 `failed` 三次，就会被自己监视的机制暂停 ——
+等于"把报警器关了"，比没有报警器更糟。所以判据结论只放 `detail` + WARNING，
+**不**用 failed 表达。
+
+**为什么排 19:00**：晚于 `mainline_daily`(17:30)、`mainline_etf_flow`(17:50)、
+`mainline_warm`(18:10) —— 白天该跑的都跑完了再判，避免盘中误报"今天还没数据"。
+
+### 55.5 判据（可复跑；判据只认机器可读的东西）
+
+```bash
+# ① 新鲜度 + 暂停（当前环境 / 指定实例 / 全实例 JSON）
+uv run python scripts/data_freshness_check.py
+uv run python scripts/data_freshness_check.py --env pilot
+uv run python scripts/data_freshness_check.py --all --json
+
+# ② "一对方括号"的护栏（AST 扫所有 _write 调用 + 空龙虎榜行为）
+uv run python -m pytest tests/unit/test_mainline_write_shape.py \
+    "tests/unit/test_mainline_datastore.py::test_sync_seats_with_empty_day_does_not_raise" -q
+
+# ③ 自检判据自身（23 条：日期归一 / 容忍边界 / 跳跃记录 / 退出码三态 / JSON 契约）
+uv run python -m pytest tests/unit/test_data_freshness_check.py -q
+```
+
+**突变自证**：把 `[(day, day, _now())]` 改回裸元组 ⇒ 行为守卫与 AST 守卫**同时变红**，
+还原即绿。AST 守卫扫的是**全部** `self._write(...)` 调用点（≥10 处），
+所以同类形状新写一处也会立刻红，不用等它触发。
+
+### 55.6 本轮实测（修完的状态）
+
+| 链路 | 修前 | 修后 |
+|---|---|---|
+| 拥挤度日线（共享库） | 20261023 | **20261029**（`manage.py crowding-refresh --env dev`：262/262 板块、0 失败、26.2 s） |
+| 拥挤度周频 4 列（pilot 库） | 用 10-23 的数据算的 | **20261029**（`as_of_date=20261029`、`flow_last_date=20261029`、261 板块、`2026-W44`） |
+| 拥挤度定时任务 | **不存在** | 已注册 `MossCrowdingRefresh`（`EveryDay 11:00`，NextRun 2026-10-30 11:00） |
+| 主线 / ETF 份额 | 20261009 / 20261023 | 用 `mainline_daily` 以 **manual 触发**重跑一次（manual 不受暂停限制）；该作业耗时 25~50 分钟，跑完即恢复排班 |
+
+### 55.7 已知缺口（诚实登记，不省略）
+
+| # | 缺口 | 状态 |
+|---|---|---|
+| ① | **pilot 上有 6 个作业处于"被自动暂停"状态**（`mainline_daily`、`daily_warm`、`auction_tick_capture`、`event_alert_intraday`、`intel_hot_topics`、`snapshot_macro` 等）。本轮只修了 `mainline_daily` 的根因并手动跑了一次，其余要**逐个**人工判断，不许盲跑 | 待办 |
+| ② | **暂停为什么不自动恢复**：设计上要人工介入（防"每 30 分钟撞同一堵墙"）。本轮补的是"看得见"，不是"自愈" | 设计如此 |
+| ③ | **`MossCrowdingRefresh` 能不能活过下一次 360 清理**：不知道。现在只能靠 ③④ 每天兜一遍（发现问题→报警），**没有**自动重建 | 待办 |
+| ④ | 判据口径是"自然日落后 > 1 天"，**节假日会误报**（日历只用来算"应有交易日"） | 设计取舍（宁可误报） |
+| ⑤ | `--all` 会把历史遗留账本（`data/scheduler`，最后一条 2026-10-09）也算进来，噪音大 | 已知；默认只扫当前环境 |
+| ⑥ | **没有接外部通知**：`DATA_STALE` 目前只写日志（`notify.env` 未配置是既定缺口，见 `CHG-0243`） | 待办 |
+| ⑦ | 「ETF 份额监控」的「立即刷新」只**重算**（`GET /snapshot?refresh=true`），**不下载**新份额数据 —— 份额数据由 `mainline_daily` 同步的 `ml_etf` 提供。用户点它是正常的，它本来就不会去拉数据 | 口径需在界面上写明 |
