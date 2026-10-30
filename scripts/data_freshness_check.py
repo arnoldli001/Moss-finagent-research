@@ -56,6 +56,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 
+#: 暂停冷却天数（与 `src/scheduler/registry.PAUSE_COOLDOWN_DAYS` 同一个口径）。
+#: 这里**不 import** `src.*`：本脚本要在"配置坏了/库打不开"时也能跑，
+#: 依赖 `src` 会把自检本身变成又一个会坏的东西。两边的一致性由
+#: `tests/unit/test_data_freshness_check.py` 里一条"常量必须相等"的判据钉住。
+PAUSE_COOLDOWN_DAYS = 7
+
 #: 共享库（多个实例共写，见 `configs/data_stores.yaml`）
 SHARED_DB = "data/moss_finagent.db"
 #: 主线行情缓存（板块指数/资金流/ETF 份额/两融…）
@@ -142,19 +148,43 @@ def judge(max_date: str, expected: str, *, tolerance: int = DEFAULT_TOLERANCE
     return False, f"落后 {behind} 天，在容忍范围内"
 
 
-def paused_jobs(records: list[dict], *, threshold: int = 3) -> list[str]:
-    """按 `RunLog.is_paused()` 的**同一判据**算：最后 `threshold` 次全是 failed。"""
-    by_job: dict[str, list[str]] = {}
+def paused_jobs(records: list[dict], *, threshold: int = 3,
+                cooldown_days: int = PAUSE_COOLDOWN_DAYS,
+                now: datetime | None = None) -> list[str]:
+    """**当前**处于暂停状态的作业（与 `RunLog.is_paused()` 逐条对齐）。
+
+    判据两条同时成立：
+      ① 最后 `threshold` 条可判记录全是 `failed`；
+      ② 最后一次失败距今 **不足** `cooldown_days` 天。
+
+    ⚠️ ② 不能省：2026-10-30 之前 `is_paused` 没有时间维度，`mainline_daily`
+    在 10-12 连续失败三次后被**永久**暂停（18 天没再被尝试）。加了冷却期之后，
+    超过 7 天会自动放行一次 —— 那时它**不该**再被报成"暂停"，
+    否则脚本说暂停、调度器却在正常跑，两边互相打脸。
+    """
+    now = now or datetime.now().astimezone()
+    by_job: dict[str, list[dict]] = {}
     for rec in records:
         status = str(rec.get("status") or "")
         if status not in ("success", "partial", "failed"):
             continue          # running / skipped 不计入（与 RunLog 一致）
-        by_job.setdefault(str(rec.get("job_name") or ""), []).append(status)
+        by_job.setdefault(str(rec.get("job_name") or ""), []).append(rec)
     out = []
     for name, history in sorted(by_job.items()):
         tail = history[-threshold:]
-        if len(tail) == threshold and all(s == "failed" for s in tail):
-            out.append(name)
+        if len(tail) != threshold or not all(r.get("status") == "failed" for r in tail):
+            continue
+        raw = str(tail[-1].get("end_time") or tail[-1].get("start_time") or "")
+        try:
+            since = datetime.fromisoformat(raw)
+        except ValueError:
+            since = None
+        if since is not None:
+            if since.tzinfo is None:
+                since = since.astimezone()
+            if (now - since).days >= cooldown_days:
+                continue          # 冷却期已过 ⇒ 调度器会再试一次，不算暂停
+        out.append(name)
     return out
 
 

@@ -955,6 +955,13 @@ RETRY_COUNTDOWNS = (60, 300, 900)
 MAX_RETRIES = 3
 # 连续失败此次数后作业自动暂停（设计文档四）
 PAUSE_AFTER_CONSECUTIVE_FAILURES = 3
+#: 暂停**最多持续**多少天；超时后自动放行一次（见 `RunLog.is_paused` 的说明）。
+#:
+#: ★ 2026-10-30 事故：`mainline_daily` 在 10-12 连续失败三次后被永久暂停，
+#: 一直到 10-30（18 天）都没再被尝试过 —— 中间根因早已修好、机器重启过十几次。
+#: "防狂撞"的机制不该变成"永久停机"。7 天 = 一周一次机会：
+#: 数据类作业最长的周期是周频，再长就没有"自己长回来"的可能了。
+PAUSE_COOLDOWN_DAYS = 7
 
 
 def get_job(name: str) -> JobSpec:

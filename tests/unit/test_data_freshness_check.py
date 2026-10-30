@@ -106,18 +106,59 @@ def test_tolerance_is_configurable() -> None:
 
 # --------------------------------------------------------------- 暂停判定
 
-def _rec(name: str, status: str) -> dict:
-    return {"job_name": name, "status": status, "start_time": "2026-10-30T08:00:00"}
+def _rec(name: str, status: str, when: str | None = None) -> dict:
+    """一条运行记录。`when` 默认"现在" —— 暂停判据**带冷却期**，
+    写死历史时刻的夹具会随日历漂移（今天绿、下周红），那是最糟的测试形状。
+    """
+    from datetime import datetime
+
+    stamp = when or datetime.now().astimezone().isoformat()
+    return {"job_name": name, "status": status, "start_time": stamp,
+            "end_time": stamp}
+
+
+def _days_ago(days: int) -> str:
+    from datetime import datetime, timedelta
+
+    return (datetime.now().astimezone() - timedelta(days=days)).isoformat()
 
 
 def test_paused_after_three_consecutive_failures() -> None:
-    """与 `RunLog.is_paused()` **同一判据**：最后 3 次全是 failed。
+    """与 `RunLog.is_paused()` **同一判据**：最后 3 次全是 failed 且**在冷却期内**。
 
     这条对齐很重要：脚本与调度器用不同判据时，会出现"脚本说暂停、
     调度器还在跑"（或反过来），两边都没错，但结论互相打脸。
     """
     records = [_rec("mainline_daily", "failed") for _ in range(3)]
     assert freshness.paused_jobs(records) == ["mainline_daily"]
+
+
+def test_pause_expires_after_cooldown() -> None:
+    """★ 2026-10-30 事故的核心：暂停**必须过期**，否则就是永久停机。
+
+    实测原状：`mainline_daily` 在 10-12 连续失败三次后被永久暂停，
+    到 10-30（18 天）都没再被尝试过 —— 中间根因早已修好、机器重启十几次。
+    所以"最后一次失败在 10 天前"**不能**再判成暂停：调度器会再试一次。
+    """
+    records = [_rec("mainline_daily", "failed", _days_ago(10)) for _ in range(3)]
+    assert freshness.paused_jobs(records) == []
+
+
+def test_pause_within_cooldown_is_still_paused() -> None:
+    """冷却期内（比如昨天刚失败三次）仍然是暂停 ⇒ 该报就要报。"""
+    records = [_rec("mainline_daily", "failed", _days_ago(1)) for _ in range(3)]
+    assert freshness.paused_jobs(records) == ["mainline_daily"]
+
+
+def test_cooldown_constant_matches_the_scheduler() -> None:
+    """脚本里的冷却天数必须与 `registry.PAUSE_COOLDOWN_DAYS` 相等。
+
+    脚本刻意**不 import** `src`（自检不该依赖业务代码），所以两边是两份字面量
+    —— 那就必须有判据钉住它们，否则改了一边另一边悄悄不一致。
+    """
+    from src.scheduler.registry import PAUSE_COOLDOWN_DAYS as scheduler_days
+
+    assert freshness.PAUSE_COOLDOWN_DAYS == scheduler_days
 
 
 def test_two_failures_are_not_paused() -> None:
