@@ -5,6 +5,8 @@
 > 行业层（A13-A16）/ 决策层（A17）/ 审计层（A18）/ 工程层（A19）。
 > 全链路数据溯源与推理路径可回溯。
 
+<p align="center"><a href="README.md">中文</a> | <a href="README_EN.md">English</a></p>
+
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688)](https://fastapi.tiangolo.com/)
 [![React](https://img.shields.io/badge/React-18-61DAFB)](https://react.dev/)
@@ -16,6 +18,7 @@
 ## 目录
 
 - [它能做什么](#它能做什么)
+- [演示](#演示)
 - [架构总览](#架构总览)
 - [三大自研基础设施](#三大自研基础设施)
 - [工程纪律](#工程纪律)
@@ -41,6 +44,91 @@
 | **ETF 份额监控** | 宽基 ETF 份额申赎的逆周期痕迹：份额环比/5-10-20 日累计 + 指数分位 + 市场环境门控（机会信号仅熊市放行）；多产品共振、行业 ETF 反转警示 | `src/mainline/etf_*`、`configs/etf_flow.yaml` |
 | **告警 / 情报** | 事件驱动告警，批量分类 + 批量打分两阶段（2 次 LLM 调用扫 30 条候选）；博查搜索 + 百度千帆两源自动换手 | `src/domain/alerts/`、`src/domain/intel/` |
 | **行业轮动日报** | 行业热力图 + 主力流向 + 规则研判 | `src/sector_rotation/` |
+
+---
+
+## 演示
+
+> 以下截图与录屏均取自在本地运行的实例（2026 年 9-10 月），数据为当时真实行情。
+> 小节标题即原始素材的文件名。
+
+### 量化平台.png
+
+![量化平台总览](docs/demo/量化平台.png)
+
+平台总览：投研分析入口、分析链路与结果看板在同一工作台内。
+
+### 复杂投研分析0930优化到26秒0930.gif
+
+![复杂投研分析端到端 26 秒](docs/demo/复杂投研分析0930优化到26秒0930.gif)
+
+复杂问句的端到端录屏：从用户提问到 A01-A18 全链路跑完，优化后耗时 26 秒。
+
+### 投资日历.png
+
+![投资日历](docs/demo/投资日历.png)
+
+投资日历：把财报、宏观数据发布、解禁与事件节点排进同一张日历。
+
+### 主线板块挖掘告警.png
+
+![主线板块挖掘告警](docs/demo/主线板块挖掘告警.png)
+
+主线板块挖掘告警：三层漏斗识别出主线后，在启动前/初期推送告警。
+
+### 主线挖掘的历史几年的回测胜率.png
+
+![主线挖掘历史回测胜率](docs/demo/主线挖掘的历史几年的回测胜率.png)
+
+主线挖掘的多年 Walk-Forward 回测胜率。
+
+### 竞价选股功能.png
+
+![集合竞价选股](docs/demo/竞价选股功能.png)
+
+集合竞价选股：9:25 出池，12 维打分 + 10 条否决，单票可逐条溯源。
+
+### 宽基etf和行业ETF份额监控.png
+
+![宽基 ETF 与行业 ETF 份额监控](docs/demo/宽基etf和行业ETF份额监控.png)
+
+宽基 ETF 与行业 ETF 份额监控：份额环比、5/10/20 日累计与指数分位。
+
+### etf份额回测和机会风险提示（辅助机构仓位管理）.png
+
+![ETF 份额回测与机会/风险提示](docs/demo/etf份额回测和机会风险提示（辅助机构仓位管理）.png)
+
+ETF 份额信号回测，以及面向机构仓位管理的机会/风险提示。
+
+### 板块资金流监控.png
+
+![板块资金流监控](docs/demo/板块资金流监控.png)
+
+板块资金流监控：主力净流入/流出与板块强弱。
+
+### 个股净流入净流出前20.png
+
+![个股净流入净流出前 20](docs/demo/个股净流入净流出前20.png)
+
+个股净流入/净流出前 20。
+
+### 策略回测（35因子和单股策略回测）.png
+
+![策略回测：35 因子与单股策略](docs/demo/策略回测（35因子和单股策略回测）.png)
+
+回测工作台：35 因子组合回测与单标的策略回测。
+
+### 关键事件的自动检索报警功能.png
+
+![关键事件自动检索报警](docs/demo/关键事件的自动检索报警功能.png)
+
+关键事件自动检索与报警。
+
+### 重大政策及事件，实时监控和评估影响面板2.png
+
+![重大政策及事件影响评估面板](docs/demo/重大政策及事件，实时监控和评估影响面板2.png)
+
+重大政策及事件的实时监控与影响评估面板。
 
 ---
 
@@ -75,7 +163,7 @@ src/
 │   ├── base_agent.py / state.py / message.py
 │   ├── config.py / models.py / schemas.py
 │   ├── market_constants.py      市场口径常量（涨跌停 / 市值 / 年化交易日）
-│   ├── trading_session.py       A 股交易时段边界（09:15/09:30/11:30/13/10/11/15/10/15/10）
+│   ├── trading_session.py       A 股交易时段边界（09:15 / 09:30 / 11:30 / 13:00 / 15:00）
 │   ├── symbols.py               sh/sz 前缀换算（**只此一处**）
 │   ├── errors.py / exceptions.py / redaction.py
 │   ├── budget.py / cancel.py / inflight.py / loop_lag.py / hop_stats.py
@@ -112,15 +200,15 @@ configs/                         全局配置（模型路由 / 数据源 / 策�
 
 ```mermaid
 flowchart LR
-    U[用户 query] --> R[POST /api/v1/research/analyze]
-    R --> P[Supervisor Planner<br/>本地 light 模型]
-    P --> A01[A01 采集<br/>ConnectorRouter 三级故障转移]
-    A01 --> A02[A02 清洗 + A03 校验 + A04 入库<br/>纯规则]
-    A02 --> A05[A05 去伪 + A06 抽取 + A07 舆情<br/>本地 medium / 云端]
-    A05 --> FAN{A08-A12 + 行业 A13-A16<br/>并行 fan-out}
-    FAN --> A17[A17 综合建议<br/>ReAct ≤3 步]
-    A17 --> A18[A18 审计<br/>哈希链 零 LLM]
-    A18 --> Out[返回
+    U["用户 query"] --> R["POST /api/v1/research/analyze"]
+    R --> P["Supervisor Planner<br/>本地 light 模型"]
+    P --> A01["A01 采集<br/>ConnectorRouter 三级故障转移"]
+    A01 --> A02["A02 清洗 + A03 校验 + A04 入库<br/>纯规则"]
+    A02 --> A05["A05 去伪 + A06 抽取 + A07 舆情<br/>本地 medium / 云端"]
+    A05 --> FAN{"A08-A12 + 行业 A13-A16<br/>并行 fan-out"}
+    FAN --> A17["A17 综合建议<br/>ReAct ≤3 步"]
+    A17 --> A18["A18 审计<br/>哈希链 零 LLM"]
+    A18 --> OUT["返回报告<br/>带数据溯源与审计指纹"]
 ```
 
 ---
